@@ -54,6 +54,27 @@ class PlaybackProgressTest {
         assertTrue(duplicate.sample(1000, 1000, true))
     }
 
+    @Test fun exportedProgressResumesWithoutCountingImportPositionJump() {
+        val source = PlaybackProgress()
+        assertFalse(source.sample(0, 0, true))
+        assertFalse(source.sample(600, 600, true))
+        val destination = PlaybackProgress().apply { restore(source.snapshot()) }
+        assertFalse(destination.sample(50_000, 30_000, true))
+        assertTrue(destination.sample(50_400, 30_400, true))
+    }
+
+    @Test fun exportedReportedGateNeverWritesAgainAndNewTraversalCanQualify() {
+        val source = PlaybackProgress()
+        source.sample(0, 0, true)
+        assertTrue(source.sample(1000, 1000, true))
+        val destination = PlaybackProgress().apply { restore(source.snapshot()) }
+        assertFalse(destination.sample(1000, 10_000, true))
+        assertFalse(destination.sample(2000, 11_000, true))
+        val nextTraversal = PlaybackProgress()
+        assertFalse(nextTraversal.sample(0, 12_000, true))
+        assertTrue(nextTraversal.sample(1000, 13_000, true))
+    }
+
     @Test fun playbackSpeedBoundsExpectedPositionProgress() {
         val gate = PlaybackProgress()
         assertFalse(gate.sample(0, 0, true, speed = 2f))

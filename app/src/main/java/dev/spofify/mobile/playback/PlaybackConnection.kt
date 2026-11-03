@@ -32,6 +32,13 @@ data class PlaybackState(
     val error: String? = null,
     val queue: List<LibraryItem> = emptyList(),
     val queueIndex: Int = -1,
+    /** Actual future traversal, excluding played/current entries even in shuffle/repeat. */
+    val upcoming: List<QueueEntry> = emptyList(),
+    val currentEntryId: String? = null,
+    val context: LibraryItem? = null,
+    val canUndoQueueRemoval: Boolean = false,
+    val playWhenReady: Boolean = false,
+    val notice: String? = null,
 )
 
 /**
@@ -43,7 +50,7 @@ data class PlaybackState(
 class PlaybackConnection(context: Context) : PlaybackControls {
     private val context = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
-    private val mainExecutor = Executor { command -> handler.post(command); Unit }
+    private val mainExecutor = Executor { command -> handler.post(command) }
     private val mutableState = MutableStateFlow(PlaybackState())
     override val state: StateFlow<PlaybackState> = mutableState.asStateFlow()
     private var controller: MediaController? = null
@@ -59,6 +66,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
     private var connectionError: String? = null
     private var queueSnapshot: List<LibraryItem> = emptyList()
+    private var requestedContext: LibraryItem? = null
 
     private data class PlayRequest(
         val items: List<MediaItem>,
@@ -66,6 +74,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         val shuffle: Boolean,
         val client: SpofifyClient,
         val epoch: Long,
+        val notice: String?,
+        val shouldPlay: Boolean = true,
     )
 
     private val listener = object : Player.Listener {
@@ -114,7 +124,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                     controller.release()
                     connectionError = "Playback stopped. Sign in or reconnect to try again."
                     mutableState.value = mutableState.value.copy(
-                        isPlaying = false, isBuffering = false, error = connectionError,
+                        isPlaying = false, playWhenReady = false, isBuffering = false, error = connectionError,
                     )
                 }
             })
@@ -131,6 +141,14 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                     pendingPlay = null
                     applyPlay(connected, request)
                 }
+                val additions = pendingEnqueues.toList()
+                pendingEnqueues.clear()
+                additions.forEach { request ->
+                    if (request.epoch == PlaybackRequests.epoch &&
+                        request.client === (context as SpofifyApplication).graph.client && request.client.currentSession() != null) {
+                        applyEnqueue(request.items, request.client, request.first)
+                    }
+                }
                 publish(refreshQueue = true)
                 handler.removeCallbacks(pollPosition)
                 handler.post(pollPosition)
@@ -138,7 +156,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             } catch (_: Exception) {
                 connectionError = "Unable to connect to playback. Sign in and try again."
                 mutableState.value = mutableState.value.copy(
-                    isPlaying = false, isBuffering = false, error = connectionError,
+                    isPlaying = false, playWhenReady = false, isBuffering = false, error = connectionError,
                 )
                 // Keep the latest explicit play request for a subsequent connect/play.
                 if (releaseAfterPending) releaseInternal()
@@ -147,7 +165,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
 
     override fun release() = onMain {
-        if ((pendingPlay != null && controller == null && controllerFuture != null) ||
+        if (((pendingPlay != null || pendingEnqueues.isNotEmpty()) && controller == null && controllerFuture != null) ||
             (controller?.playbackState == Player.STATE_BUFFERING && controller?.playWhenReady == true)) {
             // Do not tear down the binding between an explicit tap and its delivery.
             // Keep only this application-context controller until the service settles.
@@ -159,9 +177,9 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
 
     private fun maybeReleaseAfterPending() {
-        if (!releaseAfterPending || applyingPlay || pendingPlay != null) return
+        if (!releaseAfterPending || applyingPlay || pendingPlay != null || pendingEnqueues.isNotEmpty()) return
         val connected = controller ?: return
-        if (connected.playbackState == Player.STATE_READY ||
+        if (connected.playbackState == Player.STATE_READY || connected.playbackState == Player.STATE_IDLE ||
             connected.playbackState == Player.STATE_ENDED || connected.playerError != null) {
             releaseInternal()
         } else if (!releaseTimeoutScheduled) {
@@ -196,7 +214,10 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         shuffle: Boolean,
         startEntryId: String?,
     ) = onMain {
-        val tracks = items.filter { it.kind == "track" && it.playable }
+        val playable = items.filter { it.kind == "track" && it.playable }
+        val chosen = playbackStartIndex(playable, startTrackId, startEntryId)
+        // Never substitute a different first track when the explicitly selected entry is beyond the cap.
+        val tracks = if (chosen >= PlaybackQueue.LIMIT) listOf(playable[chosen]) else playable.take(PlaybackQueue.LIMIT)
         if (tracks.isEmpty()) {
             mutableState.value = mutableState.value.copy(error = "No playable tracks in this queue.")
             return@onMain
@@ -208,6 +229,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                 shuffle,
                 client,
                 PlaybackRequests.epoch,
+                when {
+                    chosen >= PlaybackQueue.LIMIT -> "This selection is beyond the 1,000-song limit. Only the selected occurrence is loaded."
+                    playable.size > PlaybackQueue.LIMIT -> "First 1,000 playable songs loaded. This context has more music."
+                    else -> null
+                },
             )
         } catch (_: IllegalArgumentException) {
             mutableState.value = mutableState.value.copy(error = "This queue contains an invalid track.")
@@ -215,6 +241,10 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         }
         connectionError = null
         cancelDeferredRelease()
+        // A later Play replaces any earlier not-yet-delivered Add actions.
+        pendingEnqueues.clear()
+        requestedContext = null
+        PlaybackService.setQueueContext(null)
         val connected = controller
         if (connected != null) {
             applyPlay(connected, request)
@@ -222,7 +252,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             pendingPlay = request
             mutableState.value = PlaybackState(
                 item = tracks[request.startIndex], queue = tracks, queueIndex = request.startIndex,
-                isBuffering = true, shuffle = shuffle,
+                isBuffering = true, playWhenReady = true, shuffle = shuffle, notice = request.notice,
             )
             connectInternal()
         }
@@ -242,10 +272,12 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         connectionError = null
         applyingPlay = true
         try {
-            connected.shuffleModeEnabled = request.shuffle
-            connected.setMediaItems(request.items, request.startIndex, 0L)
-            connected.prepare()
-            connected.play()
+            // Replacement and Add use the SAME synchronous service-owned command path.
+            // Mixing a queued controller replacement with a direct Add loses the addition.
+            connectionError = PlaybackService.replacePrepared(request.items, request.client,
+                request.startIndex, request.shuffle, request.shouldPlay)
+            PlaybackService.setQueueContext(requestedContext)
+            PlaybackService.setQueueNotice(request.notice)
         } finally {
             applyingPlay = false
         }
@@ -253,14 +285,70 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         maybeReleaseAfterPending()
     }
 
-    override fun toggle() = withController { connected ->
-        if (connected.isPlaying || (connected.playWhenReady &&
-                connected.playbackState != Player.STATE_ENDED && connected.playerError == null)) {
-            connected.pause()
-        } else if (connected.mediaItemCount > 0) {
-            if (connected.playbackState == Player.STATE_ENDED) connected.seekToDefaultPosition()
+    override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) = onMain {
+        if (client !== (context as SpofifyApplication).graph.client || client.currentSession() == null) return@onMain
+        cancelDeferredRelease()
+        // A service must exist before an empty Add, but no PlayRequest/autoplay is created.
+        if (controller == null) {
+            val tracks = items.filter { it.kind == "track" && it.playable }
+            val room = (PlaybackQueue.LIMIT - pendingEnqueues.sumOf { it.items.size }).coerceAtLeast(0)
+            if (room == 0 || tracks.isEmpty()) {
+                mutableState.value = mutableState.value.copy(error = if (tracks.isEmpty()) "No playable tracks to add." else "Queue is full (1,000 tracks).")
+                return@onMain
+            }
+            pendingEnqueues.add(EnqueueRequest(tracks.take(room), client, playNext, PlaybackRequests.epoch))
+            connectInternal()
+        } else applyEnqueue(items, client, playNext)
+    }
+
+    private data class EnqueueRequest(val items: List<LibraryItem>, val client: SpofifyClient, val first: Boolean, val epoch: Long)
+    private val pendingEnqueues = mutableListOf<EnqueueRequest>()
+
+    private fun applyEnqueue(items: List<LibraryItem>, client: SpofifyClient, first: Boolean) {
+        connectionError = PlaybackService.enqueuePrepared(items, client, first)
+        publish(refreshQueue = true)
+    }
+
+    override fun removeUpcoming(occurrenceId: String) = onMain { PlaybackService.removeQueued(occurrenceId); publish(true) }
+    override fun moveUpcoming(occurrenceId: String, toIndex: Int) = onMain { PlaybackService.moveQueued(occurrenceId, toIndex); publish(true) }
+    override fun clearUpcoming() = onMain { PlaybackService.clearQueued(); publish(true) }
+    override fun undoQueueRemoval() = onMain { PlaybackService.undoQueuedRemoval(); publish(true) }
+    override fun setContext(context: LibraryItem?) = onMain {
+        requestedContext = context?.copy(libraryPath = null)
+        PlaybackService.setQueueContext(requestedContext)
+        publish()
+    }
+    override fun selectOccurrence(occurrenceId: String) = withController { connected ->
+        val index = (0 until connected.mediaItemCount).firstOrNull {
+            PlaybackMedia.occurrence(connected.getMediaItemAt(it)) == occurrenceId
+        }
+        if (index != null) {
+            connected.seekToDefaultPosition(index)
             if (connected.playbackState == Player.STATE_IDLE || connected.playerError != null) connected.prepare()
             connected.play()
+        }
+    }
+
+    override fun toggle() = onMain {
+        val pending = pendingPlay
+        if (controller == null && pending != null) {
+            val shouldPlay = !pending.shouldPlay
+            pendingPlay = pending.copy(shouldPlay = shouldPlay)
+            mutableState.value = mutableState.value.copy(playWhenReady = shouldPlay, isBuffering = shouldPlay)
+            return@onMain
+        }
+        withController { connected ->
+            if (connected.isPlaying || (connected.playWhenReady &&
+                    connected.playbackState != Player.STATE_ENDED && connected.playerError == null)) {
+                connected.pause()
+            } else if (connected.mediaItemCount > 0) {
+                if (connected.playbackState == Player.STATE_ENDED) {
+                    PlaybackService.restartCurrentTraversal()
+                    connected.seekToDefaultPosition()
+                }
+                if (connected.playbackState == Player.STATE_IDLE || connected.playerError != null) connected.prepare()
+                connected.play()
+            }
         }
     }
 
@@ -313,6 +401,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         PlaybackRequests.invalidate()
         onMain {
             pendingPlay = null
+            pendingEnqueues.clear()
             controller?.let { it.stop(); it.clearMediaItems() }
             releaseInternal()
             PlaybackService.stopActivePlayback()
@@ -341,6 +430,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         mutableState.value = PlaybackState(
             item = currentItem,
             isPlaying = connected.isPlaying,
+            playWhenReady = connected.playWhenReady && connected.playbackState != Player.STATE_ENDED && connected.playerError == null,
             isBuffering = connected.playbackState == Player.STATE_BUFFERING,
             positionMs = connected.currentPosition.coerceAtLeast(0),
             durationMs = if (duration == C.TIME_UNSET) currentItem?.durationMs ?: 0 else duration.coerceAtLeast(0),
@@ -349,6 +439,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             error = connected.playerError?.let(::playbackErrorMessage) ?: connectionError,
             queue = queueSnapshot,
             queueIndex = if (queueSnapshot.isEmpty()) -1 else connected.currentMediaItemIndex,
+            upcoming = PlaybackService.upcomingEntries(),
+            currentEntryId = PlaybackMedia.occurrence(connected.currentMediaItem),
+            context = PlaybackService.queueContext(),
+            canUndoQueueRemoval = PlaybackService.canUndoRemoval(),
+            notice = PlaybackService.queueNotice(),
         )
     }
 

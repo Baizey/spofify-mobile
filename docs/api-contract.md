@@ -13,7 +13,7 @@ Initial audit: spofify-go main at **9d532f9**. Treat this as a client contract s
 
 ## Library / media
 
-GET /api/library uses kind, q, scope=all, availability=in-library, limit=40 and offset. Artist/album child lists omit search and use availability=all so missing tracks remain visible. No provider fetch or acquisition is triggered by browsing/play.
+GET /api/library uses kind, q, scope=all, availability and bounded limit/offset. Main Search requires a nonblank query and loads independent artists/albums/tracks pages (10 each); it never fetches the catalog on an empty query. Artist/album detail children deliberately omit the outer search and use availability=all so missing tracks remain visible. Artist release groups use the shipped releaseGroup filter. GET /api/library/{artists|albums|tracks}/{id} loads listener-safe details; GET /api/library/revision supports quiet catalog revalidation. No provider fetch or acquisition is triggered by these reads.
 
 Artist/album playback: GET /api/library/{artists|albums}/{id}/playback. The returned queue includes available members beyond the current browse page, up to 1,000. A selected track absent from a capped queue is explicitly retained rather than silently playing a different song.
 
@@ -31,8 +31,21 @@ Listener tracks use hasAudio. Admin catalog tracks use libraryPath instead; the 
 - GET /api/me/recent?limit=40; only actual progression leads to POST /api/me/history {eventId,trackId}. Event IDs identify queue occurrences and history failures are silent/best effort.
 - GET /api/me/likes, GET /api/me/likes/playback.
 - POST /api/me/likes/status {trackIds}; PUT /api/me/likes {trackId,liked}.
-- GET /api/me/playlists?kind=manual; paginated list and /{id}/entries; GET /{id}/playback.
+- GET /api/me/playlists lists manual and derived summaries; kind=manual is used for valid Add-to-playlist targets. Derived counts can be null/unevaluated, not zero.
+- Manual playlists: POST collection; GET/PATCH/DELETE /{id}; GET/POST /{id}/entries; DELETE /{id}/entries/{entryId}; PUT /{id}/order; GET /{id}/playback. Writes use the exact expectedRevision contract. Entry IDs identify occurrences, not tracks; reorder requires the complete bounded order. A 409 or lost reply is not permission to replay a mutation.
+- Derived playlists: GET/PUT /{id}/definition; GET /{id}/evaluation with signed cursor; POST /api/me/playlists/preview; POST /{id}/playback and /{id}/copy with revision/fence and selectionToken where applicable. Recipe edits invalidate preview generations. Playback consumes the approved prepared result, not a client re-evaluation of visible rows.
+- Successful confirmed likes/history/playlist writes advance client-local freshness counters so visible personal shelves can refresh independently without discarding usable content.
 
-Administrative source playlists are **not** personal playlists. Derived playlists have a separate fenced evaluation/POST-playback protocol and are intentionally excluded in the initial client. Personal owners come only from the authenticated account; the app never supplies an owner selector.
+Administrative source playlists are **not** personal playlists. Personal owners come only from the authenticated account; the app never supplies an owner selector.
+
+## Playback devices and native safety gate
+
+The native protocol adapter consumes GET /api/me/player and its existing POST actions (register, poll, rename, command, transfer, leave). Requests are bounded and one-shot; 404/409 reconciliation may preserve only a strictly validated listener-safe view, never arbitrary server error bodies. Prepared snapshots preserve exact queue keys/order, context, duplicate occurrences and history qualification—not URLs or a freshly fetched playlist.
+
+The application owns the coordinator and ties it to real service lifecycle/authentication. **The current Media3 bridge does not yet advertise exact handoff capability:** notification/system transport routing and exact authority-fenced import are still required. The device sheet can show authenticated devices read-only; native registration, output selection/commands and handoff remain disabled rather than claiming unsafe parity.
+
+## Connection persistence
+
+Sessions retain their original Android Keystore AES-GCM storage format. Optional remembered server/username/password uses a separate encrypted namespace and is excluded from backup/device transfer. Only a successful current client can save credentials; restored sessions never autoplay or trigger password-based automatic sign-in. Editing server origin or username clears the form password. Forgetting a saved login does not revoke a valid session; sign out clears the session while retaining an opted-in remembered login.
 
 Unknown response fields are ignored for forward compatibility, while missing required fields/content-type mismatches fail with local user-facing errors. No version/capability API currently exists; do not invent one or treat an arbitrary 401 as proof of server identity.

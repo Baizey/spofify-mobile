@@ -21,11 +21,12 @@ internal object PlaybackMedia {
     private const val ALBUM_ID = "spofify.albumId"
     private const val DURATION = "spofify.durationMs"
 
-    fun create(item: LibraryItem, client: SpofifyClient): MediaItem {
+    fun create(item: LibraryItem, client: SpofifyClient, occurrenceId: String = UUID.randomUUID().toString()): MediaItem {
         require(item.kind == "track" && item.playable && validId(item.id))
+        require(occurrenceId.isNotEmpty() && occurrenceId.length <= 128 && occurrenceId.all { it.code in 33..126 })
         val extras = Bundle().apply {
             putString(ID, item.id)
-            putString(OCCURRENCE, UUID.randomUUID().toString())
+            putString(OCCURRENCE, occurrenceId)
             putStringArrayList(ARTIST_IDS, ArrayList(item.artists.map { it.id }))
             putStringArrayList(ARTIST_NAMES, ArrayList(item.artists.map { it.name }))
             putString(ALBUM_ID, item.albumId)

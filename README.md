@@ -11,13 +11,13 @@ A native **Android** listener for your own [spofify-go](../spofify-go) server. K
 - Persistent mini-player, expanded Now Playing, seeking, queue selection, shuffle and repeat.
 - MediaSessionService-owned audio with foreground notification, lock-screen controls, audio focus and headphone-disconnect handling.
 - Like/unlike the current song; report listening history after actual playback progress.
-- Android Keystore-encrypted session persistence; passwords are never saved.
+- Android Keystore-encrypted sessions and optional remembered server/username/password for quicker testing and sign-in.
 
 **This is an initial implementation, not a production release.** The API contract tests, Robolectric sign-in UI checks, debug APK build and Android lint can run locally. Physical-device playback/background/codec behavior still needs the checklist in [docs/testing.md](docs/testing.md). No live backend was changed or exercised during development.
 
 ## Run
 
-Open this directory in Android Studio, install **Android SDK 36**, and run the `app` configuration on Android **8.0 / API 26 or later**. The Gradle wrapper is pinned and checksum-verified. JDK 17+ is required; development validation used JDK 25.
+Open this directory in Android Studio, install **Android SDK 36**, and run the `app` configuration on Android **8.0 / API 26 or later**. The Gradle wrapper is pinned. JDK 17+ is required; development validation used JDK 25.
 
 Command line:
 
@@ -41,11 +41,13 @@ GRADLE_USER_HOME="$PWD/.tooling/gradle" ./gradlew :core:test :app:testDebugUnitT
 Enter an **origin**, for example `https://music.example.com` or `http://192.168.1.20:8080`. Do not append `/listen` or `/api`. URL credentials, paths, query strings and fragments are rejected.
 
 - Prefer HTTPS with a certificate trusted by Android. Certificate verification is never disabled.
-- Trusted-LAN HTTP is limited to concrete private, loopback and Tailscale/shared-space IPs; the app requires acknowledgement that HTTP exposes passwords and media to the network.
+- Trusted-LAN HTTP is limited to concrete private, loopback and Tailscale/shared-space IPs. A visible warning explains that HTTP exposes passwords and media; there is no separate acknowledgement checkbox.
 - The URL's exact host/port must already be permitted by your server's origin configuration. The app does not rewrite that configuration.
 - A phone's `127.0.0.1` is the phone, not your development machine. Use its reachable LAN/Tailscale address. An emulator's `10.0.2.2` still needs to be an allowed origin on the server; the app cannot bypass Host checks.
 - Use an existing listener or admin account. Both receive the same listener-only app; no Spotify credentials are needed here.
 - Sessions expire on the server (currently 12 hours). Sign in again after expiry. Sign out before changing servers.
+- **Remember sign-in on this device** defaults on for convenient testing. After successful sign-in, one server/username/password is encrypted separately from the session using Android Keystore; it is never put in backup, saved UI state or logs. Changing the server origin or username clears the form password. It never signs in automatically with a password.
+- Sign out clears the session but keeps that remembered login for next time. **Forget saved login** (on sign-in or in Account) deletes it and turns remembering off without ending an active session. Turn remembering off on shared devices.
 
 ## Structure
 

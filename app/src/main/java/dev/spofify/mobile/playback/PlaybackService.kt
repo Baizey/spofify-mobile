@@ -17,6 +17,12 @@ import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder
+import dev.spofify.mobile.core.LibraryItem
+import dev.spofify.mobile.core.PlaybackSnapshot
+import dev.spofify.mobile.core.PlaybackOccurrence
+import dev.spofify.mobile.core.PlaybackContext
+import java.util.UUID
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.google.common.util.concurrent.Futures
@@ -41,13 +47,38 @@ import kotlinx.coroutines.launch
 @androidx.annotation.OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
     internal companion object {
-        private const val MAX_PENDING_AUDIO_URLS = 10_000
+        private const val MAX_PENDING_AUDIO_URLS = 1_000
         private var active = WeakReference<PlaybackService>(null)
 
         /** Main-thread, same-process safety net: stopService alone cannot stop a bound service. */
         fun stopActivePlayback() {
             active.get()?.shutdownPlayback()
         }
+
+        // Same-process calls only, always on the main looper. Service lifetime remains authoritative.
+        fun replacePrepared(items: List<MediaItem>, client: SpofifyClient, start: Int, shuffle: Boolean, play: Boolean): String? {
+            val service = active.get() ?: return "Playback is unavailable. Try again."
+            return service.replace(items, client, start, shuffle, play)
+        }
+        fun enqueuePrepared(items: List<LibraryItem>, client: SpofifyClient, first: Boolean): String? {
+            val service = active.get() ?: return "Unable to connect to playback. Try again."
+            return service.enqueue(items, client, first)
+        }
+        fun removeQueued(id: String) { active.get()?.removeUpcoming(id) }
+        fun moveQueued(id: String, to: Int) { active.get()?.moveUpcoming(id, to) }
+        fun clearQueued() { active.get()?.clearUpcoming() }
+        fun undoQueuedRemoval() { active.get()?.undoRemoval() }
+        fun upcomingEntries(): List<QueueEntry> = active.get()?.upcoming().orEmpty()
+        fun canUndoRemoval(): Boolean = active.get()?.validRemoval() == true
+        fun setQueueContext(value: LibraryItem?) { active.get()?.contextIdentity = value?.copy(libraryPath = null) }
+        fun queueContext(): LibraryItem? = active.get()?.contextIdentity
+        fun setQueueNotice(value: String?) { active.get()?.queueMessage = value }
+        fun queueNotice(): String? = active.get()?.queueMessage
+        fun restartCurrentTraversal() { active.get()?.restartTraversal() }
+        fun exportLocalSnapshot(): PlaybackSnapshot = active.get()?.exportPrepared() ?: PlaybackSnapshot()
+        fun suspendLocalOutput() { active.get()?.suspendBufferedOutput() }
+        /** App-owned callback, never installed by a composition. Wire before service startup. */
+        var onServiceActiveChanged: ((Boolean) -> Unit)? = null
     }
 
     private var player: ExoPlayer? = null
@@ -60,6 +91,13 @@ class PlaybackService : MediaSessionService() {
     // Main-thread only. Approved callbacks can precede the corresponding timeline update.
     private val pendingAudioUrls = mutableSetOf<String>()
     private var historyWasPlaying = false
+    private var contextIdentity: LibraryItem? = null
+    private var queueMessage: String? = null
+    private var removed: Pair<PlaybackQueue.Removal, MediaItem>? = null
+    private var arranging = false
+    private val historyNonces = mutableMapOf<String, String>()
+    private val wireKeys = mutableMapOf<String, Long>()
+    private var wireSerial = 0L
 
     private val pruneQueueState = Runnable {
         val current = player
@@ -76,6 +114,8 @@ class PlaybackService : MediaSessionService() {
         // No ever-growing history cache or URL allowlist: retain only the live queue
         // and URLs approved for a not-yet-applied session callback.
         history.keys.retainAll(activeOccurrences)
+        historyNonces.keys.retainAll(activeOccurrences)
+        wireKeys.keys.retainAll(activeOccurrences)
         allowedAudioUrls.retainAll(activeUrls + pendingAudioUrls)
     }
 
@@ -114,7 +154,8 @@ class PlaybackService : MediaSessionService() {
         val dataSources = ResolvingDataSource.Factory(
             OkHttpDataSource.Factory(sharedClient.httpClient),
         ) { spec ->
-            if (spec.uri.toString() !in allowedAudioUrls) {
+            if (sharedClient !== (application as SpofifyApplication).graph.client ||
+                sharedClient.currentSession() == null || spec.uri.toString() !in allowedAudioUrls) {
                 throw IOException("Playback source is not in the authorized queue")
             }
             spec
@@ -132,6 +173,26 @@ class PlaybackService : MediaSessionService() {
         exo.addListener(object : Player.Listener {
             override fun onTimelineChanged(timeline: Timeline, reason: Int) {
                 schedulePrune()
+            }
+
+            override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+                if (arranging || !shuffleModeEnabled) return
+                // Shuffle only the future; played/current retain their positions.
+                val ids = physicalIds()
+                val at = exo.currentMediaItemIndex.coerceAtLeast(0)
+                setTraversal(ids.take(at + 1) + ids.drop(at + 1).shuffled())
+                removed = null
+            }
+
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                // Repeat/returning is a new traversal; playlist moves are not.
+                if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED ||
+                    PlaybackMedia.occurrence(mediaItem) !in history) {
+                    PlaybackMedia.occurrence(mediaItem)?.let { id ->
+                        history[id] = PlaybackProgress()
+                        historyNonces[id] = UUID.randomUUID().toString()
+                    }
+                }
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -159,7 +220,11 @@ class PlaybackService : MediaSessionService() {
                 exo.pause()
             }
         })
-        val builder = MediaSession.Builder(this, exo).setCallback(SessionCallback(sharedClient))
+        // Intercept semantic restart actions AT execution, not during command authorization:
+        // controller batches may seek before Previous while the authorization callbacks still
+        // observe the old position. Ordinary seekTo/scrubbing never resets a traversal.
+        val sessionPlayer = TraversalPlayer(exo, ::restartTraversal)
+        val builder = MediaSession.Builder(this, sessionPlayer).setCallback(SessionCallback(sharedClient))
         packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
             builder.setSessionActivity(PendingIntent.getActivity(
                 this, 0, launchIntent,
@@ -168,6 +233,7 @@ class PlaybackService : MediaSessionService() {
         }
         session = builder.build()
         handler.post(historyTick)
+        onServiceActiveChanged?.invoke(true)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
@@ -193,7 +259,10 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun releasePlayback() {
-        if (active.get() === this) active.clear()
+        if (active.get() === this) {
+            onServiceActiveChanged?.invoke(false)
+            active.clear()
+        }
         handler.removeCallbacksAndMessages(null)
         session?.release()
         session = null
@@ -201,6 +270,11 @@ class PlaybackService : MediaSessionService() {
         player = null
         historyScope.cancel()
         history.clear()
+        historyNonces.clear()
+        wireKeys.clear()
+        removed = null
+        contextIdentity = null
+        queueMessage = null
         allowedAudioUrls.clear()
         pendingAudioUrls.clear()
         client = null
@@ -218,10 +292,11 @@ class PlaybackService : MediaSessionService() {
         val eventId = PlaybackMedia.occurrence(current) ?: return
         val sharedClient = client ?: return
         val gate = history.getOrPut(eventId) { PlaybackProgress() }
+        val nonce = historyNonces.getOrPut(eventId) { UUID.randomUUID().toString() }
         if (gate.sample(position, SystemClock.elapsedRealtime(), playing, player?.playbackParameters?.speed ?: 1f)) {
             historyScope.launch {
                 try {
-                    sharedClient.recordHistory(eventId, current.mediaId)
+                    sharedClient.recordHistory(nonce, current.mediaId)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
@@ -229,6 +304,199 @@ class PlaybackService : MediaSessionService() {
                 }
             }
         }
+    }
+
+    private fun suspendBufferedOutput() {
+        val current = player ?: return
+        sampleHistory(current.currentMediaItem, current.currentPosition, historyWasPlaying)
+        current.pause()
+        current.stop() // Discard buffered output without clearing prepared items/history/position.
+        historyWasPlaying = false
+        resetHistoryAnchor(current.currentMediaItem)
+    }
+
+    private fun exportPrepared(): PlaybackSnapshot {
+        val current = player ?: return PlaybackSnapshot()
+        sampleHistory(current.currentMediaItem, current.currentPosition, current.isPlaying)
+        val physical = physicalIds()
+        val order = traversalIds()
+        val queue = order.map { id ->
+            val index = physical.indexOf(id)
+            val item = requireNotNull(PlaybackMedia.libraryItem(current.getMediaItemAt(index)))
+            val key = wireKeys.getOrPut(id) { ++wireSerial }
+            PlaybackSnapshotCodec.track(item, key, index.toLong())
+        }
+        val currentId = currentId()
+        val position = order.indexOf(currentId)
+        val duration = if (current.duration == C.TIME_UNSET) current.currentMediaItem?.let(PlaybackMedia::libraryItem)?.durationMs ?: 0L else current.duration
+        val occurrence = currentId?.let { id ->
+            val item = current.currentMediaItem ?: return@let null
+            val gate = history.getOrPut(id) { PlaybackProgress() }.snapshot()
+            PlaybackOccurrence(wireKeys.getValue(id), item.mediaId,
+                historyNonces.getOrPut(id) { UUID.randomUUID().toString() }, gate.accumulatedMs / 1000.0, gate.recorded)
+        }
+        return PlaybackSnapshot(queue = queue, position = position,
+            context = contextIdentity?.let { PlaybackContext(it.kind, it.id, it.name) },
+            shuffle = current.shuffleModeEnabled,
+            repeat = when (current.repeatMode) { Player.REPEAT_MODE_ALL -> "all"; Player.REPEAT_MODE_ONE -> "one"; else -> "off" },
+            elapsed = current.currentPosition.coerceAtLeast(0) / 1000.0,
+            duration = duration.coerceAtLeast(0) / 1000.0,
+            playing = current.isPlaying, waiting = current.playbackState == Player.STATE_BUFFERING,
+            error = if (current.playerError == null) "" else "media", occurrence = occurrence,
+            truncated = queueMessage != null,
+            notice = if (queueMessage?.startsWith("This selection") == true) "CLICKED_OCCURRENCE_ONLY" else if (queueMessage != null) "PLAYBACK_LIMIT" else "",
+        ).validated()
+    }
+
+    private fun restartTraversal() {
+        val current = player ?: return
+        sampleHistory(current.currentMediaItem, current.currentPosition, historyWasPlaying)
+        currentId()?.let { id ->
+            history[id] = PlaybackProgress()
+            historyNonces[id] = UUID.randomUUID().toString()
+        }
+    }
+
+    private fun physicalIds(): List<String> {
+        val current = player ?: return emptyList()
+        return (0 until current.mediaItemCount).map { requireNotNull(PlaybackMedia.occurrence(current.getMediaItemAt(it))) }
+    }
+
+    private fun traversalIds(): List<String> {
+        val current = player ?: return emptyList()
+        val timeline = current.currentTimeline
+        if (timeline.isEmpty) return emptyList()
+        return PlaybackQueue.traversal(current.mediaItemCount, timeline.getFirstWindowIndex(current.shuffleModeEnabled)) {
+            timeline.getNextWindowIndex(it, Player.REPEAT_MODE_OFF, current.shuffleModeEnabled)
+        }.map { requireNotNull(PlaybackMedia.occurrence(current.getMediaItemAt(it))) }
+    }
+
+    private fun currentId(): String? = PlaybackMedia.occurrence(player?.currentMediaItem)
+
+    private fun setTraversal(ids: List<String>) {
+        val current = player ?: return
+        val physical = physicalIds()
+        if (ids.size != physical.size || ids.toSet() != physical.toSet()) return
+        current.setShuffleOrder(DefaultShuffleOrder(ids.map(physical::indexOf).toIntArray(), System.nanoTime()))
+    }
+
+    private fun upcoming(): List<QueueEntry> {
+        val current = player ?: return emptyList()
+        val physical = physicalIds()
+        return PlaybackQueue.upcoming(traversalIds(), currentId()).mapNotNull { id ->
+            val index = physical.indexOf(id)
+            PlaybackMedia.libraryItem(current.getMediaItemAt(index))?.let { QueueEntry(id, it, index) }
+        }
+    }
+
+    private fun replace(items: List<MediaItem>, requestedClient: SpofifyClient, start: Int, shuffle: Boolean, play: Boolean): String? {
+        val current = player ?: return "Playback is unavailable. Try again."
+        if (requestedClient !== client || client !== (application as SpofifyApplication).graph.client ||
+            requestedClient.currentSession() == null) return "Sign in again before playing music."
+        val safe = try {
+            require(items.size in 1..PlaybackQueue.LIMIT && start in items.indices)
+            items.map { PlaybackMedia.create(requireNotNull(PlaybackMedia.libraryItem(it)), requestedClient) }
+        } catch (_: IllegalArgumentException) { return "This queue contains an invalid track." }
+        // Validate the whole replacement before changing authorization, queue or current audio.
+        safe.forEach { allowedAudioUrls.add(requireNotNull(it.localConfiguration).uri.toString()) }
+        removed = null
+        current.pause()
+        current.shuffleModeEnabled = false
+        current.setMediaItems(safe, start, 0L)
+        current.shuffleModeEnabled = shuffle
+        current.playWhenReady = play
+        if (play) current.prepare()
+        schedulePrune()
+        return null
+    }
+
+    private fun enqueue(items: List<LibraryItem>, requestedClient: SpofifyClient, first: Boolean): String? {
+        val current = player ?: return "Playback is unavailable. Try again."
+        if (requestedClient !== client || client !== (application as SpofifyApplication).graph.client ||
+            requestedClient.currentSession() == null) return "Sign in again before adding music."
+        val tracks = items.filter { it.kind == "track" && it.playable }
+        if (tracks.isEmpty()) return "No playable tracks to add."
+        var order = traversalIds()
+        val retained = PlaybackQueue.retainedForAdd(order, currentId(), tracks.size)
+        val additions = try {
+            tracks.take(PlaybackQueue.LIMIT - retained.size).map { PlaybackMedia.create(it, requestedClient) }
+        } catch (_: IllegalArgumentException) { return "This queue contains an invalid track." }
+        if (additions.isEmpty()) return "Queue is full (1,000 tracks). Remove upcoming music first."
+        if (retained != order) {
+            val retired = order.toSet() - retained.toSet()
+            for (index in current.mediaItemCount - 1 downTo 0) {
+                if (PlaybackMedia.occurrence(current.getMediaItemAt(index)) in retired) current.removeMediaItem(index)
+            }
+            order = retained
+        }
+        val insert = if (first && currentId() != null) order.indexOf(currentId()) + 1 else order.size
+        val addedIds = additions.map { requireNotNull(PlaybackMedia.occurrence(it)) }
+        val nextOrder = order.toMutableList().apply { addAll(insert, addedIds) }
+        additions.forEach { allowedAudioUrls.add(requireNotNull(it.localConfiguration).uri.toString()) }
+        // A finished/empty player's stale playWhenReady must not make Add autoplay.
+        if (current.mediaItemCount == 0 || current.playbackState == Player.STATE_ENDED) current.pause()
+        // Add directly to the service's player. No prepare/play: empty Add remains paused/idle.
+        current.addMediaItems(additions)
+        removed = null
+        if (current.shuffleModeEnabled) setTraversal(nextOrder) else adoptDisplayedOrder(nextOrder)
+        schedulePrune()
+        if (additions.size < tracks.size) queueMessage = "Queue limited to 1,000 songs; some music was not added."
+        return null
+    }
+
+    /** Move existing MediaItems instead of resetting the playlist: current audio/position survives. */
+    private fun adoptDisplayedOrder(ids: List<String>) {
+        val current = player ?: return
+        arranging = true
+        try {
+            ids.forEachIndexed { target, id ->
+                val from = physicalIds().indexOf(id)
+                if (from >= 0 && from != target) current.moveMediaItem(from, target)
+            }
+            current.shuffleModeEnabled = false
+        } finally { arranging = false }
+    }
+
+    private fun removeUpcoming(id: String) {
+        val current = player ?: return
+        val order = traversalIds()
+        val removal = PlaybackQueue.removal(order, currentId(), id) ?: return
+        val index = physicalIds().indexOf(id)
+        val media = current.getMediaItemAt(index)
+        current.removeMediaItem(index)
+        if (current.shuffleModeEnabled) setTraversal(removal.remaining)
+        removed = removal to media
+    }
+
+    private fun validRemoval(): Boolean = removed?.first?.canUndo(traversalIds(), currentId()) == true
+
+    private fun undoRemoval() {
+        val current = player ?: return
+        val (removal, media) = removed ?: return
+        val restored = removal.undo(traversalIds(), currentId()) ?: run { removed = null; return }
+        removed = null
+        allowedAudioUrls.add(requireNotNull(media.localConfiguration).uri.toString())
+        current.addMediaItem(media)
+        if (current.shuffleModeEnabled) setTraversal(restored) else adoptDisplayedOrder(restored)
+        schedulePrune()
+    }
+
+    private fun moveUpcoming(id: String, to: Int) {
+        val moved = PlaybackQueue.move(traversalIds(), currentId(), id, to) ?: return
+        removed = null
+        adoptDisplayedOrder(moved)
+    }
+
+    private fun clearUpcoming() {
+        val current = player ?: return
+        val future = PlaybackQueue.upcoming(traversalIds(), currentId()).toSet()
+        if (future.isEmpty()) return
+        val remaining = traversalIds().filterNot { it in future }
+        removed = null
+        for (index in current.mediaItemCount - 1 downTo 0) {
+            if (PlaybackMedia.occurrence(current.getMediaItemAt(index)) in future) current.removeMediaItem(index)
+        }
+        if (current.shuffleModeEnabled) setTraversal(remaining)
     }
 
     private inner class SessionCallback(private val sharedClient: SpofifyClient) : MediaSession.Callback {
@@ -281,6 +549,7 @@ class PlaybackService : MediaSessionService() {
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
             return try {
                 val safe = sanitized(controller, mediaItems)
+                removed = null
                 approve(safe, replace = true)
                 Futures.immediateFuture(MediaSession.MediaItemsWithStartPosition(safe, startIndex, startPositionMs))
             } catch (_: IllegalArgumentException) {
@@ -292,6 +561,7 @@ class PlaybackService : MediaSessionService() {
             controller: MediaSession.ControllerInfo,
             items: List<MediaItem>,
         ): ListenableFuture<MutableList<MediaItem>> = try {
+            require((player?.mediaItemCount ?: 0) + items.size <= PlaybackQueue.LIMIT)
             val safe = sanitized(controller, items)
             approve(safe, replace = false)
             Futures.immediateFuture(safe)
@@ -302,6 +572,8 @@ class PlaybackService : MediaSessionService() {
         private fun sanitized(controller: MediaSession.ControllerInfo, items: List<MediaItem>): MutableList<MediaItem> {
             require(controller.uid == Process.myUid())
             require(sharedClient === (application as SpofifyApplication).graph.client)
+            require(sharedClient.currentSession() != null)
+            require(items.size <= PlaybackQueue.LIMIT)
             return items.map { supplied ->
                 val track = requireNotNull(PlaybackMedia.libraryItem(supplied))
                 // Rebuild instead of trusting localConfiguration, URI, headers, DRM,

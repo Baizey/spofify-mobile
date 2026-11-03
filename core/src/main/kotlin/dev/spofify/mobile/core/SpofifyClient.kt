@@ -2,6 +2,9 @@ package dev.spofify.mobile.core
 
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.Serializable
@@ -30,7 +33,13 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
     private var cookie: Cookie? = null
     private var session: Session? = null
     private var generation: Long = 0
-    /** Invoked on the request's OkHttp worker; UI consumers should dispatch to their own scope. */
+    private val mutablePersonalRevision = MutableStateFlow(PersonalRevision())
+    val personalRevision: StateFlow<PersonalRevision> = mutablePersonalRevision.asStateFlow()
+
+    /**
+     * Invoked on the request's OkHttp worker under the auth-generation lock. Must not block or
+     * wait for another thread accessing this client; UI consumers should dispatch to their scope.
+     */
     @Volatile var onUnauthorized: (() -> Unit)? = null
 
     val httpClient: OkHttpClient = OkHttpClient.Builder()
@@ -61,14 +70,37 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
                 else currentSession()?.let { builder.header("X-CSRF-Token", it.csrfToken) }
             }
             val response = chain.proceed(builder.build())
-            if (response.code == 401 && !login && invalidate(requestGeneration)) {
-                onUnauthorized?.invoke()
+            try {
+                if (response.code == 401 && !login) invalidate(requestGeneration, notifyUnauthorized = true)
+                response
+            } catch (error: Exception) {
+                // The response is not handed to a caller when invalidation/storage fails.
+                response.close()
+                throw error
             }
-            response
         }
         .build()
 
     fun currentSession(): Session? = synchronized(lock) { session }
+
+    /** Call only after a confirmed personal mutation, never after optimistic UI changes or reads. */
+    fun notifyPersonalChange(collection: PersonalCollection) = synchronized(lock) {
+        notifyPersonalChange(collection, generation)
+    }
+
+    /** Capture before an external API mutation and pass back only after its confirmed success. */
+    internal fun personalMutationGeneration(): Long = synchronized(lock) { generation }
+
+    internal fun notifyPersonalChange(collection: PersonalCollection, expectedGeneration: Long) = synchronized(lock) {
+        if (generation == expectedGeneration && session != null && cookie?.let { it.expiresAt > System.currentTimeMillis() } == true) {
+            val previous = mutablePersonalRevision.value
+            mutablePersonalRevision.value = when (collection) {
+                PersonalCollection.LIKES -> previous.copy(likes = previous.likes + 1)
+                PersonalCollection.HISTORY -> previous.copy(history = previous.history + 1)
+                PersonalCollection.PLAYLISTS -> previous.copy(playlists = previous.playlists + 1)
+            }
+        }
+    }
 
     fun clearSession() { resetSession() }
 
@@ -76,14 +108,25 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         cookie = null
         session = null
         generation++
-        store.write(null)
+        try { store.write(null) }
+        catch (_: Exception) { throw IOException("Unable to clear the saved session. Sign in again.") }
         generation
     }
 
     /** Old requests must not clear or resurrect a newer account session. */
-    private fun invalidate(expectedGeneration: Long): Boolean = synchronized(lock) {
+    private fun invalidate(expectedGeneration: Long, notifyUnauthorized: Boolean = false): Boolean = synchronized(lock) {
         if (generation != expectedGeneration) false
-        else { resetSession(); true }
+        else {
+            val invalidatedGeneration = generation + 1
+            try { resetSession() }
+            finally {
+                // Runtime auth is cleared before persistence. Even a failed disk clear must stop
+                // buffered playback. Invoke under the generation lock so an old 401 cannot signal
+                // after a newer login has installed its session on this same client.
+                if (notifyUnauthorized && generation == invalidatedGeneration && session == null) onUnauthorized?.invoke()
+            }
+            true
+        }
     }
 
     suspend fun login(username: String, password: String): Session {
@@ -181,7 +224,9 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
     suspend fun playlistPlayback(id: String): PlaybackQueue = get(server.url("api", "me", "playlists", id, "playback"))
 
     suspend fun setLiked(trackId: String, liked: Boolean) {
+        val writeGeneration = synchronized(lock) { generation }
         mutate(server.url("api", "me", "likes"), "PUT", buildJsonObject { put("trackId", validId(trackId)); put("liked", liked) }.toString())
+        notifyPersonalChange(PersonalCollection.LIKES, writeGeneration)
     }
 
     suspend fun likeStatus(trackId: String): Boolean {
@@ -194,7 +239,9 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
 
     suspend fun recent(): LibraryPage = get<TrackPage>(server.url("api", "me", "recent").newBuilder().addQueryParameter("limit", "40").build()).flatten()
     suspend fun recordHistory(eventId: String, trackId: String) {
+        val writeGeneration = synchronized(lock) { generation }
         mutate(server.url("api", "me", "history"), "POST", buildJsonObject { put("eventId", validId(eventId)); put("trackId", validId(trackId)) }.toString())
+        notifyPersonalChange(PersonalCollection.HISTORY, writeGeneration)
     }
 
     fun audioUrl(item: LibraryItem): String {
@@ -233,7 +280,11 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         .method(method, body?.toRequestBody("application/json; charset=utf-8".toMediaType())).build()
     private suspend inline fun <reified T> get(url: HttpUrl): T = response(request(url)) { decode<T>(it) }
     private suspend fun mutate(url: HttpUrl, method: String, body: String) { response(request(url, method, body)) { Unit } }
-    private suspend fun <T> response(request: Request, block: (Response) -> T): T = suspendCancellableCoroutine { continuation ->
+    internal suspend fun <T> response(
+        request: Request,
+        errorFactory: ((Response) -> ApiException)? = null,
+        block: (Response) -> T,
+    ): T = suspendCancellableCoroutine { continuation ->
         val call = httpClient.newCall(request)
         // Keep cancellation attached until the body has been consumed, not merely until headers
         // arrive. All body reading/decoding stays on OkHttp's worker, never the UI dispatcher.
@@ -245,7 +296,8 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
             override fun onResponse(call: Call, response: Response) {
                 try {
                     val result = response.use {
-                        if (!it.isSuccessful) throw ApiException(it.code, safeError(it.code, request.url.encodedPath == "/api/auth/login"))
+                        if (!it.isSuccessful) throw errorFactory?.invoke(it)
+                            ?: ApiException(it.code, safeError(it.code, request.url.encodedPath == "/api/auth/login"))
                         block(it)
                     }
                     continuation.resume(result) { _, _, _ -> }
