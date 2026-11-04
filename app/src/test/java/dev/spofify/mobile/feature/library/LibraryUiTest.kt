@@ -6,6 +6,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.*
@@ -88,8 +91,9 @@ class LibraryUiTest {
         try {
             compose.setContent {
                 MaterialTheme {
+                    val navigation by holder.state.collectAsState()
                     Box(Modifier.size(360.dp, 640.dp).testTag("viewport")) {
-                        CatalogScreenContent(holder.state.value, holder, {}, { _, _ -> }, {}, {},
+                        CatalogScreenContent(navigation, holder, {}, { _, _ -> }, {}, {},
                             artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.fillMaxSize())
                     }
                 }
@@ -99,6 +103,37 @@ class LibraryUiTest {
             assertTrue(query.center.y > viewport.top + viewport.height * .65f)
             assertTrue(query.bottom <= viewport.bottom)
             compose.onNodeWithText("Find an artist, album or song in your saved music. Start typing to search.").assertExists()
+        } finally { holder.close(); scope.cancel() }
+    }
+
+    @Test fun groupedSearchHasGenerousMoreActionsWithoutFilterOrNavigationKnobs() {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        val reader = object : CatalogReader {
+            override suspend fun browse(request: CatalogRequest) = LibraryPage(
+                listOf(LibraryItem(request.kind.removeSuffix("s"), "${request.kind}-${request.offset}", "Result")),
+                20, request.limit, request.offset, revision = 1)
+            override suspend fun detail(kind: String, id: String) = LibraryItem(kind, id, id)
+            override suspend fun revision() = 1L
+        }
+        val holder = CatalogStateHolder(reader, scope, initialKind = "all", initialQuery = "music")
+        try {
+            compose.setContent {
+                MaterialTheme {
+                    val navigation by holder.state.collectAsState()
+                    LaunchedEffect(holder) { holder.setVisible(true) }
+                    CatalogScreenContent(navigation, holder, {}, { _, _ -> }, {}, {},
+                        artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.size(360.dp, 640.dp))
+                }
+            }
+            compose.onNodeWithText("Include missing").assertDoesNotExist()
+            compose.onNodeWithText("All").assertDoesNotExist()
+            compose.onNodeWithText("Previous").assertDoesNotExist()
+            compose.onNodeWithText("Next").assertDoesNotExist()
+            compose.onNodeWithText("Back").assertDoesNotExist()
+            val more = compose.onNodeWithText("See more artists").performScrollTo()
+            more.assertHeightIsAtLeast(48.dp)
+            more.performClick()
+            compose.runOnIdle { assertEquals(2, holder.state.value.current.sections.getValue("artists").items.size) }
         } finally { holder.close(); scope.cancel() }
     }
 

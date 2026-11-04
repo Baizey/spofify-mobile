@@ -26,8 +26,13 @@ AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
 APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
 TEST_APK="$ROOT/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
 PORT=5560
-SERIAL="emulator-$PORT"
+# Dedicated server and one known loopback transport: no USB, wireless/mDNS discovery,
+# auto-connect, or scanning other emulators. Never use a person's normal ADB server.
+export ADB_MDNS=0 ADB_MDNS_AUTO_CONNECT=0 ADB_USB=0 ADB_EMU=0
+export ANDROID_ADB_SERVER_PORT=5039 ADB_SERVER_SOCKET=tcp:localhost:5039
+SERIAL="127.0.0.1:$((PORT + 1))"
 AVD=spofify_visual_test
+GPU="${UI_TEST_GPU:-software}"
 for tool in "$ADB" "$EMU" "$AVDMANAGER"; do
   [[ -x "$tool" ]] || { printf 'Missing Android tool: %s\nEvidence: %s\n' "$tool" "$RUN" >&2; exit 1; }
 done
@@ -54,6 +59,31 @@ TEST_APK=$(locate_apk app-debug-androidTest.apk)
 if ! "$BOOT_ONLY" && [[ -z "$TEST_APK" || ! -f "$TEST_APK" ]]; then
   printf 'Build :app:assembleDebugAndroidTest first.\n' >&2; exit 1
 fi
+# Some mediated/FUSE filesystems cannot support emulator writable shared mappings.
+# An opt-in disposable RAM workspace keeps runtime files off that filesystem; evidence
+# remains in the project. This never changes policy or accesses another AVD.
+RUNTIME=
+EMU_PID=
+ADB_STARTED=false
+cleanup() {
+  if [[ -n "$EMU_PID" ]]; then
+    kill "$EMU_PID" 2>/dev/null || true
+    wait "$EMU_PID" 2>/dev/null || true
+  fi
+  if "$ADB_STARTED"; then "$ADB" kill-server >/dev/null 2>&1 || true; fi
+  if [[ "$RUNTIME" == /dev/shm/spofify-ui.* && -f "$RUNTIME/.spofify-ui-owned" ]]; then
+    rm -rf -- "$RUNTIME"
+  fi
+}
+trap cleanup EXIT INT TERM
+if [[ "${UI_TEST_RAM_RUNTIME:-0}" == 1 ]]; then
+  RUNTIME=$(mktemp -d /dev/shm/spofify-ui.XXXXXX)
+  touch "$RUNTIME/.spofify-ui-owned"
+  mkdir -p "$RUNTIME/avd" "$RUNTIME/android-home" "$RUNTIME/home" "$RUNTIME/tmp"
+  export ANDROID_AVD_HOME="$RUNTIME/avd" ANDROID_USER_HOME="$RUNTIME/android-home"
+  export HOME="$RUNTIME/home" TMPDIR="$RUNTIME/tmp"
+fi
+export QT_QPA_PLATFORM=offscreen
 # Choose an installed image; do not download packages or alter an existing personal AVD.
 IMAGE="${UI_TEST_SYSTEM_IMAGE:-}"
 if [[ -z "$IMAGE" ]]; then
@@ -63,18 +93,24 @@ if [[ -z "$IMAGE" ]]; then
   done
 fi
 [[ -n "$IMAGE" ]] || { printf 'No supported image installed. Set UI_TEST_SYSTEM_IMAGE after coordinating SDK installation.\n' >&2; exit 1; }
-if [[ ! -f "$BASE/avd/$AVD.ini" ]]; then
+if [[ ! -f "$ANDROID_AVD_HOME/$AVD.ini" ]]; then
   printf 'no\n' | "$AVDMANAGER" create avd --name "$AVD" --package "$IMAGE" --device pixel_7 \
-    --path "$BASE/avd/$AVD.avd" > "$RUN/avd-create.log" 2>&1
-  touch "$BASE/avd/$AVD.avd/.spofify-ui-owned"
+    --path "$ANDROID_AVD_HOME/$AVD.avd" > "$RUN/avd-create.log" 2>&1
+  touch "$ANDROID_AVD_HOME/$AVD.avd/.spofify-ui-owned"
 fi
-[[ -f "$BASE/avd/$AVD.avd/.spofify-ui-owned" ]] || {
+[[ -f "$ANDROID_AVD_HOME/$AVD.avd/.spofify-ui-owned" ]] || {
   printf 'Refusing an AVD without the isolated test ownership marker.\n' >&2; exit 1;
 }
-# Never target a personal/previously running device by accident.
-if "$ADB" devices | grep -q "^$SERIAL[[:space:]]"; then
-  printf '%s is already in use; stop it deliberately before this isolated run.\n' "$SERIAL" >&2; exit 1
-fi
+# Refuse occupied ports rather than attaching to an existing server or personal AVD.
+python3 - <<'PY'
+import socket
+for port in (5039, 5560, 5561):
+    with socket.socket() as s:
+        try:
+            s.bind(('127.0.0.1', port))
+        except OSError as e:
+            raise SystemExit(f'Refusing occupied local test port {port}: {e}')
+PY
 ACCEL=off
 [[ -r /dev/kvm && -w /dev/kvm ]] && ACCEL=on
 {
@@ -83,21 +119,25 @@ ACCEL=off
   printf -- '- APK SHA-256: %s\n- Visual review: **PENDING**\n' "$(sha256sum "$APK" | cut -d ' ' -f 1)"
 } > "$RUN/evidence.md"
 git status --short > "$RUN/working-tree.txt"
-EMU_PID=
-cleanup() {
-  if [[ -n "$EMU_PID" ]]; then
-    kill "$EMU_PID" 2>/dev/null || true
-    wait "$EMU_PID" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT INT TERM
+CPU_ARGS=()
+[[ "$ACCEL" == off ]] && CPU_ARGS=(-qemu -cpu max)
+printf -- '- Runtime storage: %s\n' "${RUNTIME:-project-local isolated AVD}" >> "$RUN/evidence.md"
+"$ADB" start-server > "$RUN/adb-start.log" 2>&1
+ADB_STARTED=true
+"$ADB" server-status > "$RUN/adb-server-status.txt"
+grep -q 'usb_backend: USB_DISABLED' "$RUN/adb-server-status.txt"
+grep -q 'mdns_backend: MDNS_DISABLED' "$RUN/adb-server-status.txt"
+printf '\nADB USB/mDNS/discovery disabled; explicit owned-AVD loopback transport only.\n' >> "$RUN/evidence.md"
 "$EMU" -avd "$AVD" -port "$PORT" -no-window -no-audio -no-boot-anim -no-snapshot \
-  -accel "$ACCEL" -gpu swiftshader -memory 2048 -cores 2 > "$RUN/emulator.log" 2>&1 &
+  -accel "$ACCEL" -gpu "$GPU" -feature -Vulkan,-Wifi,-WiFiPacketStream,-Uwb,-Nfc,-NetsimWebUi,-NetsimCliUi \
+  -camera-back none -camera-front none -crash-report-mode disabled \
+  -memory 2048 -cores 2 "${CPU_ARGS[@]}" > "$RUN/emulator.log" 2>&1 &
 EMU_PID=$!
 ready=false
 DEADLINE=$((SECONDS + ${UI_TEST_BOOT_TIMEOUT:-240}))
 while (( SECONDS < DEADLINE )); do
   if ! kill -0 "$EMU_PID" 2>/dev/null; then break; fi
+  timeout 5 "$ADB" connect "$SERIAL" >> "$RUN/adb-connect.log" 2>&1 || true
   boot=$(timeout 5 "$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
   if [[ "$boot" == 1 ]]; then ready=true; break; fi
   sleep 3
@@ -107,7 +147,13 @@ if ! "$ready"; then
   printf 'Emulator did not boot. UI validation BLOCKED. Evidence: %s\n' "$RUN" >&2
   exit 1
 fi
-# These settings affect ONLY the isolated synthetic-data AVD. On-device fixtures use loopback.
+# Positive virtual-device check BEFORE settings, installation or app-data changes.
+qemu=$("$ADB" -s "$SERIAL" shell getprop ro.kernel.qemu | tr -d '\r')
+hardware=$("$ADB" -s "$SERIAL" shell getprop ro.hardware | tr -d '\r')
+if [[ "$qemu" != 1 || ( "$hardware" != ranchu && "$hardware" != goldfish ) ]]; then
+  printf 'Refusing a target that is not the expected Android virtual device.\n' >&2; exit 1
+fi
+# These settings affect ONLY the isolated synthetic-data AVD. In-AVD fixtures use loopback.
 "$ADB" -s "$SERIAL" shell settings put global device_provisioned 1
 "$ADB" -s "$SERIAL" shell settings put secure user_setup_complete 1
 "$ADB" -s "$SERIAL" shell settings put system font_scale 1.0

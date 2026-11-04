@@ -10,7 +10,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
@@ -19,6 +18,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -136,13 +137,19 @@ private fun CatalogRoute(
             } finally { holder.setVisible(false) }
         }
     }
-    BackHandler(navigation.canGoBack) { holder.back() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    BackHandler(navigation.canGoBack && !imeVisible) { holder.back() }
     val visibleCallback by rememberUpdatedState(onVisibleItems)
     val screen = navigation.current
     LaunchedEffect(screen.item, screen.sections) {
         visibleCallback(listOfNotNull(screen.item) + screen.sections.values.flatMap { it.items })
     }
-    CatalogScreenContent(navigation, holder, { item -> holder.open(item); onOpenItem(item) },
+    CatalogScreenContent(navigation, holder, { item ->
+        focus.clearFocus(); keyboard?.hide()
+        holder.open(item); onOpenItem(item)
+    },
         onPlayItem, onShowActions, onEnqueueItem, artwork, modifier, playback, likes, onToggleLike)
 }
 
@@ -166,25 +173,13 @@ internal fun CatalogScreenContent(
     }
     LaunchedEffect(scroll, screen.key) {
         snapshotFlow { scroll.firstVisibleItemIndex to scroll.firstVisibleItemScrollOffset }.distinctUntilChanged()
-            .collect { (index, offset) -> holder.rememberScroll(screen.key, index, offset) }
+            .collect { (index, offset) -> holder.rememberScroll(screen.key, index, offset, screen.query, screen.releaseGroup) }
     }
     Column(modifier.fillMaxSize()) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll, contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (navigation.canGoBack) item(key = "back") {
-            TextButton(onClick = { holder.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null); Text("Back") }
-        }
         val detail = screen.item
         if (detail == null) {
-            if (!screen.emptySearch) item(key = "filters") {
-                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    (listOf("all") + CatalogKinds).forEach { kind ->
-                        FilterChip(selected = screen.kind == kind, onClick = { holder.selectKind(kind) }, label = { Text(catalogLabel(kind)) })
-                    }
-                    FilterChip(selected = screen.includeMissing, onClick = { holder.includeMissing(!screen.includeMissing) },
-                        label = { Text("Include missing") })
-                }
-            }
             if (screen.emptySearch) item(key = "prompt") {
                 Text("Find an artist, album or song in your saved music. Start typing to search.",
                     Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -255,12 +250,10 @@ internal fun CatalogScreenContent(
                 MusicRow(item, onOpen, onPlay, onMore, onQueue, artwork, playback = playback,
                     like = likes[item.id], onToggleLike = onToggleLike)
             }
-            if (section.hasPrevious || section.hasNext) item(key = "$kind:pager") {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = { holder.page(kind, -1) }, enabled = section.hasPrevious && !section.loading) { Text("Previous") }
-                    Text("${if (section.total == 0) 0 else section.offset + 1}–${minOf(section.offset + section.limit, section.total)} of ${section.total}",
-                        style = MaterialTheme.typography.labelSmall)
-                    TextButton(onClick = { holder.page(kind, 1) }, enabled = section.hasNext && !section.loading) { Text("Next") }
+            if (section.hasNext) item(key = "$kind:more") {
+                TextButton(onClick = { holder.more(kind) }, enabled = !section.loading,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
+                    Text("See more ${catalogLabel(kind).lowercase()}")
                 }
             }
         }

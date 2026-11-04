@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -22,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -33,6 +33,7 @@ import dev.spofify.mobile.feature.player.NativeMiniPlayer
 import dev.spofify.mobile.feature.player.NativeNowPlaying
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
+import dev.spofify.mobile.ui.theme.AppTypography
 import java.util.Locale
 
 private val Mint = Color(0xFF78E0AC)
@@ -46,7 +47,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Mint, onPrimary = Color(0xFF08351F),
-                background = Background, surface = Surface, secondary = Mint, surfaceContainer = Surface)) {
+                background = Background, surface = Surface, secondary = Mint, surfaceContainer = Surface),
+                typography = AppTypography) {
                 SpofifyApp(model)
             }
         }
@@ -63,7 +65,8 @@ private fun SpofifyApp(model: LibraryViewModel) {
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.notice) { state.notice?.let { snackbar.showSnackbar(it); model.clearNotice() } }
     LaunchedEffect(state.session) { if (state.session == null) expanded = false }
-    BackHandler(state.canGoBack && !expanded && state.session != null) { model.back() }
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    BackHandler(state.canGoBack && !expanded && state.session != null && !imeVisible) { model.back() }
 
     if (state.restoring) {
         Box(Modifier.fillMaxSize().background(Background), contentAlignment = Alignment.Center) {
@@ -100,21 +103,12 @@ private fun SpofifyApp(model: LibraryViewModel) {
                 "artist", "album", "track" -> model.open(Page.Detail(item))
             }
         }
-        val detailPage = state.page as? Page.Detail
-        val activeCatalog = when {
-            detailPage != null -> model.catalogHolder(detailPage.item, detailPage.navigationId)
-            state.tab == Tab.SEARCH -> model.catalogHolder()
-            else -> null
-        }
         Scaffold(
             modifier = Modifier.imePadding(),
             snackbarHost = { SnackbarHost(snackbar) },
             topBar = {
                 Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 48.dp).padding(horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically) {
-                    if (state.canGoBack) IconButton(onClick = {
-                        if (activeCatalog?.back() != true) model.back()
-                    }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
                     Spacer(Modifier.weight(1f))
                     if (model.graph.playbackCoordinator != null) IconButton(onClick = { devices = true }) {
                         Icon(Icons.Default.DevicesOther, "Playback devices · read-only")

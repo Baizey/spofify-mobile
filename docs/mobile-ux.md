@@ -50,6 +50,7 @@ These are this app's requirements, not claims that every Android app must use th
 
 ### Hierarchy, reach and touch
 
+- **JetBrains Mono is the app font**, bundled locally at regular/medium/semibold/bold weights. Apply the central `AppTypography` through MaterialTheme, retain the type hierarchy, and keep Android Unicode/emoji fallback. No runtime font service. The pinned upstream version, hashes and SIL OFL license are in `third_party/jetbrains-mono/`. Recheck wrapping and large-font layouts after font changes.
 - Let artwork, musical identity and the primary listening action establish hierarchy. Put secondary actions in a contextual More menu or appropriate sheet, not five equally prominent buttons on every row.
 - Use consistent spacing, alignment, typography and artwork proportions. Avoid visual changes unrelated to the requested behavior.
 - Interactive targets should be at least **48dp** even when the icon is smaller. Provide separation that makes accidental destructive actions unlikely.
@@ -86,7 +87,7 @@ These are this app's requirements, not claims that every Android app must use th
 - Queue remove/reorder/clear must preserve the current audible occurrence and valid history semantics. Do not restart sound to refresh UI metadata.
 - Use authenticated system metadata/artwork and the same exact-origin client for API, artwork and every audio/range request. Never hand a protected bare URL to an unauthenticated system loader.
 - Selected remote output is not local audible playback/history. Advertise handoff only when exact prepared queue/position/history import and **all** app/system transport starts respect live ownership. A picker alone is not device parity.
-- Audio focus, headphone/Bluetooth changes, notifications, background execution and codec behavior need actual device acceptance, beyond UI screenshots.
+- Test audio focus, notifications, lifecycle and supported media behavior on virtual devices where feasible. If a specific Bluetooth/headphone/codec or vendor behavior genuinely needs hardware, report the limitation and coordinate a targeted check through the user; do not require or access real phones for routine work.
 
 ### Privacy and connection UX
 
@@ -98,9 +99,9 @@ These are this app's requirements, not claims that every Android app must use th
 
 ## Review and evidence gate
 
-For each change, run the automated gate **and** exercise the current installed APK on a real emulator/authorized device. Capture and inspect affected screens and states; compare before/after when possible. Check narrow and large-font layouts, keyboard interaction, system Back, scrolling and relevant music gestures. Parent integration requires a combined native smoke pass after parallel agents finish.
+For each change, run the automated gate **and** exercise the current installed APK on an explicitly selected isolated Android virtual device. Capture and inspect affected screens and states; compare before/after when possible. Check narrow and large-font layouts, keyboard interaction, system Back, scrolling and relevant music gestures. Parent integration requires a combined native smoke pass after parallel agents finish.
 
-Do not regenerate a baseline merely to accept a regression. Record device/API/viewport/font scale, APK revision, screenshots, exercised flows, problems and fixes. If native testing cannot run, completion is **blocked**, not silently replaced by Robolectric. Screenshots demonstrate rendering, not real-phone background/audio/Bluetooth acceptance.
+Do not regenerate a baseline merely to accept a regression. Record device/API/viewport/font scale, APK revision, screenshots, exercised flows, problems and fixes. If native testing cannot run, completion is **blocked**, not silently replaced by Robolectric. Screenshots demonstrate rendering, not every hardware/vendor behavior. Routine development uses emulators; any exceptional real-device verification goes through the user, not direct agent access.
 
 ## Android references
 

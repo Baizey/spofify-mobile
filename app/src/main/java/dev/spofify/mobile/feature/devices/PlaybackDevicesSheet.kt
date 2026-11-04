@@ -17,6 +17,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 @Composable
 fun PlaybackDevicesSheet(coordinator: PlaybackCoordinator, onDismiss: () -> Unit) {
     val state by coordinator.state.collectAsStateWithLifecycle()
+    val viewOnly = state.deviceId.isEmpty()
     // One authenticated read is presentation, not a receiving service heartbeat/registration.
     LaunchedEffect(coordinator) { if (coordinator.state.value.view == null) coordinator.retry() }
     var editing by remember { mutableStateOf<String?>(null) }
@@ -27,14 +28,18 @@ fun PlaybackDevicesSheet(coordinator: PlaybackCoordinator, onDismiss: () -> Unit
                 Text("Playback devices", style = MaterialTheme.typography.titleLarge)
                 TextButton(onClick = onDismiss) { Text("Close") }
             }
-            if (state.message.isNotEmpty()) Text(state.message,
+            val status = if (viewOnly) {
+                if (state.connected) "View only · Playback transfer is unavailable on this phone."
+                else "View only · Retry connection to verify devices."
+            } else state.message
+            if (status.isNotEmpty()) Text(status,
                 Modifier.padding(vertical = 12.dp).semantics { liveRegion = LiveRegionMode.Polite })
             if (state.connecting) LinearProgressIndicator(Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = coordinator::retry) { Text("Retry connection") }
-                if (state.needsTap) Button(onClick = coordinator::continuePlaybackHere) { Text("Continue playback here") }
+                if (!viewOnly && state.needsTap) Button(onClick = coordinator::continuePlaybackHere) { Text("Continue playback here") }
             }
-            if (state.devices.isEmpty()) Text("No playback services can be verified. Open Spofify on the other device.")
+            if (state.devices.isEmpty()) Text("No devices available.")
             LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false)) {
                 items(state.devices, key = { it.deviceId }) { device ->
                     val active = device.deviceId == state.activeDeviceId
@@ -49,14 +54,14 @@ fun PlaybackDevicesSheet(coordinator: PlaybackCoordinator, onDismiss: () -> Unit
                                 (if (state.selectionUnconfirmed) "Selecting" else "Selected").takeIf { selected },
                                 when { !device.available -> "Unavailable"; !active -> "Available"; musical?.error == "blocked" -> "Needs a tap"; musical?.playing == true -> "Playing"; else -> "Active output · Paused" },
                             ).joinToString(" · "), style = MaterialTheme.typography.bodySmall)
-                            if (editing == device.deviceId) {
+                            if (!viewOnly && editing == device.deviceId) {
                                 OutlinedTextField(value = draft, onValueChange = { draft = it }, label = { Text("Device name") }, singleLine = true,
                                     modifier = Modifier.fillMaxWidth())
                                 Row {
                                     TextButton(onClick = { coordinator.rename(device.deviceId, draft); editing = null }) { Text("Save") }
                                     TextButton(onClick = { editing = null }) { Text("Cancel") }
                                 }
-                            } else Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            } else if (!viewOnly) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 // Pending/quarantine intentionally DO NOT disable other available choices.
                                 TextButton(onClick = { coordinator.select(device.deviceId) },
                                     enabled = device.available && state.deviceId.isNotEmpty() && !selected && (!active || state.selectedDeviceId.isNotEmpty())) {

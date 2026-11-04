@@ -240,6 +240,45 @@ class CatalogStateTest {
         holder.close()
     }
 
+    @Test fun catalogRevisionRevalidatesPendingExpansionPrefixBeforeCombiningRows() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "all", "music")
+        holder.setVisible(true); runCurrent()
+        reader.reads.forEach { read -> read.result.complete(LibraryPage(List(10) {
+            LibraryItem(read.request.kind.removeSuffix("s"), "old-$it", "Old")
+        }, 25, revision = 1)) }; runCurrent()
+        holder.more("tracks"); runCurrent()
+        reader.reads.last().result.completeExceptionally(IOException()); runCurrent()
+        reader.revisionValue = 2
+        holder.checkRevision(); runCurrent()
+        val refresh = reader.reads.last().request
+        assertEquals("tracks", refresh.kind); assertEquals(0, refresh.offset); assertEquals(20, refresh.limit)
+        reader.reads.filterNot { it.result.isCompleted }.forEach { read -> read.result.complete(LibraryPage(
+            List(read.request.limit) { LibraryItem(read.request.kind.removeSuffix("s"), "fresh-$it", "Fresh") }, 25, revision = 2)) }
+        runCurrent()
+        val section = holder.state.value.current.sections.getValue("tracks")
+        assertEquals(20, section.items.size)
+        assertTrue(section.items.all { it.id.startsWith("fresh-") })
+        assertFalse(section.needsReload); assertFalse(section.appendPending)
+        holder.close()
+    }
+
+    @Test fun firstParentDetailFenceIsIndependentOfAnEarlierChildListingBaseline() = runTest {
+        val reader = Reader().apply { suspendDetails = true; revisionValue = 2 }
+        val holder = CatalogStateHolder(reader, backgroundScope, initialItem = LibraryItem("album", "album", "Seed"))
+        holder.setVisible(true); runCurrent()
+        reader.completePending(2); runCurrent()
+        holder.checkRevision(); runCurrent()
+        reader.pendingDetails[0].complete(LibraryItem("album", "album", "Old")); runCurrent()
+        assertEquals(2, reader.pendingDetails.size)
+        reader.pendingDetails[1].complete(LibraryItem("album", "album", "New"))
+        reader.completePending(2); runCurrent()
+        assertEquals("New", holder.state.value.current.item?.name)
+        holder.checkRevision(); runCurrent()
+        assertEquals(2, reader.pendingDetails.size)
+        holder.close()
+    }
+
     @Test fun metadataIsConciseAndDoesNotPretendMissingDurationIsZero() {
         assertNull(itemDuration(0))
         assertEquals("1:01", itemDuration(61_000))

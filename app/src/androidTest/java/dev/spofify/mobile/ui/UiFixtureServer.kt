@@ -17,22 +17,32 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sin
 
 /** Entirely on-device synthetic listener backend. Never contacts or proxies any real server. */
 class UiFixtureServer : AutoCloseable {
-    data class SearchCall(val kind: String, val query: String, val limit: Int)
+    init { VirtualAvdOnly.requireVerified() }
+
+    data class SearchCall(val kind: String, val query: String, val limit: Int, val offset: Int)
 
     val unexpectedRoutes = CopyOnWriteArrayList<String>()
     val searchCalls = CopyOnWriteArrayList<SearchCall>()
     val emptyGlobalBrowseCalls = AtomicInteger()
     val audioRequests = AtomicInteger()
+    val playbackPreparations = AtomicInteger()
     val historyWrites = AtomicInteger()
     val playlistWrites = AtomicInteger()
     val authenticationFailures = AtomicInteger()
-    @Volatile var searchBodyDelayMs: Long = 0
+    @Volatile private var searchGate: CountDownLatch? = null
+
+    fun holdSearchResponses() {
+        check(searchGate == null) { "Search responses already held" }
+        searchGate = CountDownLatch(1)
+    }
+    fun releaseSearchResponses() { searchGate?.countDown(); searchGate = null }
 
     private val server = MockWebServer()
     private val liked = linkedSetOf("track-02")
@@ -48,8 +58,18 @@ class UiFixtureServer : AutoCloseable {
 
     init {
         server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse = synchronized(this@UiFixtureServer) {
-                route(request)
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val url = request.requestUrl
+                if (url?.encodedPath == "/api/library" && !url.queryParameter("q").isNullOrBlank() &&
+                    url.queryParameter("artistId") == null && url.queryParameter("albumId") == null) {
+                    // Deterministic loading evidence, without sleeping the instrumentation thread.
+                    val gate = searchGate
+                    if (gate != null && !gate.await(60, TimeUnit.SECONDS)) {
+                        unexpectedRoutes.add("synthetic search response gate timed out")
+                        return json(JSONObject().put("error", "Synthetic response gate timed out"), 504)
+                    }
+                }
+                return synchronized(this@UiFixtureServer) { route(request) }
             }
         }
         server.start(InetAddress.getByName("127.0.0.1"), 0)
@@ -87,20 +107,18 @@ class UiFixtureServer : AutoCloseable {
                     emptyGlobalBrowseCalls.incrementAndGet()
                     return json(JSONObject().put("error", "Empty global browse is forbidden in this fixture"), 400)
                 }
-                searchCalls.add(SearchCall(kind, query, limit))
+                searchCalls.add(SearchCall(kind, query, limit, offset))
                 if (query.equals(ERROR_QUERY, true)) return json(JSONObject().put("error", "Synthetic temporary failure"), 503)
             }
             val all = when {
                 albumId != null -> tracks().filter { it.getString("albumId") == albumId }
-                artistId != null -> albums()
+                artistId != null -> if (artistId == ARTIST_ID && url.queryParameter("releaseGroup") !in listOf("singles", "appearances")) albums() else emptyList()
                 kind == "artists" -> listOf(artist())
                 kind == "albums" -> albums()
                 kind == "tracks" -> tracks()
                 else -> listOf(artist()) + albums() + tracks()
             }.filter { artistId != null || albumId != null || it.getString("name").contains(query, ignoreCase = true) }
-            return json(page(all, limit, offset)).also {
-                if (artistId == null && albumId == null && searchBodyDelayMs > 0) it.setBodyDelay(searchBodyDelayMs, TimeUnit.MILLISECONDS)
-            }
+            return json(page(all, limit, offset))
         }
         val catalog = Regex("/api/library/(artists|albums|tracks)/([^/]+)(?:/(artwork|audio|playback))?").matchEntire(path)
         if (catalog != null && method in listOf("GET", "HEAD")) {
@@ -116,6 +134,8 @@ class UiFixtureServer : AutoCloseable {
                 "artwork" -> binary(pngs[albumIndex(id)], "image/png", request)
                 "audio" -> if (kind == "tracks") { audioRequests.incrementAndGet(); binary(wav, "audio/wav", request) } else unexpected(request)
                 "playback" -> {
+                    if (kind !in listOf("artists", "albums")) return unexpected(request)
+                    playbackPreparations.incrementAndGet()
                     val items = if (kind == "artists") tracks() else tracks().filter { it.getString("albumId") == id }
                     json(playback(items, kind.removeSuffix("s"), id, item.getString("name")))
                 }
@@ -140,7 +160,10 @@ class UiFixtureServer : AutoCloseable {
             val offset = url.queryParameter("offset")?.toIntOrNull() ?: 0
             return json(page(ids.map { JSONObject().put("track", track(it)) }, limit, offset))
         }
-        if (method == "GET" && path == "/api/me/likes/playback") return json(playback(liked.map(::track), "likes", "likes", "Liked songs"))
+        if (method == "GET" && path == "/api/me/likes/playback") {
+            playbackPreparations.incrementAndGet()
+            return json(playback(liked.map(::track), "likes", "likes", "Liked songs"))
+        }
         if (method == "POST" && path == "/api/me/history") {
             val id = JSONObject(request.body.readUtf8()).getString("trackId")
             history.remove(id); history.add(0, id); historyWrites.incrementAndGet()
@@ -166,16 +189,26 @@ class UiFixtureServer : AutoCloseable {
             return json(page(entries, url.queryParameter("limit")?.toIntOrNull() ?: 40, url.queryParameter("offset")?.toIntOrNull() ?: 0))
         }
         if (method == "GET" && path == "/api/me/playlists/$MANUAL_ID/playback") {
+            playbackPreparations.incrementAndGet()
             val items = manualTrackIds.mapIndexed { index, id -> track(id).put("entryId", "entry-${index + 1}") }
             return json(playback(items, "playlist", MANUAL_ID, manualName).put("revision", manualRevision)
                 .put("context", JSONObject().put("kind", "playlist").put("id", MANUAL_ID).put("name", manualName).put("revision", manualRevision)))
         }
         if (method == "GET" && path == "/api/me/playlists/$DERIVED_ID") return json(derived())
         if (method == "GET" && path == "/api/me/playlists/$DERIVED_ID/evaluation") {
+            val limit = url.queryParameter("limit")?.toIntOrNull() ?: 40
+            if (limit !in 1..100) return unexpected(request)
+            val cursor = url.queryParameter("cursor")
+            val offset = if (cursor == null) 0 else
+                (1..3).firstOrNull { cursor == "synthetic-cursor-$it" } ?: return unexpected(request)
             return json(JSONObject().put("items", JSONArray().apply {
-                tracks().take(4).forEachIndexed { index, item -> put(JSONObject().put("occurrenceId", "derived-occurrence-$index")
-                    .put("selectionToken", "synthetic-selection-$index").put("position", index).put("track", item)) }
-            }).put("total", 4).put("availableTotal", 4).put("limit", 40).put("nextCursor", JSONObject.NULL)
+                tracks().take(4).drop(offset).take(limit).forEachIndexed { pageIndex, item ->
+                    val index = offset + pageIndex
+                    put(JSONObject().put("occurrenceId", "derived-occurrence-$index")
+                        .put("selectionToken", "synthetic-selection-$index").put("position", index).put("track", item))
+                }
+            }).put("total", 4).put("availableTotal", 4).put("limit", limit)
+                .put("nextCursor", if (offset + limit < 4) "synthetic-cursor-${offset + limit}" else JSONObject.NULL)
                 .put("revision", 1).put("fence", "synthetic-fence").put("complete", true))
         }
         if (method == "GET" && path == "/api/me/player") return json(devices())
@@ -219,7 +252,8 @@ class UiFixtureServer : AutoCloseable {
         .put("revision", 7).put("context", JSONObject().put("kind", kind).put("id", id).put("name", name))
     private fun page(items: List<JSONObject>, limit: Int, offset: Int) = JSONObject()
         .put("items", JSONArray(items.drop(offset).take(limit))).put("total", items.size).put("limit", limit).put("offset", offset).put("revision", 7)
-    private fun conflict() = json(JSONObject().put("code", "REVISION_CONFLICT").put("error", "Synthetic revision changed"), 409)
+    private fun conflict() = json(JSONObject().put("error", JSONObject().put("code", "REVISION_CONFLICT")
+        .put("message", "Synthetic revision changed")), 409)
     private fun json(value: JSONObject, status: Int = 200) = MockResponse().setResponseCode(status)
         .setHeader("Content-Type", "application/json; charset=utf-8").setBody(value.toString())
 
@@ -283,7 +317,7 @@ class UiFixtureServer : AutoCloseable {
         }.array()
     }
 
-    override fun close() { server.shutdown() }
+    override fun close() { releaseSearchResponses(); server.shutdown() }
 
     companion object {
         const val USERNAME = "fixture-listener"
@@ -297,8 +331,10 @@ class UiFixtureServer : AutoCloseable {
         const val DERIVED_ID = "ambient-rules"
         const val DERIVED_NAME = "Ambient discoveries"
         const val ERROR_QUERY = "fixture-error"
-        private const val AUDIO_SECONDS = 120
+        // Leave room for a slow software-rendered AVD without a natural track transition mid-assertion.
+        private const val AUDIO_SECONDS = 300
         val TRACK_NAMES = listOf("Orbit Dawn", "Orbit Glass", "Orbit Lantern", "Orbit Still", "Orbit Leaves", "Orbit Rain",
-            "Orbit Night", "Orbit Blue", "Orbit Ember", "Orbit Glow", "Orbit Haze", "Orbit Light", "Orbit Shore", "Orbit Foam", "Orbit Current", "Orbit Return")
+            "Orbit Night", "Orbit Blue", "Orbit Ember", "Orbit Glow", "Orbit Haze", "Orbit Light", "Orbit Shore", "Orbit Foam", "Orbit Current",
+            "Orbit Return — 夜の航路 · a slow journey through the northern lights")
     }
 }

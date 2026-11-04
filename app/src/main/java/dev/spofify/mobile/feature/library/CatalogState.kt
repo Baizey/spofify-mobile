@@ -57,6 +57,7 @@ data class CatalogSection(
     val requestedOffset: Int? = null,
     val needsReload: Boolean = false,
     val appendPending: Boolean = false,
+    val revalidateCount: Int = 0,
 ) {
     val hasPrevious get() = offset > 0
     val nextOffset get() = offset + maxOf(items.size, limit)
@@ -131,6 +132,7 @@ class CatalogStateHolder(
     private var pendingRevision: Long? = null
     private var revisionBusy = false
     private var catchUpAllowed = false
+    private var revisionValidated = false
 
     private fun update(transform: (CatalogScreen) -> CatalogScreen) {
         val value = mutable.value
@@ -173,8 +175,12 @@ class CatalogStateHolder(
         if (!value) applyPendingRevision()
     }
 
-    fun rememberScroll(screenKey: Long, index: Int, offset: Int) {
-        if (state.value.current.key == screenKey) update { it.copy(scrollIndex = index, scrollOffset = offset) }
+    fun rememberScroll(screenKey: Long, index: Int, offset: Int, expectedQuery: String? = null, expectedReleaseGroup: String? = null) {
+        val current = state.value.current
+        if (current.key == screenKey && (expectedQuery == null || current.query == expectedQuery) &&
+            (expectedReleaseGroup == null || current.releaseGroup == expectedReleaseGroup)) {
+            update { it.copy(scrollIndex = index, scrollOffset = offset) }
+        }
     }
 
     /** Only committed IME text reaches this method. Clear/submit bypass the debounce. */
@@ -259,7 +265,8 @@ class CatalogStateHolder(
         val request = screen.request(kind)
         val existing = screen.sections[kind]
         val append = existing?.appendPending == true
-        val retainedCount = if (!append && existing?.offset == request.offset) maxOf(existing.items.size, request.limit) else request.limit
+        val retainedCount = if (!append && existing != null && existing.offset == request.offset)
+            maxOf(existing.items.size, existing.revalidateCount, request.limit) else request.limit
         val jobKey = "section:$kind"
         jobs.remove(jobKey)?.cancel()
         val requestId = ++requestSerial
@@ -271,7 +278,7 @@ class CatalogStateHolder(
                 var result = reader.browse(request.copy(limit = minOf(retainedCount, 100)))
                 // Revalidate only the prefix the listener explicitly expanded, in bounded reads.
                 // Never fetch the whole catalog just to create a recommendation/ranking illusion.
-                while (result.items.size < retainedCount && request.offset + result.items.size < result.total && result.items.isNotEmpty()) {
+                while (retainedCount > request.limit && result.items.size < retainedCount && request.offset + result.items.size < result.total && result.items.isNotEmpty()) {
                     if (!current()) return@launch
                     val next = reader.browse(request.copy(offset = request.offset + result.items.size,
                         limit = minOf(retainedCount - result.items.size, 100)))
@@ -347,12 +354,14 @@ class CatalogStateHolder(
             catchUpAllowed = true
             latestObservedRevision = maxOf(latestObservedRevision ?: revision, revision)
             val known = knownRevision
-            if (known == null) {
-                knownRevision = revision
-                // Detail envelopes intentionally expose only the item. Validate once after the
-                // first revision fence, including a detail read that completed before this poll.
-                if (state.value.current.item != null) pendingRevision = revision
-            } else if (revision > known) pendingRevision = maxOf(pendingRevision ?: revision, revision)
+            val firstValidation = !revisionValidated
+            revisionValidated = true
+            if (known == null) knownRevision = revision
+            // A child listing may already have established the baseline while its older parent
+            // detail is still pending. The first cheap revision fence is independent of that.
+            if ((firstValidation && state.value.current.item != null) || (known != null && revision > known)) {
+                pendingRevision = maxOf(pendingRevision ?: revision, revision, known ?: revision)
+            }
             applyPendingRevision()
             if (jobs.isEmpty() && !composing && queryJob?.isActive != true) loadVisible()
         } catch (error: Exception) {
@@ -368,7 +377,15 @@ class CatalogStateHolder(
         catchUpAllowed = false
         pendingRevision = null
         knownRevision = maxOf(knownRevision ?: revision, revision)
-        mutable.value = mutable.value.copy(stack = mutable.value.stack.map { it.copy(stale = true) })
+        mutable.value = mutable.value.copy(stack = mutable.value.stack.map { screen ->
+            screen.copy(stale = true, sections = screen.sections.mapValues { (_, section) ->
+                // A new revision invalidates the prefix too, not just a failed/pending expansion.
+                // Preserve the listener's requested extent, but rebuild it from a fresh snapshot.
+                section.copy(appendPending = false, requestedOffset = null,
+                    revalidateCount = maxOf(section.revalidateCount,
+                        if (section.appendPending) section.nextOffset + section.limit - section.offset else 0))
+            })
+        })
         loadVisible()
     }
 
