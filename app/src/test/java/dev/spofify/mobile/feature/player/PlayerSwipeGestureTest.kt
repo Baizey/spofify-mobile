@@ -40,8 +40,8 @@ class PlayerSwipeGestureTest {
         }
     }
 
-    @Test fun coverAndQueueLeaveBothAndroidBackEdgesAlone() {
-        for (area in listOf(PlayerSwipeArea.COVER, PlayerSwipeArea.UPCOMING)) {
+    @Test fun allHorizontalAreasLeaveBothAndroidBackEdgesAlone() {
+        for (area in PlayerSwipeArea.entries) {
             for (start in listOf(0f, 23f, 277f, 300f)) {
                 val swipe = gesture(area, start)
                 assertFalse(swipe.move(-150f, 0f))
@@ -50,16 +50,14 @@ class PlayerSwipeGestureTest {
         }
     }
 
-    @Test fun miniOnlyExpandsUpAndQueueOnlyRemovesLeft() {
+    @Test fun miniExpandsUpAndQueueOnlyRemovesLeft() {
         gesture(PlayerSwipeArea.MINI).also {
             assertTrue(it.move(2f, -80f))
             assertEquals(PlayerSwipeAction.EXPAND, it.finish())
         }
-        for (delta in listOf(80f to 0f, 0f to 80f)) {
-            gesture(PlayerSwipeArea.MINI).also {
-                assertFalse(it.move(delta.first, delta.second))
-                assertNull(it.finish())
-            }
+        gesture(PlayerSwipeArea.MINI).also {
+            assertFalse(it.move(0f, 80f))
+            assertNull(it.finish())
         }
         gesture(PlayerSwipeArea.UPCOMING).also {
             it.move(-80f, 1f)
@@ -69,6 +67,63 @@ class PlayerSwipeGestureTest {
             assertFalse(it.move(80f, 0f))
             assertNull(it.finish())
         }
+    }
+
+    @Test fun miniPhysicalDirectionsCommitOnceOnlyOnRelease() {
+        for ((dx, expected) in listOf(-80f to PlayerSwipeAction.NEXT, 80f to PlayerSwipeAction.PREVIOUS)) {
+            val swipe = gesture(PlayerSwipeArea.MINI)
+            assertFalse(swipe.move(dx / 20, 0f)) // below Android slop
+            assertTrue(swipe.move(dx, 2f))
+            assertEquals(expected, swipe.finish())
+            assertNull(swipe.finish())
+            assertFalse(swipe.move(dx, 0f))
+        }
+    }
+
+    @Test fun miniShortFastFlickReversalCancellationAndRejectedIntentStayCancelled() {
+        gesture(PlayerSwipeArea.MINI).also {
+            assertTrue(it.move(-63f, 0f)) // no velocity override
+            assertNull(it.finish())
+        }
+        gesture(PlayerSwipeArea.MINI).also {
+            it.move(-100f, 0f)
+            it.move(60f, 0f)
+            assertNull(it.finish())
+        }
+        gesture(PlayerSwipeArea.MINI).also {
+            it.move(-100f, 0f)
+            it.cancel()
+            assertNull(it.finish())
+        }
+        for ((dx, dy) in listOf(-20f to 20f, 0f to 20f)) {
+            gesture(PlayerSwipeArea.MINI).also {
+                assertFalse(it.move(dx, dy))
+                assertFalse(it.move(-150f, 0f))
+                assertNull(it.finish())
+            }
+        }
+        // An upward lock may not turn into transport, nor a horizontal lock into expansion.
+        for ((first, second) in listOf((0f to -20f) to (-150f to 20f),
+            (-20f to 0f) to (20f to -150f))) {
+            gesture(PlayerSwipeArea.MINI).also {
+                assertTrue(it.move(first.first, first.second))
+                it.move(second.first, second.second)
+                assertNull(it.finish())
+            }
+        }
+        assertEquals(PlayerSwipeAction.NEXT, gesture(PlayerSwipeArea.MINI).run { move(-80f, 0f); finish() })
+    }
+
+    @Test fun miniEdgeStillAllowsUpAndHonorsAsymmetricSystemInsets() {
+        for (start in listOf(0f, 300f)) {
+            gesture(PlayerSwipeArea.MINI, start).also {
+                assertTrue(it.move(0f, -80f))
+                assertEquals(PlayerSwipeAction.EXPAND, it.finish())
+            }
+        }
+        val systemEdge = PlayerSwipeGesture(PlayerSwipeArea.MINI, 8f, 64f, 255f, 300f, 24f, 50f)
+        assertFalse(systemEdge.move(-100f, 0f))
+        assertNull(systemEdge.finish())
     }
 
     @Test fun cancelledAndDirectionChangedGesturesCannotCommit() {

@@ -50,6 +50,12 @@ data class PlaybackState(
     val interactionKey: PlaybackInteractionKey? = null,
     /** Absolute-index drop is local only. Unknown implementations fail closed. */
     val canMoveUpcomingAbsolutely: Boolean = false,
+    /** Connection-lifetime transport identity. Capture this, not the generic queue/action key,
+     * for keyed Next/Previous. Null for empty/unavailable output; never save or persist. */
+    val transportInteractionKey: PlaybackInteractionKey? = null,
+    /** Guarded semantic transport, not inferred from the displayed upcoming list. */
+    val canSkipNext: Boolean = false,
+    val canSkipPrevious: Boolean = false,
 )
 
 /**
@@ -67,6 +73,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     private var controller: MediaController? = null
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var generation = 0
+    private var interactionGeneration = 0L
     private var pendingPlay: PlayRequest? = null
     private var releaseAfterPending = false
     private var applyingPlay = false
@@ -83,6 +90,23 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     private var observing = false
     private var displayingRemote = false
     private val remoteInteractionKeys = PlaybackInteractionKeys()
+    private val localTransportKeys = PlaybackInteractionKeys()
+    private val remoteTransportKeys = PlaybackInteractionKeys()
+    private data class TransportIdentity(
+        val rawKey: PlaybackInteractionKey, val owner: PlaybackReference, val version: Triple<Long, Long, Long>,
+        val controller: PlaybackReference, val bindingGeneration: Int, val interactionGeneration: Long,
+        val capabilityRevision: Long, val selectionGeneration: Long,
+    )
+
+    private fun currentLocalTransportKey(rawKey: PlaybackInteractionKey? = PlaybackService.interactionKey()): PlaybackInteractionKey? {
+        val binding = controller
+        val owner = coordinator
+        val available = observing && !releaseAfterPending && binding != null && !hasRemoteOutput() &&
+            (PlaybackService.canSkipPrepared(true) || PlaybackService.canSkipPrepared(false))
+        return localTransportKeys.current(if (available && rawKey != null && owner != null && binding != null)
+            TransportIdentity(rawKey, PlaybackReference(owner), owner.interactionVersion, PlaybackReference(binding),
+                generation, interactionGeneration, PlaybackService.transportCapabilityRevision(), owner.transportSelectionVersion) else null)
+    }
     private data class RemoteInteractionIdentity(
         val client: PlaybackReference, val session: PlaybackReference, val coordinator: PlaybackReference,
         val deviceId: String, val outputId: String, val epoch: Long, val version: Triple<Long, Long, Long>, val requestEpoch: Long,
@@ -148,6 +172,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                     if (this@PlaybackConnection.controller !== controller) return
                     handler.removeCallbacks(releaseTimeout)
                     releaseTimeoutScheduled = false
+                    localTransportKeys.invalidate()
+                    remoteTransportKeys.invalidate()
                     this@PlaybackConnection.controller = null
                     controllerFuture = null
                     controller.removeListener(listener)
@@ -180,6 +206,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
 
     override fun release() = onMain {
+        ++interactionGeneration // Also fences a deferred release that keeps the binding alive.
+        remoteTransportKeys.invalidate()
+        localTransportKeys.invalidate()
+        mutableState.value = mutableState.value.copy(transportInteractionKey = null,
+            canSkipNext = false, canSkipPrevious = false)
         if ((pendingPlay != null && (controller != null || controllerFuture != null)) ||
             (pendingEnqueues.isNotEmpty() && controller == null && controllerFuture != null) ||
             (controller?.playbackState == Player.STATE_BUFFERING && controller?.playWhenReady == true)) {
@@ -222,8 +253,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         controllerFuture?.let { MediaController.releaseFuture(it) }
         controllerFuture = null
         releaseAfterPending = false
+        remoteTransportKeys.invalidate()
+        localTransportKeys.invalidate()
         remoteInteractionKeys.invalidate()
-        mutableState.value = mutableState.value.copy(interactionKey = null, canMoveUpcomingAbsolutely = false)
+        mutableState.value = mutableState.value.copy(interactionKey = null, transportInteractionKey = null, canMoveUpcomingAbsolutely = false,
+            canSkipNext = false, canSkipPrevious = false)
     }
 
     /** Latest explicit play wins if multiple taps arrive while connecting. */
@@ -547,6 +581,39 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     override fun next() = command("next")
     override fun previous() = command("previous")
 
+    override fun next(expectedKey: PlaybackInteractionKey): Boolean = guardedSkip(expectedKey, true)
+    override fun previous(expectedKey: PlaybackInteractionKey): Boolean = guardedSkip(expectedKey, false)
+
+    private fun guardedSkip(expectedKey: PlaybackInteractionKey, forward: Boolean): Boolean {
+        // Never post a fresh intention, connect, or recover output to make a held swipe valid.
+        if (Looper.myLooper() != Looper.getMainLooper() || !observing || controller == null || releaseAfterPending) return false
+        val binding = controller
+        val bindingGeneration = generation
+        val interaction = interactionGeneration
+        val originCurrent = {
+            observing && !releaseAfterPending && controller === binding && generation == bindingGeneration &&
+                interactionGeneration == interaction
+        }
+        if (!hasRemoteOutput()) {
+            val rawKey = PlaybackService.interactionKey() ?: return false
+            if (currentLocalTransportKey(rawKey) !== expectedKey) return false
+            // Generic queue/action keys remain service-owned; transport alone projects the
+            // originating connection lifetime. Do not compare the old projection after our seek.
+            return PlaybackService.skipPrepared(rawKey, forward, originCurrent).also { publish() }
+        }
+        val owner = coordinator ?: return false
+        fun current(): Boolean {
+            if (!originCurrent() || owner !== coordinator || !hasRemoteOutput() ||
+                currentRemoteTransportKey() !== expectedKey) return false
+            val directions = remoteSnapshot()?.let(::remoteSkipCapabilities) ?: return false
+            return if (forward) directions.first else directions.second
+        }
+        if (!current()) return false
+        owner.preparedTransportCommand(PlaybackDeviceCommand.transport(if (forward) "next" else "previous"), ::current)
+        publish()
+        return true
+    }
+
     override fun select(index: Int) = onMainQueue {
         val key = if (hasRemoteOutput()) remoteSnapshot()?.let { snapshot ->
             snapshot.queue.getOrNull(index)?.takeIf { index > snapshot.position }?.key
@@ -584,6 +651,19 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
 
     private fun remoteSnapshot(): PlaybackSnapshot? = coordinator?.state?.value?.view?.state
+
+    private fun currentRemoteTransportKey(): PlaybackInteractionKey? {
+        // Generic remote queue/context actions do not require an observing UI controller.
+        // Mini transport additionally binds connection lifetime and EVERY accepted selection.
+        val binding = controller
+        val owner = coordinator
+        val snapshot = remoteSnapshot()
+        val rawKey = if (observing && !releaseAfterPending && binding != null && snapshot != null &&
+            snapshot.queue.getOrNull(snapshot.position) != null) currentRemoteInteractionKey() else null
+        return remoteTransportKeys.current(if (rawKey != null && binding != null && owner != null)
+            TransportIdentity(rawKey, PlaybackReference(owner), owner.interactionVersion, PlaybackReference(binding),
+                generation, interactionGeneration, owner.transportCapabilityVersion, owner.transportSelectionVersion) else null)
+    }
 
     private fun currentRemoteInteractionKey(): PlaybackInteractionKey? {
         val owner = coordinator
@@ -625,10 +705,12 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
 
     private fun publishConnectionFailure() {
+        remoteTransportKeys.invalidate()
+        localTransportKeys.invalidate()
         if (hasRemoteOutput()) publish()
         else mutableState.value = mutableState.value.copy(
             isPlaying = false, playWhenReady = false, isBuffering = false, error = connectionError,
-            interactionKey = null, canMoveUpcomingAbsolutely = false,
+            interactionKey = null, transportInteractionKey = null, canMoveUpcomingAbsolutely = false, canSkipNext = false, canSkipPrevious = false,
         )
     }
 
@@ -639,15 +721,24 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         }
         // Do not read the local queue/history at all while displaying another output.
         if (hasRemoteOutput()) {
+            localTransportKeys.invalidate()
             displayingRemote = true
-            val remote = remotePlaybackState(remoteSnapshot() ?: PlaybackSnapshot(), connectionError)
+            val snapshot = remoteSnapshot() ?: PlaybackSnapshot()
+            val remote = remotePlaybackState(snapshot, connectionError)
+            val key = currentRemoteInteractionKey()
+            val transportKey = currentRemoteTransportKey()
+            val directions = remoteSkipCapabilities(snapshot)
             mutableState.value = remote.copy(
-                interactionKey = currentRemoteInteractionKey(),
+                interactionKey = key,
+                transportInteractionKey = transportKey,
+                canSkipNext = transportKey != null && directions.first,
+                canSkipPrevious = transportKey != null && directions.second,
                 notice = actionNotice ?: remote.notice,
             )
             return
         }
         remoteInteractionKeys.invalidate()
+        remoteTransportKeys.invalidate()
         val wasRemote = displayingRemote
         displayingRemote = false
         val connected = controller ?: run {
@@ -661,6 +752,9 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         }
         val duration = connected.duration
         val currentItem = connected.currentMediaItem?.let(PlaybackMedia::libraryItem)
+        val interactive = observing && !releaseAfterPending
+        val rawKey = PlaybackService.interactionKey()
+        val transportKey = currentLocalTransportKey(rawKey)
         mutableState.value = PlaybackState(
             item = currentItem,
             isPlaying = connected.isPlaying,
@@ -678,8 +772,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             context = PlaybackService.queueContext(),
             canUndoQueueRemoval = PlaybackService.canUndoRemoval(),
             notice = actionNotice ?: PlaybackService.queueNotice(),
-            interactionKey = PlaybackService.interactionKey(),
-            canMoveUpcomingAbsolutely = PlaybackService.interactionKey() != null,
+            interactionKey = rawKey,
+            transportInteractionKey = transportKey,
+            canMoveUpcomingAbsolutely = rawKey != null,
+            canSkipNext = interactive && PlaybackService.canSkipPrepared(true),
+            canSkipPrevious = interactive && PlaybackService.canSkipPrepared(false),
         )
     }
 

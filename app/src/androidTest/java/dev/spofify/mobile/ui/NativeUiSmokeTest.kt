@@ -361,6 +361,7 @@ class NativeUiSmokeTest {
                 waitFor(playingButton())
                 compose.onNodeWithText("Night walk · edited").assertExists()
                 screenshot("10b-player-collapsed")
+                assertMiniTransportAndRestore(fixture, originalQueue)
                 val density = compose.activity.resources.displayMetrics.density
                 val beforeGestureExpand = capturePlaying(fixture)
                 compose.onNode(expandPlayer).performTouchInput {
@@ -550,6 +551,118 @@ class NativeUiSmokeTest {
                 }
             }
         }
+    }
+
+    /** Real pointer transport on the production dock; restore exact fixture state for later checks. */
+    private fun assertMiniTransportAndRestore(fixture: UiFixtureServer, originalQueue: List<QueueOccurrence>) {
+        val identity = hasTestTag("mini-player-identity")
+        compose.onNode(identity).assertIsDisplayed().assert(expandPlayer)
+        // Custom actions are not a replacement visible button, and expanded Next is scoped out.
+        compose.onAllNodes(hasContentDescription("Next song") and !inPlayerSheet()).assertCountEquals(0)
+        val customActions = compose.onNode(identity).fetchSemanticsNode().config[SemanticsActions.CustomActions]
+        assertEquals(setOf("Next song", "Previous song"), customActions.map { it.label }.toSet())
+        val before = readPlaybackState()
+        val firstOccurrence = checkNotNull(before.currentEntryId)
+        assertEquals(UiFixtureServer.TRACK_NAMES.first(), before.item?.name)
+        assertEquals(originalQueue, upcomingOccurrences())
+        assertTrue("Previous restart fixture must begin beyond restart threshold", before.positionMs >= 29_000)
+        val preparations = fixture.playbackPreparations.get()
+        val density = compose.activity.resources.displayMetrics.density
+        fun pauseAfterSkip() {
+            // Existing semantic Next/Previous intentionally start playback, even from pause.
+            // Pause explicitly only after that intent has settled; never require skip to pause.
+            waitFor(playingButton() and !inPlayerSheet())
+            compose.onNode(playingButton() and !inPlayerSheet()).performTouchInput { click() }
+            waitFor(pausedButton())
+            compose.waitUntil(10_000) {
+                val state = readPlaybackState()
+                !state.playWhenReady && !state.isPlaying
+            }
+            compose.onNode(playerSheet).assertDoesNotExist()
+        }
+
+        // Use a REAL tap on the separate child target, not its semantics callback.
+        compose.onNode(playingButton() and !inPlayerSheet()).performTouchInput { click() }
+        waitFor(pausedButton())
+        compose.onNode(playerSheet).assertDoesNotExist()
+        assertEquals(firstOccurrence, readPlaybackState().currentEntryId)
+        assertEquals(originalQueue, upcomingOccurrences())
+        assertEquals(preparations, fixture.playbackPreparations.get())
+        screenshot("10ba-mini-child-pause")
+
+        // At the first occurrence Previous restarts current; no guessed queueIndex - 1.
+        compose.onNode(identity).performTouchInput {
+            swipe(center, center + Offset(100f * density, 0f), durationMillis = 350)
+        }
+        compose.waitUntil(10_000) {
+            val state = readPlaybackState()
+            state.currentEntryId == firstOccurrence && state.positionMs <= 1_000
+        }
+        compose.onNode(playerSheet).assertDoesNotExist()
+        pauseAfterSkip()
+        assertEquals(originalQueue, upcomingOccurrences())
+        screenshot("10bb-mini-previous-restart")
+
+        compose.onNode(identity).performTouchInput {
+            swipe(center, center + Offset(-100f * density, 0f), durationMillis = 350)
+        }
+        val second = originalQueue.first()
+        compose.waitUntil(10_000) { readPlaybackState().currentEntryId == second.id }
+        compose.onNode(identity).assertTextContains(second.title)
+        compose.onNode(playerSheet).assertDoesNotExist()
+        pauseAfterSkip()
+        assertEquals("One left release advances exactly one prepared occurrence", originalQueue.drop(1), upcomingOccurrences())
+        assertEquals(preparations, fixture.playbackPreparations.get())
+        // Test setup through the EXISTING UI-facing controls, never a raw player: a slow AVD
+        // may exceed Previous's restart threshold before Pause settles. Seek only this paused
+        // occurrence to zero, without preparing/replacing its queue, before testing traversal.
+        compose.runOnIdle {
+            ViewModelProvider(compose.activity)[LibraryViewModel::class.java].playback.seekTo(0)
+        }
+        compose.waitUntil(10_000) { readPlaybackState().positionMs <= 1_000 }
+        screenshot("10bc-mini-left-next")
+        assertEquals(second.id, readPlaybackState().currentEntryId)
+        compose.onNode(identity).performTouchInput {
+            swipe(center, center + Offset(100f * density, 0f), durationMillis = 350)
+        }
+        compose.waitUntil(10_000) { readPlaybackState().currentEntryId == firstOccurrence }
+        compose.onNode(identity).assertTextContains(UiFixtureServer.TRACK_NAMES.first())
+        compose.onNode(playerSheet).assertDoesNotExist()
+        pauseAfterSkip()
+        assertEquals("Previous restores the same exact upcoming occurrences", originalQueue, upcomingOccurrences())
+        assertEquals(preparations, fixture.playbackPreparations.get())
+        screenshot("10bd-mini-right-previous")
+
+        // A physical tap still expands while paused; all expanded transport stays reachable.
+        val beforeTap = readPlaybackWitness(fixture)
+        compose.onNode(identity).performTouchInput { click() }
+        waitFor(playerSheet)
+        assertPausedTransition(beforeTap, fixture)
+        listOf("Previous song", "Play", "Next song").forEach { label ->
+            compose.onNode(sheetTransport(label)).assertIsDisplayed().assertIsEnabled()
+                .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+        }
+        assertQueueSnapshot(originalQueue)
+        if (exists(hasTestTag("now-playing-queue-view"))) {
+            pressBack()
+            waitUntilAbsent(hasTestTag("now-playing-queue-view"))
+        }
+        screenshot("10be-mini-tap-expanded-controls-retained")
+        // Restore the substantial seek baseline and playback intent used by the remaining
+        // presentation/IME/font journey. No queue rebuild or fixture-total modification.
+        compose.onNode(playerPosition).performSemanticsAction(SemanticsActions.SetProgress) { action ->
+            assertTrue(action(30_000f))
+        }
+        compose.waitUntil(10_000) { positionMs() in 29_000f..33_000f }
+        compose.onNode(sheetTransport("Play")).performClick()
+        waitFor(playingButton() and inPlayerSheet())
+        val restored = capturePlaying(fixture)
+        collapsePlayer()
+        waitUntilAbsent(playerSheet)
+        assertPlayingTransition(restored, fixture, "mini transport fixture restoration")
+        assertEquals(firstOccurrence, readPlaybackState().currentEntryId)
+        assertEquals(originalQueue, upcomingOccurrences())
+        assertEquals(preparations, fixture.playbackPreparations.get())
     }
 
     private fun assertContextualListPlayback(fixture: UiFixtureServer) {

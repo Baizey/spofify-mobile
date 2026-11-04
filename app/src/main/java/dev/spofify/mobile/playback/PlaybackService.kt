@@ -117,6 +117,10 @@ class PlaybackService : MediaSessionService() {
             active.get()?.guardedMove(expectedKey, id, to)
         }
         fun interactionKey(): PlaybackInteractionKey? = active.get()?.currentInteractionKey()
+        fun canSkipPrepared(forward: Boolean): Boolean = active.get()?.canSkip(forward) == true
+        fun transportCapabilityRevision(): Long = active.get()?.transportCapabilityRevision ?: 0L
+        fun skipPrepared(expectedKey: PlaybackInteractionKey, forward: Boolean, originCurrent: () -> Boolean): Boolean =
+            active.get()?.guardedSkip(expectedKey, forward, originCurrent) == true
         fun clearQueued() { active.get()?.routeCommand(PlaybackDeviceCommand.transport("clear")) }
         fun undoQueuedRemoval() { active.get()?.localEdit { undoRemoval() } }
         fun queuedKey(id: String): Long? = active.get()?.let { it.exportPrepared(); it.wireKeys[id] }
@@ -178,6 +182,28 @@ class PlaybackService : MediaSessionService() {
         val requestEpoch: Long, val queueEpoch: Long, val current: String?, val traversal: List<String>,
         val context: PlaybackContext?,
     )
+
+    private var transportCapabilityRevision = 0L
+
+    private fun skipCapabilities(): Pair<Boolean, Boolean> {
+        val current = player ?: return false to false
+        if (current.currentMediaItem == null) return false to false
+        // The raw output's shuffle order realizes manual FIFO before the context tail,
+        // even when importedShuffle is false. Use the same semantic operations as
+        // executeOwned: explicit Next ignores repeat-one, Previous may restart current.
+        // Neither the physical queue index nor the displayed upcoming list is authority.
+        return (current.isCommandAvailable(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM) && current.hasNextMediaItem()) to
+            current.isCommandAvailable(Player.COMMAND_SEEK_TO_PREVIOUS)
+    }
+
+    private fun canSkip(forward: Boolean): Boolean {
+        val devices = (application as SpofifyApplication).graph.playbackCoordinator?.state?.value ?: return false
+        if (!devices.connected || devices.selectionUnconfirmed || devices.view?.transfer != null || devices.quarantineMs != 0L ||
+            devices.deviceId.isEmpty() || devices.deviceId != devices.activeDeviceId ||
+            devices.devices.none { it.deviceId == devices.activeDeviceId && it.available } || currentInteractionKey() == null) return false
+        val directions = skipCapabilities()
+        return if (forward) directions.first else directions.second
+    }
 
     private data class EmptyInteractionIdentity(
         val client: PlaybackReference, val session: PlaybackReference, val owner: PlaybackReference,
@@ -328,6 +354,14 @@ class PlaybackService : MediaSessionService() {
             ContextCompat.RECEIVER_NOT_EXPORTED)
         noisyRegistered = true
         exo.addListener(object : Player.Listener {
+            private var directions = false to false
+            private fun observeDirections() {
+                val next = skipCapabilities()
+                if (directions != next) { directions = next; transportCapabilityRevision++ }
+            }
+
+            override fun onAvailableCommandsChanged(availableCommands: Player.Commands) { observeDirections() }
+            override fun onRepeatModeChanged(repeatMode: Int) { observeDirections() }
             override fun onTimelineChanged(timeline: Timeline, reason: Int) {
                 schedulePrune()
             }
@@ -946,7 +980,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private suspend fun executeOwned(command: PlaybackDeviceCommand, value: PlaybackAuthority,
-        isCurrent: () -> Boolean = { true }): PlaybackEndpointResult {
+        isCurrent: () -> Boolean = { true }, onTransportMoved: () -> Unit = {}): PlaybackEndpointResult {
         if (!isCurrent() || !acceptAuthority(value)) return PlaybackEndpointResult("rejected", exportPrepared())
         val current = player ?: return PlaybackEndpointResult("rejected", PlaybackSnapshot())
         // Resolve a legacy incoming toggle against the raw service player's current intent,
@@ -980,8 +1014,8 @@ class PlaybackService : MediaSessionService() {
                 return startOwned(value, true, isCurrent)
             }
             "seek" -> { current.seekTo((json.getValue("value").jsonPrimitive.double * 1000).toLong()); resetHistoryAnchor(current.currentMediaItem) }
-            "next" -> { if (current.hasNextMediaItem()) { current.seekToNextMediaItem(); return startOwned(value, true, isCurrent) } }
-            "previous" -> { if (current.currentPosition > current.maxSeekToPreviousPosition || !current.hasPreviousMediaItem()) restartTraversal(); current.seekToPrevious(); return startOwned(value, true, isCurrent) }
+            "next" -> { if (current.hasNextMediaItem()) { current.seekToNextMediaItem(); onTransportMoved(); return startOwned(value, true, isCurrent) } }
+            "previous" -> { if (current.currentPosition > current.maxSeekToPreviousPosition || !current.hasPreviousMediaItem()) restartTraversal(); current.seekToPrevious(); onTransportMoved(); return startOwned(value, true, isCurrent) }
             "shuffle" -> toggleOwnedShuffle()
             "repeat" -> current.repeatMode = when (current.repeatMode) { Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL; Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE; else -> Player.REPEAT_MODE_OFF }
             "clear" -> clearUpcoming()
@@ -1076,6 +1110,50 @@ class PlaybackService : MediaSessionService() {
 
     private fun wireContext(item: LibraryItem?): PlaybackContext? = item?.let {
         PlaybackContext(it.kind, if (it.kind == "likes" && it.id.isEmpty()) "likes" else it.id, it.name)
+    }
+
+    private fun guardedSkip(expectedKey: PlaybackInteractionKey, forward: Boolean, originCurrent: () -> Boolean): Boolean {
+        if (Looper.myLooper() != Looper.getMainLooper()) return false
+        val graph = (application as SpofifyApplication).graph
+        val owner = graph.playbackCoordinator ?: return false
+        val devices = owner.state.value
+        val version = owner.interactionVersion
+        val selection = owner.transportSelectionVersion
+        val request = PlaybackRequests.epoch
+        var dispatchKey: PlaybackInteractionKey? = expectedKey
+        var capabilityRevision = transportCapabilityRevision
+        var moved = false
+        val isCurrent = {
+            val now = owner.state.value
+            originCurrent() && active.get() === this && graph.playbackCoordinator === owner && request == PlaybackRequests.epoch &&
+                now.connected && !now.selectionUnconfirmed && now.view?.transfer == null && now.quarantineMs == 0L &&
+                now.deviceId.isNotEmpty() && now.deviceId == now.activeDeviceId &&
+                now.devices.any { it.deviceId == now.activeDeviceId && it.available } &&
+                now.deviceId == devices.deviceId && now.activeDeviceId == devices.activeDeviceId &&
+                owner.interactionVersion == version && owner.transportSelectionVersion == selection &&
+                capabilityRevision == transportCapabilityRevision &&
+                dispatchKey != null && currentInteractionKey() === dispatchKey &&
+                (moved || canSkip(forward))
+        }
+        if (!isCurrent()) return false
+        // Same prepared-only and explicit-background-start safety as user/system transport.
+        owner.editPreparedQueue(isCurrent) { permit ->
+            if (!isCurrent() || !permit.isValid() || permit.epoch != authority?.epoch || permit.generation != authority?.generation)
+                PlaybackEndpointResult("rejected", exportPrepared())
+            else {
+                explicitBackgroundPermit = permit
+                try {
+                    executeOwned(PlaybackDeviceCommand.transport(if (forward) "next" else "previous"), permit, isCurrent) {
+                        // The intended seek itself changes current identity. Fence subsequent
+                        // readiness waits to that exact result, never to a fresh UI/current item.
+                        moved = true
+                        dispatchKey = currentInteractionKey()
+                        capabilityRevision = transportCapabilityRevision
+                    }
+                } finally { if (explicitBackgroundPermit === permit) explicitBackgroundPermit = null }
+            }
+        }
+        return true
     }
 
     private fun requestListAction(queue: dev.spofify.mobile.core.PlaybackQueue, requestedClient: SpofifyClient,

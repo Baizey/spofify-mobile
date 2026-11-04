@@ -1,5 +1,15 @@
 package dev.spofify.mobile.playback
 
+import dev.spofify.mobile.core.PlaybackSnapshot
+
+/** Same explicit-skip semantics as CoordinatedSessionPlayer: repeat-one does not wrap;
+ * Previous includes restart-current even at the first occurrence. Snapshot alone is NOT
+ * authority: callers must also require a live, available selected-output interaction key. */
+internal fun remoteSkipCapabilities(snapshot: PlaybackSnapshot): Pair<Boolean, Boolean> {
+    if (snapshot.queue.getOrNull(snapshot.position) == null) return false to false
+    return (snapshot.position < snapshot.queue.lastIndex || snapshot.repeat == "all") to true
+}
+
 /**
  * Opaque in-process interaction identity, NOT backend authority. Compare by identity/equality only.
  * Capture from [PlaybackState] at gesture start; never persist, save, log or put in media extras.

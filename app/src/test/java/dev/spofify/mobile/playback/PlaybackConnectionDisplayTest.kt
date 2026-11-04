@@ -113,6 +113,25 @@ class PlaybackConnectionDisplayTest {
         assertEquals(max, remoteUpcomingKey(source.copy(queue = source.queue + track(max, 3)), "wire-$max"))
     }
 
+    @Test fun directionalCapabilitiesMatchExplicitSkipsAndRestartRatherThanUpcomingSize() {
+        val source = PlaybackSnapshot(queue = listOf(track(1, 0), track(2, 1)), position = 0)
+        assertEquals(true to true, remoteSkipCapabilities(source))
+        assertEquals(false to true, remoteSkipCapabilities(source.copy(position = 1)))
+        assertEquals(true to true, remoteSkipCapabilities(source.copy(position = 1, repeat = "all")))
+        assertEquals(false to true, remoteSkipCapabilities(source.copy(position = 1, repeat = "one")))
+        assertEquals(true to true, remoteSkipCapabilities(source.copy(repeat = "one", shuffle = true)))
+        assertEquals(false to true, remoteSkipCapabilities(source.copy(queue = source.queue.take(1))))
+        assertEquals(true to true, remoteSkipCapabilities(source.copy(queue = source.queue.take(1), repeat = "all")))
+        assertEquals(false to false, remoteSkipCapabilities(PlaybackSnapshot()))
+        assertEquals(false to false, remoteSkipCapabilities(source.copy(position = -1)))
+        assertEquals(false to false, remoteSkipCapabilities(source.copy(position = 2)))
+        // Display-only conversion and unknown hosts never grant authority from queue shape.
+        assertFalse(remotePlaybackState(source).canSkipNext)
+        assertFalse(remotePlaybackState(source).canSkipPrevious)
+        assertFalse(PlaybackState().canSkipNext)
+        assertFalse(PlaybackState().canSkipPrevious)
+    }
+
     @Test fun remoteMoveIsOneSupportedDirectionAndNeverABatchForArbitraryReorder() {
         assertEquals("up", remoteMoveDirection(4, 3))
         assertEquals("down", remoteMoveDirection(4, 5))

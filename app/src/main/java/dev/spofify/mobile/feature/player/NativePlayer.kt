@@ -37,10 +37,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,9 +50,11 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
@@ -75,13 +79,57 @@ fun NativeMiniPlayer(
     modifier: Modifier = Modifier,
 ) {
     val item = state.item ?: return
+    val key = state.transportInteractionKey
+    // A new token on any observed identity/capability/controller transition also fences A→B→A
+    // recompositions. Progress, artwork and buffering alone leave a held gesture intact.
+    val transportToken = remember(key, state.canSkipNext, state.canSkipPrevious, controls) { Any() }
+    val currentToken = rememberUpdatedState(transportToken)
+    val currentExpand = rememberUpdatedState(onExpand)
+    var mounted by remember { mutableStateOf(true) }
+    DisposableEffect(Unit) { onDispose { mounted = false } }
+    val tapGuard = remember { MiniPlayerTapGuard() }
+    val transport: (PlayerSwipeAction) -> Boolean = { action ->
+        if (!mounted || key == null || currentToken.value !== transportToken) false
+        else when (action) {
+            PlayerSwipeAction.NEXT -> state.canSkipNext && controls.next(key)
+            PlayerSwipeAction.PREVIOUS -> state.canSkipPrevious && controls.previous(key)
+            else -> false
+        }
+    }
     Surface(modifier = modifier.fillMaxWidth(), shape = RectangleShape) {
         Column {
             Row(Modifier.fillMaxWidth().heightIn(min = 64.dp), verticalAlignment = Alignment.CenterVertically) {
                 Row(
-                    Modifier.weight(1f)
-                        .playerSwipe(PlayerSwipeArea.MINI) { onExpand() }
-                        .clickable(role = Role.Button, onClickLabel = "Expand Now Playing", onClick = onExpand)
+                    Modifier.weight(1f).testTag("mini-player-identity")
+                        .miniPlayerSwipe(tapGuard) {
+                            val transportAtDown = transport
+                            val dispatch: (PlayerSwipeAction) -> Unit = { action ->
+                                when (action) {
+                                    PlayerSwipeAction.EXPAND -> currentExpand.value()
+                                    PlayerSwipeAction.NEXT, PlayerSwipeAction.PREVIOUS -> { transportAtDown(action) }
+                                    else -> Unit
+                                }
+                            }
+                            dispatch
+                        }
+                        .semantics {
+                            stateDescription = buildList {
+                                if (key != null && state.canSkipNext) add("Swipe left for Next song")
+                                if (key != null && state.canSkipPrevious) add("Swipe right for Previous song")
+                                add("Swipe up to expand")
+                            }.joinToString("; ")
+                            customActions = buildList {
+                                if (key != null && state.canSkipNext) add(CustomAccessibilityAction("Next song") {
+                                    transport(PlayerSwipeAction.NEXT)
+                                })
+                                if (key != null && state.canSkipPrevious) add(CustomAccessibilityAction("Previous song") {
+                                    transport(PlayerSwipeAction.PREVIOUS)
+                                })
+                            }
+                        }
+                        .clickable(role = Role.Button, onClickLabel = "Expand Now Playing") {
+                            if (tapGuard.allowClick) onExpand()
+                        }
                         .heightIn(min = 64.dp).padding(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -94,9 +142,6 @@ fun NativeMiniPlayer(
                     }
                 }
                 PlayPauseButton(state, controls::toggle)
-                IconButton(onClick = controls::next, modifier = Modifier.size(48.dp)) {
-                    Icon(Icons.Default.SkipNext, "Next song")
-                }
             }
             LinearProgressIndicator(
                 progress = { if (state.durationMs > 0)

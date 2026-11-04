@@ -1,6 +1,7 @@
 package dev.spofify.mobile.feature.devices
 
 import dev.spofify.mobile.core.*
+import dev.spofify.mobile.playback.remoteSkipCapabilities
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.*
@@ -51,6 +52,10 @@ class PlaybackCoordinator(
     private var epoch = 0L
     private var sequence = 0L
     private var interactionRevision = 0L
+    private var transportDirections = false to false
+    /** Capability ABA is transport-only; generic queue/action receipts do not depend on it. */
+    internal var transportCapabilityVersion = 0L
+        private set
     /** Uptime boundary for delayed system keys, sampled at the actual accepted binding change. */
     internal var interactionChangedUptime = mediaEventUptimeMs()
         private set
@@ -62,6 +67,11 @@ class PlaybackCoordinator(
     private var interactionBinding: InteractionBinding? = null
 
     private fun observeInteractionBinding(id: String, view: PlaybackDevicesView) {
+        val directions = view.state?.let(::remoteSkipCapabilities) ?: (false to false)
+        if (directions != transportDirections) {
+            transportDirections = directions
+            transportCapabilityVersion++
+        }
         // Observe EVERY accepted publication, not just UI samples: A -> B -> A must
         // cancel a held gesture too. Deliberately exclude progress and lease metadata.
         val binding = InteractionBinding(id, view.activeDeviceId, view.epoch,
@@ -132,6 +142,9 @@ class PlaybackCoordinator(
 
     /** Transient main-dispatcher identity for held UI interactions, not wire authority. */
     internal val interactionVersion: Triple<Long, Long, Long> get() = Triple(lifecycle, generation, interactionRevision)
+    /** Accepted output choices fence held transport even when the selected output is unchanged.
+     * Kept separate from generic queue/action receipt identity. */
+    internal val transportSelectionVersion: Long get() = selectionVersion
 
     /** For endpoint/local Media3 guards. A remote display never grants this authority. */
     fun currentAuthority(): PlaybackAuthority? = if (activatedEpoch == epoch) executionAuthority() else null

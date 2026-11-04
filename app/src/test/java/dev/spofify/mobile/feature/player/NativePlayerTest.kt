@@ -17,8 +17,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.hapticfeedback.HapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertHeightIsEqualTo
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertWidthIsEqualTo
@@ -40,12 +46,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.swipe
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.LibraryItem
@@ -60,6 +68,8 @@ import dev.spofify.mobile.ui.theme.AppTypography
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlin.math.ceil
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -93,19 +103,17 @@ class NativePlayerTest {
         compose.onNodeWithTag("mini-art", useUnmergedTree = true)
             .assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
         compose.onNodeWithContentDescription("Play").assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
-        compose.onNodeWithContentDescription("Next song").assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
+        compose.onNodeWithContentDescription("Next song").assertDoesNotExist()
         val host = compose.onNodeWithTag("mini-host").fetchSemanticsNode().boundsInRoot
         val bar = compose.onNodeWithTag("mini-bar").fetchSemanticsNode().boundsInRoot
         val progress = compose.onNodeWithContentDescription("Playback progress").fetchSemanticsNode().boundsInRoot
         val art = compose.onNodeWithTag("mini-art", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
         val play = compose.onNodeWithContentDescription("Play").fetchSemanticsNode().boundsInRoot
-        val next = compose.onNodeWithContentDescription("Next song").fetchSemanticsNode().boundsInRoot
         assertEquals(host.left, bar.left, 0.5f)
         assertEquals(host.right, bar.right, 0.5f)
         assertEquals(bar.left, progress.left, 0.5f)
         assertEquals(bar.right, progress.right, 0.5f)
         assertEquals(art.center.y, play.center.y, 0.5f)
-        assertEquals(play.center.y, next.center.y, 0.5f)
         compose.runOnIdle { assertEquals(0, controls.prepares); assertEquals(0, controls.connects) }
     }
 
@@ -134,12 +142,12 @@ class NativePlayerTest {
         org.junit.Assert.assertTrue(title.right <= play.left && credit.right <= play.left)
         org.junit.Assert.assertTrue(title.bottom <= credit.top + 0.5f)
         compose.onNodeWithContentDescription("Play").assertWidthIsEqualTo(48.dp).performClick()
-        compose.onNodeWithContentDescription("Next song").assertWidthIsEqualTo(48.dp).performClick()
+        compose.onNodeWithContentDescription("Next song").assertDoesNotExist()
         compose.onNodeWithText(longTrack.name).performClick()
         compose.runOnIdle {
             assertEquals(1, expands)
             assertEquals(1, controls.toggles)
-            assertEquals(1, controls.nexts)
+            assertEquals(0, controls.nexts)
             assertEquals(0, controls.prepares)
             assertEquals(0, controls.connects)
             assertEquals(0, controls.stops)
@@ -199,7 +207,8 @@ class NativePlayerTest {
                     org.junit.Assert.assertTrue("Width-truncated identity must ellipsize: $diagnostic", layout.isLineEllipsized(0))
                 }
             }
-            for (label in listOf("Play", "Next song")) {
+            compose.onNodeWithContentDescription("Next song").assertDoesNotExist()
+            for (label in listOf("Play")) {
                 val action = compose.onNodeWithContentDescription(label)
                 action.assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
                 val bounds = action.fetchSemanticsNode().boundsInRoot
@@ -226,10 +235,10 @@ class NativePlayerTest {
             }
         }
         compose.onNodeWithContentDescription("Play").performClick()
-        compose.onNodeWithContentDescription("Next song").performClick()
+        compose.onNodeWithContentDescription("Next song").assertDoesNotExist()
         compose.runOnIdle {
             assertEquals(1, controls.toggles)
-            assertEquals(1, controls.nexts)
+            assertEquals(0, controls.nexts)
             assertEquals(0, expands)
         }
         compose.onNodeWithText("Current song").performClick()
@@ -260,6 +269,348 @@ class NativePlayerTest {
             assertEquals(0, controls.prepares)
             assertEquals(0, controls.stops)
         }
+    }
+
+    @Test fun miniPhysicalLeftAndRightCommitOnceOnReleaseIncludingRtl() {
+        val fixture = setMini()
+        val key = checkNotNull(fixture.snapshot.value.transportInteractionKey)
+        for (direction in listOf(LayoutDirection.Ltr, LayoutDirection.Rtl)) {
+            fixture.update { fixture.layoutDirection.value = direction }
+            val before = fixture.controls.keyedNext.size
+            miniIdentity().performTouchInput {
+                down(center)
+                moveBy(Offset(-px(110), 0f))
+                moveBy(Offset(px(35), 0f))
+                moveBy(Offset(-px(35), 0f))
+            }
+            compose.runOnIdle { assertEquals("No transport before release", before, fixture.controls.keyedNext.size) }
+            miniIdentity().performTouchInput { up() }
+            miniIdentity().performTouchInput { swipe(center, center + Offset(px(100), 0f)) }
+            compose.runOnIdle {
+                assertEquals(before + 1, fixture.controls.keyedNext.size)
+                assertEquals(before + 1, fixture.controls.keyedPrevious.size)
+                assertEquals(key, fixture.controls.keyedNext.last())
+                assertEquals(key, fixture.controls.keyedPrevious.last())
+                assertEquals(0, fixture.expands)
+                // No fallback to unguarded transport, including in RTL.
+                assertEquals(0, fixture.controls.nexts)
+                assertEquals(0, fixture.controls.previouses)
+            }
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniTapJitterAndUpExpandButRealPlayTargetNeverExpands() {
+        val fixture = setMini()
+        miniIdentity().performTouchInput { click() }
+        miniIdentity().performTouchInput {
+            down(center)
+            moveBy(Offset(px(1), px(-1)))
+            up()
+        }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(0f, -px(100))) }
+        compose.onNodeWithContentDescription("Play").performTouchInput { click() }
+        // Starting on the sibling control is not an identity swipe, even after leaving it.
+        compose.onNodeWithContentDescription("Play").performTouchInput {
+            swipe(center, center + Offset(-px(120), -px(100)))
+        }
+        compose.runOnIdle {
+            assertEquals(3, fixture.expands)
+            assertEquals(1, fixture.controls.toggles)
+            assertTrue(fixture.controls.keyedNext.isEmpty())
+            assertTrue(fixture.controls.keyedPrevious.isEmpty())
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniShortFastDiagonalDownAndReversedDragsDoNotSkipOrClick() {
+        val fixture = setMini()
+        // Distance, not velocity: a very fast drag still needs 64dp final displacement.
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(40), 0f), 16) }
+        // Neither axis exceeds the 1.4 dominance ratio.
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(90), -px(75))) }
+        miniIdentity().performTouchInput {
+            down(center)
+            moveBy(Offset(0f, px(30)))
+            moveBy(Offset(-px(110), 0f))
+            up()
+        }
+        miniIdentity().performTouchInput {
+            down(center)
+            moveBy(Offset(-px(110), 0f))
+            moveBy(Offset(px(75), 0f))
+            up()
+        }
+        fixture.assertCancelled()
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniRatioAnd64DpReleaseThresholdKeepHorizontalAndUpIntentSeparate() {
+        val fixture = setMini()
+        // Just below the release threshold is not a commit even with dominant intent.
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(63), 0f)) }
+        fixture.assertCancelled()
+        // A diagonal which is clearly horizontal (100/60 > 1.4) skips, never expands.
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(100), -px(60))) }
+        // A clearly upward diagonal expands and must not also skip.
+        miniIdentity().performTouchInput { swipe(center, center + Offset(px(60), -px(100))) }
+        compose.runOnIdle {
+            assertEquals(1, fixture.controls.keyedNext.size)
+            assertTrue(fixture.controls.keyedPrevious.isEmpty())
+            assertEquals(1, fixture.expands)
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniPointerCancelAndMultitouchHaveNoTransportExpansionOrSuccessFeedback() {
+        val fixture = setMini()
+        miniIdentity().performTouchInput {
+            down(center)
+            moveBy(Offset(-px(100), 0f))
+            cancel()
+        }
+        fixture.assertCancelled()
+        miniIdentity().performTouchInput {
+            down(0, center)
+            moveBy(Offset(-px(100), 0f))
+            down(1, center + Offset(px(10), 0f))
+            up(1)
+            up(0)
+        }
+        fixture.assertCancelled()
+        // Cancellation cannot poison the next deliberate gesture.
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(100), 0f)) }
+        compose.runOnIdle { assertEquals(1, fixture.controls.keyedNext.size); assertEquals(0, fixture.expands) }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniDisposalCancelsHeldPointerWithoutFeedbackOrDelayedReplay() {
+        val fixture = setMini()
+        val staleActions = miniCustomActions()
+        miniIdentity().performTouchInput { down(center); moveBy(Offset(-px(100), 0f)) }
+        fixture.update { fixture.visible.value = false }
+        compose.runOnIdle { staleActions.forEach { assertFalse("Disposed identity cannot submit ${it.label}", it.action()) } }
+        compose.onNodeWithTag("mini-player-identity").assertDoesNotExist()
+        compose.onNodeWithTag("mini-test-host").performTouchInput { up() }
+        fixture.update { fixture.visible.value = true }
+        fixture.assertCancelled()
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniPhysicalBackEdgesAreNotTransportEvenInRtl() {
+        val fixture = setMini()
+        // In LTR identity touches the physical left edge; in RTL it touches the right.
+        miniIdentity().performTouchInput {
+            swipe(Offset(px(2), center.y), Offset(px(120), center.y))
+        }
+        fixture.assertCancelled()
+        fixture.update { fixture.layoutDirection.value = LayoutDirection.Rtl }
+        miniIdentity().performTouchInput {
+            swipe(Offset(width - px(2), center.y), Offset(width - px(120), center.y))
+        }
+        fixture.assertCancelled()
+        // Leaving edge transport unconsumed must not disable subsequent accessible expansion.
+        miniIdentity().performClick()
+        compose.runOnIdle { assertEquals(1, fixture.expands) }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniProgressArtworkAndBufferingPublicationsPreservePointerDownKey() {
+        val fixture = setMini()
+        val key = checkNotNull(fixture.snapshot.value.transportInteractionKey)
+        miniIdentity().performTouchInput { down(center) }
+        repeat(3) { frame ->
+            fixture.update {
+                fixture.snapshot.value = fixture.snapshot.value.copy(positionMs = (frame + 1) * 1_000L,
+                    isBuffering = frame % 2 == 0)
+                fixture.artworkLoaded.value = true
+            }
+        }
+        // Starting motion only AFTER recomposition proves capture really happened on down.
+        miniIdentity().performTouchInput { moveBy(Offset(-px(100), 0f)); up() }
+        compose.runOnIdle {
+            assertEquals(listOf(key), fixture.controls.keyedNext)
+            assertEquals(0, fixture.expands)
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniInteractionReplacementBeforeSlopAndDuringDragNeverRetargets() {
+        val fixture = setMini()
+        for (moveBeforeReplacement in listOf(false, true)) {
+            miniIdentity().performTouchInput {
+                down(center)
+                if (moveBeforeReplacement) moveBy(Offset(-px(40), 0f))
+            }
+            fixture.update {
+                fixture.snapshot.value = fixture.snapshot.value.copy(transportInteractionKey = PlaybackInteractionKey(),
+                    item = track.copy(id = "replacement", name = "Replacement song"), currentEntryId = "replacement")
+            }
+            miniIdentity().performTouchInput { moveBy(Offset(-px(100), 0f)); up() }
+            fixture.assertCancelled()
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniObservedKeyOrCapabilityAbaDoesNotReviveHeldGestureOrOldAccessibilityCallback() {
+        val fixture = setMini()
+        val initial = fixture.snapshot.value
+        for (changeKey in listOf(true, false)) {
+            val stale = miniCustomActions()
+            miniIdentity().performTouchInput { down(center) }
+            fixture.update {
+                fixture.snapshot.value = if (changeKey) initial.copy(transportInteractionKey = PlaybackInteractionKey())
+                    else initial.copy(canSkipNext = false)
+            }
+            fixture.update { fixture.snapshot.value = initial }
+            miniIdentity().performTouchInput { moveBy(Offset(-px(100), 0f)); up() }
+            compose.runOnIdle { stale.forEach { assertFalse("Observed ABA cannot revive ${it.label}", it.action()) } }
+            fixture.assertCancelled()
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniControllerReplacementWithSameDisplayKeyCannotRetargetHeldGesture() {
+        val fixture = setMini()
+        val replacement = RecordingControls().apply { state.value = fixture.snapshot.value }
+        val stale = miniCustomActions()
+        miniIdentity().performTouchInput { down(center) }
+        fixture.update { fixture.boundControls.value = replacement }
+        miniIdentity().performTouchInput { moveBy(Offset(-px(100), 0f)); up() }
+        compose.runOnIdle {
+            stale.forEach { assertFalse(it.action()) }
+            assertTrue(replacement.keyedNext.isEmpty())
+            assertTrue(replacement.keyedPrevious.isEmpty())
+            assertEquals(0, replacement.nexts)
+            assertEquals(0, replacement.previouses)
+            assertEquals(0, replacement.prepares)
+            assertEquals(0, replacement.connects)
+            assertEquals(0, replacement.stops)
+        }
+        fixture.assertCancelled()
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniCapabilityLossWithStableKeyCancelsEachDirectionWithoutFeedback() {
+        val fixture = setMini()
+        val key = fixture.snapshot.value.transportInteractionKey
+        for (left in listOf(true, false)) {
+            fixture.update {
+                fixture.snapshot.value = fixture.snapshot.value.copy(canSkipNext = true, canSkipPrevious = true)
+            }
+            miniIdentity().performTouchInput { down(center); moveBy(Offset(if (left) -px(40) else px(40), 0f)) }
+            fixture.update {
+                fixture.snapshot.value = fixture.snapshot.value.copy(canSkipNext = !left, canSkipPrevious = left)
+            }
+            miniIdentity().performTouchInput { moveBy(Offset(if (left) -px(70) else px(70), 0f)); up() }
+            compose.runOnIdle { assertEquals(key, fixture.snapshot.value.transportInteractionKey) }
+            fixture.assertCancelled()
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniUnavailableAtPointerDownCannotBecomeAvailableMidGestureButCanExpand() {
+        val fixture = setMini(miniSnapshot().copy(canSkipNext = false, canSkipPrevious = false))
+        miniIdentity().performTouchInput { down(center) }
+        fixture.update { fixture.snapshot.value = fixture.snapshot.value.copy(canSkipNext = true) }
+        miniIdentity().performTouchInput { moveBy(Offset(-px(100), 0f)); up() }
+        fixture.assertCancelled()
+        fixture.update { fixture.snapshot.value = fixture.snapshot.value.copy(transportInteractionKey = null) }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(100), 0f)) }
+        fixture.assertCancelled()
+        miniIdentity().performTouchInput { click() }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(0f, -px(100))) }
+        compose.runOnIdle { assertEquals(2, fixture.expands) }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniGenericKeyDoesNotEnableTransportWhenTransportKeyIsUnavailable() {
+        val fixture = setMini(miniSnapshot().copy(transportInteractionKey = null))
+        compose.runOnIdle {
+            assertTrue("Generic queue interaction identity remains available", fixture.snapshot.value.interactionKey != null)
+            assertEquals(null, fixture.snapshot.value.transportInteractionKey)
+        }
+        assertTrue(miniCustomActions().isEmpty())
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(100), 0f)) }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(px(100), 0f)) }
+        fixture.assertCancelled()
+        compose.runOnIdle { assertTrue("Never fall back to the generic key", fixture.controls.keyedAttempts.isEmpty()) }
+        miniIdentity().performTouchInput { click() }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(0f, -px(100))) }
+        compose.runOnIdle { assertEquals(2, fixture.expands) }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniAccessibilityKeepsIdentityExpandAndCapabilityGuardedNamedAlternatives() {
+        val fixture = setMini()
+        val identity = miniIdentity().fetchSemanticsNode().config
+        assertEquals("Expand Now Playing", identity[SemanticsActions.OnClick].label)
+        val text = identity[SemanticsProperties.Text].joinToString(" ") { it.text }
+        assertTrue(text.contains(track.name))
+        assertTrue(text.contains(track.subtitle))
+        val accessibleContext = listOf(text, identity.getOrNull(SemanticsProperties.ContentDescription)?.joinToString(" "),
+            identity.getOrNull(SemanticsProperties.StateDescription)).filterNotNull().joinToString(" ")
+        assertTrue("Concise swipe guidance accompanies, not replaces, identity", accessibleContext.contains("swipe", ignoreCase = true))
+        val actions = miniCustomActions()
+        assertEquals(setOf("Next song", "Previous song"), actions.map { it.label }.toSet())
+        val key = checkNotNull(fixture.snapshot.value.transportInteractionKey)
+        fixture.update {
+            fixture.snapshot.value = fixture.snapshot.value.copy(positionMs = 12_000, isBuffering = true)
+            fixture.artworkLoaded.value = true
+        }
+        compose.runOnIdle { actions.forEach { assertTrue("Benign publications retain ${it.label}", it.action()) } }
+        compose.runOnIdle {
+            assertEquals(listOf(key), fixture.controls.keyedNext)
+            assertEquals(listOf(key), fixture.controls.keyedPrevious)
+            assertEquals(0, fixture.expands)
+        }
+        compose.onNodeWithContentDescription("Next song").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Play").assertIsEnabled().assertWidthIsEqualTo(48.dp)
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniUnavailableAccessibilityActionsAreOmittedAndOldCallbacksFailClosed() {
+        val fixture = setMini()
+        val stale = miniCustomActions()
+        fixture.update { fixture.snapshot.value = fixture.snapshot.value.copy(transportInteractionKey = PlaybackInteractionKey()) }
+        compose.runOnIdle { stale.forEach { assertFalse("Old callback cannot retarget ${it.label}", it.action()) } }
+        val current = miniCustomActions()
+        fixture.update { fixture.snapshot.value = fixture.snapshot.value.copy(canSkipNext = false, canSkipPrevious = false) }
+        assertTrue(miniCustomActions().isEmpty())
+        compose.runOnIdle { current.forEach { assertFalse("Capability loss rejects ${it.label}", it.action()) } }
+        fixture.update { fixture.snapshot.value = fixture.snapshot.value.copy(canSkipPrevious = true) }
+        assertEquals(listOf("Previous song"), miniCustomActions().map { it.label })
+        fixture.update { fixture.snapshot.value = fixture.snapshot.value.copy(canSkipNext = true, canSkipPrevious = false) }
+        assertEquals(listOf("Next song"), miniCustomActions().map { it.label })
+        fixture.update { fixture.snapshot.value = fixture.snapshot.value.copy(transportInteractionKey = null, canSkipNext = true, canSkipPrevious = true) }
+        assertTrue(miniCustomActions().isEmpty())
+        fixture.assertCancelled()
+        miniIdentity().performClick() // Expansion remains the non-swipe way to expanded controls.
+        compose.runOnIdle { assertEquals(1, fixture.expands) }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun miniRejectedGuardedDispatchDoesNotClaimSuccessOrProduceHaptic() {
+        val fixture = setMini()
+        fixture.controls.acceptKeyedTransport = false
+        val actions = miniCustomActions()
+        compose.runOnIdle { actions.forEach { assertFalse(it.action()) } }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(100), 0f)) }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(px(100), 0f)) }
+        compose.runOnIdle {
+            assertTrue("Exercise actual guarded rejection, not only UI gating", fixture.controls.keyedAttempts.isNotEmpty())
+        }
+        fixture.assertCancelled()
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun absentCurrentItemHasNoMiniIdentityProgressOrTransport() {
+        val fixture = setMini(miniSnapshot().copy(item = null))
+        miniIdentity().assertDoesNotExist()
+        compose.onNodeWithContentDescription("Playback progress").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Play").assertDoesNotExist()
+        fixture.assertCancelled()
+        fixture.assertPresentationOnly()
     }
 
     @Test fun expandedBufferingPlaybackIntentKeepsPauseActionAvailable() {
@@ -681,6 +1032,74 @@ class NativePlayerTest {
         }
     }
 
+    private fun miniSnapshot() = PlaybackState(item = track, currentEntryId = "current-occurrence",
+        durationMs = 100_000, interactionKey = PlaybackInteractionKey(), transportInteractionKey = PlaybackInteractionKey(),
+        canSkipNext = true, canSkipPrevious = true)
+
+    private fun miniIdentity() = compose.onNodeWithTag("mini-player-identity")
+    private fun px(dp: Int) = with(compose.density) { dp.dp.toPx() }
+    private fun miniCustomActions(): List<CustomAccessibilityAction> =
+        miniIdentity().fetchSemanticsNode().config.getOrNull(SemanticsActions.CustomActions).orEmpty()
+
+    private fun setMini(initial: PlaybackState = miniSnapshot()): MiniFixture {
+        val fixture = MiniFixture(initial)
+        compose.setContent {
+            CompositionLocalProvider(LocalLayoutDirection provides fixture.layoutDirection.value,
+                LocalHapticFeedback provides fixture.haptics) {
+                MaterialTheme {
+                    Box(Modifier.fillMaxSize().testTag("mini-test-host")) {
+                        if (fixture.visible.value) NativeMiniPlayer(fixture.snapshot.value, fixture.boundControls.value,
+                            { fixture.expands++ }, artwork = { _, modifier ->
+                                Box(modifier.testTag("mini-art")) {
+                                    if (fixture.artworkLoaded.value) androidx.compose.material3.Text("♪")
+                                }
+                            })
+                    }
+                }
+            }
+        }
+        return fixture
+    }
+
+    private inner class MiniFixture(initial: PlaybackState) {
+        val snapshot = mutableStateOf(initial)
+        val visible = mutableStateOf(true)
+        val artworkLoaded = mutableStateOf(false)
+        val layoutDirection = mutableStateOf(LayoutDirection.Ltr)
+        val controls = RecordingControls().apply { state.value = initial }
+        val boundControls = mutableStateOf(controls)
+        var expands = 0
+        val feedback = mutableListOf<HapticFeedbackType>()
+        val haptics = object : HapticFeedback {
+            override fun performHapticFeedback(hapticFeedbackType: HapticFeedbackType) { feedback += hapticFeedbackType }
+        }
+
+        fun update(block: () -> Unit) {
+            compose.runOnIdle {
+                block()
+                controls.state.value = snapshot.value
+                boundControls.value.state.value = snapshot.value
+            }
+            compose.waitForIdle()
+        }
+
+        fun assertCancelled() = compose.runOnIdle {
+            assertTrue(controls.keyedNext.isEmpty())
+            assertTrue(controls.keyedPrevious.isEmpty())
+            assertEquals(0, controls.nexts)
+            assertEquals(0, controls.previouses)
+            assertEquals(0, expands)
+            assertTrue("Cancelled/rejected work must not emit success haptics", feedback.isEmpty())
+        }
+
+        fun assertPresentationOnly() = compose.runOnIdle {
+            assertEquals(0, controls.prepares)
+            assertEquals(0, controls.connects)
+            assertEquals(0, controls.stops)
+            assertEquals(0, controls.seeks)
+        }
+    }
+
     private fun assertSingleLineFits(text: String) {
         val node = compose.onNodeWithText(text, useUnmergedTree = true).assertIsDisplayed()
         val layouts = mutableListOf<TextLayoutResult>()
@@ -735,6 +1154,10 @@ class NativePlayerTest {
         var toggles = 0
         var nexts = 0
         var previouses = 0
+        var acceptKeyedTransport = true
+        val keyedAttempts = mutableListOf<Pair<String, PlaybackInteractionKey>>()
+        val keyedNext = mutableListOf<PlaybackInteractionKey>()
+        val keyedPrevious = mutableListOf<PlaybackInteractionKey>()
         var seeks = 0
         var shuffles = 0
         var repeats = 0
@@ -752,6 +1175,18 @@ class NativePlayerTest {
         override fun toggle() { toggles++ }
         override fun next() { nexts++ }
         override fun previous() { previouses++ }
+        override fun next(expectedKey: PlaybackInteractionKey): Boolean {
+            keyedAttempts += "next" to expectedKey
+            if (!acceptKeyedTransport || state.value.transportInteractionKey != expectedKey || !state.value.canSkipNext) return false
+            keyedNext += expectedKey
+            return true
+        }
+        override fun previous(expectedKey: PlaybackInteractionKey): Boolean {
+            keyedAttempts += "previous" to expectedKey
+            if (!acceptKeyedTransport || state.value.transportInteractionKey != expectedKey || !state.value.canSkipPrevious) return false
+            keyedPrevious += expectedKey
+            return true
+        }
         override fun select(index: Int) = Unit
         override fun seekTo(positionMs: Long) { seeks++ }
         override fun toggleShuffle() { shuffles++ }

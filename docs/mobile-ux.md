@@ -94,7 +94,7 @@ Use the familiar **sheet**, not a fixed-fullscreen replacement. The requirements
 
 ### Gestures and accessibility
 
-- Use contextual gestures, not global horizontal interception: mini-player swipe up; sheet swipe down; cover-only Next/Previous; row long press/More; optional queue enqueue/remove and dedicated reorder handles.
+- Use contextual gestures, not global horizontal interception: bottom mini-player artwork/identity swipe up expands, physical left/right performs Next/Previous; sheet swipe down; expanded-player Next/Previous gestures stay cover-only; row long press/More; optional queue enqueue/remove and dedicated reorder handles. The mini-player keeps Play/Pause and tap-to-expand, plus named accessible transport actions; only its visible Next button is removed.
 - Preserve vertical list scrolling, seeking and Android edge Back. Use touch slop, direction/commit thresholds and at most one committed action per gesture.
 - Music gestures need visible or accessible alternatives. Native system Back does **not** require a duplicate app Back button.
 - Removing an upcoming occurrence is not deleting a library song or saved playlist entry. Offer occurrence-aware Undo only while it is still valid.

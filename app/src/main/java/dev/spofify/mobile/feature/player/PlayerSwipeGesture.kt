@@ -18,10 +18,13 @@ internal class PlayerSwipeGesture(
     startX: Float,
     width: Float,
     edgeInset: Float,
+    endEdgeInset: Float = edgeInset,
 ) {
-    private var rejected = area != PlayerSwipeArea.MINI &&
-        (startX < edgeInset || startX > width - edgeInset || width <= edgeInset * 2)
+    private val edgeStart = startX < edgeInset || startX > width - endEdgeInset ||
+        width <= edgeInset + endEdgeInset
+    private var rejected = area != PlayerSwipeArea.MINI && edgeStart
     private var locked = false
+    private var upward = false
     private var ended = false
     private var x = 0f
     private var y = 0f
@@ -33,7 +36,11 @@ internal class PlayerSwipeGesture(
         y += dy
         if (!locked && maxOf(abs(x), abs(y)) > touchSlop) {
             locked = when (area) {
-                PlayerSwipeArea.MINI -> -y > abs(x) * DIRECTION_RATIO
+                PlayerSwipeArea.MINI -> when {
+                    -y > abs(x) * DIRECTION_RATIO -> { upward = true; true }
+                    abs(x) > abs(y) * DIRECTION_RATIO -> !edgeStart
+                    else -> false
+                }
                 PlayerSwipeArea.COVER -> abs(x) > abs(y) * DIRECTION_RATIO
                 PlayerSwipeArea.UPCOMING -> -x > abs(y) * DIRECTION_RATIO
             }
@@ -47,8 +54,13 @@ internal class PlayerSwipeGesture(
         ended = true
         if (rejected || !locked) return null
         return when (area) {
-            PlayerSwipeArea.MINI -> if (-y >= threshold && -y > abs(x) * DIRECTION_RATIO)
-                PlayerSwipeAction.EXPAND else null
+            PlayerSwipeArea.MINI -> if (upward) {
+                if (-y >= threshold && -y > abs(x) * DIRECTION_RATIO) PlayerSwipeAction.EXPAND else null
+            } else {
+                if (abs(x) >= threshold && abs(x) > abs(y) * DIRECTION_RATIO)
+                    if (x < 0) PlayerSwipeAction.NEXT else PlayerSwipeAction.PREVIOUS
+                else null
+            }
             PlayerSwipeArea.COVER -> if (abs(x) >= threshold && abs(x) > abs(y) * DIRECTION_RATIO)
                 if (x < 0) PlayerSwipeAction.NEXT else PlayerSwipeAction.PREVIOUS
             else null

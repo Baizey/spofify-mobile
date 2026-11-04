@@ -57,6 +57,12 @@ interface PlaybackControls {
     fun toggle()
     fun next()
     fun previous()
+    /** Prepared-only transport against PlaybackState.transportInteractionKey captured at interaction start. False means
+     * unavailable/stale (including unsupported implementations); never fall back to no-arg calls.
+     * True admits one guarded submission, not confirmation of remote playback or audible start.
+     * UI calls run on main; implementations may conservatively reject other threads. */
+    fun next(expectedKey: PlaybackInteractionKey): Boolean = false
+    fun previous(expectedKey: PlaybackInteractionKey): Boolean = false
     fun select(index: Int)
     fun seekTo(positionMs: Long)
     fun toggleShuffle()

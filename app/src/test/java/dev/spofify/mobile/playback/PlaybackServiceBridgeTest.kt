@@ -223,7 +223,7 @@ class PlaybackServiceBridgeTest {
         }
     }
 
-    private fun connectedPlayback(): PlaybackConnection {
+    private fun connectedPlayback(existing: PlaybackConnection? = null): PlaybackConnection {
         val service = controller!!.get()
         val mediaSession = PlaybackService::class.java.getDeclaredField("session").let {
             it.isAccessible = true; it.get(service) as androidx.media3.session.MediaSession
@@ -231,7 +231,7 @@ class PlaybackServiceBridgeTest {
         val future = androidx.media3.session.MediaController.Builder(service, mediaSession.token).buildAsync()
         shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
         val mediaController = future.get(1, TimeUnit.SECONDS)
-        return PlaybackConnection(service).also { connection ->
+        return (existing ?: PlaybackConnection(service)).also { connection ->
             // Only binding injection: Play, delivery, authority, queue import and transport still
             // use the actual production connection/service. Robolectric does not bind an AVD.
             PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true; set(connection, mediaController) }
@@ -1079,6 +1079,599 @@ class PlaybackServiceBridgeTest {
         closed.finalClose!!.dispose(); heldTimer.run()
         assertFalse(shadowOf(controller!!.get()).isStoppedBySelf)
         assertEquals(replacement, endpoint.exportSnapshot())
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun capturedLocalTransportUsesExistingNextAndPreviousRestartIntent() = runTest {
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
+        runCurrent()
+        val connection = connectedPlayback()
+        shadowOf(controller!!.get()).setThrowInStartForeground(
+            android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
+        try {
+            connection.connect()
+            // Empty output retains a generic cancellation key for contextual queue actions,
+            // but has no transport identity and cannot initialize music from a skip.
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            assertNotNull(connection.state.value.interactionKey)
+            assertNull(connection.state.value.transportInteractionKey)
+            assertFalse(connection.state.value.canSkipNext)
+            assertFalse(connection.state.value.canSkipPrevious)
+            assertFalse(connection.next(PlaybackInteractionKey()))
+            assertFalse(connection.previous(PlaybackInteractionKey()))
+            assertEquals(0, player.mediaItemCount)
+            // The same paused prepared intent as legacy transport: an explicit skip tries
+            // to start via Android's real foreground gate; this fixture blocks before audio.
+            for ((forward, position, elapsed, expected) in listOf(
+                TransportCase(true, 1, 0.0, 32L),
+                // Reaching terminal removes Next capability during the intended seek.
+                // Still reach startOwned's real Android blocker, not stale rejection.
+                TransportCase(true, 2, 0.0, 45L),
+                TransportCase(false, 1, 1.0, 91L),
+                TransportCase(false, 1, 65.536, 7L),
+                TransportCase(false, 0, 1.0, 91L),
+            )) {
+                val prepared = snapshot().paused().copy(position = position, elapsed = elapsed, occurrence = null)
+                owner.localAction { endpoint.activate(prepared, it) }; runCurrent()
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                val state = connection.state.value
+                val key = requireNotNull(state.transportInteractionKey)
+                assertTrue(if (forward) state.canSkipNext else state.canSkipPrevious)
+                assertTrue(if (forward) connection.next(key) else connection.previous(key))
+                runCurrent()
+                val result = endpoint.exportSnapshot()
+                assertEquals(expected, result.queue[result.position].key)
+                assertEquals("blocked", result.error)
+                assertEquals(Player.STATE_IDLE, player.playbackState)
+                assertFalse(player.playWhenReady)
+            }
+            assertEquals(loginCount, web.requestCount) // No prepare/fetch/audio/history HTTP.
+        } finally { connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    private data class TransportCase(val forward: Boolean, val position: Int, val elapsed: Double, val expected: Long)
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun capturedLocalTransportDoesNotOutliveOriginatingConnectionReleaseOrReconnect() = runTest {
+        var gate: CompletableDeferred<Unit>? = null
+        var pollEntered: CompletableDeferred<Unit>? = null
+        var pollFinished: CompletableDeferred<Unit>? = null
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone",
+            onPoll = { _, _ ->
+                val waiting = gate
+                if (waiting != null) {
+                    pollEntered!!.complete(Unit)
+                    try { waiting.await() } finally { pollFinished!!.complete(Unit) }
+                }
+            })
+        runCurrent()
+        shadowOf(controller!!.get()).setThrowInStartForeground(
+            android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
+        try {
+            for (forward in listOf(true, false)) for (reconnect in listOf(false, true)) {
+                owner.localAction { endpoint.activate(snapshot().paused(), it) }; runCurrent()
+                val connection = connectedPlayback()
+                try {
+                    connection.connect()
+                    shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                    val key = requireNotNull(connection.state.value.transportInteractionKey)
+                    val rawKey = requireNotNull(connection.state.value.interactionKey)
+                    val before = endpoint.exportSnapshot()
+                    val queueEpoch = PlaybackRequests.queueEpoch
+                    gate = CompletableDeferred(); pollEntered = CompletableDeferred(); pollFinished = CompletableDeferred()
+                    owner.retry(); runCurrent()
+                    assertTrue("poll owns coordinator transport before dispatch", pollEntered!!.isCompleted)
+                    assertTrue(if (forward) connection.next(key) else connection.previous(key))
+                    connection.release()
+                    if (reconnect) {
+                        // Rebind the SAME controls object to the SAME service; the service key
+                        // is intentionally unchanged, so only the originating lifetime fences it.
+                        connectedPlayback(connection)
+                        connection.connect()
+                    }
+                    assertSame(rawKey, PlaybackService.interactionKey())
+                    assertEquals("release must not stop or edit service playback", before, endpoint.exportSnapshot())
+                    gate!!.complete(Unit); gate = null; runCurrent()
+                    assertTrue("owning poll is fully drained", pollFinished!!.isCompleted)
+                    assertEquals("stale direction=$forward reconnect=$reconnect must not seek/start", before, endpoint.exportSnapshot())
+                    assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
+                    assertEquals(Player.STATE_IDLE, player.playbackState)
+                    assertFalse(player.playWhenReady); assertFalse(player.isLoading)
+                    assertEquals(loginCount, web.requestCount)
+                } finally {
+                    gate?.complete(Unit); gate = null
+                    connection.release(); runCurrent()
+                }
+            }
+        } finally { gate?.complete(Unit); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun pointerDownTransportKeyCannotReviveBeforeSubmissionAfterReleaseAndReconnect() = runTest {
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
+        runCurrent()
+        shadowOf(controller!!.get()).setThrowInStartForeground(
+            android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
+        try {
+            for (forward in listOf(true, false)) for (deferred in listOf(false, true)) {
+                owner.localAction { endpoint.activate(snapshot().paused(), it) }; runCurrent()
+                val connection = connectedPlayback()
+                val publish = PlaybackConnection::class.java.getDeclaredMethod("publish", java.lang.Boolean.TYPE).apply {
+                    isAccessible = true
+                }
+                try {
+                    val rawBeforeObservation = requireNotNull(PlaybackService.interactionKey())
+                    publish.invoke(connection, false)
+                    assertSame("generic local publication does not require UI observation", rawBeforeObservation, connection.state.value.interactionKey)
+                    assertTrue(connection.state.value.canMoveUpcomingAbsolutely)
+                    assertNull(connection.state.value.transportInteractionKey)
+                    assertFalse(connection.state.value.canSkipNext)
+                    assertFalse(connection.state.value.canSkipPrevious)
+                    connection.connect()
+                    shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                    val state = connection.state.value
+                    val held = requireNotNull(state.transportInteractionKey)
+                    val rawKey = requireNotNull(state.interactionKey)
+                    val before = endpoint.exportSnapshot()
+                    val bindingField = PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true }
+                    val binding = bindingField.get(connection)
+                    shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.SECONDS)
+                    assertSame("progress keeps transport projection stable", held, connection.state.value.transportInteractionKey)
+                    if (deferred) {
+                        // The injected controller has not refreshed the UI queue cache. Stage
+                        // from the actual prepared fixture, not that empty display projection.
+                        // Do not deliver it: this test owns/cancels the pending request below.
+                        val preparedItems = before.queue.map(PlaybackSnapshotCodec::libraryItem)
+                        assertTrue(preparedItems.isNotEmpty())
+                        connection.play(preparedItems, client)
+                        assertNotNull("deferred release requires an actually pending explicit tap",
+                            PlaybackConnection::class.java.getDeclaredField("pendingPlay").apply {
+                                isAccessible = true
+                            }.get(connection))
+                    }
+                    connection.release()
+                    assertNull(connection.state.value.transportInteractionKey)
+                    if (deferred) {
+                        assertSame("pending intent retains the controller", binding, bindingField.get(connection))
+                        assertSame("deferred release preserves generic identity immediately", rawKey, connection.state.value.interactionKey)
+                        assertTrue(connection.state.value.canMoveUpcomingAbsolutely)
+                        publish.invoke(connection, false)
+                        assertSame("deferred publications retain generic queue behavior", rawKey, connection.state.value.interactionKey)
+                        assertTrue(connection.state.value.canMoveUpcomingAbsolutely)
+                        assertNull(connection.state.value.transportInteractionKey)
+                        assertFalse(connection.state.value.canSkipNext)
+                        assertFalse(connection.state.value.canSkipPrevious)
+                        connection.connect() // Cancels deferred release without replacing controller.
+                        assertSame(binding, bindingField.get(connection))
+                        PlaybackConnection::class.java.getDeclaredField("pendingPlay").apply {
+                            isAccessible = true; set(connection, null)
+                        } // The posted delivery now has no fixture request to execute.
+                    } else {
+                        connectedPlayback(connection)
+                        connection.connect()
+                        assertNotSame(binding, bindingField.get(connection))
+                    }
+                    assertSame("connection lifetime must not invalidate other controllers' generic key", rawKey, PlaybackService.interactionKey())
+                    assertFalse(if (forward) connection.next(held) else connection.previous(held))
+                    runCurrent()
+                    assertEquals("unsampled pre-submission lifecycle ABA does not seek/start", before, endpoint.exportSnapshot())
+                    shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                    val fresh = requireNotNull(connection.state.value.transportInteractionKey)
+                    assertNotSame(held, fresh)
+                    assertSame(rawKey, connection.state.value.interactionKey)
+                    assertFalse("generic keys are not a transport fallback", connection.next(rawKey))
+                    assertTrue(if (forward) connection.next(fresh) else connection.previous(fresh))
+                    runCurrent()
+                    val after = endpoint.exportSnapshot()
+                    assertEquals(if (forward) 32L else 7L, after.queue[after.position].key)
+                    assertEquals("blocked", after.error) // Fresh transport reaches the normal start gate.
+                    assertFalse(player.playWhenReady)
+                } finally { connection.release() }
+            }
+        } finally { owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun capturedLocalTransportRejectsUnsampledSelectedAvailabilityAbaBeforeDispatch() = runTest {
+        var available = true
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone",
+            viewTransform = { view -> view.copy(devices = view.devices.map {
+                if (it.deviceId == "phone") it.copy(available = available) else it
+            }) })
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            connection.connect()
+            for (forward in listOf(true, false)) {
+                owner.localAction { endpoint.activate(snapshot().paused(), it) }; runCurrent()
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                val key = requireNotNull(connection.state.value.transportInteractionKey)
+                val rawKey = requireNotNull(connection.state.value.interactionKey)
+                val before = endpoint.exportSnapshot()
+                val queueEpoch = PlaybackRequests.queueEpoch
+                val authority = requireNotNull(owner.currentAuthority())
+                val version = owner.interactionVersion
+                // No connection/UI publication between accepted false and true states.
+                available = false; owner.retry(); runCurrent()
+                assertFalse(owner.state.value.devices.first { it.deviceId == "phone" }.available)
+                available = true; owner.retry(); runCurrent()
+                assertTrue(owner.state.value.devices.first { it.deviceId == "phone" }.available)
+                val renewed = requireNotNull(owner.currentAuthority())
+                assertEquals(authority.epoch, renewed.epoch)
+                assertEquals(authority.generation, renewed.generation)
+                assertEquals(version.first, owner.interactionVersion.first)
+                assertEquals(version.second, owner.interactionVersion.second)
+                assertTrue(owner.interactionVersion.third > version.third)
+                assertSame("UI still holds the original pointer-down sample", key, connection.state.value.transportInteractionKey)
+                assertFalse(if (forward) connection.next(key) else connection.previous(key))
+                runCurrent()
+                assertSame("transport availability must not invalidate generic queue receipts", rawKey, PlaybackService.interactionKey())
+                assertEquals(before, endpoint.exportSnapshot())
+                assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
+                assertEquals(Player.STATE_IDLE, player.playbackState)
+                assertFalse(player.playWhenReady); assertFalse(player.isLoading)
+            }
+        } finally { connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun transportKeysRejectUnsampledSameOutputSelectionWithoutInvalidatingGenericKeys() = runTest {
+        shadowOf(controller!!.get()).setThrowInStartForeground(
+            android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
+        for (output in listOf("phone", "pc")) for (forward in listOf(true, false)) {
+            val commands = mutableListOf<PlaybackDeviceCommand>()
+            val prepared = snapshot().paused()
+            // installOwner's transfer returns the exact same view: no owner/epoch/queue
+            // change can accidentally supply the cancellation this regression requires.
+            val owner = installOwner(backgroundScope, { testScheduler.currentTime }, output,
+                initial = if (output == "pc") prepared else null, command = commands::add)
+            runCurrent()
+            if (output == "phone") { owner.localAction { endpoint.activate(prepared, it) }; runCurrent() }
+            val connection = connectedPlayback()
+            try {
+                connection.connect()
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                val held = requireNotNull(connection.state.value.transportInteractionKey)
+                val generic = requireNotNull(connection.state.value.interactionKey)
+                val before = endpoint.exportSnapshot()
+                val version = owner.interactionVersion
+                val selection = owner.transportSelectionVersion
+                owner.select(output)
+                assertTrue(owner.state.value.selectionUnconfirmed)
+                runCurrent() // Complete selection without any connection/UI publication.
+                assertFalse(owner.state.value.selectionUnconfirmed)
+                assertEquals(output, owner.state.value.activeDeviceId)
+                assertEquals(version, owner.interactionVersion)
+                assertEquals(selection + 1, owner.transportSelectionVersion)
+                assertSame("UI still holds the pointer-down sample", held, connection.state.value.transportInteractionKey)
+                assertFalse(if (forward) connection.next(held) else connection.previous(held))
+                runCurrent()
+                assertEquals(before, endpoint.exportSnapshot())
+                assertTrue(commands.isEmpty())
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                assertSame("selection fencing is transport-only, not generic receipt identity", generic, connection.state.value.interactionKey)
+                val fresh = requireNotNull(connection.state.value.transportInteractionKey)
+                assertNotSame(held, fresh)
+                assertTrue(if (forward) connection.next(fresh) else connection.previous(fresh))
+                runCurrent()
+                if (output == "phone") {
+                    val after = endpoint.exportSnapshot()
+                    assertEquals(if (forward) 32L else 7L, after.queue[after.position].key)
+                    assertEquals("blocked", after.error)
+                } else {
+                    assertEquals(listOf(PlaybackDeviceCommand.transport(if (forward) "next" else "previous")), commands)
+                    assertEquals(before, endpoint.exportSnapshot())
+                }
+            } finally { connection.release(); owner.close() }
+        }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun localNextCapabilityUsesRepeatWrappingAndInvalidatesLossRegainBeforeDispatch() = runTest {
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            connection.connect()
+            val terminal = snapshot().paused().copy(position = 3, occurrence = null)
+            for ((mode, available) in listOf("off" to false, "one" to false, "all" to true)) {
+                owner.localAction { endpoint.activate(terminal.copy(repeat = mode), it) }; runCurrent()
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                val state = connection.state.value
+                assertTrue(state.upcoming.isEmpty())
+                assertEquals(available, state.canSkipNext)
+                assertTrue(state.canSkipPrevious)
+                if (!available) {
+                    assertFalse(connection.next(requireNotNull(state.transportInteractionKey)))
+                    runCurrent(); assertEquals(terminal.copy(repeat = mode), endpoint.exportSnapshot())
+                }
+            }
+            val held = requireNotNull(connection.state.value.transportInteractionKey)
+            val rawKey = requireNotNull(connection.state.value.interactionKey)
+            assertTrue(connection.next(held)) // Waiting for serialized coordinator dispatch.
+            val permit = requireNotNull(owner.currentAuthority())
+            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // all -> one: capability lost
+            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // one -> off
+            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // off -> all: regained
+            // Deliver service events but no UI publication is needed to invalidate held work.
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+            val after = endpoint.exportSnapshot()
+            runCurrent()
+            assertEquals(after, endpoint.exportSnapshot())
+            assertSame("capability changes do not invalidate generic receipts", rawKey, PlaybackService.interactionKey())
+            assertFalse(connection.next(held))
+        } finally { connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun capturedLocalTransportRechecksQueueAuthorityAndCurrentAbaBeforeExecution() = runTest {
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
+        runCurrent()
+        val connection = connectedPlayback()
+        shadowOf(controller!!.get()).setThrowInStartForeground(
+            android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
+        try {
+            connection.connect()
+            for (race in listOf("queue", "current-aba", "authority", "reauth")) {
+                owner.localAction { endpoint.activate(snapshot().paused(), it) }; runCurrent()
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                val key = requireNotNull(connection.state.value.transportInteractionKey)
+                assertTrue(connection.previous(key))
+                val permit = requireNotNull(owner.currentAuthority())
+                when (race) {
+                    "queue" -> endpoint.execute(PlaybackDeviceCommand.queue("remove", 32), permit)
+                    "current-aba" -> {
+                        endpoint.execute(PlaybackDeviceCommand.queue("jump", 32), permit)
+                        endpoint.execute(PlaybackDeviceCommand.transport("previous"), permit)
+                    }
+                    "authority" -> endpoint.suspendOutput()
+                    "reauth" -> login()
+                }
+                shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+                val after = endpoint.exportSnapshot()
+                runCurrent()
+                assertEquals("stale $race must not execute Previous/restart", after, endpoint.exportSnapshot())
+                assertFalse(connection.previous(key))
+            }
+        } finally { connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun capturedRemoteDirectionsSubmitExactlyOneSemanticPreparedCommandAndReleaseFailsClosed() = runTest {
+        for (forward in listOf(true, false)) {
+            val commands = mutableListOf<PlaybackDeviceCommand>()
+            val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "pc",
+                initial = snapshot().paused(), command = commands::add)
+            runCurrent()
+            val connection = connectedPlayback()
+            try {
+                connection.connect()
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                val state = connection.state.value
+                val key = requireNotNull(state.transportInteractionKey)
+                assertTrue(state.canSkipNext); assertTrue(state.canSkipPrevious)
+                assertTrue(if (forward) connection.next(key) else connection.previous(key))
+                runCurrent()
+                assertEquals(listOf(PlaybackDeviceCommand.transport(if (forward) "next" else "previous")), commands)
+                assertEquals(0, player.mediaItemCount) // No remote-to-local fallback/import.
+                connection.release()
+                assertFalse(connection.next(key)); assertFalse(connection.previous(key))
+                assertFalse(connection.state.value.canSkipNext); assertFalse(connection.state.value.canSkipPrevious)
+                runCurrent(); assertEquals(1, commands.size)
+            } finally { connection.release(); owner.close() }
+        }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun genericRemoteKeyWithoutUiObservationDoesNotGrantMiniTransport() = runTest {
+        val commands = mutableListOf<PlaybackDeviceCommand>()
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "pc",
+            initial = snapshot().paused(), command = commands::add)
+        runCurrent()
+        val connection = connectedPlayback() // Bound controller, deliberately not observing.
+        fun key(method: String): PlaybackInteractionKey? = PlaybackConnection::class.java.getDeclaredMethod(method).let {
+            it.isAccessible = true; it.invoke(connection) as PlaybackInteractionKey?
+        }
+        try {
+            val generic = requireNotNull(key("currentRemoteInteractionKey"))
+            assertNull(key("currentRemoteTransportKey"))
+            assertFalse(connection.next(generic)); assertFalse(connection.previous(generic))
+            assertSame("transport gating does not invalidate the generic queue identity", generic, key("currentRemoteInteractionKey"))
+            runCurrent(); assertTrue(commands.isEmpty())
+            connection.connect()
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            val held = requireNotNull(connection.state.value.transportInteractionKey)
+            connection.release()
+            assertNull(key("currentRemoteTransportKey"))
+            assertNotNull("generic remote actions retain their observation-independent contract", key("currentRemoteInteractionKey"))
+            assertFalse(connection.next(held)); assertFalse(connection.previous(held))
+            runCurrent(); assertTrue(commands.isEmpty())
+        } finally { connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun heldRemoteTransportSurvivesProgressBufferingAndBenignRenewalButNeverPostsOffMain() = runTest {
+        val initial = snapshot().paused()
+        var heartbeat = 0L
+        var now = 0L
+        val commands = mutableListOf<PlaybackDeviceCommand>()
+        val owner = installOwner(backgroundScope, { now }, "pc", initial = initial,
+            viewTransform = { view ->
+                heartbeat++
+                view.copy(stateSeq = heartbeat, leaseMs = 8000 - heartbeat % 3,
+                    state = initial.copy(elapsed = initial.elapsed + heartbeat / 10.0,
+                        waiting = heartbeat % 2 == 0L, loading = heartbeat % 3 == 0L))
+            }, command = commands::add)
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            connection.connect()
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            val held = requireNotNull(connection.state.value.transportInteractionKey)
+            var offMainAccepted = true
+            Thread { offMainAccepted = connection.next(held) }.also { it.start(); it.join(1000); assertFalse(it.isAlive) }
+            assertFalse(offMainAccepted)
+            repeat(12) {
+                now += 1000; owner.retry(); runCurrent()
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                assertSame(held, connection.state.value.transportInteractionKey)
+                assertTrue(connection.state.value.canSkipNext)
+                assertTrue(connection.state.value.canSkipPrevious)
+            }
+            assertTrue(commands.isEmpty()) // No deferred off-main replay.
+            assertTrue(connection.next(held)); runCurrent()
+            assertEquals(listOf(PlaybackDeviceCommand.transport("next")), commands)
+            assertEquals(0, player.mediaItemCount)
+        } finally { connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun capturedRemoteTransportRechecksCapabilityQueueOutputAndSessionAfterWait() = runTest {
+        val commands = mutableListOf<PlaybackDeviceCommand>()
+        var remote = snapshot().paused().copy(position = 3, repeat = "all", occurrence = null)
+        var epoch = 1L
+        var available = true
+        var gate: CompletableDeferred<Unit>? = null
+        var pollEntered: CompletableDeferred<Unit>? = null
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "pc", initial = remote,
+            onPoll = { _, _ -> pollEntered?.complete(Unit); gate?.await() },
+            viewTransform = { view -> view.copy(state = remote, epoch = epoch,
+                devices = view.devices.map { if (it.deviceId == "pc") it.copy(available = available) else it }) },
+            command = commands::add)
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            connection.connect()
+            suspend fun race(change: () -> Unit) {
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                assertTrue("each race starts with the same connected fixture owner", owner.state.value.connected)
+                val key = requireNotNull(connection.state.value.transportInteractionKey)
+                gate = CompletableDeferred()
+                pollEntered = CompletableDeferred()
+                owner.retry(); runCurrent()
+                assertTrue("the poll must own transport before the captured submission", pollEntered!!.isCompleted)
+                assertTrue(connection.next(key))
+                val dispatchTime = testScheduler.currentTime
+                change()
+                assertEquals("fixture mutation must not advance the held poll's timeout", dispatchTime, testScheduler.currentTime)
+                gate!!.complete(Unit); gate = null; runCurrent()
+                assertTrue("a stale-key rejection must not be a disconnected-poll false positive", owner.state.value.connected)
+                assertTrue(commands.isEmpty())
+                assertEquals(0, player.mediaItemCount)
+                assertFalse(connection.next(key))
+            }
+            race { remote = remote.copy(repeat = "off") } // Same queue/current, capability removed.
+            remote = remote.copy(repeat = "all"); owner.retry(); runCurrent()
+            race { remote = remote.copy(queue = remote.queue.reversed()) }
+            race { epoch++ }
+            // Login uses real OkHttp/MockWebServer I/O. Do not suspend this runTest body:
+            // auto-advancing its scheduler while the real response is in flight can expire
+            // the gated poll's 4s protocol timeout and disconnect the NEXT race's owner.
+            // A non-suspending mutation callback enforces ownership of that virtual clock.
+            race { runBlocking { login() } }
+            race { available = false }
+        } finally { gate?.complete(Unit); connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun timedOutHeldRemotePollRevokesTransportIdentityWithoutReplayingCapturedCommand() = runTest {
+        val commands = mutableListOf<PlaybackDeviceCommand>()
+        val gate = CompletableDeferred<Unit>()
+        val pollEntered = CompletableDeferred<Unit>()
+        val pollFinished = CompletableDeferred<Unit>()
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "pc", initial = snapshot().paused(),
+            onPoll = { _, _ ->
+                pollEntered.complete(Unit)
+                try { gate.await() } finally { pollFinished.complete(Unit) }
+            }, command = commands::add)
+        runCurrent() // Registration is synchronous; only explicit retry below enters onPoll.
+        val connection = connectedPlayback()
+        try {
+            connection.connect()
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            val key = requireNotNull(connection.state.value.transportInteractionKey)
+            owner.retry(); runCurrent()
+            assertTrue(pollEntered.isCompleted)
+            assertFalse(pollFinished.isCompleted)
+            assertTrue(connection.next(key))
+            // Exact production request deadline, not a wall-clock wait or idle heuristic.
+            // This is the failure mode the real-I/O race fixture above must NOT trigger.
+            testScheduler.advanceTimeBy(4000); runCurrent()
+            assertTrue("timeout cancellation drains the gate's owning poll", pollFinished.isCompleted)
+            assertFalse(owner.state.value.connected)
+            assertTrue(commands.isEmpty())
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            assertNull(connection.state.value.transportInteractionKey)
+            assertFalse(connection.state.value.canSkipNext)
+            assertFalse(connection.state.value.canSkipPrevious)
+            gate.complete(Unit); runCurrent()
+            assertFalse(connection.next(key))
+            assertTrue("completing an abandoned gate cannot replay stale transport", commands.isEmpty())
+            assertEquals(0, player.mediaItemCount)
+        } finally { gate.complete(Unit); connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun capturedRemoteNextRejectsUnsampledQueueCurrentAndCapabilityLossRegainAba() = runTest {
+        val initial = snapshot().paused().copy(position = 3, repeat = "all", occurrence = null)
+        val commands = mutableListOf<PlaybackDeviceCommand>()
+        val responses = ArrayDeque<PlaybackSnapshot>()
+        var sequence = 0L
+        var gate: CompletableDeferred<Unit>? = null
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "pc", initial = initial,
+            onPoll = { _, _ -> gate?.await() },
+            viewTransform = { it.copy(state = responses.removeFirstOrNull() ?: initial, stateSeq = ++sequence) },
+            command = commands::add)
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            connection.connect()
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            for (changed in listOf(
+                initial.copy(queue = initial.queue.reversed()),
+                initial.copy(position = 0),
+                initial.copy(repeat = "off"), // Next disappears then returns, same queue/current.
+            )) {
+                val held = requireNotNull(connection.state.value.transportInteractionKey)
+                val generic = requireNotNull(connection.state.value.interactionKey)
+                val genericVersion = owner.interactionVersion
+                val capabilityVersion = owner.transportCapabilityVersion
+                assertTrue(connection.state.value.canSkipNext)
+                gate = CompletableDeferred()
+                owner.retry(); runCurrent()
+                owner.retry(); runCurrent()
+                assertTrue(connection.next(held))
+                responses.addLast(changed); responses.addLast(initial)
+                gate!!.complete(Unit); gate = null
+                // Both accepted publications precede dispatch; no UI sample observes B.
+                runCurrent()
+                assertEquals(initial, owner.state.value.view!!.state)
+                assertTrue(responses.isEmpty()); assertTrue(commands.isEmpty())
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                assertNotSame(held, connection.state.value.transportInteractionKey)
+                assertFalse(connection.next(held))
+                assertTrue(connection.state.value.canSkipNext)
+                if (changed.repeat == "off") {
+                    assertEquals("capability-only ABA leaves generic binding version unchanged", genericVersion, owner.interactionVersion)
+                    assertSame("generic remote queue receipts survive capability-only publications", generic, connection.state.value.interactionKey)
+                    assertTrue(owner.transportCapabilityVersion > capabilityVersion)
+                }
+            }
+            assertEquals(0, player.mediaItemCount)
+        } finally { gate?.complete(Unit); connection.release(); owner.close() }
         assertSilent()
     }
 
