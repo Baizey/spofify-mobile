@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -33,6 +34,10 @@ import dev.spofify.mobile.feature.player.NativeMiniPlayer
 import dev.spofify.mobile.feature.player.NativeNowPlaying
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
+import dev.spofify.mobile.ui.ListeningChrome
+import dev.spofify.mobile.ui.MusicActionsContent
+import dev.spofify.mobile.ui.hideListeningChrome
+import dev.spofify.mobile.ui.rememberSearchEditing
 import dev.spofify.mobile.ui.theme.AppFontLicenseDialog
 import dev.spofify.mobile.ui.theme.AppTypography
 import java.util.Locale
@@ -83,6 +88,9 @@ private fun SpofifyApp(model: LibraryViewModel) {
         return
     }
     val client = model.graph.client ?: return
+    val searchPage = state.page is Page.Search || state.page is Page.Catalog
+    val searchEditing = rememberSearchEditing(client, state.session?.accountId, searchPage)
+    val onSearchEditingChanged = remember(searchEditing) { { editing: Boolean -> searchEditing.value = editing } }
     key(client, state.session?.accountId) {
         val pages = rememberSaveableStateHolder()
         var devices by remember { mutableStateOf(false) }
@@ -107,34 +115,29 @@ private fun SpofifyApp(model: LibraryViewModel) {
                 "artist", "album", "track" -> model.open(Page.Detail(item))
             }
         }
-        Scaffold(
-            modifier = Modifier.imePadding(),
+        ListeningChrome(
+            chromeHidden = hideListeningChrome(searchPage, searchEditing.value, imeVisible),
             snackbarHost = { SnackbarHost(snackbar) },
-            topBar = {
-                Row(Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 48.dp).padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically) {
-                    Spacer(Modifier.weight(1f))
-                    if (model.graph.playbackCoordinator != null) IconButton(onClick = { devices = true }) {
-                        Icon(Icons.Default.DevicesOther, "Playback devices · read-only")
+            connectionActions = {
+                if (model.graph.playbackCoordinator != null) IconButton(onClick = { devices = true }) {
+                    Icon(Icons.Default.DevicesOther, "Playback devices · read-only")
+                }
+                IconButton(onClick = { account = true }) { Icon(Icons.Default.AccountCircle, "Account and server") }
+            },
+            miniPlayer = {
+                NativeMiniPlayer(player, model.playback, { expanded = true }, art, Modifier.fillMaxWidth())
+            },
+            navigation = {
+                NavigationBar(modifier = Modifier.testTag("primary-navigation"), containerColor = Background) {
+                    listOf(Tab.HOME to Icons.Default.Home, Tab.SEARCH to Icons.Default.Search,
+                        Tab.PLAYLISTS to Icons.AutoMirrored.Filled.QueueMusic).forEach { (tab, icon) ->
+                        NavigationBarItem(selected = state.tab == tab, onClick = { model.switchTab(tab) },
+                            icon = { Icon(icon, null) }, label = { Text(tab.name.lowercase().replaceFirstChar { it.titlecase() }) })
                     }
-                    IconButton(onClick = { account = true }) { Icon(Icons.Default.AccountCircle, "Account and server") }
                 }
             },
-            bottomBar = {
-                Column {
-                    NativeMiniPlayer(player, model.playback, { expanded = true }, art,
-                        Modifier.fillMaxWidth().padding(horizontal = 8.dp))
-                    NavigationBar(containerColor = Background) {
-                        listOf(Tab.HOME to Icons.Default.Home, Tab.SEARCH to Icons.Default.Search,
-                            Tab.PLAYLISTS to Icons.AutoMirrored.Filled.QueueMusic).forEach { (tab, icon) ->
-                            NavigationBarItem(selected = state.tab == tab, onClick = { model.switchTab(tab) },
-                                icon = { Icon(icon, null) }, label = { Text(tab.name.lowercase().replaceFirstChar { it.titlecase() }) })
-                        }
-                    }
-                }
-            }, containerColor = Background,
         ) { padding ->
-            Box(Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+            Box(Modifier.padding(padding).consumeWindowInsets(padding).fillMaxSize(), contentAlignment = Alignment.TopCenter) {
                 val contentModifier = Modifier.widthIn(max = 760.dp).fillMaxSize()
                 val pageKey = when (val page = state.page) {
                     is Page.Detail -> "detail:${page.item.kind}:${page.item.id}:${page.navigationId}"
@@ -154,7 +157,7 @@ private fun SpofifyApp(model: LibraryViewModel) {
                             onOpenItem = {}, onPlayItem = play, onShowActions = showMore, onEnqueueItem = queue,
                             artwork = art, modifier = contentModifier, playback = feedback, likes = likeStates,
                             onToggleLike = model::likeAction, onVisibleItems = model::checkVisibleLikes,
-                            stateHolder = model.catalogHolder())
+                            stateHolder = model.catalogHolder(), onSearchEditingChanged = onSearchEditingChanged)
                         is Page.Detail -> ItemDetailsRoute(client, page.item,
                             onOpenItem = {}, onPlayItem = play, onShowActions = showMore, onEnqueueItem = queue,
                             artwork = art, modifier = contentModifier, playback = feedback, likes = likeStates,
@@ -197,19 +200,13 @@ private fun SpofifyApp(model: LibraryViewModel) {
         more?.let { item ->
             LaunchedEffect(item.id) { if (item.kind == "track") model.checkLike(item) }
             ModalBottomSheet(onDismissRequest = { more = null }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(item.name, style = MaterialTheme.typography.titleLarge)
-                    TextButton(onClick = { more = null; play(item, false) }, enabled = item.playable) { Text("Play") }
-                    TextButton(onClick = { more = null; model.enqueueFrom(client, item, playNext = true) }, enabled = item.playable) { Text("Play next") }
-                    TextButton(onClick = { more = null; queue(item) }, enabled = item.playable) { Text("Add to queue") }
-                    if (item.kind == "track") {
-                        LikeButton(state.likes[item.id], item.id in state.pendingLikes, item.id in state.failedLikeStatus,
-                            toggle = { model.likeAction(item) }, retry = { model.checkLike(item) })
-                        TextButton(onClick = { more = null; addToPlaylist = item }) { Text("Add to playlist") }
-                    }
-                    TextButton(onClick = { more = null; openExternal(item) }) { Text("Open details") }
-                    MusicCredits(item, { credit -> more = null; openExternal(credit) })
-                }
+                MusicActionsContent(item, state.likes[item.id], item.id in state.pendingLikes, item.id in state.failedLikeStatus,
+                    onPlay = { more = null; play(item, false) },
+                    onPlayNext = { more = null; model.enqueueFrom(client, item, playNext = true) },
+                    onEnqueue = { more = null; queue(item) },
+                    onToggleLike = { model.likeAction(item) }, onRetryLike = { model.checkLike(item) },
+                    onAddToPlaylist = { more = null; addToPlaylist = item },
+                    onOpenItem = { target -> more = null; openExternal(target) })
             }
         }
         addToPlaylist?.let { item -> AddToPlaylistSheet(client, item, onDismiss = {

@@ -51,6 +51,8 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -82,9 +84,9 @@ fun NativeMiniPlayer(
     modifier: Modifier = Modifier,
 ) {
     val item = state.item ?: return
-    Surface(modifier = modifier, shape = MaterialTheme.shapes.medium, tonalElevation = 3.dp) {
+    Surface(modifier = modifier.fillMaxWidth(), shape = RectangleShape) {
         Column {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().heightIn(min = 64.dp), verticalAlignment = Alignment.CenterVertically) {
                 Row(
                     Modifier.weight(1f)
                         .playerSwipe(PlayerSwipeArea.MINI) { onExpand() }
@@ -93,7 +95,7 @@ fun NativeMiniPlayer(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     artwork(item, Modifier.size(48.dp))
-                    Column(Modifier.padding(start = 12.dp)) {
+                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
                         Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
                             style = MaterialTheme.typography.titleSmall)
                         Text(item.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -108,7 +110,11 @@ fun NativeMiniPlayer(
             LinearProgressIndicator(
                 progress = { if (state.durationMs > 0)
                     (state.positionMs.toFloat() / state.durationMs).coerceIn(0f, 1f) else 0f },
-                modifier = Modifier.fillMaxWidth().height(2.dp),
+                modifier = Modifier.fillMaxWidth().height(2.dp)
+                    .semantics { contentDescription = "Playback progress" },
+                strokeCap = StrokeCap.Butt,
+                gapSize = 0.dp,
+                drawStopIndicator = {},
             )
         }
     }

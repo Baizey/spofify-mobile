@@ -3,6 +3,7 @@ package dev.spofify.mobile.ui
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.WindowInsets
 import androidx.compose.ui.semantics.SemanticsActions
@@ -31,7 +32,7 @@ import java.io.File
 @LargeTest
 class NativeUiSmokeTest {
     companion object {
-        // JUnit runs this before ActivityScenarioRule launches MainActivity (and before test writes).
+        // Defense in depth after the runner's pre-Application guard, before Activity/test writes.
         @JvmStatic @BeforeClass fun requireVirtualAvdBeforeActivityLaunch() { VirtualAvdOnly.verify() }
     }
 
@@ -101,6 +102,15 @@ class NativeUiSmokeTest {
                 waitForIme(true)
                 assertSearchInThumbZone(imeVisible = true)
                 screenshot("04-search-keyboard")
+                pressBack()
+                waitForIme(false)
+                assertListeningChrome(editing = false)
+                assertEquals("Native Back must retain empty Search", "", queryText())
+                assertEquals(0, fixture.searchCalls.size)
+                screenshot("04b-search-back-restored")
+                compose.onNodeWithTag("search-query").performClick()
+                waitForIme(true)
+                assertListeningChrome(editing = true)
                 fixture.holdSearchResponses()
                 try {
                     search("Orbit")
@@ -110,18 +120,22 @@ class NativeUiSmokeTest {
                 scrollToCatalogItem(UiFixtureServer.ALBUM_NAME)
                 waitForIme(false)
                 assertSearchInThumbZone()
-                screenshot("05-search-results")
                 assertGroupedSearchBounded(fixture, "Orbit")
-                scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.first())
+                waitUntilAbsent(hasContentDescription("Searching saved music"))
+                assertSearchGroupOrdering()
+                screenshot("05-search-results")
+                assertCompactSearchRows()
                 screenshot("05b-search-songs")
+                assertFourArtistCreditNavigation(fixture)
                 scrollToText("See more songs")
                 compose.onNodeWithText("See more songs").assertIsEnabled().assertHeightIsAtLeast(48.dp).performClick()
                 compose.waitUntil(15_000) { fixture.searchCalls.any { it.query == "Orbit" && it.kind == "tracks" && it.offset == 10 } }
                 scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last()).assertIsDisplayed()
                 screenshot("05bb-search-see-more")
+                assertSearchEditingContinuity(fixture, "05bd", playing = false)
 
                 search("unmatched-synthetic-query")
-                waitFor(hasText("No artists match this search."))
+                waitFor(hasText("No music matches this search."))
                 screenshot("05c-search-no-results")
                 search(UiFixtureServer.ERROR_QUERY)
                 waitFor(hasText("Retry", substring = true))
@@ -219,12 +233,18 @@ class NativeUiSmokeTest {
                 waitFor(pausedButton() and inPlayerSheet())
                 compose.onNode(sheetTransport("Play")).performScrollTo().performClick()
                 waitFor(playingButton() and inPlayerSheet())
-                compose.waitUntil(10_000) { positionMs() > 0f }
-                val positionBeforeCollapse = positionMs()
+                // An intentional seek gives reset detection a substantial baseline while the
+                // fixture's WAV and metadata leave ten minutes for the rest of the journey.
+                compose.onNode(playerSheet).performSemanticsAction(SemanticsActions.SetProgress) { action ->
+                    assertTrue(action(30_000f))
+                }
+                compose.waitUntil(10_000) { positionMs() in 29_000f..33_000f }
                 compose.onNodeWithText("Clear upcoming").performScrollTo()
                 compose.onNodeWithContentDescription("Upcoming queue").performScrollTo()
                 waitFor(hasText("Up next · 5"))
                 screenshot("10-queue")
+                val originalQueue = captureQueueSnapshot()
+                assertEquals(UiFixtureServer.TRACK_NAMES.subList(1, 6), originalQueue)
                 compose.onNodeWithContentDescription("Queue actions for ${UiFixtureServer.TRACK_NAMES[1]}").performScrollTo().performClick()
                 compose.onNodeWithText("Remove from queue").performClick()
                 waitUntilAbsent(hasText("Remove from queue") and hasClickAction())
@@ -232,67 +252,105 @@ class NativeUiSmokeTest {
                 compose.onNodeWithText("Undo").performScrollTo().performClick()
                 waitFor(hasText("Up next · 5"))
                 waitUntilAbsent(hasText("Undo") and hasClickAction())
+                assertQueueSnapshot(originalQueue)
+                val beforeCollapse = capturePlaying(fixture)
                 pressBack() // Dismiss the player sheet first; playlist stays beneath it.
                 waitUntilAbsent(playerSheet)
+                assertPlayingTransition(beforeCollapse, fixture, "native Back collapse")
                 compose.onNode(expandPlayer).assertExists().assertTextContains(UiFixtureServer.TRACK_NAMES.first())
                 waitFor(playingButton())
                 compose.onNodeWithText("Night walk · edited").assertExists()
                 screenshot("10b-player-collapsed")
                 val density = compose.activity.resources.displayMetrics.density
+                val beforeGestureExpand = capturePlaying(fixture)
                 compose.onNode(expandPlayer).performTouchInput {
                     swipe(center, center.copy(y = center.y - 100f * density), durationMillis = 350)
                 }
                 waitFor(playerSheet)
-                assertTrue("Collapsing must not restart the audible occurrence", positionMs() >= positionBeforeCollapse)
-                waitFor(playingButton() and inPlayerSheet())
+                assertPlayingTransition(beforeGestureExpand, fixture, "gesture expansion")
                 compose.onNodeWithText("Clear upcoming").performScrollTo()
                 compose.onNodeWithText("Up next · 5").assertExists()
-                assertQueueIdentity()
+                assertQueueSnapshot(originalQueue)
                 // Collapsing a paused player must not turn pause into resume either.
                 compose.onNode(sheetTransport("Pause")).performScrollTo().performClick()
                 waitFor(pausedButton() and inPlayerSheet())
-                val pausedPosition = positionMs()
+                val beforePausedCollapse = readPlaybackWitness(fixture)
                 pressBack()
                 waitUntilAbsent(playerSheet)
-                waitFor(pausedButton())
+                assertPausedTransition(beforePausedCollapse, fixture)
+                val beforePausedExpand = readPlaybackWitness(fixture)
                 compose.onNode(expandPlayer).performClick()
                 waitFor(playerSheet)
-                waitFor(pausedButton() and inPlayerSheet())
-                assertTrue("Paused collapse must preserve position", kotlin.math.abs(positionMs() - pausedPosition) < 1_000f)
+                assertPausedTransition(beforePausedExpand, fixture)
+                assertQueueSnapshot(originalQueue)
                 compose.onNode(sheetTransport("Play")).performScrollTo().performClick()
                 waitFor(playingButton() and inPlayerSheet())
+                val beforeResumedCollapse = capturePlaying(fixture)
                 pressBack()
                 waitUntilAbsent(playerSheet)
+                assertPlayingTransition(beforeResumedCollapse, fixture, "resumed player collapse")
+                val beforePlaylistBack = capturePlaying(fixture)
                 pressBack() // With the sheet gone, native Back now pops the playlist detail.
                 waitFor(hasText(UiFixtureServer.DERIVED_NAME))
+                assertPlayingTransition(beforePlaylistBack, fixture, "playlist Back navigation")
+
+                // Editing Search must not affect an already audible occurrence or its queue.
+                val beforeSearchTab = capturePlaying(fixture)
+                compose.onNodeWithText("Search").performClick()
+                waitFor(hasTestTag("search-query"))
+                assertPlayingTransition(beforeSearchTab, fixture, "Search tab navigation")
+                val beforeQuerySubmit = capturePlaying(fixture)
+                search("Orbit")
+                scrollToText("See more songs")
+                assertPlayingTransition(beforeQuerySubmit, fixture, "query submission")
+                compose.onNodeWithText("See more songs").performClick()
+                scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last())
+                val preparationsBeforeSearchEditing = fixture.playbackPreparations.get()
+                assertQueuePreservedFromMini(originalQueue, fixture)
+                assertSearchEditingContinuity(fixture, "10c", playing = true, expectedQueue = originalQueue)
+                assertEquals("Search focus/IME must not prepare another queue", preparationsBeforeSearchEditing, fixture.playbackPreparations.get())
 
                 // Isolated AVD only. Restore the baseline even if a large-font assertion fails.
                 fontChanged = true
+                val beforeFontScale = capturePlaying(fixture)
                 shell("settings put system font_scale 1.3")
                 waitForFont(1.3f)
+                assertPlayingTransition(beforeFontScale, fixture, "font-scale configuration change")
+                val beforeRecreation = capturePlaying(fixture)
                 compose.activityRule.scenario.recreate()
                 waitFor(hasText("Home"))
+                assertPlayingTransition(beforeRecreation, fixture, "Activity recreation")
+                assertQueuePreservedFromMini(originalQueue, fixture)
+                val beforeHomeTab = capturePlaying(fixture)
                 compose.onNodeWithText("Home").performClick()
                 waitFor(hasText("Recently played"))
+                assertPlayingTransition(beforeHomeTab, fixture, "large-font Home navigation")
                 screenshot("11-large-font-home")
+                val beforeLargeSearchTab = capturePlaying(fixture)
                 compose.onNodeWithText("Search").performClick()
                 waitFor(hasTestTag("search-query"))
+                assertPlayingTransition(beforeLargeSearchTab, fixture, "large-font Search navigation")
                 waitForIme(false)
                 assertSearchInThumbZone()
+                waitUntilAbsent(hasContentDescription("Searching saved music"))
+                assertCompactSearchRows()
                 screenshot("12-large-font-search")
                 waitFor(expandPlayer)
+                val beforeLargePlayerExpand = capturePlaying(fixture)
                 compose.onNode(expandPlayer).performClick()
                 waitFor(playerSheet)
-                waitFor(playingButton() and inPlayerSheet())
+                assertPlayingTransition(beforeLargePlayerExpand, fixture, "large-font player expansion")
+                assertEquals("Font recreation must not prepare another queue", preparationsBeforeSearchEditing, fixture.playbackPreparations.get())
                 screenshot("13-large-font-now-playing")
                 compose.onNodeWithText("Clear upcoming").performScrollTo()
                 compose.onNodeWithContentDescription("Upcoming queue").performScrollTo()
                 compose.onNodeWithText("Up next · 5").assertExists()
+                assertQueueSnapshot(originalQueue)
                 screenshot("14-large-font-queue")
                 assertEquals("No query-free catalog reads are allowed", 0, fixture.emptyGlobalBrowseCalls.get())
                 assertEquals("Real auth cookie and CSRF must reach the fixture", 0, fixture.authenticationFailures.get())
                 assertTrue("Unexpected fixture routes: ${fixture.unexpectedRoutes.joinToString()}", fixture.unexpectedRoutes.isEmpty())
-                File(evidence, "fixture-summary.txt").writeText("tracks=16\nalbums=3\nartists=1\nmanualPlaylists=1\nderivedPlaylists=1\n" +
+                File(evidence, "fixture-summary.txt").writeText("tracks=16\nalbums=3\nartists=1\ncreditArtistAliases=3\nmanualPlaylists=1\nderivedPlaylists=1\n" +
                     "audioRequests=${fixture.audioRequests.get()}\nplaybackPreparations=${fixture.playbackPreparations.get()}\nhistoryWrites=${fixture.historyWrites.get()}\nplaylistWrites=${fixture.playlistWrites.get()}\n" +
                     "emptyGlobalBrowseCalls=${fixture.emptyGlobalBrowseCalls.get()}\nauthenticationFailures=${fixture.authenticationFailures.get()}\nunexpectedRoutes=${fixture.unexpectedRoutes.size}\n")
             } catch (error: Throwable) {
@@ -330,12 +388,135 @@ class NativeUiSmokeTest {
         return compose.onNode(row)
     }
     private fun catalogItem(name: String) = hasText(name) and hasAnyDescendant(hasContentDescription("More actions for $name"))
-    private fun assertRetainedSearchPosition(expectedTop: Float) {
+    private fun assertRetainedSearchPosition(expectedTop: Float, name: String = UiFixtureServer.ALBUM_NAME) {
         // Do not scroll here: doing so would hide a Back/tab restoration regression.
         compose.waitUntil(10_000) {
-            val row = compose.onAllNodes(catalogItem(UiFixtureServer.ALBUM_NAME)).fetchSemanticsNodes().singleOrNull()
+            val row = compose.onAllNodes(catalogItem(name)).fetchSemanticsNodes().singleOrNull()
             row != null && kotlin.math.abs(row.boundsInRoot.top - expectedTop) <= 2f
         }
+    }
+    private fun queryText() = compose.onNodeWithTag("search-query").fetchSemanticsNode()
+        .config[SemanticsProperties.EditableText].text
+
+    private fun assertListeningChrome(editing: Boolean) {
+        listOf("primary-navigation", "app-actions").forEach { tag ->
+            if (editing) {
+                waitUntilAbsent(hasTestTag(tag))
+                compose.onNodeWithTag(tag).assertDoesNotExist()
+            } else {
+                waitFor(hasTestTag(tag))
+                compose.onNodeWithTag(tag).assertIsDisplayed()
+            }
+        }
+        if (editing) compose.onNodeWithTag("search-query").assertIsFocused()
+        else compose.onNodeWithTag("search-query").assertIsNotFocused()
+    }
+
+    private fun assertSearchGroupOrdering() {
+        // With 1 artist + 3 albums, the first song is item four. No type/count rows belong
+        // between those groups. Check actual native list placement, not network request order.
+        val list = compose.onAllNodes(hasScrollToIndexAction()).onFirst()
+        listOf(Triple(0, UiFixtureServer.ARTIST_NAME, "Artist"),
+            Triple(1, UiFixtureServer.ALBUM_NAME, "Album"),
+            Triple(4, UiFixtureServer.TRACK_NAMES.first(), "Song")).forEach { (index, name, type) ->
+            list.performScrollToIndex(index)
+            val row = compose.onNode(catalogItem(name)).assertIsDisplayed().assert(hasContentDescription(type))
+            val top = row.fetchSemanticsNode().boundsInRoot.top
+            val listTop = list.fetchSemanticsNode().boundsInRoot.top
+            val paddingAllowance = 16f * compose.activity.resources.displayMetrics.density
+            assertTrue("Expected $type at item $index, not a type/count header", kotlin.math.abs(top - listTop) <= paddingAllowance)
+            compose.onAllNodes(hasText("Artists") or hasText("Albums") or hasText("Songs") or
+                hasText("1") or hasText("3") or hasText("16")).assertCountEquals(0)
+        }
+        list.performScrollToIndex(0)
+    }
+
+    private fun assertCompactSearchRows() {
+        val heights = listOf(UiFixtureServer.ARTIST_NAME, UiFixtureServer.ALBUM_NAME,
+            "Orbit Afterglow", UiFixtureServer.TRACK_NAMES[0], UiFixtureServer.TRACK_NAMES[1]).map { name ->
+            val row = scrollToCatalogItem(name)
+            val bounds = row.getUnclippedBoundsInRoot()
+            val height = (bounds.bottom - bounds.top).value
+            // The row destination has only separate Play and More targets; metadata is plain
+            // text, not one credit/Like button per artist. Custom accessibility actions remain.
+            assertEquals("Unexpected inline metadata/actions for $name", 2,
+                compose.onAllNodes(hasClickAction() and hasAnyAncestor(catalogItem(name))).fetchSemanticsNodes().size)
+            height
+        }
+        assertTrue("One/four-artist rows must share pitch at the same font scale: $heights",
+            heights.maxOrNull()!! - heights.minOrNull()!! <= 1f)
+        compose.onNode(catalogItem(UiFixtureServer.TRACK_NAMES[1])).assert(
+            hasText(UiFixtureServer.CREDIT_ARTISTS.joinToString(", ") { it.second }, substring = true))
+    }
+
+    private fun assertFourArtistCreditNavigation(fixture: UiFixtureServer) {
+        val name = UiFixtureServer.TRACK_NAMES[1]
+        val top = scrollToCatalogItem(name).fetchSemanticsNode().boundsInRoot.top
+        compose.onNodeWithContentDescription("More actions for $name").performClick()
+        waitFor(hasText("Open details") and hasClickAction())
+        compose.onNodeWithText("Open details").assertIsDisplayed().performClick()
+        waitUntilAbsent(hasText("Open details") and hasClickAction())
+        waitFor(hasContentDescription("More actions for $name"))
+        UiFixtureServer.CREDIT_ARTISTS.forEach { (id, artist) ->
+            compose.onNode(hasText(artist) and hasClickAction()).performScrollTo().performClick()
+            waitFor(hasContentDescription("More actions for $artist"))
+            compose.waitUntil(15_000) { fixture.catalogDetails.any { it.kind == "artist" && it.id == id } }
+            if (id == UiFixtureServer.CREDIT_ARTISTS.last().first) screenshot("05bc-four-artist-credit-details")
+            pressBack()
+            waitFor(hasContentDescription("More actions for $name"))
+        }
+        pressBack()
+        waitFor(hasTestTag("search-query"))
+        assertEquals("Orbit", queryText())
+        assertRetainedSearchPosition(top, name)
+        assertNoAutoplayOnBrowse(fixture)
+    }
+
+    private fun assertSearchEditingContinuity(
+        fixture: UiFixtureServer, evidencePrefix: String, playing: Boolean, expectedQueue: List<String>? = null,
+    ) {
+        // Sixteen loaded songs leave a real middle anchor, not the first row or a clamped end.
+        waitUntilAbsent(hasContentDescription("Searching saved music"))
+        val anchor = UiFixtureServer.TRACK_NAMES[4]
+        val list = compose.onAllNodes(hasScrollToIndexAction()).onFirst()
+        list.performScrollToIndex(8) // 1 artist + 3 albums + the fifth song.
+        val anchorTop = compose.onNode(catalogItem(anchor)).assertIsDisplayed().fetchSemanticsNode().boundsInRoot.top
+        val contentTop = list.fetchSemanticsNode().boundsInRoot.top
+        val query = queryText()
+        val requests = fixture.searchCalls.size
+        val preparations = fixture.playbackPreparations.get()
+        listOf(false, true).forEach { submit ->
+            val action = if (submit) "submit" else "back"
+            val beforeFocus = if (playing) capturePlaying(fixture) else null
+            compose.onNodeWithTag("search-query").performClick()
+            waitForIme(true)
+            assertSearchInThumbZone(imeVisible = true)
+            assertTrue("Editing must remove reserved top-toolbar space", list.fetchSemanticsNode().boundsInRoot.top < contentTop)
+            if (playing) {
+                compose.onNode(expandPlayer).assertIsDisplayed().assertTextContains(UiFixtureServer.TRACK_NAMES.first())
+                assertPlayingTransition(checkNotNull(beforeFocus), fixture, "Search focus/IME opening")
+            }
+            screenshot("$evidencePrefix-search-keyboard-$action")
+            // Do not replace text here: unchanged-query IME submit must preserve loaded pages
+            // and scroll by itself, not quietly turn this check into a brand-new search.
+            val beforeEditingEnd = if (playing) capturePlaying(fixture) else null
+            if (submit) compose.onNodeWithTag("search-query").performImeAction() else pressBack()
+            waitForIme(false)
+            assertListeningChrome(editing = false)
+            assertEquals("Ending editing must retain the query", query, queryText())
+            assertRetainedSearchPosition(anchorTop, anchor)
+            assertEquals("Unchanged-query $action must retain loaded search pages", requests, fixture.searchCalls.size)
+            assertEquals("Search editing must not prepare playback", preparations, fixture.playbackPreparations.get())
+            if (playing) {
+                assertPlayingTransition(checkNotNull(beforeEditingEnd), fixture, "Search IME $action")
+                assertQueuePreservedFromMini(checkNotNull(expectedQueue), fixture)
+                assertRetainedSearchPosition(anchorTop, anchor)
+            } else assertNoAutoplayOnBrowse(fixture)
+            screenshot("$evidencePrefix-search-$action-restored")
+        }
+        // Only after both restoration checks, scroll to prove the appended page itself survived.
+        scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last()).assertIsDisplayed()
+        assertEquals("The appended page must survive without another fetch", requests, fixture.searchCalls.size)
     }
     private fun scrollToText(text: String) = scrollTo(hasText(text))
     private fun scrollTo(matcher: SemanticsMatcher) {
@@ -363,12 +544,110 @@ class NativeUiSmokeTest {
         assertEquals("Browsing and liking must not request audio", 0, fixture.audioRequests.get())
         assertEquals("Browsing must not report audible history", 0, fixture.historyWrites.get())
     }
-    private fun assertQueueIdentity() {
-        val queue = compose.onNodeWithContentDescription("Upcoming queue")
-        UiFixtureServer.TRACK_NAMES.subList(1, 6).forEach { name ->
-            queue.performScrollToNode(hasContentDescription("Queue actions for $name"))
-            compose.onNodeWithContentDescription("Queue actions for $name").assertExists()
+    private fun captureQueueSnapshot(count: Int = 5): List<String> {
+        compose.onNodeWithText("Up next · $count").assertExists()
+        val queue = compose.onNodeWithContentDescription("Upcoming queue").performScrollTo()
+        // The native queue is a bounded LazyColumn, NOT an eagerly composed Column. Inspect
+        // actual list indices and each handle's native ordinal, never seek expected track names.
+        val names = (0 until count).map { index ->
+            queue.performScrollToIndex(index)
+            val handles = hasContentDescription("Reorder ", substring = true) and
+                hasAnyAncestor(hasContentDescription("Upcoming queue"))
+            val ordinal = SemanticsMatcher("native upcoming position ${index + 1} of $count") {
+                it.config.getOrNull(SemanticsProperties.StateDescription)?.startsWith("Position ${index + 1} of $count.") == true
+            }
+            val handle = compose.onNode(handles and ordinal).assertIsDisplayed()
+            // Also verify that concurrently composed handles have ascending native ordinals
+            // in their UNCLIPPED layout order (boundsInRoot can collapse off-screen nodes).
+            val placed = compose.onAllNodes(handles).fetchSemanticsNodes().sortedBy { it.positionInRoot.y }
+            val positions = placed.map { node ->
+                val state = node.config[SemanticsProperties.StateDescription]
+                checkNotNull(Regex("^Position (\\d+) of $count\\.").find(state)).groupValues[1].toInt()
+            }
+            assertEquals("Queue geometry must agree with traversal ordinals", positions.sorted(), positions)
+            handle.fetchSemanticsNode().config[SemanticsProperties.ContentDescription]
+                .single { it.startsWith("Reorder ") }.removePrefix("Reorder ")
         }
+        assertEquals("Synthetic upcoming occurrences have unique identities", count, names.toSet().size)
+        queue.performScrollToIndex(0) // Restore only the viewport; no queue commands or reordering.
+        return names
+    }
+    private fun assertQueueSnapshot(expected: List<String>) {
+        assertEquals("Upcoming occurrence order/traversal changed", expected, captureQueueSnapshot(expected.size))
+    }
+
+    private data class PlaybackWitness(
+        val positionMs: Float, val durationMs: Float, val sampledAtMs: Long,
+        val track: String, val preparations: Int,
+    )
+    private fun activePlayingButton() = if (exists(playerSheet)) playingButton() and inPlayerSheet() else playingButton()
+    private fun readPlaybackWitness(fixture: UiFixtureServer): PlaybackWitness {
+        val sampledAt = SystemClock.elapsedRealtime()
+        val titles = compose.onNode(expandPlayer).fetchSemanticsNode().config[SemanticsProperties.Text].map { it.text }
+        val track = checkNotNull(titles.singleOrNull { it in UiFixtureServer.TRACK_NAMES })
+        assertEquals("The unique audible occurrence must remain selected", UiFixtureServer.TRACK_NAMES.first(), track)
+        val position: Float
+        val duration: Float
+        if (exists(playerSheet)) {
+            val range = compose.onNode(playerSheet).fetchSemanticsNode().config[SemanticsProperties.ProgressBarRangeInfo]
+            position = range.current
+            duration = range.range.endInclusive
+        } else {
+            val progress = compose.onNodeWithContentDescription("Playback progress").fetchSemanticsNode()
+                .config[SemanticsProperties.ProgressBarRangeInfo]
+            assertEquals(0f, progress.range.start, .001f)
+            assertEquals(1f, progress.range.endInclusive, .001f)
+            duration = UiFixtureServer.AUDIO_DURATION_MS.toFloat()
+            position = progress.current * duration
+        }
+        assertEquals("Actual duration must agree with synthetic metadata/WAV", UiFixtureServer.AUDIO_DURATION_MS.toFloat(), duration, 1f)
+        assertTrue("Fixture must not naturally finish during this journey", position + 90_000f < duration)
+        return PlaybackWitness(position, duration, sampledAt, track, fixture.playbackPreparations.get())
+    }
+    private fun capturePlaying(fixture: UiFixtureServer): PlaybackWitness {
+        waitFor(activePlayingButton())
+        return readPlaybackWitness(fixture)
+    }
+    private fun assertPlaybackTimeline(before: PlaybackWitness, after: PlaybackWitness, label: String) {
+        assertEquals("$label must retain the audible occurrence", before.track, after.track)
+        assertEquals("$label must retain duration", before.durationMs, after.durationMs, 1f)
+        assertEquals("$label must not prepare another queue", before.preparations, after.preparations)
+        val elapsed = (after.sampledAtMs - before.sampledAtMs).toFloat()
+        val expected = before.positionMs + elapsed
+        // Media3 publishes on a UI polling cadence. Two seconds covers that sampling lag, not
+        // an arbitrary rewind: comparison is against elapsed-time progress, not merely >= before.
+        assertTrue("$label reset/froze/jumped playback: before=${before.positionMs}, after=${after.positionMs}, elapsed=$elapsed",
+            after.positionMs in (expected - 2_000f)..(expected + 2_000f))
+    }
+    private fun assertPlayingTransition(before: PlaybackWitness, fixture: UiFixtureServer, label: String) {
+        waitFor(activePlayingButton())
+        val after = readPlaybackWitness(fixture)
+        assertPlaybackTimeline(before, after, label)
+        // A stale Playing flag and frozen position must not pass the timeline's poll tolerance.
+        compose.waitUntil(5_000) {
+            val advancing = readPlaybackWitness(fixture)
+            assertPlaybackTimeline(after, advancing, "$label subsequent advancement")
+            exists(activePlayingButton()) && advancing.positionMs >= after.positionMs + 250f
+        }
+    }
+    private fun assertPausedTransition(before: PlaybackWitness, fixture: UiFixtureServer) {
+        waitFor(if (exists(playerSheet)) pausedButton() and inPlayerSheet() else pausedButton())
+        val after = readPlaybackWitness(fixture)
+        assertEquals(before.track, after.track)
+        assertEquals(before.durationMs, after.durationMs, 1f)
+        assertEquals("Paused collapse must not prepare another queue", before.preparations, after.preparations)
+        assertEquals("Paused collapse must preserve position", before.positionMs, after.positionMs, 1_000f)
+    }
+    private fun assertQueuePreservedFromMini(expected: List<String>, fixture: UiFixtureServer) {
+        val beforeExpand = capturePlaying(fixture)
+        compose.onNode(expandPlayer).performClick()
+        waitFor(playerSheet)
+        assertPlayingTransition(beforeExpand, fixture, "queue inspection expansion")
+        assertQueueSnapshot(expected)
+        val beforeCollapse = capturePlaying(fixture)
+        pressBack()
+        waitUntilAbsent(playerSheet)
+        assertPlayingTransition(beforeCollapse, fixture, "queue inspection collapse")
     }
     private fun exists(matcher: SemanticsMatcher): Boolean = compose.onAllNodes(matcher).fetchSemanticsNodes().isNotEmpty()
     private fun waitFor(matcher: SemanticsMatcher) { compose.waitUntil(20_000) { exists(matcher) } }
@@ -382,6 +661,7 @@ class NativeUiSmokeTest {
 
     private fun assertSearchInThumbZone(imeVisible: Boolean = false) {
         waitForIme(imeVisible)
+        assertListeningChrome(editing = imeVisible)
         val root = compose.onRoot().fetchSemanticsNode().boundsInRoot
         val field = compose.onNodeWithTag("search-query").fetchSemanticsNode()
         val search = field.boundsInRoot
@@ -393,8 +673,10 @@ class NativeUiSmokeTest {
         val density = compose.activity.resources.displayMetrics.density
         assertTrue("Search must retain a 48dp touch target", search.height >= 48f * density - 1f)
         assertTrue("Search must stay inside its dock", search.top >= dock.top && search.bottom <= dock.bottom)
-        val navigation = compose.onNode(hasText("Search") and hasClickAction()).fetchSemanticsNode().boundsInRoot
-        assertTrue("Search dock must stay above navigation", dock.bottom <= navigation.top + 1f)
+        if (!imeVisible) {
+            val navigation = compose.onNodeWithTag("primary-navigation").fetchSemanticsNode().boundsInRoot
+            assertTrue("Search dock must stay above navigation", dock.bottom <= navigation.top + 1f)
+        }
         if (exists(expandPlayer)) {
             val miniPlayer = compose.onNode(expandPlayer).fetchSemanticsNode().boundsInRoot
             assertTrue("Search dock must stay above the mini-player", dock.bottom <= miniPlayer.top + 1f)

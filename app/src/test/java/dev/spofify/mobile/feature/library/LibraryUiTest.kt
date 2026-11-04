@@ -1,6 +1,7 @@
 package dev.spofify.mobile.feature.library
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.width
@@ -17,6 +18,7 @@ import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.LibraryPage
+import dev.spofify.mobile.ui.theme.AppTypography
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -38,7 +40,7 @@ class LibraryUiTest {
         val song = LibraryItem("track", "song", "Song", hasAudio = true)
         var opened = 0; var played = 0; var actions = 0
         compose.setContent {
-            MaterialTheme { MusicRow(song, { opened++ }, { _, _ -> played++ }, { actions++ }, {},
+            MaterialTheme(typography = AppTypography) { MusicRow(song, { opened++ }, { _, _ -> played++ }, { actions++ }, {},
                 artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(360.dp)) }
         }
         compose.onNodeWithText("Song").performClick()
@@ -50,17 +52,28 @@ class LibraryUiTest {
         compose.runOnIdle { assertEquals(2, actions) }
     }
 
-    @Test fun unavailableRowsKeepDisabledPlaySpaceAndCreditsNavigateIndividually() {
+    @Test fun unavailableRowsKeepCompactCreditsAndReservedActionsWithDistinctLinksInMore() {
         val song = LibraryItem("track", "song", "Missing song", hasAudio = false,
             artists = listOf(ArtistCredit("one", "First artist"), ArtistCredit("two", "Second artist")),
             albumId = "album", albumName = "The album")
         val opened = mutableListOf<String>()
+        val actions = mutableStateOf(false)
         compose.setContent {
-            MaterialTheme { MusicRow(song, { opened += it.id }, { _, _ -> }, {}, {},
-                artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(400.dp)) }
+            MaterialTheme(typography = AppTypography) {
+                Column {
+                    MusicRow(song, { opened += it.id }, { _, _ -> }, { actions.value = true }, {},
+                        artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(400.dp))
+                    if (actions.value) MusicCredits(song, { opened += it.id })
+                }
+            }
         }
-        compose.onNodeWithContentDescription("Play Missing song").assertIsNotEnabled()
-        compose.onNodeWithText("Unavailable").assertExists()
+        val play = compose.onNodeWithContentDescription("Play Missing song")
+        play.assertIsNotEnabled().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("First artist, Second artist", substring = true).assertExists()
+        compose.onNodeWithText("First artist").assertDoesNotExist()
+        compose.onNodeWithText("Second artist").assertDoesNotExist()
+        compose.onNodeWithContentDescription("More actions for Missing song")
+            .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
         compose.onNodeWithText("First artist").performClick()
         compose.onNodeWithText("Second artist").performClick()
         compose.onNodeWithText("The album").performClick()
@@ -70,7 +83,7 @@ class LibraryUiTest {
     @Test fun shortHorizontalGestureQueuesOnceAndVerticalAndEdgeGesturesDoNot() {
         var queued = 0
         compose.setContent {
-            MaterialTheme { MusicRow(LibraryItem("track", "song", "Song", hasAudio = true), {}, { _, _ -> }, {}, { queued++ },
+            MaterialTheme(typography = AppTypography) { MusicRow(LibraryItem("track", "song", "Song", hasAudio = true), {}, { _, _ -> }, {}, { queued++ },
                 artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(360.dp).testTag("row")) }
         }
         compose.onNodeWithTag("row").performTouchInput { swipe(start = center.copy(x = width * .3f), end = center.copy(x = width * .8f)) }
@@ -90,7 +103,7 @@ class LibraryUiTest {
         val holder = CatalogStateHolder(reader, scope, initialKind = "all")
         try {
             compose.setContent {
-                MaterialTheme {
+                MaterialTheme(typography = AppTypography) {
                     val navigation by holder.state.collectAsState()
                     Box(Modifier.size(360.dp, 640.dp).testTag("viewport")) {
                         CatalogScreenContent(navigation, holder, {}, { _, _ -> }, {}, {},
@@ -118,13 +131,17 @@ class LibraryUiTest {
         val holder = CatalogStateHolder(reader, scope, initialKind = "all", initialQuery = "music")
         try {
             compose.setContent {
-                MaterialTheme {
+                MaterialTheme(typography = AppTypography) {
                     val navigation by holder.state.collectAsState()
                     LaunchedEffect(holder) { holder.setVisible(true) }
                     CatalogScreenContent(navigation, holder, {}, { _, _ -> }, {}, {},
                         artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.size(360.dp, 640.dp))
                 }
             }
+            compose.onNodeWithText("Artists").assertDoesNotExist()
+            compose.onNodeWithText("Albums").assertDoesNotExist()
+            compose.onNodeWithText("Songs").assertDoesNotExist()
+            compose.onNodeWithText("20").assertDoesNotExist()
             compose.onNodeWithText("Include missing").assertDoesNotExist()
             compose.onNodeWithText("All").assertDoesNotExist()
             compose.onNodeWithText("Previous").assertDoesNotExist()
@@ -139,7 +156,7 @@ class LibraryUiTest {
 
     @Test fun searchClearAndRestoredQueryStayInSyncWithoutAutoplay() {
         val query = mutableStateOf("first")
-        compose.setContent { MaterialTheme { CommittedSearchField(query.value) { value, _ -> query.value = value } } }
+        compose.setContent { MaterialTheme(typography = AppTypography) { CommittedSearchField(query.value) { value, _ -> query.value = value } } }
         compose.onNodeWithContentDescription("Clear search").performClick()
         compose.runOnIdle { assertEquals("", query.value); query.value = "restored" }
         compose.onNodeWithText("restored").assertExists()

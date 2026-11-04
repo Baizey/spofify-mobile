@@ -17,6 +17,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -58,8 +59,9 @@ fun SearchRoute(
     onToggleLike: ((LibraryItem) -> Unit)? = null,
     onVisibleItems: (List<LibraryItem>) -> Unit = {},
     stateHolder: CatalogStateHolder? = null,
+    onSearchEditingChanged: (Boolean) -> Unit = {},
 ) = CatalogRoute(client, "all", initialQuery, null, onOpenItem, onPlayItem, onShowActions,
-    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder)
+    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder, onSearchEditingChanged)
 
 /** Compatibility entry point. Still query-driven; this is not a top-level catalog landing. */
 @Composable
@@ -117,6 +119,7 @@ private fun CatalogRoute(
     onToggleLike: ((LibraryItem) -> Unit)?,
     onVisibleItems: (List<LibraryItem>) -> Unit,
     stateHolder: CatalogStateHolder?,
+    onSearchEditingChanged: (Boolean) -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     val account = client.currentSession()?.accountId
@@ -150,7 +153,9 @@ private fun CatalogRoute(
         focus.clearFocus(); keyboard?.hide()
         holder.open(item); onOpenItem(item)
     },
-        onPlayItem, onShowActions, onEnqueueItem, artwork, modifier, playback, likes, onToggleLike)
+        { item, shuffle -> focus.clearFocus(); keyboard?.hide(); onPlayItem(item, shuffle) },
+        { item -> focus.clearFocus(); keyboard?.hide(); onShowActions(item) },
+        onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onSearchEditingChanged)
 }
 
 @Composable
@@ -166,6 +171,7 @@ internal fun CatalogScreenContent(
     playback: CatalogPlaybackFeedback = CatalogPlaybackFeedback(),
     likes: Map<String, CatalogLikeState> = emptyMap(),
     onToggleLike: ((LibraryItem) -> Unit)? = null,
+    onSearchEditingChanged: (Boolean) -> Unit = {},
 ) {
     val screen = navigation.current
     val scroll = remember(screen.key, screen.kind, screen.query, screen.includeMissing, screen.releaseGroup) {
@@ -176,9 +182,12 @@ internal fun CatalogScreenContent(
             .collect { (index, offset) -> holder.rememberScroll(screen.key, index, offset, screen.query, screen.releaseGroup) }
     }
     Column(modifier.fillMaxSize()) {
-    LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll, contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) {
         val detail = screen.item
+        if (detail == null && !screen.emptySearch && screen.sections.values.any { it.loading }) item(key = "search-loading") {
+            LinearProgressIndicator(Modifier.fillMaxWidth().semantics { contentDescription = "Searching saved music" })
+        }
         if (detail == null) {
             if (screen.emptySearch) item(key = "prompt") {
                 Text("Find an artist, album or song in your saved music. Start typing to search.",
@@ -233,7 +242,7 @@ internal fun CatalogScreenContent(
         }
         if (!screen.emptySearch && !screen.detailUnavailable) screen.sectionKinds.forEach { kind ->
             val section = screen.sections[kind] ?: CatalogSection(limit = screen.request(kind).limit)
-            item(key = "$kind:heading") {
+            if (detail != null) item(key = "$kind:heading") {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text(if (detail?.kind == "artist") ReleaseGroups.first { it.first == screen.releaseGroup }.second else catalogLabel(kind),
                         Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
@@ -242,8 +251,8 @@ internal fun CatalogScreenContent(
                 }
             }
             section.error?.let { error -> item(key = "$kind:error") { LoadError(error, "Retry ${catalogLabel(kind).lowercase()}") { holder.retry(kind) } } }
-            if (section.loaded && section.items.isEmpty()) item(key = "$kind:empty") {
-                Text(if (detail != null) "No saved ${catalogLabel(kind).lowercase()} in this group." else "No ${catalogLabel(kind).lowercase()} match this search.",
+            if (detail != null && section.loaded && section.items.isEmpty()) item(key = "$kind:empty") {
+                Text("No saved ${catalogLabel(kind).lowercase()} in this group.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
             }
             itemsIndexed(section.items, key = { index, item -> "$kind:${section.offset}:$index:${item.id}" }) { _, item ->
@@ -257,20 +266,45 @@ internal fun CatalogScreenContent(
                 }
             }
         }
+        if (detail == null && !screen.emptySearch && screen.sectionKinds.all { kind ->
+            screen.sections[kind]?.let { it.loaded && !it.loading && it.items.isEmpty() && it.error == null } == true
+        }) item(key = "search-empty") {
+            Text("No music matches this search.", Modifier.padding(vertical = 16.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
     if (screen.item == null) Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth().testTag("search-dock")) {
-        Box(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-            CommittedSearchField(screen.query, holder::setComposing, holder::commitQuery)
+        Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            CommittedSearchField(screen.query, holder::setComposing,
+                onSearchEditingChanged = onSearchEditingChanged, commit = holder::commitQuery)
         }
     }
     }
 }
 
 @Composable
-internal fun CommittedSearchField(query: String, onCompositionChanged: (Boolean) -> Unit = {}, commit: (String, Boolean) -> Unit) {
+internal fun CommittedSearchField(
+    query: String,
+    onCompositionChanged: (Boolean) -> Unit = {},
+    onSearchEditingChanged: (Boolean) -> Unit = {},
+    commit: (String, Boolean) -> Unit,
+) {
     var field by remember { mutableStateOf(TextFieldValue(query)) }
+    var editing by remember { mutableStateOf(false) }
+    var imeShownForFocus by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
-    DisposableEffect(Unit) { onDispose { onCompositionChanged(false) } }
+    val focus = LocalFocusManager.current
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val editingChanged by rememberUpdatedState(onSearchEditingChanged)
+    val compositionChanged by rememberUpdatedState(onCompositionChanged)
+    DisposableEffect(Unit) { onDispose { compositionChanged(false); editingChanged(false) } }
+    LaunchedEffect(editing, imeVisible) {
+        if (!editing) imeShownForFocus = false
+        else if (imeVisible) imeShownForFocus = true
+        else if (imeShownForFocus) focus.clearFocus()
+    }
+    // With a hardware keyboard there is no IME to dismiss; Back first ends field editing.
+    BackHandler(editing && !imeVisible) { focus.clearFocus() }
     LaunchedEffect(query) {
         if (field.text != query && field.composition == null) field = TextFieldValue(query, TextRange(query.length))
     }
@@ -278,13 +312,22 @@ internal fun CommittedSearchField(query: String, onCompositionChanged: (Boolean)
         if (next.text.codePointCount(0, next.text.length) <= 200) {
             field = next
             if (next.composition == null) commit(next.text, next.text.isEmpty())
-            onCompositionChanged(next.composition != null)
+            compositionChanged(next.composition != null)
         }
     }, singleLine = true, placeholder = { Text("Search your music") }, shape = MaterialTheme.shapes.extraLarge,
         leadingIcon = { Icon(Icons.Default.Search, null) },
-        trailingIcon = { if (field.text.isNotEmpty()) IconButton(onClick = { field = TextFieldValue(""); commit("", true); onCompositionChanged(false) }) { Icon(Icons.Default.Close, "Clear search") } },
+        trailingIcon = { if (field.text.isNotEmpty()) IconButton(onClick = { field = TextFieldValue(""); commit("", true); compositionChanged(false) }) { Icon(Icons.Default.Close, "Clear search") } },
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-        keyboardActions = KeyboardActions(onSearch = { commit(field.text, true); onCompositionChanged(false); keyboard?.hide() }), modifier = Modifier.fillMaxWidth().testTag("search-query").semantics { contentDescription = "Search your music" })
+        keyboardActions = KeyboardActions(onSearch = {
+            commit(field.text, true); compositionChanged(false); focus.clearFocus(); keyboard?.hide()
+        }), modifier = Modifier.fillMaxWidth().testTag("search-query")
+            .onFocusChanged { state ->
+                if (editing != state.isFocused) {
+                    editing = state.isFocused
+                    if (!state.isFocused) imeShownForFocus = false
+                    editingChanged(state.isFocused)
+                }
+            }.semantics { contentDescription = "Search your music" })
 }
 
 @Composable

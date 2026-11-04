@@ -179,7 +179,7 @@ else
   set +e
   timeout 300 "$ADB" -s "$SERIAL" shell am instrument -w -r \
     -e class dev.spofify.mobile.ui.NativeUiSmokeTest \
-    dev.spofify.mobile.test/androidx.test.runner.AndroidJUnitRunner > "$RUN/instrumentation.log" 2>&1
+    dev.spofify.mobile.test/dev.spofify.mobile.ui.VirtualAvdTestRunner > "$RUN/instrumentation.log" 2>&1
   result=$?
   set -e
   "$ADB" -s "$SERIAL" pull /sdcard/Android/data/dev.spofify.mobile/files/ui-evidence "$RUN/screenshots/native" > "$RUN/pull.log" 2>&1 || true

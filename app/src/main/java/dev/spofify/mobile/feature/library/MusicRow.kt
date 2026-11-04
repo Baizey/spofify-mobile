@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
@@ -13,10 +14,15 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -38,6 +44,11 @@ data class CatalogPlaybackFeedback(
 /** Like state belongs to the account's shared personal-action owner, not each row. */
 data class CatalogLikeState(val liked: Boolean? = null, val pending: Boolean = false, val failed: Boolean = false)
 
+/**
+ * Shared compact identity row. Opening only navigates; Play is always a separate action.
+ * [like] and [onToggleLike] supply the optional, pending-guarded Like/Unlike accessibility
+ * action without a third inline button. Rich credit links belong in [MusicCredits] in More/details.
+ */
 @Composable
 fun MusicRow(
     item: LibraryItem,
@@ -50,10 +61,18 @@ fun MusicRow(
     playback: CatalogPlaybackFeedback = CatalogPlaybackFeedback(),
     like: CatalogLikeState? = null,
     onToggleLike: ((LibraryItem) -> Unit)? = null,
-    onOpenCredit: (LibraryItem) -> Unit = onOpenItem,
 ) {
     val haptic = LocalHapticFeedback.current
+    val typography = MaterialTheme.typography
+    // Reserve the same two-line copy slot even when metadata is absent. Convert through
+    // Android's font scaling rather than fixing a height that clips enlarged text.
+    val copyHeight = with(LocalDensity.current) {
+        typography.bodyMedium.lineHeight.toDp() + typography.bodySmall.lineHeight.toDp() + 2.dp
+    }
+    val rowHeight = maxOf(72.dp, copyHeight + 20.dp)
+    val subtitle = compactMusicSubtitle(item)
     val current = item.kind == "track" && playback.trackId == item.id
+    val playLabel = if (current && playback.isPlaying) "Pause ${item.name}" else "Play ${item.name}"
     var drag by remember(item.id, item.entryId) { mutableFloatStateOf(0f) }
     val enqueue by rememberUpdatedState(onEnqueueItem)
     val rowItem by rememberUpdatedState(item)
@@ -96,7 +115,7 @@ fun MusicRow(
             }
         } else Modifier
         Row(Modifier.offset { IntOffset(drag.roundToInt(), 0) }.background(
-            if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.surface)
+            if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background)
             .then(gesture)
             .combinedClickable(onClick = { onOpenItem(item) }, onLongClickLabel = "More actions for ${item.name}",
                 onLongClick = { onShowActions(item) })
@@ -105,33 +124,38 @@ fun MusicRow(
                 customActions = buildList {
                     add(CustomAccessibilityAction("More actions") { onShowActions(item); true })
                     if (item.playable) add(CustomAccessibilityAction("Add to queue") { onEnqueueItem(item); true })
+                    if (item.kind == "track" && onToggleLike != null && like?.pending != true) {
+                        add(CustomAccessibilityAction(if (like?.liked == true) "Unlike song" else "Like song") {
+                            onToggleLike(item); true
+                        })
+                    }
                 }
-            }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            artwork(item, Modifier.size(48.dp))
-            Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                Text(item.name, maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium,
-                    color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
-                MusicCredits(item, onOpenCredit)
-                val metadata = itemMetadata(item).ifEmpty {
-                    if (item.kind == "artist") item.genres.take(2).joinToString(" · ") else ""
-                }
-                if (metadata.isNotEmpty()) Text(metadata, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }.heightIn(min = rowHeight).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            val type = musicTypeLabel(item.kind)
+            Box(Modifier.size(52.dp).clearAndSetSemantics { contentDescription = type }) {
+                artwork(item, Modifier.fillMaxSize().clip(if (item.kind == "artist") CircleShape else RectangleShape))
+                Icon(when (item.kind) {
+                    "artist" -> Icons.Default.Person
+                    "album" -> Icons.Default.Album
+                    else -> Icons.Default.MusicNote
+                }, contentDescription = null, modifier = Modifier.align(Alignment.BottomEnd).size(18.dp)
+                    .background(MaterialTheme.colorScheme.background, CircleShape).padding(2.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (item.kind == "track" && onToggleLike != null) {
-                IconButton(onClick = { onToggleLike(item) }, enabled = like?.pending != true,
-                    modifier = Modifier.size(48.dp)) {
-                    if (like?.pending == true) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                    else Icon(when { like?.failed == true -> Icons.Default.Refresh; like?.liked == true -> Icons.Default.Favorite; else -> Icons.Default.FavoriteBorder },
-                        when { like?.failed == true -> "Retry like status for ${item.name}"; like?.liked == true -> "Unlike ${item.name}"; like?.liked == false -> "Like ${item.name}"; else -> "Load like status for ${item.name}" })
-                }
+            Column(Modifier.weight(1f).padding(horizontal = 10.dp).heightIn(min = copyHeight),
+                verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(item.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium,
+                    color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                if (subtitle.isNotBlank()) Text(subtitle, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             IconButton(onClick = {
                 if (current && playback.onToggle != null) playback.onToggle.invoke() else onPlayItem(item, false)
-            }, enabled = item.playable, modifier = Modifier.size(48.dp)) {
+            }, enabled = item.playable, modifier = Modifier.size(48.dp).semantics { contentDescription = playLabel }) {
                 if (current && playback.buffering) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                else Icon(if (current && playback.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                    if (current && playback.isPlaying) "Pause ${item.name}" else "Play ${item.name}")
+                else Icon(if (current && playback.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, null)
             }
             IconButton(onClick = { onShowActions(item) }, modifier = Modifier.size(48.dp)) {
                 Icon(Icons.Default.MoreVert, "More actions for ${item.name}")
@@ -140,13 +164,30 @@ fun MusicRow(
     }
 }
 
+internal fun musicTypeLabel(kind: String): String = when (kind) {
+    "artist" -> "Artist"
+    "album" -> "Album"
+    else -> "Song"
+}
+
+/** Compact rows never grow with credit count; full opaque-ID credit links live in More/details. */
+internal fun compactMusicSubtitle(item: LibraryItem): String = buildList {
+    val artists = item.artists.map { it.name.trim() }.filter { it.isNotEmpty() }.joinToString(", ")
+    if (artists.isNotEmpty()) add(artists)
+    else if (item.kind == "artist") item.genres.map { it.trim() }.filter { it.isNotEmpty() }
+        .take(2).joinToString(" · ").takeIf { it.isNotEmpty() }?.let(::add)
+    itemYear(item)?.let(::add)
+    itemDuration(item.durationMs)?.let(::add)
+    if (!item.playable) add("Unavailable")
+}.joinToString(" · ")
+
 /** Every credited artist and the album retain distinct opaque-ID navigation targets. */
 @Composable
 fun MusicCredits(item: LibraryItem, onOpenItem: (LibraryItem) -> Unit, modifier: Modifier = Modifier) {
     Column(modifier) {
         item.artists.forEach { artist ->
             if (artist.id.isNotBlank()) TextButton(onClick = { onOpenItem(LibraryItem("artist", artist.id, artist.name)) },
-                contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 36.dp)) {
+                contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 48.dp)) {
                 Text(artist.name, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             } else Text(artist.name, style = MaterialTheme.typography.bodySmall)
         }
@@ -154,7 +195,7 @@ fun MusicCredits(item: LibraryItem, onOpenItem: (LibraryItem) -> Unit, modifier:
         val albumId = item.albumId
         if (item.kind == "track" && !albumName.isNullOrBlank()) {
             if (!albumId.isNullOrBlank()) TextButton(onClick = { onOpenItem(LibraryItem("album", albumId, albumName)) },
-                contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 36.dp)) {
+                contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 48.dp)) {
                 Text(albumName, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             } else Text(albumName, style = MaterialTheme.typography.bodySmall)
         }

@@ -27,7 +27,9 @@ class UiFixtureServer : AutoCloseable {
     init { VirtualAvdOnly.requireVerified() }
 
     data class SearchCall(val kind: String, val query: String, val limit: Int, val offset: Int)
+    data class DetailCall(val kind: String, val id: String)
 
+    val catalogDetails = CopyOnWriteArrayList<DetailCall>()
     val unexpectedRoutes = CopyOnWriteArrayList<String>()
     val searchCalls = CopyOnWriteArrayList<SearchCall>()
     val emptyGlobalBrowseCalls = AtomicInteger()
@@ -112,7 +114,8 @@ class UiFixtureServer : AutoCloseable {
             }
             val all = when {
                 albumId != null -> tracks().filter { it.getString("albumId") == albumId }
-                artistId != null -> if (artistId == ARTIST_ID && url.queryParameter("releaseGroup") !in listOf("singles", "appearances")) albums() else emptyList()
+                artistId != null -> if (url.queryParameter("releaseGroup") !in listOf("singles", "appearances"))
+                    albums().filter { hasArtist(it, artistId) } else emptyList()
                 kind == "artists" -> listOf(artist())
                 kind == "albums" -> albums()
                 kind == "tracks" -> tracks()
@@ -126,7 +129,7 @@ class UiFixtureServer : AutoCloseable {
             val id = catalog.groupValues[2]
             val action = catalog.groupValues[3]
             val item = when (kind) {
-                "artists" -> artist().takeIf { id == ARTIST_ID }
+                "artists" -> CREDIT_ARTISTS.firstOrNull { it.first == id }?.let { artist(id) }
                 "albums" -> albums().firstOrNull { it.getString("id") == id }
                 else -> tracks().firstOrNull { it.getString("id") == id }
             } ?: return unexpected(request)
@@ -136,10 +139,14 @@ class UiFixtureServer : AutoCloseable {
                 "playback" -> {
                     if (kind !in listOf("artists", "albums")) return unexpected(request)
                     playbackPreparations.incrementAndGet()
-                    val items = if (kind == "artists") tracks() else tracks().filter { it.getString("albumId") == id }
+                    val items = if (kind == "artists") tracks().filter { hasArtist(it, id) }
+                        else tracks().filter { it.getString("albumId") == id }
                     json(playback(items, kind.removeSuffix("s"), id, item.getString("name")))
                 }
-                "" -> json(JSONObject().put("item", item).put("revision", 7))
+                "" -> {
+                    catalogDetails.add(DetailCall(kind.removeSuffix("s"), id))
+                    json(JSONObject().put("item", item).put("revision", 7))
+                }
                 else -> unexpected(request)
             }
         }
@@ -216,18 +223,31 @@ class UiFixtureServer : AutoCloseable {
     }
 
     private fun session() = JSONObject().put("accountId", "synthetic-listener").put("username", USERNAME).put("role", "user").put("csrfToken", CSRF)
-    private fun artist() = JSONObject().put("kind", "artist").put("id", ARTIST_ID).put("name", ARTIST_NAME)
-        .put("genres", JSONArray(listOf("Ambient", "Electronic"))).put("coverage", JSONObject().put("tracks", 16).put("inLibrary", 16).put("albums", 3))
+    private fun artist(id: String = ARTIST_ID): JSONObject {
+        val name = CREDIT_ARTISTS.single { it.first == id }.second
+        val primary = id == ARTIST_ID
+        return JSONObject().put("kind", "artist").put("id", id).put("name", name)
+            .put("genres", JSONArray(listOf("Ambient", "Electronic"))).put("coverage", JSONObject()
+                .put("tracks", if (primary) 16 else 1).put("inLibrary", if (primary) 16 else 1).put("albums", if (primary) 3 else 1))
+    }
     private fun albums() = listOf(ALBUM_NAME, "Orbit Afterglow", "Orbit Tides").mapIndexed { index, name ->
-        JSONObject().put("kind", "album").put("id", "album-${index + 1}").put("name", name).put("artists", credits())
+        JSONObject().put("kind", "album").put("id", "album-${index + 1}").put("name", name).put("artists", credits(multiple = index == 0))
             .put("albumType", "album").put("releaseDate", "2025-0${index + 1}-14")
             .put("coverage", JSONObject().put("tracks", if (index == 0) 8 else 4).put("inLibrary", if (index == 0) 8 else 4))
     }
-    private fun credits() = JSONArray().put(JSONObject().put("id", ARTIST_ID).put("name", ARTIST_NAME))
+    private fun credits(multiple: Boolean = false) = JSONArray().apply {
+        (if (multiple) CREDIT_ARTISTS else CREDIT_ARTISTS.take(1)).forEach { (id, name) ->
+            put(JSONObject().put("id", id).put("name", name))
+        }
+    }
+    private fun hasArtist(item: JSONObject, id: String): Boolean {
+        val artists = item.getJSONArray("artists")
+        return (0 until artists.length()).any { artists.getJSONObject(it).getString("id") == id }
+    }
     private fun tracks() = (1..16).map { index ->
         val album = when { index <= 8 -> 1; index <= 12 -> 2; else -> 3 }
         JSONObject().put("kind", "track").put("id", "track-%02d".format(index))
-            .put("name", TRACK_NAMES[index - 1]).put("artists", credits()).put("albumId", "album-$album")
+            .put("name", TRACK_NAMES[index - 1]).put("artists", credits(multiple = index == 2)).put("albumId", "album-$album")
             .put("albumName", listOf(ALBUM_NAME, "Orbit Afterglow", "Orbit Tides")[album - 1])
             .put("durationMs", AUDIO_SECONDS * 1000).put("hasAudio", true).put("discNumber", 1).put("trackNumber", index)
             .put("genres", JSONArray(listOf("Ambient")))
@@ -325,6 +345,14 @@ class UiFixtureServer : AutoCloseable {
         private const val CSRF = "synthetic-ui-csrf"
         const val ARTIST_ID = "artist-orbit"
         const val ARTIST_NAME = "Orbit Ensemble"
+        // Credit-only aliases keep the root catalog at one searchable artist / three albums /
+        // sixteen tracks, while each of the four displayed credits has a real detail identity.
+        val CREDIT_ARTISTS = listOf(
+            ARTIST_ID to ARTIST_NAME,
+            "artist-credit-mira" to "Mira 夜航",
+            "artist-credit-sol" to "Sol & the Northern Lights Ensemble",
+            "artist-credit-noe" to "Noé Álvarez · 遠い海",
+        )
         const val ALBUM_NAME = "Orbit Bloom"
         const val MANUAL_ID = "night-walk"
         const val MANUAL_NAME = "Night walk"
@@ -332,7 +360,8 @@ class UiFixtureServer : AutoCloseable {
         const val DERIVED_NAME = "Ambient discoveries"
         const val ERROR_QUERY = "fixture-error"
         // Leave room for a slow software-rendered AVD without a natural track transition mid-assertion.
-        private const val AUDIO_SECONDS = 300
+        private const val AUDIO_SECONDS = 600
+        const val AUDIO_DURATION_MS = AUDIO_SECONDS * 1000L
         val TRACK_NAMES = listOf("Orbit Dawn", "Orbit Glass", "Orbit Lantern", "Orbit Still", "Orbit Leaves", "Orbit Rain",
             "Orbit Night", "Orbit Blue", "Orbit Ember", "Orbit Glow", "Orbit Haze", "Orbit Light", "Orbit Shore", "Orbit Foam", "Orbit Current",
             "Orbit Return — 夜の航路 · a slow journey through the northern lights")
