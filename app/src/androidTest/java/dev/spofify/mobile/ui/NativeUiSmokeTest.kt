@@ -92,6 +92,27 @@ class NativeUiSmokeTest {
                 pressBack()
                 waitUntilAbsent(fontLicenseTitle)
                 compose.onNodeWithText("Connect & listen").assertExists()
+                // Typography must also fit before authentication, including its offline dialog.
+                sizeChanged = true
+                val signInNarrowWidth = (320f * compose.activity.resources.displayMetrics.density).roundToInt()
+                shell("wm size ${signInNarrowWidth}x${baselineDisplaySize.substringAfter('x')}")
+                compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == signInNarrowWidth }
+                screenshot("01c-narrow-sign-in")
+                fontChanged = true
+                shell("settings put system font_scale 2.0")
+                waitForFont(2f)
+                compose.onNodeWithText("Connect & listen").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+                screenshot("01d-font2-narrow-sign-in")
+                compose.onNodeWithText("Font license").performScrollTo().performClick()
+                waitFor(fontLicenseTitle)
+                screenshot("00b-font2-narrow-font-license")
+                compose.onNodeWithText("Done").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+                pressBack()
+                waitUntilAbsent(fontLicenseTitle)
+                shell("settings put system font_scale $originalFontScale")
+                waitForFont(originalFontScale)
+                shell("wm size ${originalSizeOverride ?: "reset"}")
+                compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
                 compose.onNodeWithText("Server URL").performScrollTo().performClick().performTextReplacement(fixture.origin)
                 compose.onNodeWithText("Username").performScrollTo().performClick().performTextReplacement(UiFixtureServer.USERNAME)
                 compose.onNodeWithText("Password").performScrollTo().performClick().performTextReplacement(UiFixtureServer.PASSWORD)
@@ -429,6 +450,13 @@ class NativeUiSmokeTest {
                 assertSearchStartsAtFirstResult()
                 assertPlayingTransition(beforeNarrowRoots, fixture, "narrow root navigation and fresh Search")
                 assertEquals(originalQueue, upcomingOccurrences())
+                assertQueuePreservedFromMini(originalQueue, fixture)
+                compose.onNode(expandPlayer).performClick()
+                waitFor(playerSheet)
+                assertPlayerPresentation()
+                screenshot("10h-narrow-now-playing")
+                collapsePlayer()
+                waitUntilAbsent(playerSheet)
 
                 // Isolated AVD only. Restore both settings even if a font2 assertion fails.
                 fontChanged = true

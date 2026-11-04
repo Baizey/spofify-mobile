@@ -66,13 +66,14 @@ sha256sum --check third_party/jetbrains-mono/SHA256SUMS
 Public entry points in package `dev.spofify.mobile.ui.theme`:
 
 - `JetBrainsMono: FontFamily`, the four resource-backed static faces.
-- `AppTypography: Typography`, Material 3 `Typography()` defaults with only
-  `fontFamily` changed on all 15 display/headline/title/body/label styles.
+- `AppTypography: Typography`, the central modest scale applied through
+  `MaterialTheme(typography = AppTypography, ...)`. All 15 roles use the bundled
+  family. Headline/title/body sizes and line heights are intentionally reduced;
+  primary body is 13–14sp and secondary body remains 12sp. Display sizes and
+  labels are unchanged. See `Typography.kt` and its exact-role regression tests.
 
-The parent owns root integration via `MaterialTheme(typography = AppTypography,
-...)`; this scoped change does not edit the Activity or root graph. Sizes,
-weights, line heights, tracking, platform text options and font feature settings
-are preserved, not redesigned.
+Weights, tracking, platform text options and font feature settings remain
+Material defaults. Sizes and leading use scaled sp, not fixed pixels.
 
 These are the standard JetBrains Mono faces, not the NL variant. Compose/Android
 retain their normal text shaping and ligature behavior: there is no global
@@ -86,19 +87,18 @@ pixels in a JVM test.
 ## Validation status
 
 `app/src/test/java/dev/spofify/mobile/ui/theme/TypographyTest.kt` checks all 15
-styles use the bundled family, all other default style properties are unchanged,
-and the four normal-style resource names and weights map as intended.
+styles use the bundled family, exact role sizes/leading, hierarchy and scaled-sp
+behavior, preserved weights/tracking/shaping, and the four normal-style resource
+names and weights.
 `FontLicenseTest.kt` in the same directory checks the packaged asset's exact
 known SHA-256, size, copyright and complete OFL sections, plus full-notice dialog
-semantics and Done dismissal on Robolectric SDK 35. The new license tests have
-**not been run** in this scoped task: the parent owns the Gradle build slot and
-will rerun the gate after this addition. No Gradle/dependency changes are needed.
+semantics and Done dismissal on Robolectric SDK 35. No Gradle/dependency changes
+are needed. Current exact-candidate automated and native results belong in the
+feature's validation evidence; historical results do not approve a new scale.
 
-**UI validation blocked / not complete:** the reported AVD startup fails with a
-TCG crash. No emulator or ADB operation was attempted in this scoped task. The
-parent must integrate the theme, run the automated gate, and capture/inspect
-actual screenshots (including narrow viewport, large font scale, wrapping,
-long/Unicode music metadata, and the required combined native flows) before
-claiming visual readiness. Unit tests and font-file verification do not establish
-visual quality. Use isolated virtual devices only; any exceptional hardware
-check must be coordinated through the user.
+The feature owner must capture and inspect actual APK renders, including narrow
+320dp/font2 layouts, offline dialogs, long/Unicode music metadata and relevant
+native flows. Unit tests and font-file verification do not establish visual
+quality. If native startup fails, report **UI validation blocked / not complete**
+with current evidence. Use isolated synthetic virtual devices only; exceptional
+hardware checks must be coordinated through the user. See `docs/ui-validation.md`.
