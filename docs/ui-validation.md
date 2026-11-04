@@ -2,7 +2,9 @@
 
 ## Policy: virtual devices are the normal path
 
-Every agent must follow `AGENTS.md` and [mobile-ux.md](mobile-ux.md). A successful build, lint run or Robolectric test does **not** prove the app looks or behaves correctly.
+Every agent must follow `AGENTS.md`, [mobile-ux.md](mobile-ux.md) and the isolated [worktree/review workflow](worktree-review.md). A successful build, lint run or Robolectric test does **not** prove the app looks or behaves correctly.
+
+**Current migration stop:** actual native AVD after-rendering is **blocked / not complete**; the single diagnostic budget is exhausted. Do not run the native/device commands below, retry emulator startup/configuration or attempt ADB/discovery under the current authorization. See [current status](testing.md#current-native-status-blocked--not-complete). These instructions describe the required gate once a working environment and explicit authorization are available, not permission to retry now. The stop does not forbid existing synthetic in-process/loopback unit fixtures in approved tests, and does not grant new external network permissions, live-backend access or network-diagnosis attempts.
 
 Use an isolated Android Virtual Device (AVD) with synthetic data. Agents must not connect to, install on or test against real phones. If a particular hardware/vendor behavior genuinely cannot be established virtually, describe the precise uncertainty and coordinate any exceptional check **through the user**. Real-device access is not a routine prerequisite for development.
 
@@ -10,22 +12,24 @@ Do not use personal AVD data, existing accounts, the live backend, production cr
 
 ## Required gates
 
-1. Run the automated gate:
+1. Request and wait for a parent-granted serialized shared-cache build slot, then run the automated gate from your own worktree (not shared build outputs):
 
    ```sh
-   GRADLE_USER_HOME="$PWD/.tooling/gradle" \
+   GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
      ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug \
-       --no-daemon --console=plain
+       --offline --no-daemon --console=plain
    ```
 
-2. Build and run the native AVD journey:
+2. Once native execution is explicitly authorized, run the native AVD journey against the APKs built from the same SHA in step 1. Use `--skip-build` because the runner's default build does not supply `--offline`; do not bypass shared-cache slots or offline requirements:
 
    ```sh
-   tools/ui/validate-native.sh
+   tools/ui/validate-native.sh --skip-build
    ```
+
+   Verify recorded APK hashes match those just built. This is deliberate build reuse, not permission to validate stale artifacts.
 
 3. **Open and inspect the resulting screenshots.** Source code, view trees and a passing instrumentation result are insufficient. Answer the [rendered-review questions](mobile-ux.md#rendered-review-questions--answer-with-evidence-not-source-assertions) with image paths and measurements/observations, compare before/after when a baseline exists, fix regressions and re-run. An independent read-only reviewer must inspect the affected renders and constraints; address non-nit findings and repeat review until clean.
-4. Record the evidence and remaining limitations. Parent integration requires a combined native smoke pass after parallel edits settle, not only separate component tests.
+4. Record the evidence and remaining limitations. Finished work must land in main through an explicitly parent-granted lead squash slot; temporary integration is optional staging only. The parent owns the combined automated/native smoke gate after parallel edits settle, not only separate component tests. Preserve dirty/ignored evidence and verify main content/patch accounting before authorized worktree/ref cleanup; see [worktree-review.md](worktree-review.md#finish-and-clean-every-lane). Landing or cleanup never converts blocked AVD validation into a pass.
 
 Do not change or regenerate a baseline just to approve a regression. Generic stock-control density is not an acceptable replacement for coherent music-first design.
 
@@ -100,7 +104,7 @@ Record in `evidence.md` (or a linked review):
 - Visual/correctness findings, fixes, re-captured evidence and reviewer identity; include visible complete-row count, row/cardinality uniformity, IME/chrome budget and actionable-versus-metadata targets from the mobile UX checklist.
 - Automated/native results and precise unverified claims.
 
-The supplied `/tmp/Spectacle.uTAxWI/Screenshot_20261104_011326.png` was inspected as a **before-only** baseline. It is not an approved after-render or a successful native gate; see [current blocked status](testing.md#current-native-status-blocked--not-complete).
+The supplied image, preserved at `/var/home/lsm/repos/spofify-mobile/.tooling/ui-testing/reviews/20261104-user-before.png` (originally `/tmp/Spectacle.uTAxWI/Screenshot_20261104_011326.png`), was inspected as a **before-only** baseline. It is not an approved after-render or a successful native gate; see [current blocked status](testing.md#current-native-status-blocked--not-complete).
 
 If an emulator cannot boot, instrumentation fails, a required flow is untested or screenshots were not inspected, report **UI validation blocked / not complete**, with the concrete reason. Never silently substitute unit tests or claim a visual pass. Ordinary emulator-validated work does not need an invented physical-device acceptance blocker.
 
