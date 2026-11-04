@@ -26,6 +26,7 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -64,10 +65,24 @@ fun MusicRow(
 ) {
     val haptic = LocalHapticFeedback.current
     val typography = MaterialTheme.typography
-    // Reserve the same two-line copy slot even when metadata is absent. Convert through
-    // Android's font scaling rather than fixing a height that clips enlarged text.
+    val titleStyle = typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
+    val subtitleStyle = typography.bodySmall
+    val textMeasurer = rememberTextMeasurer()
+    // Native fallback ascent/descent can exceed the declared line height. Reserve a
+    // content-independent envelope for common scripts/emoji using the actual row styles;
+    // measuring each item's copy instead would recreate credit-dependent row pitch.
+    // This is not a cap: unusual fallback metrics may still expand naturally, never clip.
+    val lineHeights = remember(textMeasurer, titleStyle, subtitleStyle) {
+        val fallbackProbe = "Ag Égj 音楽 🌙 العربية हिन्दी"
+        listOf(titleStyle, subtitleStyle).map { style ->
+            textMeasurer.measure(fallbackProbe, style = style, maxLines = 1, softWrap = false).size.height
+        }
+    }
+    // Reserve both copy slots even when metadata is absent. Round each role separately,
+    // matching native layout, and retain Android's current font scaling/density.
     val copyHeight = with(LocalDensity.current) {
-        typography.bodyMedium.lineHeight.toDp() + typography.bodySmall.lineHeight.toDp() + 2.dp
+        maxOf(titleStyle.lineHeight.roundToPx(), lineHeights[0]).toDp() +
+            maxOf(subtitleStyle.lineHeight.roundToPx(), lineHeights[1]).toDp() + 2.dp
     }
     val rowHeight = maxOf(72.dp, copyHeight + 20.dp)
     val subtitle = compactMusicSubtitle(item)
@@ -144,11 +159,11 @@ fun MusicRow(
             }
             Column(Modifier.weight(1f).padding(horizontal = 10.dp).heightIn(min = copyHeight),
                 verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(item.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1,
-                    overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium,
+                Text(item.name, style = titleStyle, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                     color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
                 if (subtitle.isNotBlank()) Text(subtitle, maxLines = 1,
-                    overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
+                    overflow = TextOverflow.Ellipsis, style = subtitleStyle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             IconButton(onClick = {

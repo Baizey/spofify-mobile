@@ -75,11 +75,17 @@ class MusicRowTest {
             track.copy(hasAudio = false),
             track.copy(kind = "artist", artists = emptyList(), genres = listOf("Art pop", "電子音楽"),
                 durationMs = 0, releaseDate = null, coverage = Coverage(inLibrary = 1)),
-        )
+        ) + listOf("音楽 🌙", "🌙 Égj", "العربية", "हिन्दी").map { fallback ->
+            // Put fallback glyphs before the ellipsis boundary in both roles. A trailing
+            // Unicode suffix alone can disappear before it exercises native font metrics.
+            track.copy(name = "$fallback ${track.name}",
+                artists = listOf(ArtistCredit("fallback-artist", "$fallback ${credits.first().name}")))
+        }
         var normalHeight = 0f
         for (fontScale in listOf(1f, 1.35f, 2f)) {
             for (hostWidth in listOf(320.dp, 360.dp)) {
                 var expected: Map<String, Rect>? = null
+                var baselineTitle: Rect? = null
                 for ((fixtureIndex, fixture) in cases.withIndex()) {
                     compose.runOnIdle { item.value = fixture; scale.value = fontScale; width.value = hostWidth }
                     val row = compose.onNodeWithTag("row")
@@ -108,14 +114,20 @@ class MusicRowTest {
                             assertEquals("top: $diagnostic", before.top, after.top, 1f)
                         }
                     } ?: run { expected = geometry }
-                    // Compare stable row/art/action slots, not title glyph rectangles: native
+                    // Compare stable row/art/action slots, not title text-layout rectangles: native
                     // fallback metrics can change how two text lines center inside the row.
                     val rowBounds = geometry.getValue("row")
                     val artBounds = geometry.getValue("art")
                     val playBounds = geometry.getValue("play")
                     val moreBounds = geometry.getValue("more")
+                    assertEquals("Artwork stays centered in the row: $context", rowBounds.center.y, artBounds.center.y, 1f)
                     assertEquals(artBounds.center.y, playBounds.center.y, 1f)
                     assertEquals(playBounds.center.y, moreBounds.center.y, 1f)
+                    for ((slot, bounds) in geometry.filterKeys { it != "row" }) {
+                        assertTrue("Slot stays inside row: $context, slot=$slot, row=$rowBounds, actual=$bounds",
+                            bounds.left >= rowBounds.left - 1f && bounds.top >= rowBounds.top - 1f &&
+                                bounds.right <= rowBounds.right + 1f && bounds.bottom <= rowBounds.bottom + 1f)
+                    }
                     assertEquals("Reserved copy starts after artwork: $context", artBounds.right +
                         with(compose.density) { 10.dp.toPx() }, titleBounds.left, 1f)
                     assertTrue("Text cannot overlap Play: $context", titleBounds.right <= playBounds.left)
@@ -123,7 +135,15 @@ class MusicRowTest {
                     assertTrue(moreBounds.right <= rowBounds.right)
                     assertTrue(titleBounds.top >= rowBounds.top && titleBounds.bottom <= rowBounds.bottom)
                     val titleLayout = assertSingleLine(title, context, mustEllipsize = true)
+                    baselineTitle?.let { baseline ->
+                        if (kotlin.math.abs(baseline.top - titleBounds.top) > 1f) {
+                            println("MusicRow text-position diagnostic [$context]: " +
+                                "baselineTitle=$baseline, actualTitle=$titleBounds, row=$rowBounds, " +
+                                "layoutSize=${titleLayout.size}")
+                        }
+                    } ?: run { baselineTitle = titleBounds }
                     if (fixture == cases.first()) println("MusicRow title metrics [$context]: " +
+                        "row=$rowBounds, artwork=$artBounds, play=$playBounds, more=$moreBounds, " +
                         "intrinsicWidth=${titleLayout.multiParagraph.maxIntrinsicWidth}, " +
                         "paragraphWidth=${titleLayout.multiParagraph.width}, lineRight=${titleLayout.getLineRight(0)}, " +
                         "size=${titleLayout.size}, constraints=${titleLayout.layoutInput.constraints}, " +
@@ -320,7 +340,8 @@ class MusicRowTest {
         // paragraph height instead so correctly ellipsized text is not mistaken for clipping.
         assertTrue("Paragraph height fits the text layout: $diagnostic",
             layout.multiParagraph.height <= layout.size.height.toFloat() + 1f)
-        assertEquals("Text layout fits its actual node: $diagnostic", layout.size.height.toFloat(), node.bounds().height, 1f)
+        assertEquals("Text layout height fits its actual node: $diagnostic", layout.size.height.toFloat(), node.bounds().height, 1f)
+        assertEquals("Text layout width fits its actual node: $diagnostic", layout.size.width.toFloat(), node.bounds().width, 1f)
         // Native Paint must measure our deliberately long identity as overflowing at
         // every fixture width/scale; a wrong renderer or unconstrained slot must fail.
         if (mustEllipsize) {
