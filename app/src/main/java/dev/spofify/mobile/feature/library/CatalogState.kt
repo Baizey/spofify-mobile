@@ -145,14 +145,29 @@ class CatalogStateHolder(
         if (value) loadVisible() else cancelReads()
     }
 
-    private fun cancelReads() {
+    private fun cancelReads(markInterrupted: Boolean = true) {
         generation++
         queryJob?.cancel(); queryJob = null
         jobs.values.forEach { it.cancel() }; jobs.clear(); requests.clear()
+        if (!markInterrupted) return
         update { screen -> screen.copy(detailLoading = false,
             detailNeedsReload = screen.detailNeedsReload || screen.detailLoading,
             sections = screen.sections.mapValues { (_, section) -> section.copy(loading = false,
                 needsReload = section.needsReload || section.loading) }) }
+    }
+
+    /**
+     * Explicit Search-tab intent, unlike normal Back/visibility/query preservation.
+     * Publishes one fresh empty root, fences obsolete reads and scroll callbacks, and
+     * drops composition/deferred refresh work without fetching or touching playback.
+     * Focus and local IME draft reset belong to the caller's activation event.
+     */
+    fun activateSearchRoot(): Unit {
+        cancelReads(markInterrupted = false)
+        composing = false
+        pendingRevision = null
+        catchUpAllowed = false
+        mutable.value = CatalogNavigationState(listOf(CatalogScreen(key = ++serial, kind = "all", search = true)))
     }
 
     fun open(item: LibraryItem) {
@@ -365,9 +380,12 @@ class CatalogStateHolder(
     suspend fun checkRevision() {
         if (!visible || revisionBusy) return
         revisionBusy = true
+        // Normal inner navigation preserves revision knowledge; an explicit fresh root does not
+        // accept a poll begun for the discarded stack, even if its transport ignores cancellation.
+        val rootKey = state.value.stack.first().key
         try {
             val revision = reader.revision()
-            if (!visible) return
+            if (!visible || state.value.stack.first().key != rootKey) return
             catchUpAllowed = true
             latestObservedRevision = maxOf(latestObservedRevision ?: revision, revision)
             val known = knownRevision

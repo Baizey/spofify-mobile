@@ -50,6 +50,8 @@ data class LibraryState(
     val tab: Tab = Tab.HOME,
     val page: Page = Page.Home,
     val canGoBack: Boolean = false,
+    /** One-shot current-session nav intent; never saved/restored with route/query state. */
+    val searchActivationId: Long? = null,
     val items: List<LibraryItem> = emptyList(),
     val playlists: List<PlaylistSummary> = emptyList(),
     val total: Int = 0,
@@ -84,6 +86,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private var featureAccount: String? = null
     private val catalogHolders = linkedMapOf<String, CatalogStateHolder>()
     private var navigationSerial = 0L
+    private var searchActivationSerial = 0L
     private var home: HomeStateHolder? = null
     private var personalJob: Job? = null
     private var likesCache: LibraryPage? = null
@@ -131,6 +134,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     private fun clearFeatureState() {
+        mutable.update { it.copy(searchActivationId = null) }
         catalogHolders.values.forEach { it.close() }; catalogHolders.clear()
         home?.setVisible(false); home = null
         personalJob?.cancel(); personalJob = null
@@ -264,6 +268,38 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     fun forgetSavedLogin() = setRememberLogin(false)
 
+    /** Explicit bottom-nav Search intent, including reselect; not an ordinary tab return. */
+    fun activateSearch() {
+        val client = graph.client ?: return
+        val account = state.value.session?.accountId ?: return
+        if (state.value.busy || client.currentSession()?.accountId != account) return
+        val holder = catalogHolder() ?: return
+        holder.activateSearchRoot()
+        if (state.value.tab != Tab.SEARCH) tabStacks[state.value.tab] = stack.toList()
+        val root = Page.Search()
+        stack.clear(); stack.add(root)
+        tabStacks[Tab.SEARCH] = listOf(root)
+        loadJob?.cancel(); generation++
+        val activation = ++searchActivationSerial
+        mutable.update { it.copy(tab = Tab.SEARCH, page = root, canGoBack = false,
+            searchActivationId = activation, loading = false, error = null,
+            items = emptyList(), playlists = emptyList(), total = 0, offset = 0) }
+    }
+
+    fun consumeSearchActivation(expectedClient: SpofifyClient, expectedAccount: String?, activation: Long) {
+        if (!ownsSearchActivation(expectedClient, expectedAccount)) return
+        mutable.update { if (it.searchActivationId == activation) it.copy(searchActivationId = null) else it }
+    }
+
+    /** Stop a pending keyboard delivery when its host/client/lifecycle is leaving. */
+    fun cancelSearchActivation(expectedClient: SpofifyClient, expectedAccount: String?) {
+        if (ownsSearchActivation(expectedClient, expectedAccount)) mutable.update { it.copy(searchActivationId = null) }
+    }
+
+    private fun ownsSearchActivation(client: SpofifyClient, account: String?): Boolean =
+        account != null && graph.client === client && state.value.session?.accountId == account &&
+            client.currentSession()?.accountId == account
+
     fun switchTab(tab: Tab) {
         if (tab == state.value.tab) return
         tabStacks[state.value.tab] = stack.toList()
@@ -274,11 +310,12 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             Tab.PLAYLISTS -> Page.Playlists
         }
         stack.addAll(tabStacks[tab] ?: listOf(page))
-        mutable.update { it.copy(tab = tab) }
+        mutable.update { it.copy(tab = tab, searchActivationId = null) }
         load(stack.last())
     }
 
     fun open(page: Page) {
+        mutable.update { it.copy(searchActivationId = null) }
         val destination = if (page is Page.Detail) page.copy(navigationId = ++navigationSerial) else page
         stack.add(destination)
         load(destination)
@@ -286,6 +323,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     fun back() {
         if (stack.size <= 1) return
+        mutable.update { it.copy(searchActivationId = null) }
         stack.removeAt(stack.lastIndex)
         load(stack.last())
     }

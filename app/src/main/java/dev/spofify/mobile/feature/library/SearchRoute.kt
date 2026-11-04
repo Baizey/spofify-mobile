@@ -45,6 +45,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.SpofifyClient
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 
@@ -70,8 +71,11 @@ fun SearchRoute(
     onVisibleItems: (List<LibraryItem>) -> Unit = {},
     stateHolder: CatalogStateHolder? = null,
     onSearchEditingChanged: (Boolean) -> Unit = {},
+    searchActivationId: Long? = null,
+    onSearchActivationConsumed: (Long) -> Unit = {},
 ) = CatalogRoute(client, "all", initialQuery, null, onOpenItem, onPlayItem, onShowActions,
-    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder, onSearchEditingChanged)
+    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder,
+    onSearchEditingChanged, searchActivationId, onSearchActivationConsumed)
 
 /** Compatibility entry point. Still query-driven; this is not a top-level catalog landing. */
 @Composable
@@ -130,6 +134,8 @@ private fun CatalogRoute(
     onVisibleItems: (List<LibraryItem>) -> Unit,
     stateHolder: CatalogStateHolder?,
     onSearchEditingChanged: (Boolean) -> Unit = {},
+    searchActivationId: Long? = null,
+    onSearchActivationConsumed: (Long) -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     val account = client.currentSession()?.accountId
@@ -165,7 +171,8 @@ private fun CatalogRoute(
     },
         { item, shuffle -> focus.clearFocus(); keyboard?.hide(); onPlayItem(item, shuffle) },
         { item -> focus.clearFocus(); keyboard?.hide(); onShowActions(item) },
-        onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onSearchEditingChanged)
+        onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onSearchEditingChanged,
+        searchActivationId, onSearchActivationConsumed)
 }
 
 @Composable
@@ -182,6 +189,8 @@ internal fun CatalogScreenContent(
     likes: Map<String, CatalogLikeState> = emptyMap(),
     onToggleLike: ((LibraryItem) -> Unit)? = null,
     onSearchEditingChanged: (Boolean) -> Unit = {},
+    searchActivationId: Long? = null,
+    onSearchActivationConsumed: (Long) -> Unit = {},
 ) {
     val screen = navigation.current
     val scroll = remember(screen.key, screen.kind, screen.query, screen.includeMissing, screen.releaseGroup) {
@@ -287,7 +296,9 @@ internal fun CatalogScreenContent(
         modifier = Modifier.fillMaxWidth().testTag("search-dock")) {
         Box(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
             CommittedSearchField(screen.query, holder::setComposing,
-                onSearchEditingChanged = onSearchEditingChanged, commit = holder::commitQuery)
+                onSearchEditingChanged = onSearchEditingChanged,
+                activationId = searchActivationId, onActivationConsumed = onSearchActivationConsumed,
+                commit = holder::commitQuery)
         }
     }
     }
@@ -298,6 +309,8 @@ internal fun CommittedSearchField(
     query: String,
     onCompositionChanged: (Boolean) -> Unit = {},
     onSearchEditingChanged: (Boolean) -> Unit = {},
+    activationId: Long? = null,
+    onActivationConsumed: (Long) -> Unit = {},
     commit: (String, Boolean) -> Unit,
 ) {
     var field by remember { mutableStateOf(TextFieldValue(query)) }
@@ -305,6 +318,8 @@ internal fun CommittedSearchField(
     var imeShownForFocus by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
     val restingFocus = remember { FocusRequester() }
+    val fieldFocus = remember { FocusRequester() }
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     var requestingRest by remember { mutableStateOf(false) }
     var resting by remember { mutableStateOf(false) }
     fun endEditing() {
@@ -317,6 +332,27 @@ internal fun CommittedSearchField(
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val editingChanged by rememberUpdatedState(onSearchEditingChanged)
     val compositionChanged by rememberUpdatedState(onCompositionChanged)
+    val activationConsumed by rememberUpdatedState(onActivationConsumed)
+    var deliveredActivation by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(activationId, lifecycle) {
+        val activation = activationId ?: return@LaunchedEffect
+        if (deliveredActivation == activation) return@LaunchedEffect
+        // A deliberate nav tap overrides even an uncommitted composing draft. Ordinary query
+        // reconciliation below intentionally does not. The owner clears accepted state first.
+        field = TextFieldValue("")
+        compositionChanged(false)
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            if (deliveredActivation == activation) awaitCancellation()
+            // Await attachment/layout, not the navigation item's lifetime: focusing hides that
+            // item immediately, but must not cancel this field-owned delivery.
+            withFrameNanos { }
+            while (!fieldFocus.requestFocus()) withFrameNanos { }
+            deliveredActivation = activation
+            keyboard?.show()
+            activationConsumed(activation)
+            awaitCancellation()
+        }
+    }
     DisposableEffect(Unit) { onDispose { compositionChanged(false); editingChanged(false) } }
     LaunchedEffect(editing, imeVisible) {
         if (!editing) imeShownForFocus = false
@@ -372,7 +408,7 @@ internal fun CommittedSearchField(
         keyboardActions = KeyboardActions(onSearch = {
             commit(field.text, true); compositionChanged(false); endEditing(); keyboard?.hide()
         }), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("search-query")
-            .onFocusChanged { state ->
+            .focusRequester(fieldFocus).onFocusChanged { state ->
                 if (editing != state.isFocused) {
                     editing = state.isFocused
                     if (!state.isFocused) imeShownForFocus = false

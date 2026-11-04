@@ -23,9 +23,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import dev.spofify.mobile.core.LibraryItem
@@ -73,7 +78,7 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SpofifyApp(model: LibraryViewModel) {
+internal fun SpofifyApp(model: LibraryViewModel) {
     val state by model.state.collectAsStateWithLifecycle()
     val player by model.playback.state.collectAsStateWithLifecycle()
     var expanded by rememberSaveable { mutableStateOf(false) }
@@ -101,6 +106,22 @@ private fun SpofifyApp(model: LibraryViewModel) {
     val searchPage = state.page is Page.Search || state.page is Page.Catalog
     val searchEditing = rememberSearchEditing(client, state.session?.accountId, searchPage)
     val onSearchEditingChanged = remember(searchEditing) { { editing: Boolean -> searchEditing.value = editing } }
+    val focus = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(model, client, state.session?.accountId, lifecycle) {
+        val owner = state.session?.accountId
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP || event == Lifecycle.Event.ON_DESTROY) {
+                model.cancelSearchActivation(client, owner)
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+            model.cancelSearchActivation(client, owner)
+        }
+    }
     key(client, state.session?.accountId) {
         val pages = rememberSaveableStateHolder()
         var devices by remember { mutableStateOf(false) }
@@ -135,14 +156,24 @@ private fun SpofifyApp(model: LibraryViewModel) {
                 IconButton(onClick = { account = true }) { Icon(Icons.Default.AccountCircle, "Account and server") }
             },
             miniPlayer = {
-                NativeMiniPlayer(player, model.playback, { expanded = true }, art, Modifier.fillMaxWidth())
+                NativeMiniPlayer(player, model.playback, {
+                    model.cancelSearchActivation(client, accountId)
+                    focus.clearFocus(); keyboard?.hide()
+                    expanded = true
+                }, art, Modifier.fillMaxWidth())
             },
             navigation = {
                 CompactNavigation(modifier = Modifier.testTag("primary-navigation")) {
                     listOf(Tab.HOME to Icons.Default.Home, Tab.SEARCH to Icons.Default.Search,
                         Tab.PLAYLISTS to Icons.AutoMirrored.Filled.QueueMusic).forEach { (tab, icon) ->
-                        CompactNavigationItem(selected = state.tab == tab, onClick = { model.switchTab(tab) },
-                            icon = { Icon(icon, null) }, label = tab.name.lowercase().replaceFirstChar { it.titlecase() })
+                        CompactNavigationItem(selected = state.tab == tab,
+                            onClick = {
+                                if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                                    if (tab == Tab.SEARCH) model.activateSearch() else model.switchTab(tab)
+                                }
+                            },
+                            icon = { Icon(icon, null) }, label = tab.name.lowercase().replaceFirstChar { it.titlecase() },
+                            modifier = Modifier.testTag("nav-${tab.name.lowercase()}"))
                     }
                 }
             },
@@ -167,7 +198,9 @@ private fun SpofifyApp(model: LibraryViewModel) {
                             onOpenItem = {}, onPlayItem = play, onShowActions = showMore, onEnqueueItem = queue,
                             artwork = art, modifier = contentModifier, playback = feedback, likes = likeStates,
                             onToggleLike = model::likeAction, onVisibleItems = model::checkVisibleLikes,
-                            stateHolder = model.catalogHolder(), onSearchEditingChanged = onSearchEditingChanged)
+                            stateHolder = model.catalogHolder(), onSearchEditingChanged = onSearchEditingChanged,
+                            searchActivationId = state.searchActivationId,
+                            onSearchActivationConsumed = { model.consumeSearchActivation(client, accountId, it) })
                         is Page.Detail -> ItemDetailsRoute(client, page.item,
                             onOpenItem = {}, onPlayItem = play, onShowActions = showMore, onEnqueueItem = queue,
                             artwork = art, modifier = contentModifier, playback = feedback, likes = likeStates,

@@ -51,13 +51,25 @@ class UiFixtureServer : AutoCloseable {
         require(milliseconds >= 0)
         playerRoom.advanceClock(milliseconds)
     }
-    @Volatile private var searchGate: CountDownLatch? = null
-
-    fun holdSearchResponses() {
-        check(searchGate == null) { "Search responses already held" }
-        searchGate = CountDownLatch(1)
+    /** Per-hold acknowledgements contain counts only, never input or request payloads. */
+    class HeldSearchResponses internal constructor() {
+        internal val release = CountDownLatch(1)
+        internal val entered = AtomicInteger()
+        internal val prepared = AtomicInteger()
+        val enteredRequests: Int get() = entered.get()
+        val preparedResponses: Int get() = prepared.get()
     }
-    fun releaseSearchResponses() { searchGate?.countDown(); searchGate = null }
+    @Volatile private var searchGate: HeldSearchResponses? = null
+
+    fun holdSearchResponses(): HeldSearchResponses {
+        check(searchGate == null) { "Search responses already held" }
+        return HeldSearchResponses().also { searchGate = it }
+    }
+    fun releaseSearchResponses() {
+        val held = searchGate
+        searchGate = null
+        held?.release?.countDown()
+    }
 
     private val server = MockWebServer()
     private val liked = linkedSetOf("track-02")
@@ -79,9 +91,18 @@ class UiFixtureServer : AutoCloseable {
                     url.queryParameter("artistId") == null && url.queryParameter("albumId") == null) {
                     // Deterministic loading evidence, without sleeping the instrumentation thread.
                     val gate = searchGate
-                    if (gate != null && !gate.await(60, TimeUnit.SECONDS)) {
-                        unexpectedRoutes.add("synthetic search response gate timed out")
-                        return json(JSONObject().put("error", "Synthetic response gate timed out"), 504)
+                    if (gate != null) {
+                        gate.entered.incrementAndGet()
+                        try {
+                            if (!gate.release.await(60, TimeUnit.SECONDS)) {
+                                unexpectedRoutes.add("synthetic search response gate timed out")
+                                return json(JSONObject().put("error", "Synthetic response gate timed out"), 504)
+                            }
+                            return synchronized(this@UiFixtureServer) { route(request) }
+                        } finally {
+                            // Dispatcher completion, not a claim that a cancelled client accepted it.
+                            gate.prepared.incrementAndGet()
+                        }
                     }
                 }
                 return synchronized(this@UiFixtureServer) { route(request) }

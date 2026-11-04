@@ -20,6 +20,8 @@ import androidx.test.filters.LargeTest
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.spofify.mobile.LibraryViewModel
 import dev.spofify.mobile.MainActivity
+import dev.spofify.mobile.Page
+import dev.spofify.mobile.Tab
 import dev.spofify.mobile.playback.PlaybackState
 import org.junit.Assert.*
 import org.junit.BeforeClass
@@ -27,6 +29,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import kotlin.math.roundToInt
 
 /**
  * Run only after pm clear on a fresh isolated test AVD. One journey intentionally owns one fixture
@@ -63,6 +66,12 @@ class NativeUiSmokeTest {
             check(originalFontSetting == "null" || originalFontSetting.toFloatOrNull()?.let { it.isFinite() && it > 0f } == true) {
                 "Cannot safely restore the AVD's baseline font setting"
             }
+            val originalDisplaySize = shell("wm size")
+            val originalSizeOverride = Regex("Override size: (\\d+x\\d+)").find(originalDisplaySize)?.groupValues?.get(1)
+            val baselineDisplaySize = originalSizeOverride
+                ?: checkNotNull(Regex("Physical size: (\\d+x\\d+)").find(originalDisplaySize)).groupValues[1]
+            val baselineWidth = baselineDisplaySize.substringBefore('x').toInt()
+            var sizeChanged = false
             var fontChanged = false
             var journeyFailure: Throwable? = null
             try {
@@ -98,26 +107,35 @@ class NativeUiSmokeTest {
                 screenshot("02-home")
                 assertEquals(0, fixture.emptyGlobalBrowseCalls.get())
 
-                compose.onNodeWithText("Search").performClick()
-                waitFor(hasTestTag("search-query"))
-                compose.onNodeWithTag("search-query").assertIsDisplayed().assert(hasSetTextAction())
-                assertEquals("Empty Search must not request a match-all catalog", 0, fixture.searchCalls.size)
+                // The actual bottom-tab tap itself must focus the empty root and open the IME.
+                // Do not tap the field afterward: that would conceal failed activation delivery.
+                activateSearchAndAssertEmpty(fixture, "04-search-keyboard")
+                dismissSearchImeAndAssertEmptyRoot()
                 assertSearchInThumbZone()
                 assertCompactSearchFieldTargets()
                 assertCompactNavigationTargets()
                 screenshot("03-search-empty")
                 captureNarrowNavigation("03a-narrow-navigation")
-                compose.onNodeWithTag("search-query").performClick()
-                waitForIme(true)
-                assertSearchInThumbZone(imeVisible = true)
-                assertCompactSearchFieldTargets()
-                screenshot("04-search-keyboard")
-                pressBack()
-                waitForIme(false)
-                assertListeningChrome(editing = false)
-                assertEquals("Native Back must retain empty Search", "", queryText())
+                // Same-empty-query reselect still needs a fresh one-shot focus/IME request.
+                activateSearchAndAssertEmpty(fixture, "04b-search-reselected-keyboard")
+                dismissSearchImeAndAssertEmptyRoot()
                 assertEquals(0, fixture.searchCalls.size)
-                screenshot("04b-search-back-restored")
+                screenshot("04c-search-back-restored")
+                val heldSearch = fixture.holdSearchResponses()
+                try {
+                    search("Orbit")
+                    waitFor(hasContentDescription("Searching saved music"))
+                    // Prove all three old grouped reads entered this exact fixture hold before
+                    // resetting; UI loading alone can appear before any transport request starts.
+                    compose.waitUntil(15_000) { heldSearch.enteredRequests == 3 }
+                    activateSearchAndAssertEmpty(fixture, "04d-held-results-reset-keyboard")
+                } finally { fixture.releaseSearchResponses() }
+                // Observe fixture dispatch completion, not an arbitrary sleep or a claim that a
+                // cancelled client accepted the responses. Non-cancellable arrivals have state tests.
+                compose.waitUntil(15_000) { heldSearch.preparedResponses == heldSearch.enteredRequests }
+                compose.waitForIdle()
+                assertEmptySearchRoot()
+                dismissSearchImeAndAssertEmptyRoot()
                 compose.onNodeWithTag("search-query").performClick()
                 waitForIme(true)
                 assertListeningChrome(editing = true)
@@ -174,14 +192,53 @@ class NativeUiSmokeTest {
                 assertRetainedSearchPosition(retainedAlbumTop)
                 compose.onNodeWithText("Home").performClick()
                 waitFor(hasText("Recently played"))
-                compose.onNodeWithText("Search").performClick()
+                // Ordinary return is deliberately different from an explicit bottom Search tap.
+                compose.runOnIdle {
+                    ViewModelProvider(compose.activity)[LibraryViewModel::class.java].switchTab(Tab.SEARCH)
+                }
                 waitFor(hasTestTag("search-query"))
                 compose.onNodeWithTag("search-query").assertTextContains("Orbit")
+                assertListeningChrome(editing = false)
+                waitForIme(false)
                 assertRetainedSearchPosition(retainedAlbumTop)
-                screenshot("06c-search-retained-after-back-and-tabs")
+                screenshot("06c-search-retained-after-back-and-programmatic-return")
                 assertNoAutoplayOnBrowse(fixture)
+
+                // A deliberate Search tap must discard the catalog's inner detail stack,
+                // not merely restore the Search tab's old detail or retain its accepted query.
+                scrollToCatalogItem(UiFixtureServer.ALBUM_NAME).performClick()
+                waitFor(hasContentDescription("More actions for ${UiFixtureServer.ALBUM_NAME}"))
+                activateSearchAndAssertEmpty(fixture, "06d-detail-to-empty-search-keyboard")
+                dismissSearchImeAndAssertEmptyRoot()
+                // Reset a populated, paged and scrolled root on actual nav reselect as well.
+                search("Orbit")
+                scrollToText("See more songs")
+                compose.onNodeWithText("See more songs").performClick()
+                scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last()).assertIsDisplayed()
+                activateSearchAndAssertEmpty(fixture, "06e-paged-root-reselect-keyboard")
+                dismissSearchImeAndAssertEmptyRoot()
+                search("Orbit")
+                assertSearchStartsAtFirstResult()
+                // Search songs also use the catalog's inner stack. Home recents instead open
+                // the actual host Page.Detail; explicitly cover Search activation from there.
+                compose.onNodeWithText("Home").performClick()
+                waitFor(hasText("Recently played"))
+                scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.first()).performClick()
+                waitFor(hasText("Unlike"))
+                compose.runOnIdle {
+                    assertTrue("Home recent must open the host detail stack",
+                        ViewModelProvider(compose.activity)[LibraryViewModel::class.java].state.value.page is Page.Detail)
+                }
+                activateSearchAndAssertEmpty(fixture, "06f-host-detail-to-empty-search-keyboard")
+                dismissSearchImeAndAssertEmptyRoot()
+                search("Orbit")
+                assertSearchStartsAtFirstResult()
                 compose.onNodeWithContentDescription("Clear search").performClick()
-                waitFor(hasText("Start typing to search.", substring = true))
+                compose.waitUntil(10_000) { queryText().isEmpty() }
+                if (isImeVisible()) pressBack()
+                waitForIme(false)
+                assertListeningChrome(editing = false)
+                assertEmptySearchRoot()
                 assertEquals(0, fixture.emptyGlobalBrowseCalls.get())
                 screenshot("03b-search-cleared")
 
@@ -311,9 +368,10 @@ class NativeUiSmokeTest {
 
                 // Editing Search must not affect an already audible occurrence or its queue.
                 val beforeSearchTab = capturePlaying(fixture)
-                compose.onNodeWithText("Search").performClick()
-                waitFor(hasTestTag("search-query"))
-                assertPlayingTransition(beforeSearchTab, fixture, "Search tab navigation")
+                activateSearchAndAssertEmpty(fixture, "10bb-playing-search-activation-keyboard")
+                assertPlayingTransition(beforeSearchTab, fixture, "explicit Search activation")
+                dismissSearchImeAndAssertEmptyRoot()
+                assertQueuePreservedFromMini(originalQueue, fixture)
                 val beforeQuerySubmit = capturePlaying(fixture)
                 search("Orbit")
                 scrollToText("See more songs")
@@ -325,7 +383,47 @@ class NativeUiSmokeTest {
                 assertSearchEditingContinuity(fixture, "10c", playing = true, expectedQueue = originalQueue)
                 assertEquals("Search focus/IME must not prepare another queue", preparationsBeforeSearchEditing, fixture.playbackPreparations.get())
 
-                // Isolated AVD only. Restore the baseline even if a large-font assertion fails.
+                val beforePlayingReselect = capturePlaying(fixture)
+                activateSearchAndAssertEmpty(fixture, "10cc-playing-paged-root-reselect-keyboard")
+                assertPlayingTransition(beforePlayingReselect, fixture, "playing Search reselect resets only browsing")
+                assertEquals("Search reset must preserve exact upcoming occurrences", originalQueue, upcomingOccurrences())
+                dismissSearchImeAndAssertEmptyRoot()
+                search("Orbit")
+                assertSearchStartsAtFirstResult()
+
+                // A real narrow window, not a cropped screenshot or altered Compose density.
+                // Keep this viewport for font2 so combined narrow/large-font regressions surface.
+                sizeChanged = true
+                val narrowWidth = (320f * compose.activity.resources.displayMetrics.density).roundToInt()
+                val beforeNarrowWindow = capturePlaying(fixture)
+                shell("wm size ${narrowWidth}x${baselineDisplaySize.substringAfter('x')}")
+                compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == narrowWidth }
+                waitFor(hasTestTag("search-query"))
+                assertPlayingTransition(beforeNarrowWindow, fixture, "narrow-window configuration change")
+                assertSearchInThumbZone()
+                screenshot("10d-narrow-search-closed")
+                compose.onNodeWithTag("search-query").performClick()
+                waitForIme(true)
+                assertSearchInThumbZone(imeVisible = true)
+                screenshot("10e-narrow-search-keyboard")
+                pressBack()
+                waitForIme(false)
+                assertListeningChrome(editing = false)
+                val beforeNarrowRoots = capturePlaying(fixture)
+                compose.onNodeWithText("Home").performClick()
+                waitFor(hasText("Recently played"))
+                screenshot("10f-narrow-home")
+                compose.onNodeWithText("Playlists").performClick()
+                waitFor(hasText(UiFixtureServer.DERIVED_NAME))
+                screenshot("10g-narrow-playlists")
+                activateSearchAndAssertEmpty(fixture, "10h-narrow-reselect-keyboard")
+                dismissSearchImeAndAssertEmptyRoot()
+                search("Orbit")
+                assertSearchStartsAtFirstResult()
+                assertPlayingTransition(beforeNarrowRoots, fixture, "narrow root navigation and fresh Search")
+                assertEquals(originalQueue, upcomingOccurrences())
+
+                // Isolated AVD only. Restore both settings even if a font2 assertion fails.
                 fontChanged = true
                 val beforeFontScale = capturePlaying(fixture)
                 shell("settings put system font_scale 2.0")
@@ -341,13 +439,19 @@ class NativeUiSmokeTest {
                 waitFor(hasText("Recently played"))
                 assertPlayingTransition(beforeHomeTab, fixture, "large-font Home navigation")
                 screenshot("11-large-font-home")
+                val beforeLargePlaylistsTab = capturePlaying(fixture)
+                compose.onNodeWithText("Playlists").performClick()
+                waitFor(hasText(UiFixtureServer.DERIVED_NAME))
+                assertPlayingTransition(beforeLargePlaylistsTab, fixture, "font2 Playlists navigation")
+                screenshot("11b-font2-narrow-playlists")
                 val beforeLargeSearchTab = capturePlaying(fixture)
-                compose.onNodeWithText("Search").performClick()
-                waitFor(hasTestTag("search-query"))
-                assertPlayingTransition(beforeLargeSearchTab, fixture, "large-font Search navigation")
-                waitForIme(false)
+                activateSearchAndAssertEmpty(fixture, "12a-font2-narrow-empty-search-keyboard")
+                assertPlayingTransition(beforeLargeSearchTab, fixture, "font2 Search activation")
+                dismissSearchImeAndAssertEmptyRoot()
                 assertSearchInThumbZone()
-                waitUntilAbsent(hasContentDescription("Searching saved music"))
+                screenshot("12b-font2-narrow-empty-search-closed")
+                search("Orbit")
+                assertSearchStartsAtFirstResult()
                 assertCompactSearchRows()
                 assertCompactSearchFieldTargets()
                 assertCompactNavigationTargets()
@@ -357,7 +461,7 @@ class NativeUiSmokeTest {
                 waitForIme(true)
                 assertSearchInThumbZone(imeVisible = true)
                 assertCompactSearchFieldTargets()
-                screenshot("12c-font2-results-keyboard")
+                screenshot("12c-font2-narrow-results-keyboard")
                 pressBack()
                 waitForIme(false)
                 assertListeningChrome(editing = false)
@@ -385,15 +489,23 @@ class NativeUiSmokeTest {
                 runCatching { screenshot("99-failure") }
                 throw error
             } finally {
-                if (fontChanged) {
-                    try {
-                        if (originalFontSetting == "null") shell("settings delete system font_scale")
-                        else shell("settings put system font_scale $originalFontSetting")
-                        waitForFont(originalFontScale)
-                    } catch (restoreFailure: Throwable) {
-                        val primary = journeyFailure
-                        if (primary != null) primary.addSuppressed(restoreFailure) else throw restoreFailure
-                    }
+                // Attempt both restorations independently, including after a failed assertion.
+                var cleanupFailure: Throwable? = null
+                if (fontChanged) runCatching {
+                    if (originalFontSetting == "null") shell("settings delete system font_scale")
+                    else shell("settings put system font_scale $originalFontSetting")
+                    waitForFont(originalFontScale)
+                }.exceptionOrNull()?.let { cleanupFailure = it }
+                if (sizeChanged) runCatching {
+                    shell("wm size ${originalSizeOverride ?: "reset"}")
+                    compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
+                }.exceptionOrNull()?.let { error ->
+                    val first = cleanupFailure
+                    if (first == null) cleanupFailure = error else first.addSuppressed(error)
+                }
+                cleanupFailure?.let { error ->
+                    val primary = journeyFailure
+                    if (primary != null) primary.addSuppressed(error) else throw error
                 }
             }
         }
@@ -432,6 +544,51 @@ class NativeUiSmokeTest {
     }
     private fun queryText() = compose.onNodeWithTag("search-query").fetchSemanticsNode()
         .config[SemanticsProperties.EditableText].text
+
+    /** Drive the real navigation item, including reselect; never repair focus with a field tap. */
+    private fun activateSearchAndAssertEmpty(fixture: UiFixtureServer, evidenceName: String) {
+        val navigationSearch = hasText("Search") and hasAnyAncestor(hasTestTag("primary-navigation"))
+        waitFor(navigationSearch)
+        compose.onNode(navigationSearch).assertIsDisplayed()
+            .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
+        waitFor(hasTestTag("search-query"))
+        compose.waitUntil(10_000) { queryText().isEmpty() }
+        waitForIme(true) // The isolated software-IME AVD must provide actual keyboard evidence.
+        assertSearchInThumbZone(imeVisible = true)
+        assertCompactSearchFieldTargets()
+        assertEmptySearchRoot()
+        assertEquals("Search activation must never issue match-all requests", 0, fixture.emptyGlobalBrowseCalls.get())
+        screenshot(evidenceName)
+    }
+
+    private fun assertEmptySearchRoot() {
+        compose.onNodeWithTag("search-query").assertIsDisplayed().assert(hasSetTextAction())
+        assertEquals("Activation must clear accepted text and the visible local draft", "", queryText())
+        compose.onAllNodes(hasContentDescription("More actions for ", substring = true)).assertCountEquals(0)
+        compose.onAllNodes(hasText("See more ", substring = true)).assertCountEquals(0)
+        // This extraction retains baseline empty-Search prose; copy removal is feature 02.
+        compose.onNodeWithText("Start typing to search.", substring = true).assertIsDisplayed()
+        compose.onAllNodes(hasText("No music matches this search.")).assertCountEquals(0)
+        compose.onAllNodes(hasContentDescription("Searching saved music")).assertCountEquals(0)
+    }
+
+    private fun dismissSearchImeAndAssertEmptyRoot() {
+        pressBack()
+        waitForIme(false)
+        assertListeningChrome(editing = false)
+        // This single Back dismisses editing only. It must not pop back to a saved detail/Home.
+        assertEmptySearchRoot()
+    }
+
+    private fun assertSearchStartsAtFirstResult() {
+        waitUntilAbsent(hasContentDescription("Searching saved music"))
+        waitFor(catalogItem(UiFixtureServer.ARTIST_NAME))
+        val list = compose.onAllNodes(hasScrollToIndexAction()).onFirst()
+        val row = compose.onNode(catalogItem(UiFixtureServer.ARTIST_NAME)).assertIsDisplayed()
+        val paddingAllowance = 16f * compose.activity.resources.displayMetrics.density
+        assertTrue("Fresh Search must reset root scroll without a corrective test scroll",
+            kotlin.math.abs(row.fetchSemanticsNode().boundsInRoot.top - list.fetchSemanticsNode().boundsInRoot.top) <= paddingAllowance)
+    }
 
     private fun assertCompactSearchFieldTargets() {
         compose.onNodeWithTag("search-query").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
@@ -612,6 +769,32 @@ class NativeUiSmokeTest {
                 assertRetainedSearchPosition(anchorTop, anchor)
             } else assertNoAutoplayOnBrowse(fixture)
             screenshot("$evidencePrefix-search-$action-restored")
+        }
+        if (playing) {
+            // Expand with the actual software IME still visible. A pre-dismissed keyboard
+            // would not exercise the host's new focus/activation cancellation path.
+            val beforeExpansion = capturePlaying(fixture)
+            compose.onNodeWithTag("search-query").performClick()
+            waitForIme(true)
+            assertListeningChrome(editing = true)
+            screenshot("$evidencePrefix-before-player-expansion-keyboard")
+            compose.onNode(expandPlayer).performClick()
+            waitFor(playerSheet)
+            waitForIme(false)
+            assertPlayingTransition(beforeExpansion, fixture, "player expansion dismisses Search IME")
+            assertEquals(checkNotNull(expectedQueue), upcomingOccurrences())
+            screenshot("$evidencePrefix-player-expanded-from-keyboard")
+            collapsePlayer()
+            waitUntilAbsent(playerSheet)
+            waitForIme(false)
+            assertListeningChrome(editing = false)
+            assertEquals(query, queryText())
+            assertRetainedSearchPosition(anchorTop, anchor)
+            assertEquals(requests, fixture.searchCalls.size)
+            assertEquals(preparations, fixture.playbackPreparations.get())
+            assertEquals(expectedQueue, upcomingOccurrences())
+            assertPlayingTransition(beforeExpansion, fixture, "player collapse must not refocus Search")
+            screenshot("$evidencePrefix-search-after-player-collapse")
         }
         // Only after both restoration checks, scroll to prove the appended page itself survived.
         scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last()).assertIsDisplayed()
@@ -996,12 +1179,15 @@ class NativeUiSmokeTest {
         assertTrue("Every independent group must be bounded at ten", calls.all { it.limit == 10 })
         assertEquals(setOf("artists", "albums", "tracks"), calls.map { it.kind }.toSet())
     }
-    private fun waitForIme(visible: Boolean) {
-        compose.waitUntil(10_000) {
-            var actual = false
-            instrumentation.runOnMainSync { actual = compose.activity.window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true }
-            actual == visible
+    private fun isImeVisible(): Boolean {
+        var visible = false
+        instrumentation.runOnMainSync {
+            visible = compose.activity.window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
         }
+        return visible
+    }
+    private fun waitForIme(visible: Boolean) {
+        compose.waitUntil(10_000) { isImeVisible() == visible }
     }
     private fun waitForFont(scale: Float) {
         compose.waitUntil(20_000) {
@@ -1019,6 +1205,16 @@ class NativeUiSmokeTest {
         val bitmap = checkNotNull(instrumentation.uiAutomation.takeScreenshot()) { "Native screenshot unavailable" }
         try {
             File(evidence, "$name.png").outputStream().use { check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) }
+            // Record each actual render's dimensions/font/chrome, not just startup configuration.
+            // A captured image still requires human inspection; these are not visual pass labels.
+            val metrics = compose.activity.resources.displayMetrics
+            val chrome = listOf("app-actions", "primary-navigation", "search-dock", "search-query").joinToString("\n") { tag ->
+                val bounds = compose.onAllNodes(hasTestTag(tag)).fetchSemanticsNodes().singleOrNull()?.boundsInRoot
+                "$tag=${bounds ?: "absent"}"
+            }
+            File(evidence, "$name.txt").writeText("bitmap=${bitmap.width}x${bitmap.height}\n" +
+                "viewport=${metrics.widthPixels}x${metrics.heightPixels}\ndensity=${metrics.density}\n" +
+                "fontScale=${compose.activity.resources.configuration.fontScale}\nimeVisible=${isImeVisible()}\n$chrome\n")
         } finally { bitmap.recycle() }
     }
     private fun writeRunInfo() {
@@ -1028,7 +1224,7 @@ class NativeUiSmokeTest {
         val revision = InstrumentationRegistry.getArguments().getString("apkRevision") ?: "not supplied"
         File(evidence, "run-info.txt").writeText("device=${Build.MODEL}\nhardware=${Build.HARDWARE}\nro.kernel.qemu=1\napi=${Build.VERSION.SDK_INT}\n" +
             "viewport=${metrics.widthPixels}x${metrics.heightPixels}\ndensity=${metrics.density}\n" +
-            "fontScale=${context.resources.configuration.fontScale}\nlargeFontScale=2.0\n" +
+            "fontScale=${context.resources.configuration.fontScale}\nlargeFontScale=2.0\nnarrowWidthDp=320\n" +
             "apkRevision=$revision\npackage=${context.packageName}\nversionName=${pkg.versionName}\nlastUpdateTime=${pkg.lastUpdateTime}\n" +
             "data=synthetic on-device loopback fixture only\nscreenshotSource=UiAutomation.takeScreenshot\n" +
             "visualReview=required; screenshots are evidence, not automatic visual approval\n")
