@@ -103,7 +103,9 @@ class NativeUiSmokeTest {
                 compose.onNodeWithTag("search-query").assertIsDisplayed().assert(hasSetTextAction())
                 assertEquals("Empty Search must not request a match-all catalog", 0, fixture.searchCalls.size)
                 assertSearchInThumbZone()
+                assertCompactNavigationTargets()
                 screenshot("03-search-empty")
+                captureNarrowNavigation("03a-narrow-navigation")
                 compose.onNodeWithTag("search-query").performClick()
                 waitForIme(true)
                 assertSearchInThumbZone(imeVisible = true)
@@ -324,8 +326,8 @@ class NativeUiSmokeTest {
                 // Isolated AVD only. Restore the baseline even if a large-font assertion fails.
                 fontChanged = true
                 val beforeFontScale = capturePlaying(fixture)
-                shell("settings put system font_scale 1.3")
-                waitForFont(1.3f)
+                shell("settings put system font_scale 2.0")
+                waitForFont(2f)
                 assertPlayingTransition(beforeFontScale, fixture, "font-scale configuration change")
                 val beforeRecreation = capturePlaying(fixture)
                 compose.activityRule.scenario.recreate()
@@ -345,7 +347,9 @@ class NativeUiSmokeTest {
                 assertSearchInThumbZone()
                 waitUntilAbsent(hasContentDescription("Searching saved music"))
                 assertCompactSearchRows()
+                assertCompactNavigationTargets()
                 screenshot("12-large-font-search")
+                captureNarrowNavigation("12a-narrow-font2-navigation")
                 waitFor(expandPlayer)
                 val beforeLargePlayerExpand = capturePlaying(fixture)
                 compose.onNode(expandPlayer).performClick()
@@ -417,6 +421,46 @@ class NativeUiSmokeTest {
     }
     private fun queryText() = compose.onNodeWithTag("search-query").fetchSemanticsNode()
         .config[SemanticsProperties.EditableText].text
+
+    private fun captureNarrowNavigation(name: String) {
+        // This test owns only the isolated AVD. Restore any prior override even on failure.
+        val originalSize = shell("wm size").lineSequence()
+            .firstOrNull { it.startsWith("Override size:") }?.substringAfter(":")?.trim()
+        val originalWidthDp = compose.activity.resources.configuration.screenWidthDp
+        val metrics = compose.activity.resources.displayMetrics
+        val widthPixels = (280f * metrics.density).toInt()
+        val heightPixels = metrics.heightPixels
+        try {
+            shell("wm size ${widthPixels}x$heightPixels")
+            compose.waitUntil(10_000) { compose.activity.resources.configuration.screenWidthDp <= 282 }
+            waitFor(hasTestTag("primary-navigation"))
+            assertCompactNavigationTargets()
+            screenshot(name)
+        } finally {
+            shell("wm size ${originalSize ?: "reset"}")
+            compose.waitUntil(10_000) { compose.activity.resources.configuration.screenWidthDp == originalWidthDp }
+        }
+    }
+
+    private fun assertCompactNavigationTargets() {
+        assertListeningChrome(editing = false)
+        val targets = listOf("Home", "Search", "Playlists").map { label ->
+            compose.onNode(hasText(label) and hasAnyAncestor(hasTestTag("primary-navigation")))
+                .assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+                .getUnclippedBoundsInRoot()
+        }
+        targets.zipWithNext().forEach { (left, right) ->
+            assertTrue("Navigation destinations must not overlap", left.right <= right.left)
+        }
+        // Actual targets exclude the outer bar's legitimate system bottom inset.
+        // Large labels may grow instead of being clipped to the default budget.
+        if (compose.activity.resources.configuration.fontScale <= 1.01f) {
+            targets.forEach { bounds ->
+                assertTrue("Default navigation content must be compact, not clipped 80dp Material content",
+                    (bounds.bottom - bounds.top).value in 48f..60f)
+            }
+        }
+    }
 
     private fun assertListeningChrome(editing: Boolean) {
         listOf("primary-navigation", "app-actions").forEach { tag ->
@@ -949,7 +993,7 @@ class NativeUiSmokeTest {
         val revision = InstrumentationRegistry.getArguments().getString("apkRevision") ?: "not supplied"
         File(evidence, "run-info.txt").writeText("device=${Build.MODEL}\nhardware=${Build.HARDWARE}\nro.kernel.qemu=1\napi=${Build.VERSION.SDK_INT}\n" +
             "viewport=${metrics.widthPixels}x${metrics.heightPixels}\ndensity=${metrics.density}\n" +
-            "fontScale=${context.resources.configuration.fontScale}\nlargeFontScale=1.3\n" +
+            "fontScale=${context.resources.configuration.fontScale}\nlargeFontScale=2.0\n" +
             "apkRevision=$revision\npackage=${context.packageName}\nversionName=${pkg.versionName}\nlastUpdateTime=${pkg.lastUpdateTime}\n" +
             "data=synthetic on-device loopback fixture only\nscreenshotSource=UiAutomation.takeScreenshot\n" +
             "visualReview=required; screenshots are evidence, not automatic visual approval\n")

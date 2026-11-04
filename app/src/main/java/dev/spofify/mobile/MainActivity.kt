@@ -37,6 +37,8 @@ import dev.spofify.mobile.feature.player.NativeNowPlayingDialog
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
 import dev.spofify.mobile.ui.ListeningChrome
+import dev.spofify.mobile.ui.CompactNavigation
+import dev.spofify.mobile.ui.CompactNavigationItem
 import dev.spofify.mobile.ui.MusicActionsContent
 import dev.spofify.mobile.ui.hideListeningChrome
 import dev.spofify.mobile.ui.rememberSearchEditing
@@ -136,11 +138,11 @@ private fun SpofifyApp(model: LibraryViewModel) {
                 NativeMiniPlayer(player, model.playback, { expanded = true }, art, Modifier.fillMaxWidth())
             },
             navigation = {
-                NavigationBar(modifier = Modifier.testTag("primary-navigation"), containerColor = Background) {
+                CompactNavigation(modifier = Modifier.testTag("primary-navigation")) {
                     listOf(Tab.HOME to Icons.Default.Home, Tab.SEARCH to Icons.Default.Search,
                         Tab.PLAYLISTS to Icons.AutoMirrored.Filled.QueueMusic).forEach { (tab, icon) ->
-                        NavigationBarItem(selected = state.tab == tab, onClick = { model.switchTab(tab) },
-                            icon = { Icon(icon, null) }, label = { Text(tab.name.lowercase().replaceFirstChar { it.titlecase() }) })
+                        CompactNavigationItem(selected = state.tab == tab, onClick = { model.switchTab(tab) },
+                            icon = { Icon(icon, null) }, label = tab.name.lowercase().replaceFirstChar { it.titlecase() })
                     }
                 }
             },
