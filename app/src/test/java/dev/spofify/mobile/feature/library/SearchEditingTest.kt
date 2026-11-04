@@ -1,6 +1,7 @@
 package dev.spofify.mobile.feature.library
 
 import android.view.View
+import android.widget.Magnifier
 import androidx.activity.OnBackPressedDispatcher
 import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.material3.MaterialTheme
@@ -41,10 +42,21 @@ import org.junit.rules.TestWatcher
 import org.junit.runner.Description
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35])
+@Config(sdk = [35], shadows = [SearchEditingTest.NoSurfaceMagnifier::class])
 class SearchEditingTest {
+    // Robolectric has no magnifier Surface. Keep real touch/focus/IME/Back dispatch below,
+    // but stub only the unsupported popup rendering (native AVD validation still required).
+    @Implements(Magnifier::class)
+    class NoSurfaceMagnifier {
+        @Implementation protected fun show(sourceX: Float, sourceY: Float) = Unit
+        @Implementation protected fun show(sourceX: Float, sourceY: Float, windowX: Float, windowY: Float) = Unit
+        @Implementation protected fun dismiss() = Unit
+    }
+
     // Compose test clicks dispatch to the owner view, bypassing ViewRoot's touch-mode entry.
     // Set the window-session mode before the activity attaches; a later @Before is too late.
     @get:Rule(order = 0) val touchMode = object : TestWatcher() {

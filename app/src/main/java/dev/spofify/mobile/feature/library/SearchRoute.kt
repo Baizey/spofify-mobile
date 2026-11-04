@@ -7,6 +7,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -17,6 +18,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
@@ -33,6 +37,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -278,8 +283,9 @@ internal fun CatalogScreenContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
-    if (screen.item == null) Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth().testTag("search-dock")) {
-        Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+    if (screen.item == null) Surface(color = MaterialTheme.colorScheme.background,
+        modifier = Modifier.fillMaxWidth().testTag("search-dock")) {
+        Box(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
             CommittedSearchField(screen.query, holder::setComposing,
                 onSearchEditingChanged = onSearchEditingChanged, commit = holder::commitQuery)
         }
@@ -330,19 +336,42 @@ internal fun CommittedSearchField(
             // never ordinary Tab/arrow traversal, while the query is the active descendant.
             onExit = { if (requestedFocusDirection == FocusDirection.Exit && editing) endEditing() }
         }.focusTarget()) {
-    OutlinedTextField(value = field, onValueChange = { next ->
+    val colors = MaterialTheme.colorScheme
+    BasicTextField(value = field, onValueChange = { next ->
         if (next.text.codePointCount(0, next.text.length) <= 200) {
             field = next
             if (next.composition == null) commit(next.text, next.text.isEmpty())
             compositionChanged(next.composition != null)
         }
-    }, singleLine = true, placeholder = { Text("Search your music") }, shape = MaterialTheme.shapes.extraLarge,
-        leadingIcon = { Icon(Icons.Default.Search, null) },
-        trailingIcon = { if (field.text.isNotEmpty()) IconButton(onClick = { field = TextFieldValue(""); commit("", true); compositionChanged(false) }) { Icon(Icons.Default.Close, "Clear search") } },
+    }, singleLine = true,
+        textStyle = MaterialTheme.typography.bodyLarge.copy(color = colors.onBackground),
+        cursorBrush = SolidColor(colors.primary),
+        decorationBox = { input ->
+            Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                .drawBehind {
+                    // A quiet baseline at rest and a clear mint focus cue; no raised tonal fill.
+                    val thickness = (if (editing) 2.dp else 1.dp).toPx()
+                    drawLine(if (editing) colors.primary else colors.outlineVariant,
+                        Offset(0f, size.height - thickness / 2), Offset(size.width, size.height - thickness / 2), thickness)
+                }, verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Search, null, tint = colors.onSurfaceVariant)
+                }
+                Box(Modifier.weight(1f).padding(vertical = 8.dp)) {
+                    if (field.text.isEmpty()) Text("Search your music", style = MaterialTheme.typography.bodyLarge,
+                        color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    input()
+                }
+                if (field.text.isNotEmpty()) IconButton(onClick = {
+                    field = TextFieldValue(""); commit("", true); compositionChanged(false)
+                }, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.Close, "Clear search", tint = colors.onBackground) }
+                else Spacer(Modifier.width(48.dp))
+            }
+        },
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
         keyboardActions = KeyboardActions(onSearch = {
             commit(field.text, true); compositionChanged(false); endEditing(); keyboard?.hide()
-        }), modifier = Modifier.fillMaxWidth().testTag("search-query")
+        }), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("search-query")
             .onFocusChanged { state ->
                 if (editing != state.isFocused) {
                     editing = state.isFocused

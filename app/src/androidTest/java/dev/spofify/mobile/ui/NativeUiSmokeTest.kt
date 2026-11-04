@@ -103,12 +103,14 @@ class NativeUiSmokeTest {
                 compose.onNodeWithTag("search-query").assertIsDisplayed().assert(hasSetTextAction())
                 assertEquals("Empty Search must not request a match-all catalog", 0, fixture.searchCalls.size)
                 assertSearchInThumbZone()
+                assertCompactSearchFieldTargets()
                 assertCompactNavigationTargets()
                 screenshot("03-search-empty")
                 captureNarrowNavigation("03a-narrow-navigation")
                 compose.onNodeWithTag("search-query").performClick()
                 waitForIme(true)
                 assertSearchInThumbZone(imeVisible = true)
+                assertCompactSearchFieldTargets()
                 screenshot("04-search-keyboard")
                 pressBack()
                 waitForIme(false)
@@ -347,9 +349,18 @@ class NativeUiSmokeTest {
                 assertSearchInThumbZone()
                 waitUntilAbsent(hasContentDescription("Searching saved music"))
                 assertCompactSearchRows()
+                assertCompactSearchFieldTargets()
                 assertCompactNavigationTargets()
                 screenshot("12-large-font-search")
                 captureNarrowNavigation("12a-narrow-font2-navigation")
+                compose.onNodeWithTag("search-query").performClick()
+                waitForIme(true)
+                assertSearchInThumbZone(imeVisible = true)
+                assertCompactSearchFieldTargets()
+                screenshot("12c-font2-results-keyboard")
+                pressBack()
+                waitForIme(false)
+                assertListeningChrome(editing = false)
                 waitFor(expandPlayer)
                 val beforeLargePlayerExpand = capturePlaying(fixture)
                 compose.onNode(expandPlayer).performClick()
@@ -422,6 +433,21 @@ class NativeUiSmokeTest {
     private fun queryText() = compose.onNodeWithTag("search-query").fetchSemanticsNode()
         .config[SemanticsProperties.EditableText].text
 
+    private fun assertCompactSearchFieldTargets() {
+        compose.onNodeWithTag("search-query").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        compose.onAllNodes(hasContentDescription("Clear search")).fetchSemanticsNodes().singleOrNull()?.let {
+            compose.onNodeWithContentDescription("Clear search").assertIsDisplayed()
+                .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+        }
+        // The Search-only slice must work with the baseline Material navigation bar.
+        // Font2 is allowed to grow naturally instead of being clipped to the default budget.
+        if (compose.activity.resources.configuration.fontScale <= 1.01f) {
+            val dock = compose.onNodeWithTag("search-dock").getUnclippedBoundsInRoot()
+            assertTrue("Default Search dock must use the compact approximately 56dp budget",
+                (dock.bottom - dock.top).value in 48f..60f)
+        }
+    }
+
     private fun captureNarrowNavigation(name: String) {
         // This test owns only the isolated AVD. Restore any prior override even on failure.
         val originalSize = shell("wm size").lineSequence()
@@ -435,7 +461,16 @@ class NativeUiSmokeTest {
             compose.waitUntil(10_000) { compose.activity.resources.configuration.screenWidthDp <= 282 }
             waitFor(hasTestTag("primary-navigation"))
             assertCompactNavigationTargets()
+            assertCompactSearchFieldTargets()
             screenshot(name)
+            compose.onNodeWithTag("search-query").performClick()
+            waitForIme(true)
+            assertSearchInThumbZone(imeVisible = true)
+            assertCompactSearchFieldTargets()
+            screenshot("$name-keyboard")
+            pressBack()
+            waitForIme(false)
+            assertListeningChrome(editing = false)
         } finally {
             shell("wm size ${originalSize ?: "reset"}")
             compose.waitUntil(10_000) { compose.activity.resources.configuration.screenWidthDp == originalWidthDp }
