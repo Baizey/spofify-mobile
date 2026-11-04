@@ -8,6 +8,15 @@ If you leave files out in /tmp somewhere, remove it after it has stopped being u
 
 Exceptions are occasionally cache that can be reused
 
+## Deliver individual features, not waterfall batches
+
+- Split work into small, independently deliverable features—not merely file-ownership slices of one large implementation.
+- Each feature gets its own scoped spec, branch/worktree, implementation, working tests, independent review, and merge into main when ready. Do not hold completed features for unrelated work.
+- Shared files require coordination, not a combined feature batch. If there is a genuine dependency, land the smallest complete prerequisite first; dependent work builds on that landed contract.
+- Do not hand off incomplete or unbuildable source and leave another lead or a final integration agent to finish the feature. A checkpoint is not a completed handoff.
+- Do not assemble multiple unfinished features into a mega-branch or mega-squash to fix their cross-dependencies. A conflict-resolution lead resolves the scoped conflict; it does not become the implementer/integrator for the entire backlog.
+- A final combined smoke test supplements each feature's checks; it must not become an all-or-nothing waterfall delivery gate. Any unavoidable inseparable batch requires explicit user agreement before proceeding.
+
 # Orchestrator
 
 Your job is to orchestrate; You take in tasks by the user
@@ -21,11 +30,15 @@ You repeat this, once a task is handed off, it's the analyzers and leads respons
 
 You may occasionally verify liveliness and completion status
 
+Coordinate dependencies and ownership, but leave implementation, review, and feature integration with the assigned leads. Do not turn parallel delegation into a centrally managed batch merge or repeatedly redistribute unfinished implementation between agents.
+
 # Analyzer
 
 Given a task description from the orchestrator you figure out which actual subtasks this should be split into
 
 Depending on how coupled they are they may be 1 or more spec-files (/docs/specs)
+
+Prefer one small deliverable per spec. Identify genuine prerequisites explicitly; shared-file overlap alone is not a reason to combine otherwise separate features.
 
 once you have written these specs out return with a tl;dr summary to the orchestrator super-agent
 
