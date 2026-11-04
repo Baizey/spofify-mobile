@@ -3,7 +3,7 @@
 ## Tracking
 
 - ID: FEAT-000
-- Status: in-progress
+- Status: done
 - Phase: implementation
 - Spec readiness: ready
 - Owner: foundation-lead
@@ -12,7 +12,7 @@
 - Depends on: none
 - Discovery depends on: none
 - Touchpoints: docs/specs/**, scripts/specs.py, scripts/test_specs.py, AGENTS.md, README.md, docs/worktree-review.md, docs/testing.md lease guidance, .gitignore Python caches, .github/workflows/android.yml existing-CI stdlib board gate
-- Next action: gate and independently review exact candidate; self-squash under main lease; post-check and separately review verified completion record
+- Next action: none for foundation publication; assign FEAT-001–003 discovery and keep native completion gates explicit
 
 ## User problem and outcomes
 
@@ -53,4 +53,10 @@ The user requests a small repository-owned spec/task system **before new feature
 
 ## Evidence and delivery log
 
-Assignment/base: `4183ed3ba98d4cea77c116ca9311c7eb2696fe20`, dedicated branch/worktree above. Required mobile guidance and sibling backend docs/specs README, template, FEAT-000 plus scripts/specs.py and test_specs.py were read in full (paginated tool/test reads). Tool/tests adapted without backend modification or execution. Candidate not yet reviewed/integrated: deliberately not done. Exact review/test/candidate/main evidence will be archived outside this worktree; a separately reviewed follow-up can record actual verified completion without self-referential SHA claims.
+Assignment/base: `4183ed3ba98d4cea77c116ca9311c7eb2696fe20`, dedicated branch/worktree above (historical provenance; not an existence check). Required mobile guidance and sibling backend docs/specs README, template, FEAT-000 plus scripts/specs.py and test_specs.py were read in full (paginated tool/test reads). Tool/tests adapted without backend modification or execution. Earlier candidates deliberately remained in-progress until actual reviewed integration and verification.
+
+Verified foundation candidate `e31b4c16dfb132d1259e0aa3eff5bcc43c2d3f01` received CLEAN independent read-only review from `subagent-86360dd1-0084-4ed1-9a6e-7376071b6e2a` against the assignment base. The complete review included the minimal existing-CI step and latest initial-only/single-sheet FEAT-002 clarification. Reviewer passed CLI/text/JSON/outside-cwd and whitespace checks; its full unittest attempt encountered three harness-denied temp-directory creations, so no complete independent test-run pass is claimed. The lead's full 26-test suite passed before integration and again on main.
+
+Standing assigned-scope authority was exercised under exclusive `/var/home/lsm/repos/spofify-mobile/.git/spofify-main.lock`, continuously covering destination/base/clean-tree/index/candidate/reviewer/scope fences, squash staged diff, commit and verification. The entire staged patch was byte-identical to the reviewed base-to-candidate delta. Main squash **`4d1dd866801fee7bf838aece4cd8d282ed4a3431`** has the exact candidate tree. Post-integration `python3 -m unittest discover -s scripts -p 'test_specs.py' -v` passed **26 tests**; `board`, `ready`, `check` in text and JSON, outside-cwd invocation, `git diff --check` and clean-tree checks passed. The ready list is only FEAT-001–003 discovery; no new feature implementation is claimed. No Gradle/AVD/network/backend execution was needed or performed.
+
+Tests, review record, exact candidate/staged patches, integration/post-check logs and recovery/accounting artifacts are preserved outside the lead worktree at `/var/home/lsm/repos/spofify-mobile/.tooling/feature-board-foundation/20261104/`. This separately reviewed completion follow-up records the already integrated/verified foundation, not a fictional approval or landing SHA for itself. Final follow-up review/landing and non-forced worktree/ref cleanup are recorded in that external evidence after they actually occur. Application native AFTER/audio/background remains **BLOCKED / NOT COMPLETE** under BUG-001; foundation completion does not close it or any future feature.
