@@ -1,3 +1,5 @@
+READ AGENT_BEHAVIOUR.md according to your role(s)
+
 # Spofify Mobile
 
 Native Android only: Kotlin, Jetpack Compose, Media3. No WebView, Node, Expo or management UI.
@@ -11,20 +13,6 @@ Native Android only: Kotlin, Jetpack Compose, Media3. No WebView, Node, Expo or 
 - Track assigned contracts and evidence in the repository-owned [feature board](docs/specs/README.md): `python3 scripts/specs.py board|ready|check` (choose one command). Python is development tooling only; app code stays Kotlin/Compose/Media3. Board metadata is not a lock or automatic assignment.
 - Run the automated gate in [docs/testing.md](docs/testing.md) with the API 37.0 compile platform under the separate exclusive Gradle advisory lease. Assigned leads may acquire it themselves for their own worktree outputs. Independently review the exact candidate commit before integration; automated/source checks do not waive native validation.
 - Use the bundled **JetBrains Mono** family through central `AppTypography`; preserve the type hierarchy and Android Unicode/emoji fallback. Ship its full license in the APK and keep the offline notice accessible.
-
-## Changes and commits
-
-- Make focused, meaningful commits after coherent work and relevant checks; committing is part of the agent’s responsibility, not a user cleanup task. Report commit hashes and validation state. A checkpoint commit does not waive the native visual gate.
-- Each implementation lead works in an actual dedicated Git worktree and topic branch, with its own index and build outputs—not file assignments inside one shared checkout. Preserve dirty work in an agreed scoped checkpoint before migration; never lose or replay already-captured concurrent work. Leads own focused commits in their assigned scope.
-- Finished work must land in **main**; a temporary integration branch is optional, not the destination. [docs/worktree-review.md](docs/worktree-review.md) grants assigned leads **standing conditional self-integration authority for assigned scope only**, without an individual parent roundtrip: independent read-only exact-SHA review, correction/re-review, scoped gates and a continuously held exclusive main advisory lease across destination path/branch/expected-HEAD/clean-tree/index fences, exact candidate/review/scope checks, full squash staged-diff inspection and commit. Not self-approval or parallel merging. If main moved from the reviewed base, release, normal-merge current main in the own topic branch, resolve only owned scoped conflicts, re-gate and re-review the new exact SHA, then retry. Never fix/reset/stash/revert/restore in main; stop on unknown/uncoordinated writers or unexpected dirt/index changes.
-- Separate OS advisory leases are `spofify-main.lock` and `spofify-gradle.lock` under the **absolute Git common directory**, held with `flock`; never delete/replace lock files. Locks are cooperative, not protection from nonparticipating writers. Assigned leads may acquire the Gradle lease for the absolute shared `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle`, own-worktree outputs and `--offline --no-daemon`; no overlapping builds. Own-worktree builds hold BUILD only, releasing before MAIN; root/main Gradle holds MAIN then BUILD to freeze source, never build→main. The parent/coordinator owns combined validation accounting. After post-checks, preserve tests/reviews/candidate/recovery bundles outside the worktree and verify source/patch accounting before non-forced removal and expected-tip topic deletion. Do not mark unintegrated candidates done. No push/deploy.
-- Preserve existing/concurrent commits and staged work. Never reset, revert, stash, restore snapshots or rewrite/amend external work. No history rewriting.
-
-## Temporary storage and cleanup — every agent
-
-- Follow [storage hygiene](docs/storage-hygiene.md) before artifact-heavy work. Check `/tmp` and output bytes/inodes/quota separately; home-disk free space does not prove temporary quota headroom. Stop on EDQUOT/ENOSPC rather than retrying or flooding logs.
-- Own a bounded per-run scratch directory and verify the actual test JVM temporary location; `TMPDIR` alone is insufficient for Java/Robolectric. Clean verified disposable scratch after processes stop, including failure/cancellation and crashed descendants, while preserving required source/review/test evidence. Never blanket-delete `/tmp`, another lane's files or active runtimes.
-- Explicitly pass this policy to every subagent and require it to read the repo guidance; ambient files are not automatically loaded by Pi.lot children. Every handoff reports generated paths, cleanup performed, retained evidence and unresolved cleanup. The coordinator verifies all lanes.
 
 ## Mobile product and interaction rules
 
