@@ -7,6 +7,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check repository feature contracts
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_specs.py' -v
+          python3 scripts/specs.py check
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

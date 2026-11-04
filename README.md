@@ -16,6 +16,10 @@ A native **Android** listener for your own [spofify-go](../spofify-go) server. K
 
 **This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory; the current environment's emulator crashes before app launch, so **UI validation is blocked / not complete**. The supplied screenshot was inspected as a before-only baseline; no after-render is approved. See [docs/ui-validation.md](docs/ui-validation.md) and [docs/testing.md](docs/testing.md). No live backend was changed or exercised.
 
+## Feature contracts and task board
+
+The repository-owned [mobile feature board](docs/specs/README.md) records discovery, implementation, ownership, dependencies and evidence. It is not a hosted system, automated claim mechanism or lock. `python3 scripts/specs.py board` shows the inventory; `ready` lists eligible todo work and `check` validates metadata (each supports `--json`). Python is standard-library-only development tooling, not an Android runtime dependency. New UI contracts remain drafts until assigned/reviewed; blocked native validation is not a blanket source-work dependency. Assigned leads follow [exact-SHA review and leased self-integration](docs/worktree-review.md), never self-approval or parallel main writes.
+
 ## Run
 
 Open this directory in Android Studio and install the **Android API 37.0 compile platform** (`platforms;android-37.0`). Minimum Android remains **8.0 / API 26** and target SDK remains **36**. The Gradle wrapper is pinned; local validation used JDK 25 and CI uses JDK 21.
@@ -33,7 +37,7 @@ Agents must not target real phones, personal AVDs or live accounts. The runner d
 
 Depending on AGP, the debug APK is under `app/build/outputs/apk/debug/` or `app/build/intermediates/apk/debug/`; the runner locates the actual artifact. Debug builds are not store releases; no release signing key is included.
 
-On this machine, ignored SDK and Gradle tooling live under `.tooling/`. Prefix the Gradle command with `GRADLE_USER_HOME="$PWD/.tooling/gradle"` to reuse that cache.
+On this machine, ignored SDK and Gradle tooling live under `.tooling/`. Agents use the absolute shared `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle` with own-worktree outputs, `--offline --no-daemon` and the separate exclusive Gradle advisory lease described in [docs/worktree-review.md](docs/worktree-review.md); do not overlap builds.
 
 ## Connect your server
 

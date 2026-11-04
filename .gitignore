@@ -7,3 +7,5 @@ local.properties
 .tooling/
 *.jks
 *.keystore
+__pycache__/
+*.py[cod]

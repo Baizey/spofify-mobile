@@ -1,10 +1,10 @@
 # Validation
 
-Read [mobile-ux.md](mobile-ux.md) and [ui-validation.md](ui-validation.md) before changing a screen. Follow [worktree-review.md](worktree-review.md) for dedicated worktrees, exact-SHA review, serialized shared-cache builds, explicitly granted lead-owned squash landing in **main**, and evidence-preserving cleanup after scoped/combined validation. Temporary integration branches are optional, not the final destination. **Automated checks and rendered native validation are separate gates.**
+Read [mobile-ux.md](mobile-ux.md) and [ui-validation.md](ui-validation.md) before changing a screen. Follow [worktree-review.md](worktree-review.md) for dedicated worktrees, exact-SHA review, separate advisory-locked shared-cache builds, standing conditional assigned-scope self-integration in **main**, and evidence-preserving cleanup after scoped/combined validation. Temporary integration branches are optional, not the final destination. **Automated checks and rendered native validation are separate gates.**
 
 ## Automated gate
 
-Use the provisioned API 37.0 compile platform via the worktree's local SDK configuration; minimum Android remains API 26 and target SDK remains 36. Request and wait for a parent-granted shared-cache build slot, then run from your own worktree:
+Use the provisioned API 37.0 compile platform via the worktree's local SDK configuration; minimum Android remains API 26 and target SDK remains 36. Assigned leads may acquire the exclusive `spofify-gradle.lock` advisory lease under the absolute Git common directory themselves (see worktree policy), verify no uncoordinated build is active, then run from their own worktree while continuously holding it:
 
 ```sh
 GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
@@ -12,7 +12,7 @@ GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
     :app:assembleDebugAndroidTest :app:lintDebug --offline --no-daemon --console=plain
 ```
 
-The absolute cache above is shared and its use must be serialized; indexes and build outputs remain worktree-local. Release the build slot after reporting results. CI uses JDK 21; local validation uses JDK 25. APK paths can be under `outputs/` or `intermediates/`, depending on AGP; the native runner finds the actual artifacts.
+The absolute cache above is shared and its use must be serialized; indexes and build outputs remain worktree-local. Release the build lease after recording results; no overlapping builds. This lease is separate from `spofify-main.lock` and does not authorize main writes. Own-worktree builds hold **BUILD only** and release it before attempting MAIN. Root/main post-integration Gradle acquires **MAIN then BUILD**, holds both to freeze main source throughout compilation and releases BUILD before MAIN. Never acquire build→main or overlap integration with root compilation. CI uses JDK 21; local validation uses JDK 25. APK paths can be under `outputs/` or `intermediates/`, depending on AGP; the native runner finds the actual artifacts.
 
 Core tests use MockWebServer, never the live backend or real accounts. Existing synthetic in-process/loopback unit fixtures remain allowed in approved test runs despite the native diagnostic stop; this grants no new external network permissions or network-diagnosis attempts. They cover exact origins/IP policy, opaque IDs, authentication/CSRF, cookies, redirect refusal, one-shot writes, session-generation races, cancellation, transport bounds, catalog paging/revisions and personal/derived collections.
 
@@ -22,13 +22,13 @@ A historical full gate passed **99 core + 156 app tests** (not validation of the
 
 ## Required native AVD gate
 
-Currently blocked: do not run native/device commands until explicitly authorized; see the status below. After the approved automated build above, a future authorized native run reuses those exact APKs (verify their recorded hashes):
+Currently blocked: do not run native/device commands until explicitly authorized; see the status below. After the leased automated build above, a future authorized native run reuses those exact APKs (verify their recorded hashes):
 
 ```sh
 tools/ui/validate-native.sh --skip-build
 ```
 
-The runner's default build does not supply `--offline`, so do not use it to bypass the explicit build slot and offline gate. The runner uses a dedicated synthetic AVD, disabled ADB mDNS/wireless discovery and USB transports, an explicitly selected loopback emulator transport, and a fixture server inside the emulator. Its native test also rejects a non-emulator before Activity launch or test writes. Agents must not target real phones, personal AVDs or live accounts. Do not use an unqualified `adb install` or arbitrary-device `connectedAndroidTest`.
+The runner's default build does not supply `--offline`, so do not use it to bypass the exclusive build lease and offline gate. The runner uses a dedicated synthetic AVD, disabled ADB mDNS/wireless discovery and USB transports, an explicitly selected loopback emulator transport, and a fixture server inside the emulator. Its native test also rejects a non-emulator before Activity launch or test writes. Agents must not target real phones, personal AVDs or live accounts. Do not use an unqualified `adb install` or arbitrary-device `connectedAndroidTest`.
 
 **Open and actually inspect screenshots**, exercise the changed flows, fix regressions, and recapture. Passing instrumentation without image review is not visual approval. Record the APK hash/revision, image/API/viewport, font scale, actions, image paths, findings and reviewer. Compare before/after when a baseline exists and answer the [mobile rendered-review checklist](mobile-ux.md#rendered-review-questions--answer-with-evidence-not-source-assertions). An independent reviewer inspects affected screenshots; fix non-nit findings and re-review until clean.
 

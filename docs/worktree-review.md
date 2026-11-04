@@ -1,66 +1,70 @@
-# Isolated worktrees, exact-SHA review and squash integration
+# Isolated worktrees, exact-SHA review and leased self-integration
 
-**Finished work must land in `main`.** Temporary integration branches are optional staging only, never the final destination. Each implementation lead must use an **actual dedicated Git worktree and topic branch**, not a shared checkout with file assignments. Read `AGENTS.md` and the local `.tooling/lead-handoff.md` first. Verify `pwd`, `git branch --show-current`, `git rev-parse HEAD` and `git status --short`; record the starting base SHA and assigned paths. Work only in that scope. Coordinate shared interfaces before changing them.
+**Finished work must land in `main`.** Each assigned lead uses an actual dedicated Git worktree/topic branch, its own index and outputs. Temporary integration branches are not the destination. Read `AGENTS.md`, relevant [specs](specs/README.md) and any local handoff. Verify absolute worktree, branch, HEAD and `git status --short`; record base SHA and assigned paths. Board metadata records coordination; it is not a lock or permission to edit another scope.
 
-## Preserve work before migration
+## Standing conditional authority — assigned scope only
 
-Freeze old shared-checkout writers. Inventory existing commits, dirty paths and staged changes without modifying them. The owner must preserve agreed dirty work in scoped checkpoint commit(s) on a migration branch before creating or moving worktrees. Do not sweep another lane's changes into a checkpoint. Record which deltas belong to which lane and apply each only once. Already-captured external commits remain intact; do not replay their content as new work.
+The user grants assigned leads **standing conditional self-integration authority** for their assigned scope, and separate shared-cache build-lease acquisition. A lead need not return for an individual parent integration/build grant once all conditions below are met. This supersedes the previous manual parent-slot roundtrip, **not** independent review or serialized access. Assignment is not broad write permission, self-approval, permission for parallel main writes, push/deployment or history rewriting. An unassigned helper/reviewer has no integration authority.
 
-Each worktree has its own index, source checkout and build outputs. Do not share or redirect `app/build`, `core/build`, root `build` or other generated output directories across worktrees. Point each untracked `local.properties` at the provisioned shared SDK; do not modify the SDK or sibling checkout configuration. Leads make focused commits on their own branches without a centralized Git writer. Never reset, revert, stash, restore snapshots or rewrite external commits/staged work. No history rewriting, unauthorized main writes or push. Main squash writes require the explicit slot below.
+Stop on an unknown/uncoordinated writer, dirty destination, unexpected branch/index/source changes or failed checks. Advisory locks are cooperative: they cannot prevent nonparticipants, IDE/background processes, another clone using a different common directory, or preexisting commands ignoring the lease. Establish that no such writer is active before proceeding; never assume an unlocked file proves safety. The earlier manual slot 12 has finished; there is no inherited slot or background build authority. Check the actual current state on every attempt.
 
-## Independent exact-commit review
+## Preserve isolated work
 
-1. Run appropriate scoped checks, including `git diff --check`, and commit only assigned paths. Record the full candidate SHA and base SHA. A checkpoint/source commit is not native acceptance.
-2. Obtain a **fresh independent, read-only reviewer** for that exact candidate SHA. Supply the base, scope, requirements, check results and evidence/blockers. Review committed content/diff, not an uncommitted moving tree. The reviewer must not edit source, stage files or commit. UI reviews must also inspect relevant actual renders; a before-only image or Robolectric render is not AVD approval.
-3. Fix non-nit findings in a new scoped commit, yielding a new candidate SHA, then obtain re-review of that SHA. Repeat until the source/documentation review is clean. Never transfer approval from an older SHA to corrected content.
-4. Report reviewer job/identity, reviewed full SHA, findings and disposition. A clean source review can be ready for integration while native validation remains explicitly blocked; it does not mean visual completion.
+Inventory commits/dirty/staged/untracked/needed ignored evidence before migration/reassignment. Owners preserve agreed dirty work in scoped checkpoints; never sweep another lane into a commit, lose changes or replay already-captured deltas. Outputs (`app/build`, `core/build`, root build) stay worktree-local. Do not modify shared SDK or sibling checkout configuration. Never reset/revert/stash/restore snapshots, rewrite/amend external work or force cleanup. Do not make source fixes in main.
 
-## Shared-cache build slots are separate
+## Independent exact-SHA review
 
-Do not start Gradle until the parent explicitly grants a serialized shared-cache build slot for the requested worktree, candidate and tasks. One active slot at a time; report completion and release before another lane starts. A source assignment, review pass or integration slot does not grant a build slot.
+1. Run scoped checks and `git diff --check`; commit only assigned paths. Record full candidate and validated main-base SHAs, scope and evidence. A source checkpoint is not native acceptance.
+2. Obtain a fresh independent **read-only** review of that exact committed candidate against that base. Provide requirements, tests and blockers. Reviewer inspects committed diff/source and relevant real renders; no edits/staging/commits. Before-only screenshots or source/Robolectric results are not native after-render approval.
+3. Fix non-nit findings in a new scoped commit, run gates, and re-review the new full SHA until clean. Approval never transfers to changed content or a new base. Record reviewer identity, exact SHA, findings and disposition outside the frozen candidate if necessary to avoid self-reference.
+4. Clean source review may permit landing with explicitly blocked native gates, but never claiming rendered/audio/background completion. Feature done requires actual applicable completion evidence.
 
-Run from the lead's own worktree, with its own outputs and the provisioned SDK:
+## Two separate OS advisory leases
+
+`flock` is installed. Resolve the **absolute shared Git common directory**, not a per-worktree gitdir or cwd-relative `.git`. Every participating writer uses these same two persistent lock paths; never unlink/replace lock files (that creates split locks). Locks release with process/descriptor lifetime, including crashes; lock-file existence is not ownership.
 
 ```sh
-GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
-  ./gradlew <approved-tasks> --offline --no-daemon --console=plain
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
+# Run each lease in one shell so its descriptor remains open throughout work.
+(
+  flock -x 9
+  # Main fences, exact-candidate checks, squash inspection and commit HERE.
+) 9>"$COMMON/spofify-main.lock"
+# Separate shell/lease for Gradle, not inside the main lease:
+(
+  flock -x 8
+  GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
+    ./gradlew <assigned-tasks> --offline --no-daemon --console=plain
+) 8>"$COMMON/spofify-gradle.lock"
 ```
 
-Record actual commands, SHA, results and failures; never infer a pass from an older checkpoint or historical test count. The parent owns the combined test/build/lint and native smoke gate after integration. See [testing.md](testing.md) for tasks and [ui-validation.md](ui-validation.md) for native requirements. Do not run a native runner that implicitly builds without an applicable build slot.
+Use finite/nonblocking acquisition if coordination is uncertain; stop/report rather than waiting blindly. No overlapping Gradle builds, including implicitly building native runners. Assigned leads may acquire the build lease themselves, only for own-worktree outputs and the absolute cache above. **Lock order is mandatory:** own-worktree Gradle holds **only BUILD**, releases it before attempting MAIN, and never waits for MAIN while holding BUILD. Root/main post-integration Gradle must freeze main source by acquiring **MAIN first, then BUILD**, hold both throughout the build and release BUILD before MAIN. Never acquire build→main; that can deadlock against main→build and lets compilation read changing main source. Keep main's tree/index/source fenced and unchanged during root validation; no parallel integration. Record command/candidate/results and release; parent/coordinator still owns combined validation accounting. No build is required for pure board/docs foundation changes. See [testing.md](testing.md).
 
-## Request, then execute a serialized main squash slot
+## Main lease: continuously fenced squash transaction
 
-The parent serializes **all writes to the shared destination checkout**; only the explicitly granted lead performs its squash. Request a **MAIN squash slot** only after scoped source/review gates are ready, supplying:
+Destination is `/var/home/lsm/repos/spofify-mobile`, branch `main`. Before acquiring, identify the reviewed candidate, **main base validated and reviewed**, scope, checks and independent review identity. Hold exclusive `spofify-main.lock` **continuously from before all destination fences through squash staged inspection, commit and immediate verification**. A brief lock around commit alone is unsafe.
 
-- Lead worktree/topic branch; full candidate and starting base SHAs.
-- Exact changed paths and a short purpose; scoped tests/checks with results.
-- Independent reviewer job/identity and exact reviewed SHA; unresolved findings, if any.
-- Remaining blockers, especially native AVD evidence not complete.
+1. Verify destination's exact absolute path, `main` branch, full HEAD equal the validated/reviewed expected base, and completely clean tree/index (`git status --porcelain --untracked-files=all`). Check for unknown writers. Unexpected dirt/branch/index: stop without cleanup. If main has moved, do **not** squash the stale candidate.
+2. On moved main, release the lease. In the lead's **own** topic worktree normally merge current main (no rebase/history rewriting). Resolve only owned scoped conflicts; stop/escalate other conflicts. Re-run appropriate gates and obtain independent exact-SHA review of the new candidate against the new base; then reacquire and repeat all fences. Never fix/merge source into main to catch up.
+3. Verify topic ref still equals the exact reviewed candidate and review approves that SHA/base/scope; inspect full `git diff <base>..<candidate>` and changed paths. Check dependency/interface tips and account already-landed content. Failures, changed source or unresolved findings stop integration. Review records cannot be replaced by a board status.
+4. Run `git merge --squash <exact-candidate>`. Inspect **the entire staged diff**, path list and `git diff --cached --check`; compare to the approved base-to-candidate delta. No unrelated changes or ad-hoc conflict resolution. Unexpected/conflicted stage: stop/report, preserve state and freeze other writers; no reset/stash/revert/restore in main.
+5. Commit one focused squash identifying full candidate, base and reviewer identity/reviewed SHA. Verify resulting source/patch accounting, intended paths, commit and clean tree/index while still leased. Record full main SHA and release. Do not label unintegrated work done in anticipation of this step.
+6. Run post-integration scoped checks on main; report combined/native gates honestly. If root Gradle is required, retain/reacquire MAIN and then acquire BUILD in that order so main source stays frozen throughout; own-worktree builds use BUILD only and release before integration. If post-checks require fixes, return to the owning topic branch for new checks/review/leased landing. No fixes in main. A separately reviewed scoped follow-up may record verified done metadata after initial integration, avoiding self-referential SHA fiction.
 
-Wait for the parent to grant the destination checkout, branch **`main`**, approved candidate SHA/scope and **expected main HEAD SHA**. Never self-grant, merge early or modify main/sibling source without that grant. A previous temporary-integration grant does not authorize main writes. Then:
+No push, deployment, force operations or history rewriting are authorized. Conditional authority applies only to assigned scope; unowned changes and unknown writers require coordination, not improvisation.
 
-1. In the granted destination checkout, verify its absolute path, `main` branch and full HEAD match the grant. Confirm `git status --porcelain --untracked-files=all` is empty, including no staged/untracked surprises. If anything differs, **abort and report**; never clean up, stash or overwrite unexpected work.
-2. Confirm the candidate still equals the approved, independently reviewed SHA and inspect `git diff <baseSHA>..<candidateSHA> --name-only` for scope. Check overlapping main changes before proceeding; account for any content already landed so it is not replayed. Abort on unexpected source, staged changes or conflicts; do not improvise a resolution into the approved candidate. Obtain a corrected candidate and re-review if needed.
-3. Only while holding the slot, run `git merge --squash <candidateSHA>`. Inspect the entire staged diff and path list against the approved scope and candidate, preserving already-landed concurrent changes, then run `git diff --cached --check`. Do not include unrelated changes. If the staged result is unexpected, stop and tell the parent; do not reset/restore/stash it or continue to commit.
-4. Create one focused **main** commit identifying the candidate and reviewer SHA in the commit message. Verify the resulting commit, paths and clean tree; report the main full SHA, checks and remaining blockers, and release the slot. The parent owns the subsequent combined gate; landing alone is not validation completion.
+## Evidence, accounting and non-forced cleanup
 
-Do not perform source fixes in the shared destination checkout. Combined validation failures return to the owning topic worktree for a new candidate and exact-SHA review. A grant does not authorize extra edits, history rewriting or push. If the parent explicitly uses a temporary integration branch, apply the same checkout/branch/expected-HEAD/clean-index fences there, then separately request main landing of an exact reviewed candidate. Never treat a temporary commit as finished or replay an obsolete candidate.
+Assigned leads may finish cleanup for their accounted scope after post-integration checks; the coordinator accounts for every active/idle/crashed lane. Do not delete unfinished work just because a lane is idle.
 
-## Finish and clean every lane
+1. Freeze writers; inventory all topic commits, staged/dirty/untracked files, ignored artifacts/configuration and running jobs. Record base/candidate/review/main SHAs, commands/results, remaining gates and any intentional supersession. Copy needed non-sensitive test/review logs, candidate/recovery Git bundle and patches outside the worktree; verify hashes/bundle validity. Never publish secrets/private data.
+2. Verify main content or patch equivalence for **every relevant delta**, including migration checkpoints/previously landed slices. Squash ancestry or `branch --merged` alone proves nothing. Use scoped source comparison, stable patch IDs/range-diff and final-file inspection; explain metadata supersession. Any unaccounted work retains ref/worktree for resolution.
+3. Confirm no active writer, pending work or unpreserved dirty/untracked/ignored evidence. From outside the worktree, recheck path and status then `git worktree remove <verified-path>` **without `--force`**. A refusal means stop/inspect, never filesystem deletion. Ignored artifacts must be preserved/handled explicitly, not swept away by force.
+4. Delete only a specifically accounted topic ref after removal, with expected-tip checking, e.g. `git update-ref -d refs/heads/<topic> <verified-tip>`. Never wildcard-delete or delete main. Report removed worktree/ref, retained evidence and honest blockers.
 
-The parent tracks every active, idle or crashed worktree to a final disposition; do not abandon unfinished lanes. Inventory each lane's commits, status (including staged/untracked files), ignored evidence and running jobs. Stop/freeze its writers before reassignment or removal. Preserve dirty work in owner-approved scoped checkpoints and copy needed ignored artifacts (logs, screenshots, handoffs and configuration) to an approved local evidence location outside the worktree before removal; verify preservation without publishing secrets. Resume/reassign unfinished work through scoped checks, exact-SHA review and authorized main squash landing.
+## Current native blocker and historical accounting (2026-11-04)
 
-After scoped and parent-owned combined validation, request explicit cleanup authorization. Record failures/blockers truthfully: the blocked AVD gate is not a pass, and cleanup must not erase the evidence or manufacture a completion claim. For each worktree/topic ref:
-
-1. Record base/candidate/review SHAs, main landing SHA(s), scoped/combined results and remaining blockers. Verify actual main content or patch-equivalence for **every** relevant commit/delta, including migration checkpoints and previously landed slices. Squash landing does not make topic commits ancestors of main; neither `git branch --merged` nor `git merge-base --is-ancestor` alone proves content accounting. Use scoped diff/patch comparison (for example `git range-diff`/stable patch IDs) plus final-file inspection, explaining any intentional supersession. If anything is unaccounted, preserve the ref/worktree and resolve it; never delete it as merely idle.
-2. Confirm no active job, pending work, unpreserved dirty/untracked changes or needed ignored evidence remains. Outside that worktree, recheck path and status, then use `git worktree remove <verified-path>` **without `--force`**. If Git refuses, stop and inspect; do not force or use filesystem deletion.
-3. Delete only the specifically verified, accounted topic refs after their worktrees are removed, using a parent-approved expected-tip check (for example `git update-ref -d refs/heads/<topic> <verified-tip>`). Never wildcard-delete refs, delete main, rewrite main history or push. Temporary integration/migration refs also require full content accounting and explicit cleanup approval; keep any ref still needed to preserve evidence or unfinished work.
-4. Report removed worktrees/refs, retained evidence paths and any retained blockers. Finished work is in main, not only on a detached/staging/topic branch.
-
-## Current migration and native blocker (2026-11-04)
-
-- Final destination checkout: `/var/home/lsm/repos/spofify-mobile` on `main`; the parent grants its current expected HEAD for each slot. Leads use their assigned worktrees under `/var/home/lsm/repos/spofify-mobile-worktrees/`. Earlier `integration/mobile-ux-review-20261104` commits (including policy staging `8c79539848274f0620006591ce99f107788d1475`) are temporary, not final landing or authorization to merge an obsolete candidate.
-- Main/external checkpoint `92111dc7f46581330f5e01ec3cd8c832d317ea30` already captured prior broad UI work. Preserve it as main history while adding authorized focused squash commits; do not rewrite or replay it. Two remaining dirty deltas were checkpointed at `5c63cf3` on `migration/mobile-ux-handoff-20261104`; only the row-test delta belongs to compact-rows and only the palette delta to search-chrome. The local handoff records lane assignments.
-- **Actual native AVD after-rendering: BLOCKED / NOT COMPLETE.** The software emulator segfaults before app launch; the single diagnostic budget is exhausted. No emulator startup/configuration retries, ADB/discovery attempts, physical devices, personal AVDs, live-backend/accounts or network diagnosis attempts are authorized in this migration. This native diagnostic stop **does not forbid existing synthetic in-process/loopback unit fixtures** (such as MockWebServer) used by approved tests; it grants no new external network permissions. A new native environment/attempt requires explicit coordination, not an implied exception from the general validation instructions.
-- Before-only image: `/var/home/lsm/repos/spofify-mobile/.tooling/ui-testing/reviews/20261104-user-before.png`. Inspect it when relevant, but do not call it an after-render. Production-font/native-graphics Robolectric checks, source checkpoints and clean reviews do **not** waive native validation. Do not re-baseline bad layout to obtain a pass.
-- The parent owns combined validation and must report the blocked native gate truthfully. Integration readiness is not visual completion; no lane may claim the rendered app approved without actual current-APK evidence.
+- Starting foundation base is `4183ed3ba98d4cea77c116ca9311c7eb2696fe20`; always fence actual expected main, never reuse this as a permanent grant. Existing native-device work at `77d45be` is merged there, not a new unimplemented epic; recovery owns remaining critical review/lint issues (see [FEAT-004](specs/FEAT-004-native-device-participation.md)).
+- External checkpoint `92111dc7f46581330f5e01ec3cd8c832d317ea30` captured prior broad UI work. Migration `5c63cf3` captured row-test (compact-rows) and palette (search-chrome) deltas. Preserve main history; do not replay. Earlier integration staging, including `8c79539848274f0620006591ce99f107788d1475`, is not permission to merge obsolete source.
+- **Native AFTER rendering/audio/background: BLOCKED / NOT COMPLETE.** Isolated software emulator segfaulted before app launch; single diagnostic budget exhausted. No more emulator/configuration/startup, ADB/discovery, real-phone/personal-AVD/live-account/backend or external-network attempts. Existing approved synthetic in-process/loopback unit fixtures remain allowed; this grants no external networking. A new environment/attempt needs explicit coordination. [BUG-001](specs/BUG-001-native-validation-environment.md) gates completion/validation, never blanket source work.
+- Before-only image `/var/home/lsm/repos/spofify-mobile/.tooling/ui-testing/reviews/20261104-user-before.png` is not approved after-render evidence. Native-graphics tests, APKs, clean source review and landing cannot waive rendered acceptance. Parent/coordinator reports combined/native gates truthfully.
