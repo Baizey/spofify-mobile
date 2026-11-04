@@ -183,10 +183,25 @@ class CatalogStateHolder(
         }
     }
 
-    /** Only committed IME text reaches this method. Clear/submit bypass the debounce. */
+    /** Only committed IME text reaches this method. Submit flushes debounce, not accepted results. */
     fun commitQuery(query: String, immediate: Boolean = false) {
         val cleaned = cleanCatalogQuery(query)
-        if (cleaned == state.value.current.query && !immediate) return
+        val current = state.value.current
+        if (cleaned == current.query) {
+            val pending = queryJob
+            if (immediate && pending?.isActive == true) {
+                val token = generation
+                pending.cancel()
+                if (queryJob === pending) {
+                    queryJob = null
+                    if (token == generation && visible && state.value.current.key == current.key && state.value.current.query == cleaned) {
+                        loadVisible(preservePending = true)
+                        applyPendingRevision()
+                    }
+                }
+            }
+            return
+        }
         cancelReads()
         update { it.copy(query = cleaned, search = true, item = null, sections = emptyMap(),
             scrollIndex = 0, scrollOffset = 0, detailResolved = false) }
@@ -245,15 +260,17 @@ class CatalogStateHolder(
     fun retry(kind: String) = loadSection(kind)
     fun retryDetail() = loadDetail()
 
-    private fun loadVisible() {
+    private fun loadVisible(preservePending: Boolean = false) {
         if (!visible) return
         val screen = state.value.current
         if (screen.emptySearch) return
         val stale = screen.stale
-        if (screen.item != null && (!screen.detailResolved || screen.detailNeedsReload || stale)) loadDetail(quiet = stale || screen.detailResolved)
+        if (screen.item != null && (!screen.detailResolved || screen.detailNeedsReload || stale) &&
+            (!preservePending || !screen.detailLoading)) loadDetail(quiet = stale || screen.detailResolved)
         if (!screen.detailUnavailable) screen.sectionKinds.forEach { kind ->
             val section = screen.sections[kind]
-            if (section?.loaded != true || section.needsReload || stale) loadSection(kind, quiet = stale || section?.loaded == true)
+            if ((section?.loaded != true || section.needsReload || stale) && (!preservePending || section?.loading != true))
+                loadSection(kind, quiet = stale || section?.loaded == true)
         }
         update { it.copy(stale = false) }
     }

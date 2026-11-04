@@ -4,6 +4,7 @@ import dev.spofify.mobile.core.ApiException
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.LibraryPage
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
@@ -15,7 +16,7 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class CatalogStateTest {
     private class Reader : CatalogReader {
-        data class Read(val request: CatalogRequest, val result: CompletableDeferred<LibraryPage> = CompletableDeferred())
+        data class Read(val request: CatalogRequest, val result: CompletableDeferred<LibraryPage> = CompletableDeferred(), var cancelled: Boolean = false)
         val reads = mutableListOf<Read>()
         val details = mutableListOf<Pair<String, String>>()
         var revisionValue = 1L
@@ -25,7 +26,12 @@ class CatalogStateTest {
         val pendingDetails = mutableListOf<CompletableDeferred<LibraryItem>>()
         override suspend fun browse(request: CatalogRequest): LibraryPage {
             val read = Read(request).also { reads += it }
-            return if (ignoreCancellation) withContext(NonCancellable) { read.result.await() } else read.result.await()
+            return try {
+                if (ignoreCancellation) withContext(NonCancellable) { read.result.await() } else read.result.await()
+            } catch (error: CancellationException) {
+                read.cancelled = true
+                throw error
+            }
         }
         override suspend fun detail(kind: String, id: String): LibraryItem {
             details += kind to id
@@ -50,6 +56,203 @@ class CatalogStateTest {
         assertTrue(reader.reads.isEmpty())
         holder.commitQuery("   ", immediate = true); runCurrent()
         assertTrue(reader.reads.isEmpty())
+        holder.close()
+    }
+
+    private fun Reader.Read.completeRows(total: Int = 45, revision: Long = 1) {
+        result.complete(LibraryPage(List(request.limit) { index ->
+            LibraryItem(request.kind.removeSuffix("s"), "${request.kind}-${request.offset + index}", "Result")
+        }, total, request.limit, request.offset, revision))
+    }
+
+    @Test fun unchangedSubmitPreservesSelectedSectionExpandedPageScrollAndRevisionBaseline() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+        holder.includeMissing(true)
+        holder.setVisible(true); runCurrent()
+        reader.reads.last().completeRows(revision = 7); runCurrent()
+        holder.page("tracks", 1); runCurrent()
+        reader.reads.last().completeRows(revision = 7); runCurrent()
+        holder.more("tracks"); runCurrent()
+        reader.reads.last().completeRows(revision = 7); runCurrent()
+        holder.rememberScroll(0, 12, 37, expectedQuery = "music")
+        val accepted = holder.state.value.current
+        assertEquals(10, accepted.sections.getValue("tracks").offset)
+        assertEquals(20, accepted.sections.getValue("tracks").items.size)
+        val count = reader.reads.size
+
+        holder.commitQuery("music", immediate = true)
+        holder.commitQuery("mu\nsic", immediate = true)
+        holder.commitQuery("music")
+        runCurrent(); advanceTimeBy(300); runCurrent()
+        assertSame(accepted, holder.state.value.current)
+        assertEquals(count, reader.reads.size)
+        assertTrue(reader.reads.none { it.cancelled })
+        assertEquals("tracks", holder.state.value.current.kind)
+        assertTrue(holder.state.value.current.includeMissing)
+        assertEquals(12, holder.state.value.current.scrollIndex)
+        assertEquals(37, holder.state.value.current.scrollOffset)
+
+        reader.revisionValue = 7
+        holder.checkRevision(); runCurrent()
+        assertEquals(count, reader.reads.size)
+        reader.revisionValue = 8
+        holder.checkRevision(); runCurrent()
+        assertEquals(count + 1, reader.reads.size)
+        assertEquals(10, reader.reads.last().request.offset)
+        assertEquals(20, reader.reads.last().request.limit)
+        assertEquals(accepted.sections.getValue("tracks").items, holder.state.value.current.sections.getValue("tracks").items)
+        reader.reads.last().completeRows(revision = 8); runCurrent()
+        assertEquals(12, holder.state.value.current.scrollIndex)
+        assertEquals(37, holder.state.value.current.scrollOffset)
+        holder.close()
+    }
+
+    @Test fun unchangedSubmitDoesNotCancelOrReplacePendingGroupedBodies() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "all", "music")
+        holder.setVisible(true); runCurrent()
+        holder.rememberScroll(0, 3, 19)
+        val pending = holder.state.value.current
+
+        holder.commitQuery("music", immediate = true)
+        runCurrent(); advanceTimeBy(300); runCurrent()
+        assertSame(pending, holder.state.value.current)
+        assertEquals(3, reader.reads.size)
+        assertTrue(reader.reads.none { it.cancelled })
+        reader.reads.forEach { it.completeRows() }; runCurrent()
+        assertTrue(holder.state.value.current.sections.values.all { it.loaded && !it.loading && it.items.size == 10 })
+        assertEquals(3, holder.state.value.current.scrollIndex)
+        assertEquals(19, holder.state.value.current.scrollOffset)
+        assertEquals(3, reader.reads.size)
+        holder.close()
+    }
+
+    @Test fun unchangedSubmitPreservesPendingAppendAndItsLoadedPrefix() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+        holder.setVisible(true); runCurrent()
+        reader.reads.last().completeRows(); runCurrent()
+        holder.more("tracks"); runCurrent()
+        holder.rememberScroll(0, 8, 27)
+        val pending = holder.state.value.current
+        val section = pending.sections.getValue("tracks")
+        assertTrue(section.appendPending)
+        assertEquals(10, section.requestedOffset)
+
+        holder.commitQuery("music", immediate = true)
+        runCurrent(); advanceTimeBy(300); runCurrent()
+        assertSame(pending, holder.state.value.current)
+        assertEquals(2, reader.reads.size)
+        assertTrue(reader.reads.none { it.cancelled })
+        reader.reads.last().completeRows(); runCurrent()
+        val appended = holder.state.value.current.sections.getValue("tracks")
+        assertEquals((0 until 20).map { "tracks-$it" }, appended.items.map { it.id })
+        assertEquals(0, appended.offset)
+        assertFalse(appended.appendPending)
+        assertNull(appended.requestedOffset)
+        assertEquals(8, holder.state.value.current.scrollIndex)
+        assertEquals(27, holder.state.value.current.scrollOffset)
+        assertEquals(2, reader.reads.size)
+        holder.close()
+    }
+
+    @Test fun unchangedImmediateSubmitFlushesActiveDebounceExactlyOnceWithoutResettingScroll() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "all")
+        holder.setVisible(true)
+        holder.commitQuery("music"); runCurrent()
+        advanceTimeBy(100); runCurrent()
+        assertTrue(reader.reads.isEmpty())
+        holder.rememberScroll(0, 2, 17, expectedQuery = "music")
+
+        holder.commitQuery("music", immediate = true); runCurrent()
+        assertEquals(3, reader.reads.size)
+        assertTrue(reader.reads.all { it.request.query == "music" && it.request.limit == 10 })
+        assertEquals(2, holder.state.value.current.scrollIndex)
+        assertEquals(17, holder.state.value.current.scrollOffset)
+        advanceTimeBy(300); runCurrent()
+        assertEquals(3, reader.reads.size)
+        assertTrue(reader.reads.none { it.cancelled })
+        reader.completePending(); runCurrent()
+        holder.commitQuery("music", immediate = true); runCurrent()
+        assertEquals(3, reader.reads.size)
+        assertTrue(holder.state.value.current.sections.values.all { it.loaded })
+        holder.close()
+    }
+
+    @Test fun flushingDebouncePreservesAReadAlreadyStartedByExplicitRetry() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "all")
+        holder.setVisible(true)
+        holder.commitQuery("music"); runCurrent()
+        holder.retry("tracks"); runCurrent()
+        assertEquals(1, reader.reads.size)
+        val pending = reader.reads.single()
+        val pendingSection = holder.state.value.current.sections.getValue("tracks")
+
+        holder.commitQuery("music", immediate = true); runCurrent()
+        assertSame(pendingSection, holder.state.value.current.sections.getValue("tracks"))
+        assertEquals(CatalogKinds.toSet(), reader.reads.map { it.request.kind }.toSet())
+        assertEquals(3, reader.reads.size)
+        assertFalse(pending.cancelled)
+        advanceTimeBy(300); runCurrent()
+        assertEquals(3, reader.reads.size)
+        assertTrue(reader.reads.none { it.cancelled })
+        reader.reads.forEach { it.completeRows() }; runCurrent()
+        assertTrue(holder.state.value.current.sections.values.all { it.loaded && it.items.size == 10 })
+        holder.close()
+    }
+
+    @Test fun unchangedImmediateSubmitCanFlushBeforeDebounceCoroutineStarts() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks")
+        holder.setVisible(true)
+        holder.commitQuery("music")
+        holder.commitQuery("music", immediate = true); runCurrent()
+        assertEquals(1, reader.reads.size)
+        assertEquals("music", reader.reads.single().request.query)
+        advanceTimeBy(300); runCurrent()
+        assertEquals(1, reader.reads.size)
+        assertFalse(reader.reads.single().cancelled)
+        reader.completePending(); runCurrent(); holder.close()
+    }
+
+    @Test fun changedImmediateQueryStillResetsRowsPagingAndScrollWithoutWaitingForDebounce() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "old")
+        holder.setVisible(true); runCurrent()
+        reader.reads.last().completeRows(); runCurrent()
+        holder.page("tracks", 1); runCurrent()
+        reader.reads.last().completeRows(); runCurrent()
+        holder.rememberScroll(0, 9, 31)
+
+        holder.commitQuery("new", immediate = true)
+        assertEquals("new", holder.state.value.current.query)
+        assertTrue(holder.state.value.current.sections.isEmpty())
+        assertEquals(0, holder.state.value.current.scrollIndex)
+        assertEquals(0, holder.state.value.current.scrollOffset)
+        runCurrent()
+        assertEquals(3, reader.reads.size)
+        assertEquals("new", reader.reads.last().request.query)
+        assertEquals(0, reader.reads.last().request.offset)
+        reader.completePending(); runCurrent(); holder.close()
+    }
+
+    @Test fun unchangedSubmitDoesNotTurnExplicitRetryIntoANoOp() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+        holder.setVisible(true); runCurrent()
+        reader.reads.single().result.completeExceptionally(IOException()); runCurrent()
+        val failed = holder.state.value.current
+        holder.commitQuery("music", immediate = true); runCurrent()
+        assertSame(failed, holder.state.value.current)
+        assertEquals(1, reader.reads.size)
+        holder.retry("tracks"); runCurrent()
+        assertEquals(2, reader.reads.size)
+        reader.reads.last().completeRows(); runCurrent()
+        assertTrue(holder.state.value.current.sections.getValue("tracks").loaded)
+        assertNull(holder.state.value.current.sections.getValue("tracks").error)
         holder.close()
     }
 
