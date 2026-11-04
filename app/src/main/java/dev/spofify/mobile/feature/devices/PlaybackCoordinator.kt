@@ -36,6 +36,8 @@ class PlaybackCoordinator(
     private val name: String = "Android phone",
     private val clockMs: () -> Long = { android.os.SystemClock.elapsedRealtime() },
     private val identity: (() -> PlaybackDeviceIdentityStore?)? = null,
+    // Production supplies Android uptime for KeyEvent timestamps; injected test clocks stay JVM-only.
+    private val mediaEventUptimeMs: () -> Long = clockMs,
 ) {
     private val work = CoroutineScope(scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]))
     private val mutableState = MutableStateFlow(PlaybackDevicesState())
@@ -49,6 +51,9 @@ class PlaybackCoordinator(
     private var epoch = 0L
     private var sequence = 0L
     private var interactionRevision = 0L
+    /** Uptime boundary for delayed system keys, sampled at the actual accepted binding change. */
+    internal var interactionChangedUptime = mediaEventUptimeMs()
+        private set
     private data class InteractionBinding(
         val deviceId: String, val outputId: String, val epoch: Long,
         val queue: List<PlaybackTrack>?, val position: Int?, val context: PlaybackContext?, val shuffle: Boolean?,
@@ -66,6 +71,7 @@ class PlaybackCoordinator(
         if (binding != interactionBinding) {
             interactionBinding = binding
             interactionRevision++
+            interactionChangedUptime = mediaEventUptimeMs()
         }
     }
     private var leaseDeadline = 0L
@@ -288,6 +294,13 @@ class PlaybackCoordinator(
 
     /** Route ALL app/notification actions here, not straight to a controller that bypasses ownership. */
     fun remoteCommand(command: PlaybackDeviceCommand, isCurrent: () -> Boolean = { true }) = submitAction(command, isCurrent = isCurrent)
+
+    /** System transport can operate prepared output, never initialize/import a queue for Play.
+     * Pause still interrupts synchronously before this prepared-only dispatch gate. Remote
+     * transport retains its normal authority routing; it never initializes local output.
+     */
+    internal fun preparedTransportCommand(command: PlaybackDeviceCommand, isCurrent: () -> Boolean) =
+        submitAction(command = command, isCurrent = isCurrent, initialize = false)
 
     /** Only a NEW explicit user action, never startup/restoration or deferred reconnect autoplay. */
     fun localAction(action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) = submitAction(action = action)

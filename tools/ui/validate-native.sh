@@ -33,6 +33,11 @@ export ANDROID_ADB_SERVER_PORT=5039 ADB_SERVER_SOCKET=tcp:localhost:5039
 SERIAL="127.0.0.1:$((PORT + 1))"
 AVD=spofify_visual_test
 GPU="${UI_TEST_GPU:-software}"
+# Each feature can explicitly select its fresh-data journey; the default remains smoke.
+TEST_CLASS="${UI_TEST_CLASS:-dev.spofify.mobile.ui.NativeUiSmokeTest}"
+[[ "$TEST_CLASS" =~ ^dev\.spofify\.mobile\.ui\.[A-Za-z][A-Za-z0-9_]*$ ]] || {
+  printf 'Invalid UI_TEST_CLASS: expected one dev.spofify.mobile.ui test class.\n' >&2; exit 2;
+}
 for tool in "$ADB" "$EMU" "$AVDMANAGER"; do
   [[ -x "$tool" ]] || { printf 'Missing Android tool: %s\nEvidence: %s\n' "$tool" "$RUN" >&2; exit 1; }
 done
@@ -116,7 +121,7 @@ ACCEL=off
 {
   printf '# Native UI run\n\n- Started (UTC): %s\n- Serial: %s\n- Image: %s\n- Acceleration: %s\n' "$(date -u +%FT%TZ)" "$SERIAL" "$IMAGE" "$ACCEL"
   printf -- '- Git HEAD: %s (see working-tree.txt for local changes)\n' "$(git rev-parse HEAD)"
-  printf -- '- APK SHA-256: %s\n- Visual review: **PENDING**\n' "$(sha256sum "$APK" | cut -d ' ' -f 1)"
+  printf -- '- APK SHA-256: %s\n- Test APK SHA-256: %s\n- Instrumentation class: %s\n- Visual review: **PENDING**\n' "$(sha256sum "$APK" | cut -d ' ' -f 1)" "$(if [[ -f "$TEST_APK" ]]; then sha256sum "$TEST_APK" | cut -d ' ' -f 1; else printf 'not used'; fi)" "$TEST_CLASS"
 } > "$RUN/evidence.md"
 git status --short > "$RUN/working-tree.txt"
 CPU_ARGS=()
@@ -178,7 +183,7 @@ else
   "$ADB" -s "$SERIAL" install -r "$TEST_APK" >> "$RUN/install.log" 2>&1
   set +e
   timeout 300 "$ADB" -s "$SERIAL" shell am instrument -w -r \
-    -e class dev.spofify.mobile.ui.NativeUiSmokeTest \
+    -e class "$TEST_CLASS" \
     dev.spofify.mobile.test/dev.spofify.mobile.ui.VirtualAvdTestRunner > "$RUN/instrumentation.log" 2>&1
   result=$?
   set -e

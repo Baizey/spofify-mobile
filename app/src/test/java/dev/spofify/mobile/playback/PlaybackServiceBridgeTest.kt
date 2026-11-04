@@ -566,6 +566,10 @@ class PlaybackServiceBridgeTest {
         val owner = PlaybackCoordinator(protocol, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
         AppGraph::class.java.getDeclaredField("playbackCoordinator").apply { isAccessible = true; set(graph, owner) }
         owner.setServiceActive(true); runCurrent()
+        // Establish the coordinator's prepared local output once, before observing media Play.
+        // System Play must never initialize/import a queue to make an unprepared request valid.
+        owner.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
+        published.clear()
         val service = controller!!.get()
         shadowOf(service).setThrowInStartForeground(android.app.ForegroundServiceStartNotAllowedException("Synthetic user-start restriction"))
         val mediaSession = PlaybackService::class.java.getDeclaredField("session").let {
@@ -659,7 +663,11 @@ class PlaybackServiceBridgeTest {
         assertSilent()
     }
 
-    @Test fun retainedNotificationTokenCannotBeUpgradedIntoANewPlaybackGeneration() = runBlocking {
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun retainedNotificationTokenCannotBeUpgradedIntoANewPlaybackGeneration() = runTest {
+        val commands = mutableListOf<PlaybackDeviceCommand>()
+        installOwner(backgroundScope, { testScheduler.currentTime }, "pc", initial = snapshot().paused(), command = { commands += it })
+        runCurrent()
         val service = controller!!.get()
         val make = PlaybackService::class.java.getDeclaredMethod("notificationIntent", String::class.java).apply { isAccessible = true }
         val old = make.invoke(service, "resume") as android.app.PendingIntent
@@ -673,16 +681,23 @@ class PlaybackServiceBridgeTest {
         val before = graph.playbackCoordinator!!.state.value
         old.send() // Deliver the HELD PendingIntent after the fresh token was minted.
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 1)
+        runCurrent()
         assertEquals(before, graph.playbackCoordinator!!.state.value)
-        // The fresh token reaches the actual coordinator (still nonparticipating in setup),
-        // proving that silence above came from the stale-token fence rather than a dead route.
+        assertTrue(commands.isEmpty())
+        // A prepared authoritative remote owner makes the positive control meaningful:
+        // an unregistered/viewless fixture must now fail closed even for a fresh token.
         fresh.send()
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 2)
-        assertNotEquals(before.message, graph.playbackCoordinator!!.state.value.message)
+        runCurrent()
+        assertEquals(listOf("resume"), commands.map { it.type })
         assertSilent()
     }
 
-    @Test fun retainedNotificationTokenCannotTargetAReplacementQueueInTheSameClientGeneration() = runBlocking {
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun retainedNotificationTokenCannotTargetAReplacementQueueInTheSameClientGeneration() = runTest {
+        val commands = mutableListOf<PlaybackDeviceCommand>()
+        installOwner(backgroundScope, { testScheduler.currentTime }, "pc", initial = snapshot().paused(), command = { commands += it })
+        runCurrent()
         val service = controller!!.get()
         val make = PlaybackService::class.java.getDeclaredMethod("notificationIntent", String::class.java).apply { isAccessible = true }
         assertEquals("ok", endpoint.activate(snapshot().paused(), authority()).status)
@@ -695,10 +710,13 @@ class PlaybackServiceBridgeTest {
         val before = graph.playbackCoordinator!!.state.value
         old.send() // Not a copied stale Intent: exercise the token after UPDATE_CURRENT minting.
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 1)
+        runCurrent()
         assertEquals(before, graph.playbackCoordinator!!.state.value)
+        assertTrue(commands.isEmpty())
         fresh.send()
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 2)
-        assertNotEquals(before.message, graph.playbackCoordinator!!.state.value.message)
+        runCurrent()
+        assertEquals(listOf("next"), commands.map { it.type })
         assertSilent()
     }
 

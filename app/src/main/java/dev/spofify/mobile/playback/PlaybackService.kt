@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.IntentFilter
 import android.media.AudioManager
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -33,6 +34,7 @@ import dev.spofify.mobile.core.PlaybackDeviceCommand
 import dev.spofify.mobile.core.PreparedPlaybackAuthority
 import dev.spofify.mobile.core.Session
 import dev.spofify.mobile.feature.devices.PlaybackAuthority
+import dev.spofify.mobile.feature.devices.PlaybackCoordinator
 import dev.spofify.mobile.feature.devices.PlaybackEndpointResult
 import dev.spofify.mobile.feature.devices.PlaybackFinalClose
 import kotlinx.coroutines.delay
@@ -132,8 +134,16 @@ class PlaybackService : MediaSessionService() {
         }
     }
     private var lastSuspendedUptime = 0L
+    private var mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
+    private data class NotificationBinding(
+        val owner: PlaybackCoordinator?, val version: Triple<Long, Long, Long>?, val localCurrent: PlaybackInteractionKey?,
+    )
+    private var notificationBinding: NotificationBinding? = null
+    private var notificationBindingSerial = 0L
     private data class Admission(val command: Int, val requestEpoch: Long)
     private val admissions = mutableMapOf<MediaSession.ControllerInfo, Admission>()
+    private data class MediaButtonDown(val key: Int, val device: Int, val source: Int, val down: Long, val time: Long)
+    private val mediaButtonDowns = linkedSetOf<MediaButtonDown>() // Bounded exact-event dedup, not tap debounce.
     private var client: SpofifyClient? = null
     private val handler = Handler(Looper.getMainLooper())
     private val historyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -224,6 +234,9 @@ class PlaybackService : MediaSessionService() {
             }
             if (!hasAuthority() && (current.playWhenReady || current.isPlaying)) suspendBufferedOutput()
             sampleHistory(current.currentMediaItem, current.currentPosition, current.isPlaying)
+            // Refresh the read-only selected-output projection on the existing main tick.
+            // No second player/poller, output start or local history credit is introduced.
+            (session?.player as? CoordinatedSessionPlayer)?.refreshSessionState()
             handler.postDelayed(this, 100)
         }
     }
@@ -287,6 +300,7 @@ class PlaybackService : MediaSessionService() {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 // Record transitions even between UI samples (including A -> B -> A).
                 interactionKeys.invalidate()
+                mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
                 if (importing) return
                 if (!hasAuthority() && exo.playWhenReady) suspendBufferedOutput()
                 // Repeat/returning is a new traversal; playlist moves are not.
@@ -339,9 +353,12 @@ class PlaybackService : MediaSessionService() {
         // Intercept semantic restart actions AT execution, not during command authorization:
         // controller batches may seek before Previous while the authorization callbacks still
         // observe the old position. Ordinary seekTo/scrubbing never resets a traversal.
-        val sessionPlayer = CoordinatedSessionPlayer(exo, ::routeSessionCommand, ::exportPrepared) { index ->
-            if (index in 0 until exo.mediaItemCount) PlaybackMedia.occurrence(exo.getMediaItemAt(index))?.let { wireKeys[it] } else null
-        }
+        val sessionPlayer = CoordinatedSessionPlayer(exo, ::routeSessionCommand, ::sessionTransportSnapshot) { index ->
+            // The local physical timeline is not an index-addressable remote queue. The
+            // read-only remote projection owns its own exact wire-key mapping.
+            if (remoteSessionSnapshot() != null) null
+            else if (index in 0 until exo.mediaItemCount) PlaybackMedia.occurrence(exo.getMediaItemAt(index))?.let { wireKeys[it] } else null
+        }.apply { setRemoteSnapshotProvider(::remoteSessionSnapshot) }
         val builder = MediaSession.Builder(this, sessionPlayer).setCallback(SessionCallback(sharedClient))
         packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
             builder.setSessionActivity(PendingIntent.getActivity(
@@ -355,25 +372,42 @@ class PlaybackService : MediaSessionService() {
         onServiceActiveChanged?.invoke(true)
     }
 
+    private fun notificationBindingId(): Long {
+        val owner = (application as SpofifyApplication).graph.playbackCoordinator
+        val devices = owner?.state?.value
+        val remote = devices != null && devices.activeDeviceId.isNotEmpty() && devices.activeDeviceId != devices.deviceId
+        // Local identity follows the actual output, not the later server echo of its result.
+        // Otherwise a correctly posted local token can expire as that echo is accepted.
+        val binding = NotificationBinding(owner, if (remote) owner?.interactionVersion else null,
+            if (remote) null else currentInteractionKey())
+        if (notificationBinding != binding) {
+            notificationBinding = binding
+            notificationBindingSerial++
+        }
+        return notificationBindingSerial
+    }
+
     private fun notificationIntent(type: String): PendingIntent {
         // Auth expiry can invalidate off-main: use one captured capability in identity AND extras.
         val epoch = PlaybackRequests.epoch
         val queueEpoch = PlaybackRequests.queueEpoch
+        val binding = notificationBindingId()
         return PendingIntent.getService(this, type.hashCode(),
             Intent(this, PlaybackService::class.java).setAction(ACTION_TRANSPORT)
                 // PendingIntent equality ignores extras. Scope its IDENTITY too, otherwise
                 // UPDATE_CURRENT silently upgrades a retained old Resume token to a new epoch.
                 .setData(Uri.Builder().scheme("spofify-playback").authority(serviceNonce)
-                    .appendPath(epoch.toString()).appendPath(queueEpoch.toString()).appendPath(type).build())
+                    .appendPath(epoch.toString()).appendPath(queueEpoch.toString()).appendPath(binding.toString()).appendPath(type).build())
                 .putExtra("command", type).putExtra("service", serviceNonce).putExtra("generation", epoch)
-                .putExtra("queueGeneration", queueEpoch),
+                .putExtra("queueGeneration", queueEpoch).putExtra("binding", binding),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_TRANSPORT) {
             if (intent.getStringExtra("service") == serviceNonce && intent.getLongExtra("generation", -1) == PlaybackRequests.epoch &&
-                intent.getLongExtra("queueGeneration", -1) == PlaybackRequests.queueEpoch) {
+                intent.getLongExtra("queueGeneration", -1) == PlaybackRequests.queueEpoch &&
+                intent.getLongExtra("binding", -1) == notificationBindingId()) {
                 intent.getStringExtra("command")?.takeIf { it in setOf("resume", "pause", "next", "previous") }
                     ?.let { routeCommand(PlaybackDeviceCommand.transport(it), userInteraction = true) }
             }
@@ -406,8 +440,13 @@ class PlaybackService : MediaSessionService() {
             return Futures.immediateFailedFuture(PlayContinuationSuppressed())
         }
         val current = player
-        val track = current?.currentMediaItem?.let(PlaybackMedia::libraryItem)
-        foreground?.update(mediaSession, track, hasAuthority() && current?.playWhenReady == true)
+        val remote = remoteSessionSnapshot()
+        val track = if (remote != null) remotePlaybackState(remote).item else current?.currentMediaItem?.let(PlaybackMedia::libraryItem)
+        // Buffering retains Pause/ongoing only for a valid, error-free remote playback intent.
+        val playing = if (remote != null) track != null && remote.error.isEmpty() && remote.playing
+            else hasAuthority() && current?.playWhenReady == true
+        // Remote display/control state may update metadata, never promote local output/FGS.
+        foreground?.update(mediaSession, track, playing)
         return Futures.immediateFuture(null)
     }
 
@@ -441,6 +480,7 @@ class PlaybackService : MediaSessionService() {
         cancelCloseDisposal()
         handler.removeCallbacksAndMessages(null)
         admissions.clear()
+        mediaButtonDowns.clear()
         startAttempt = null
         foreground?.close()
         foreground = null
@@ -588,15 +628,50 @@ class PlaybackService : MediaSessionService() {
         return hasAuthority()
     }
 
+    private fun remoteSessionSnapshot(): PlaybackSnapshot? {
+        val devices = (application as SpofifyApplication).graph.playbackCoordinator?.state?.value ?: return null
+        return if (devices.activeDeviceId.isNotEmpty() && devices.activeDeviceId != devices.deviceId)
+            devices.view?.state ?: PlaybackSnapshot() else null
+    }
+
+    private fun sessionTransportSnapshot(): PlaybackSnapshot = remoteSessionSnapshot() ?: exportPrepared()
+
     private fun routeCommand(command: PlaybackDeviceCommand, userInteraction: Boolean = false) {
-        if (client == null || authenticatedSession == null || client?.currentSession() !== authenticatedSession) return
-        val owner = (application as SpofifyApplication).graph.playbackCoordinator ?: return
-        val local = owner.state.value.let { it.deviceId.isNotEmpty() && it.activeDeviceId == it.deviceId }
-        if (userInteraction && local && command.type in setOf("resume", "retry", "next", "previous", "jump")) {
-            val request = PlaybackRequests.epoch
-            val intended = exportPrepared()
+        val graph = (application as SpofifyApplication).graph
+        val source = client ?: return
+        val login = authenticatedSession ?: return
+        if (active.get() !== this || source !== graph.client || source.currentSession() !== login) return
+        val owner = graph.playbackCoordinator ?: return
+        val devices = owner.state.value
+        val local = devices.deviceId.isNotEmpty() && devices.activeDeviceId == devices.deviceId
+        val version = owner.interactionVersion
+        val request = PlaybackRequests.epoch
+        val queueEpoch = PlaybackRequests.queueEpoch
+        val pause = command.type == "pause"
+        val isCurrent = {
+            val current = owner.state.value
+            val now = owner.interactionVersion
+            active.get() === this && source === client && source === graph.client &&
+                login === authenticatedSession && source.currentSession() === login && graph.playbackCoordinator === owner &&
+                current.deviceId == devices.deviceId && current.activeDeviceId == devices.activeDeviceId &&
+                current.view?.epoch == devices.view?.epoch && queueEpoch == PlaybackRequests.queueEpoch &&
+                // Pause intentionally interrupts output synchronously inside submitAction,
+                // advancing the request/generation itself. It still retains all identity,
+                // output and queue/current-binding fences, but cannot self-cancel on that stop.
+                (if (pause) now.first == version.first && now.third == version.third
+                    else request == PlaybackRequests.epoch && now == version)
+        }
+        val intended = exportPrepared()
+        if (userInteraction && !pause) {
+            val prepared = if (local) intended else devices.view?.state
+            if (prepared == null || prepared.queue.getOrNull(prepared.position) == null) return
+        }
+        if (userInteraction && local && command.type in setOf("resume", "retry", "next", "previous", "jump", "seek", "shuffle", "repeat")) {
             val restartId = currentId()?.takeIf { command.type == "jump" && command.json["key"]?.jsonPrimitive?.long == wireKeys[it] }
-            owner.localAction { permit ->
+            // The existing prepared-output gate checks before initialization and never imports
+            // a restored/server queue to make a system Play valid. A fresh catalog action is
+            // a separate path; media Play only resumes this in-memory prepared occurrence.
+            owner.editPreparedQueue(isCurrent = isCurrent) { permit ->
                 val currentState = exportPrepared()
                 val sameQueue = currentState.queue == intended.queue &&
                     currentState.queue.getOrNull(currentState.position)?.key == intended.queue.getOrNull(intended.position)?.key &&
@@ -611,13 +686,14 @@ class PlaybackService : MediaSessionService() {
                         // an ordinary scrub and unlike future-only wire jump/remove/move.
                         if (restartId != null) {
                             if (currentId() != restartId || !acceptAuthority(permit)) PlaybackEndpointResult("rejected", exportPrepared())
-                            else { restartTraversal(); player?.seekToDefaultPosition(); startOwned(permit, true) }
-                        } else executeOwned(command, permit)
+                            else { restartTraversal(); player?.seekToDefaultPosition(); startOwned(permit, true, isCurrent) }
+                        } else executeOwned(command, permit, isCurrent)
                     }
                     finally { if (explicitBackgroundPermit === permit) explicitBackgroundPermit = null }
                 }
             }
-        } else owner.remoteCommand(command)
+        } else if (userInteraction) owner.preparedTransportCommand(command, isCurrent = isCurrent)
+        else owner.remoteCommand(command, isCurrent = isCurrent)
     }
 
     private fun routeSessionCommand(command: PlaybackDeviceCommand) {
@@ -657,6 +733,7 @@ class PlaybackService : MediaSessionService() {
         if (!acceptAuthority(value)) return PlaybackEndpointResult("rejected", exportPrepared())
         val current = player ?: return PlaybackEndpointResult("rejected", PlaybackSnapshot())
         importing = true
+        mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         startAttempt = null
         PlaybackRequests.queueChanged()
         try {
@@ -803,17 +880,19 @@ class PlaybackService : MediaSessionService() {
         return info.importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
     }
 
-    private suspend fun executeOwned(command: PlaybackDeviceCommand, value: PlaybackAuthority): PlaybackEndpointResult {
-        if (!acceptAuthority(value)) return PlaybackEndpointResult("rejected", exportPrepared())
+    private suspend fun executeOwned(command: PlaybackDeviceCommand, value: PlaybackAuthority,
+        isCurrent: () -> Boolean = { true }): PlaybackEndpointResult {
+        if (!isCurrent() || !acceptAuthority(value)) return PlaybackEndpointResult("rejected", exportPrepared())
         val current = player ?: return PlaybackEndpointResult("rejected", PlaybackSnapshot())
         // Resolve a legacy incoming toggle against the raw service player's current intent,
         // including buffering, not the remote UI snapshot. Native callers send explicit intent.
         if (command.type == "toggle") return executeOwned(
-            PlaybackDeviceCommand.transport(if (current.playWhenReady) "pause" else "resume"), value)
+            PlaybackDeviceCommand.transport(if (current.playWhenReady) "pause" else "resume"), value, isCurrent)
         val json = command.json
         when (command.type) {
             "pause" -> { audioFocus?.abandon(); current.pause(); current.stop(); historyWasPlaying = false; resetHistoryAnchor(current.currentMediaItem); foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem)) }
             "close" -> {
+                mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
                 PlaybackRequests.invalidate(); PlaybackRequests.queueChanged()
                 authorityRequestEpoch = PlaybackRequests.epoch
                 admissions.clear(); historyScope.coroutineContext.cancelChildren()
@@ -832,11 +911,11 @@ class PlaybackService : MediaSessionService() {
             "resume", "retry" -> {
                 if (current.mediaItemCount == 0) return PlaybackEndpointResult("rejected", exportPrepared())
                 if (current.playbackState == Player.STATE_ENDED) { restartTraversal(); current.seekToDefaultPosition() }
-                return startOwned(value, true)
+                return startOwned(value, true, isCurrent)
             }
             "seek" -> { current.seekTo((json.getValue("value").jsonPrimitive.double * 1000).toLong()); resetHistoryAnchor(current.currentMediaItem) }
-            "next" -> { if (current.hasNextMediaItem()) { current.seekToNextMediaItem(); return startOwned(value, true) } }
-            "previous" -> { if (current.currentPosition > current.maxSeekToPreviousPosition || !current.hasPreviousMediaItem()) restartTraversal(); current.seekToPrevious(); return startOwned(value, true) }
+            "next" -> { if (current.hasNextMediaItem()) { current.seekToNextMediaItem(); return startOwned(value, true, isCurrent) } }
+            "previous" -> { if (current.currentPosition > current.maxSeekToPreviousPosition || !current.hasPreviousMediaItem()) restartTraversal(); current.seekToPrevious(); return startOwned(value, true, isCurrent) }
             "shuffle" -> toggleOwnedShuffle()
             "repeat" -> current.repeatMode = when (current.repeatMode) { Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL; Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE; else -> Player.REPEAT_MODE_OFF }
             "clear" -> clearUpcoming()
@@ -846,7 +925,7 @@ class PlaybackService : MediaSessionService() {
                 val order = traversalIds(); val index = order.indexOf(id); val at = order.indexOf(currentId())
                 if (index <= at) return PlaybackEndpointResult("rejected", exportPrepared())
                 when (command.type) {
-                    "jump" -> { current.seekToDefaultPosition(physicalIds().indexOf(id)); return startOwned(value, true) }
+                    "jump" -> { current.seekToDefaultPosition(physicalIds().indexOf(id)); return startOwned(value, true, isCurrent) }
                     "remove" -> removeUpcoming(id)
                     "move" -> {
                         val target = when (json["direction"]?.jsonPrimitive?.content) { "next" -> 0; "up" -> index - at - 2; "down" -> index - at; else -> -1 }
@@ -1122,6 +1201,7 @@ class PlaybackService : MediaSessionService() {
         }
         val next = order.toMutableList().apply { addAll(insertion, added) }
         if (current.mediaItemCount == 0 || current.playbackState == Player.STATE_ENDED) current.pause()
+        mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()
         current.addMediaItems(media)
         removed = null
@@ -1178,6 +1258,7 @@ class PlaybackService : MediaSessionService() {
         val current = player ?: return
         val physical = physicalIds()
         if (ids.size != physical.size || ids.toSet() != physical.toSet()) return
+        mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()
         current.setShuffleOrder(DefaultShuffleOrder(ids.map(physical::indexOf).toIntArray(), System.nanoTime()))
     }
@@ -1202,6 +1283,7 @@ class PlaybackService : MediaSessionService() {
     private fun adoptDisplayedOrder(ids: List<String>) {
         val current = player ?: return
         arranging = true
+        mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()
         try {
             ids.forEachIndexed { target, id ->
@@ -1221,6 +1303,7 @@ class PlaybackService : MediaSessionService() {
         val index = physicalIds().indexOf(id)
         val media = current.getMediaItemAt(index)
         removedTrack = wireTracks[id]
+        mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()
         current.removeMediaItem(index)
         if (current.shuffleModeEnabled) setTraversal(removal.remaining)
@@ -1262,6 +1345,7 @@ class PlaybackService : MediaSessionService() {
         if (future.isEmpty()) return
         val remaining = traversalIds().filterNot { it in future }
         removed = null
+        mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()
         for (index in current.mediaItemCount - 1 downTo 0) {
             if (PlaybackMedia.occurrence(current.getMediaItemAt(index)) in future) current.removeMediaItem(index)
@@ -1293,21 +1377,54 @@ class PlaybackService : MediaSessionService() {
         override fun onDisconnected(mediaSession: MediaSession, controller: MediaSession.ControllerInfo) { admissions.remove(controller) }
 
         override fun onMediaButtonEvent(mediaSession: MediaSession, controller: MediaSession.ControllerInfo, mediaButtonIntent: Intent): Boolean {
-            @Suppress("DEPRECATION")
-            val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT) ?: return true
-            if (!trusted(controller) || event.action != KeyEvent.ACTION_DOWN || event.repeatCount != 0 || event.eventTime < lastSuspendedUptime) return true
-            val remote = (application as SpofifyApplication).graph.playbackCoordinator?.state?.value
-            val playing = if (remote?.activeDeviceId != remote?.deviceId) remote?.view?.state?.playing == true else player?.playWhenReady == true
+            if (mediaSession !== session || active.get() !== this@PlaybackService || sharedClient !== client ||
+                sharedClient !== (application as SpofifyApplication).graph.client || authenticatedSession == null ||
+                sharedClient.currentSession() !== authenticatedSession || !PlaybackMediaButtonTrust.accepts(this@PlaybackService, controller)) return true
+            if (mediaButtonIntent.action != Intent.ACTION_MEDIA_BUTTON) return false
+            val event = try {
+                IntentCompat.getParcelableExtra(mediaButtonIntent, Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+            } catch (_: RuntimeException) { null } ?: return true
+            val known = event.keyCode in setOf(KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE,
+                KeyEvent.KEYCODE_MEDIA_STOP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK,
+                KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD, KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+                KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, KeyEvent.KEYCODE_MEDIA_REWIND)
+            // Volume is an OS music-stream operation, not player gain or musical transport.
+            // Delegate genuinely unmapped keys only after caller admission. Rejected callers
+            // must never borrow Media3's notification-controller fallback identity.
+            if (!known) return false
+            if (event.action != KeyEvent.ACTION_DOWN || event.repeatCount != 0) return true
+            val owner = (application as SpofifyApplication).graph.playbackCoordinator
+            val devices = owner?.state?.value
+            val remote = devices != null && devices.activeDeviceId.isNotEmpty() && devices.activeDeviceId != devices.deviceId
+            val boundary = maxOf(lastSuspendedUptime, mediaButtonBoundaryUptime,
+                if (remote) owner?.interactionChangedUptime ?: 0L else 0L)
+            // First delivery can itself be delayed across a queue/output/service replacement.
+            // Do not turn an old physical press into a fresh intent for the replacement binding.
+            if (event.downTime <= boundary || event.eventTime < event.downTime ||
+                event.eventTime > SystemClock.uptimeMillis()) return true
+            val identity = MediaButtonDown(event.keyCode, event.deviceId, event.source, event.downTime, event.eventTime)
+            if (!mediaButtonDowns.add(identity)) return true
+            if (mediaButtonDowns.size > 32) mediaButtonDowns.remove(mediaButtonDowns.first())
+            val state = sessionTransportSnapshot()
             val type = when (event.keyCode) {
                 KeyEvent.KEYCODE_MEDIA_PLAY -> "resume"
                 KeyEvent.KEYCODE_MEDIA_PAUSE, KeyEvent.KEYCODE_MEDIA_STOP -> "pause"
-                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK -> if (playing) "pause" else "resume"
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK -> if (state.playing) "pause" else "resume"
                 KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD -> "next"
                 KeyEvent.KEYCODE_MEDIA_PREVIOUS, KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD -> "previous"
                 else -> null
             }
-            type?.let { routeCommand(PlaybackDeviceCommand.transport(it), userInteraction = true) }
-            return true // Never leave a delayed headset single/double-tap start in Media3.
+            if (type != null) routeCommand(PlaybackDeviceCommand.transport(type), userInteraction = true)
+            else if (state.queue.getOrNull(state.position) != null && state.elapsed.isFinite()) {
+                val increment = if (event.keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) player?.seekForwardIncrement
+                    else player?.seekBackIncrement?.let { -it }
+                val view = RemoteSessionView(state)
+                val upper = view.durationMs.takeIf { it != C.TIME_UNSET }?.div(1000.0) ?: 604800.0
+                increment?.let { routeCommand(PlaybackDeviceCommand.seek((view.positionMs / 1000.0 + it / 1000.0).coerceIn(0.0, upper)), userInteraction = true) }
+            }
+            // Immediate single-press toggle policy. No default delayed single/double-tap task
+            // may re-admit an old headset Play after cancellation; no universal multi-click claim.
+            return true
         }
 
         override fun onConnect(

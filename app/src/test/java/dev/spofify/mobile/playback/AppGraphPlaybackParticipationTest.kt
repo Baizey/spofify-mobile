@@ -214,7 +214,11 @@ class AppGraphPlaybackParticipationTest {
             // and adds a duplicate without opening audio or earning imported-position history.
             val track = seed.toJson().getValue("queue").jsonArray.single().jsonObject
             owner.remoteCommand(PlaybackDeviceCommand.musical("enqueue", track = track, first = true))
-            await("Real enqueue result must be published") { fixture.states().any { it.queue.size == 2 } }
+            // Server receipt precedes the client's response/command completion. Do not issue
+            // the next deliberate Play while the coordinator still awaits this publication.
+            await("Real enqueue result must be published and accepted by the coordinator") {
+                fixture.states().any { it.queue.size == 2 } && owner.state.value.view?.state?.queue?.size == 2
+            }
             val queued = fixture.states().last()
             assertFalse(queued.playing)
             assertEquals(seed.occurrence, queued.occurrence)

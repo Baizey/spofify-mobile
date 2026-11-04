@@ -1,6 +1,7 @@
 package dev.spofify.mobile
 
 import android.os.Bundle
+import android.media.AudioManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -67,6 +68,7 @@ class MainActivity : ComponentActivity() {
     private val model: LibraryViewModel by viewModels()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        volumeControlStream = AudioManager.STREAM_MUSIC
         enableEdgeToEdge()
         setContent {
             MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
