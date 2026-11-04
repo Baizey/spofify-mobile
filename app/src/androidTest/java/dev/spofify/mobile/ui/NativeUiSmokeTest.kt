@@ -12,10 +12,13 @@ import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.spofify.mobile.LibraryViewModel
 import dev.spofify.mobile.MainActivity
+import dev.spofify.mobile.playback.PlaybackState
 import org.junit.Assert.*
 import org.junit.BeforeClass
 import org.junit.Rule
@@ -244,7 +247,7 @@ class NativeUiSmokeTest {
                 waitFor(hasText("Up next · 5"))
                 screenshot("10-queue")
                 val originalQueue = captureQueueSnapshot()
-                assertEquals(UiFixtureServer.TRACK_NAMES.subList(1, 6), originalQueue)
+                assertEquals(UiFixtureServer.TRACK_NAMES.subList(1, 6), originalQueue.map { it.title })
                 compose.onNodeWithContentDescription("Queue actions for ${UiFixtureServer.TRACK_NAMES[1]}").performScrollTo().performClick()
                 compose.onNodeWithText("Remove from queue").performClick()
                 waitUntilAbsent(hasText("Remove from queue") and hasClickAction())
@@ -473,7 +476,7 @@ class NativeUiSmokeTest {
     }
 
     private fun assertSearchEditingContinuity(
-        fixture: UiFixtureServer, evidencePrefix: String, playing: Boolean, expectedQueue: List<String>? = null,
+        fixture: UiFixtureServer, evidencePrefix: String, playing: Boolean, expectedQueue: List<QueueOccurrence>? = null,
     ) {
         // Sixteen loaded songs leave a real middle anchor, not the first row or a clamped end.
         waitUntilAbsent(hasContentDescription("Searching saved music"))
@@ -544,12 +547,23 @@ class NativeUiSmokeTest {
         assertEquals("Browsing and liking must not request audio", 0, fixture.audioRequests.get())
         assertEquals("Browsing must not report audible history", 0, fixture.historyWrites.get())
     }
-    private fun captureQueueSnapshot(count: Int = 5): List<String> {
+    private data class QueueOccurrence(val id: String, val title: String)
+    // Read the Activity's EXISTING UI-facing state on main; do not create a second connection,
+    // export a handoff snapshot (which samples history), or send player/queue commands.
+    private fun readPlaybackState(): PlaybackState = compose.runOnIdle {
+        ViewModelProvider(compose.activity)[LibraryViewModel::class.java].playback.state.value
+    }
+    private fun upcomingOccurrences(): List<QueueOccurrence> = readPlaybackState().upcoming.map {
+        QueueOccurrence(it.occurrenceId, it.item.name)
+    }
+    private fun captureQueueSnapshot(count: Int = 5): List<QueueOccurrence> {
         compose.onNodeWithText("Up next · $count").assertExists()
+        val expected = upcomingOccurrences()
+        assertEquals("Actual upcoming occurrence count", count, expected.size)
         val queue = compose.onNodeWithContentDescription("Upcoming queue").performScrollTo()
         // The native queue is a bounded LazyColumn, NOT an eagerly composed Column. Inspect
         // actual list indices and each handle's native ordinal, never seek expected track names.
-        val names = (0 until count).map { index ->
+        val occurrences = (0 until count).map { index ->
             queue.performScrollToIndex(index)
             val handles = hasContentDescription("Reorder ", substring = true) and
                 hasAnyAncestor(hasContentDescription("Upcoming queue"))
@@ -565,27 +579,36 @@ class NativeUiSmokeTest {
                 checkNotNull(Regex("^Position (\\d+) of $count\\.").find(state)).groupValues[1].toInt()
             }
             assertEquals("Queue geometry must agree with traversal ordinals", positions.sorted(), positions)
-            handle.fetchSemanticsNode().config[SemanticsProperties.ContentDescription]
+            val title = handle.fetchSemanticsNode().config[SemanticsProperties.ContentDescription]
                 .single { it.startsWith("Reorder ") }.removePrefix("Reorder ")
+            assertEquals("Rendered queue ordinal must identify the actual occurrence", expected[index].title, title)
+            expected[index]
         }
-        assertEquals("Synthetic upcoming occurrences have unique identities", count, names.toSet().size)
+        assertEquals("Upcoming occurrence IDs must be unique", count, occurrences.map { it.id }.toSet().size)
+        assertTrue("Upcoming occurrence IDs must not be blank", occurrences.all { it.id.isNotBlank() })
+        assertEquals("Queue must not change while inspecting lazy indices", expected, upcomingOccurrences())
         queue.performScrollToIndex(0) // Restore only the viewport; no queue commands or reordering.
-        return names
+        return occurrences
     }
-    private fun assertQueueSnapshot(expected: List<String>) {
+    private fun assertQueueSnapshot(expected: List<QueueOccurrence>) {
         assertEquals("Upcoming occurrence order/traversal changed", expected, captureQueueSnapshot(expected.size))
     }
 
     private data class PlaybackWitness(
         val positionMs: Float, val durationMs: Float, val sampledAtMs: Long,
-        val track: String, val preparations: Int,
+        val track: String, val occurrenceId: String, val preparations: Int,
     )
     private fun activePlayingButton() = if (exists(playerSheet)) playingButton() and inPlayerSheet() else playingButton()
     private fun readPlaybackWitness(fixture: UiFixtureServer): PlaybackWitness {
+        val state = readPlaybackState()
         val sampledAt = SystemClock.elapsedRealtime()
+        val occurrenceId = checkNotNull(state.currentEntryId) { "Audible occurrence identity is missing" }
+        assertTrue("Audible occurrence identity must not be blank", occurrenceId.isNotBlank())
         val titles = compose.onNode(expandPlayer).fetchSemanticsNode().config[SemanticsProperties.Text].map { it.text }
         val track = checkNotNull(titles.singleOrNull { it in UiFixtureServer.TRACK_NAMES })
         assertEquals("The unique audible occurrence must remain selected", UiFixtureServer.TRACK_NAMES.first(), track)
+        assertEquals("Rendered title must match the actual selected occurrence", state.item?.name, track)
+        assertEquals("Actual player duration must agree with synthetic metadata/WAV", UiFixtureServer.AUDIO_DURATION_MS, state.durationMs)
         val position: Float
         val duration: Float
         if (exists(playerSheet)) {
@@ -597,19 +620,20 @@ class NativeUiSmokeTest {
                 .config[SemanticsProperties.ProgressBarRangeInfo]
             assertEquals(0f, progress.range.start, .001f)
             assertEquals(1f, progress.range.endInclusive, .001f)
-            duration = UiFixtureServer.AUDIO_DURATION_MS.toFloat()
+            duration = state.durationMs.toFloat()
             position = progress.current * duration
         }
         assertEquals("Actual duration must agree with synthetic metadata/WAV", UiFixtureServer.AUDIO_DURATION_MS.toFloat(), duration, 1f)
         assertTrue("Fixture must not naturally finish during this journey", position + 90_000f < duration)
-        return PlaybackWitness(position, duration, sampledAt, track, fixture.playbackPreparations.get())
+        return PlaybackWitness(position, duration, sampledAt, track, occurrenceId, fixture.playbackPreparations.get())
     }
     private fun capturePlaying(fixture: UiFixtureServer): PlaybackWitness {
         waitFor(activePlayingButton())
         return readPlaybackWitness(fixture)
     }
     private fun assertPlaybackTimeline(before: PlaybackWitness, after: PlaybackWitness, label: String) {
-        assertEquals("$label must retain the audible occurrence", before.track, after.track)
+        assertEquals("$label must retain the audible track", before.track, after.track)
+        assertEquals("$label must retain the exact prepared occurrence", before.occurrenceId, after.occurrenceId)
         assertEquals("$label must retain duration", before.durationMs, after.durationMs, 1f)
         assertEquals("$label must not prepare another queue", before.preparations, after.preparations)
         val elapsed = (after.sampledAtMs - before.sampledAtMs).toFloat()
@@ -634,11 +658,12 @@ class NativeUiSmokeTest {
         waitFor(if (exists(playerSheet)) pausedButton() and inPlayerSheet() else pausedButton())
         val after = readPlaybackWitness(fixture)
         assertEquals(before.track, after.track)
+        assertEquals("Paused transition must retain the exact prepared occurrence", before.occurrenceId, after.occurrenceId)
         assertEquals(before.durationMs, after.durationMs, 1f)
         assertEquals("Paused collapse must not prepare another queue", before.preparations, after.preparations)
         assertEquals("Paused collapse must preserve position", before.positionMs, after.positionMs, 1_000f)
     }
-    private fun assertQueuePreservedFromMini(expected: List<String>, fixture: UiFixtureServer) {
+    private fun assertQueuePreservedFromMini(expected: List<QueueOccurrence>, fixture: UiFixtureServer) {
         val beforeExpand = capturePlaying(fixture)
         compose.onNode(expandPlayer).performClick()
         waitFor(playerSheet)
