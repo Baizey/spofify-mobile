@@ -37,6 +37,15 @@ class LibraryViewModelTest {
         var plays = 0
         var enqueues = 0
         val contexts = mutableListOf<LibraryItem?>()
+        val listActions = mutableListOf<PlaybackListAction>()
+        val actionResults = ArrayDeque<(PlaybackActionResult) -> Unit>()
+        override fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?,
+            startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean,
+            onResult: (PlaybackActionResult) -> Unit) {
+            listActions += action
+            actionResults.addLast(onResult)
+        }
         override fun connect() = Unit
         override fun release() = Unit
         override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean, startEntryId: String?) { plays++ }
@@ -110,15 +119,29 @@ class LibraryViewModelTest {
             assertEquals(intent, model.state.value.playbackIntentGeneration)
             assertEquals(0, playback.plays)
             assertEquals(0, playback.enqueues)
+            assertTrue(playback.listActions.isEmpty())
+            assertTrue(playback.actionResults.isEmpty())
             assertTrue(playback.contexts.isEmpty())
             assertNull(model.state.value.notice)
             if (retry) {
                 request()
-                until { !model.state.value.preparing }
+                if (enqueue) until { playback.listActions.size == 1 }
+                else until { !model.state.value.preparing }
                 assertEquals(if (enqueue) 0 else 1, playback.plays)
-                assertEquals(if (enqueue) 1 else 0, playback.enqueues)
+                assertEquals(0, playback.enqueues)
                 assertEquals(if (enqueue) 0 else 1, playback.contexts.size)
-                assertEquals("This queue is limited to 1,000 available songs.", model.state.value.notice)
+                if (enqueue) {
+                    assertEquals(listOf(PlaybackListAction.PLAY_NEXT), playback.listActions)
+                    assertTrue("The action stays preparing until authoritative acceptance", model.state.value.preparing)
+                    assertNull("Preparation is not service acceptance, even for a truncated queue", model.state.value.notice)
+                    val result = PlaybackActionResult(PlaybackActionStatus.LIMITED, acceptedCount = 1)
+                    playback.actionResults.removeFirst().invoke(result)
+                    until { !model.state.value.preparing }
+                    assertEquals(result.userMessage, model.state.value.notice)
+                } else {
+                    assertTrue(playback.listActions.isEmpty())
+                    assertEquals("This queue is limited to 1,000 available songs.", model.state.value.notice)
+                }
             }
         } finally {
             releaseQueue.countDown(); store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain()
@@ -220,6 +243,7 @@ class LibraryViewModelTest {
             until { !model.state.value.preparing && !model.state.value.busy }
             assertEquals(0, playback.plays)
             assertEquals(0, playback.enqueues)
+            assertTrue(playback.listActions.isEmpty())
             assertTrue(playback.contexts.isEmpty())
             assertNull(model.state.value.notice)
             if (logout) {

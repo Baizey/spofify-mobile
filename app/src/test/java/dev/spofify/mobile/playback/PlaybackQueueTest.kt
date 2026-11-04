@@ -48,9 +48,9 @@ class PlaybackQueueTest {
         assertEquals(listOf("played", "current"), order.filterNot { it in future })
     }
 
-    @Test fun capacityRetiresOnlyPlayedEntriesNeverCurrentOrUpcoming() {
+    @Test fun capacityPreservesPlayedCurrentAndFutureAndNeverMakesDestructiveRoom() {
         val order = (0 until PlaybackQueue.LIMIT).map(Int::toString)
-        assertEquals(order.drop(700), PlaybackQueue.retainedForAdd(order, "700", 20))
+        assertEquals(order, PlaybackQueue.retainedForAdd(order, "700", 20))
         assertEquals(order, PlaybackQueue.retainedForAdd(order, "0", 20))
         assertEquals(order, PlaybackQueue.retainedForAdd(order, "700", 0))
     }

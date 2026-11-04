@@ -11,8 +11,18 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.test.performTouchInput
+import dev.spofify.mobile.playback.PlaybackInteractionKey
+import dev.spofify.mobile.playback.PlaybackActionResult
+import dev.spofify.mobile.playback.PlaybackActionStatus
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
@@ -31,6 +41,7 @@ import dev.spofify.mobile.playback.QueueEntry
 import dev.spofify.mobile.ui.theme.AppTypography
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -56,9 +67,11 @@ class NativeUpcomingQueueTest {
         compose.setContent {
             MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                 parentState = rememberLazyListState()
+                val actionIsCurrent = rememberUpcomingQueueActionIsCurrent(controls)
                 LazyColumn(Modifier.size(400.dp, 500.dp).testTag("queue-parent"), state = parentState) {
                     item(key = "player-header") { Text("Pinned elsewhere", Modifier.height(96.dp)) }
-                    nativeUpcomingQueue(state, controls, {}, { _, modifier -> Box(modifier) }, parentState)
+                    nativeUpcomingQueue(state, controls, {}, { _, modifier -> Box(modifier) }, parentState,
+                        actionIsCurrent = actionIsCurrent)
                 }
             }
         }
@@ -95,7 +108,9 @@ class NativeUpcomingQueueTest {
         // A progress-only publication must preserve the keyed occurrence's open menu.
         compose.runOnIdle { snapshot.value = snapshot.value.copy(positionMs = 12_000) }
         compose.onNodeWithText("Move up").performClick()
-        compose.onAllNodesWithContentDescription("Play queued song Duplicate song")[1].performClick()
+        compose.onAllNodesWithContentDescription("Play queued song Duplicate song").assertCountEquals(0)
+        compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1].performClick()
+        compose.onNodeWithText("Play now").performClick()
         compose.runOnIdle {
             assertEquals(listOf("second" to 0), controls.moves)
             assertEquals(listOf("second"), controls.selected)
@@ -129,12 +144,225 @@ class NativeUpcomingQueueTest {
         }
     }
 
+    @Test fun bothPresentationsDispatchExactOccurrenceOnceOnlyOnRightReleaseAndExposeMoreAlternative() {
+        val controls = QueueRecordingControls()
+        val compact = mutableStateOf(false)
+        val key = PlaybackInteractionKey()
+        val state = PlaybackState(item = track, isPlaying = true, interactionKey = key,
+            upcoming = listOf(QueueEntry("exact-duplicate", track, 4)))
+        compose.setContent {
+            MaterialTheme {
+                Column(Modifier.size(400.dp, 500.dp)) {
+                    NativeUpcomingQueue(state, controls, {}, { _, modifier -> Box(modifier) }, compact = compact.value)
+                }
+            }
+        }
+        for (presentation in listOf(false, true)) {
+            compose.runOnIdle { compact.value = presentation; controls.contextual.clear() }
+            compose.onAllNodesWithContentDescription("Play queued song Duplicate song").assertCountEquals(0)
+            compose.onNodeWithText("Duplicate song").performTouchInput {
+                // This is in the identity target, not More or the dedicated reorder handle.
+                down(Offset(60f, 20f)); moveTo(Offset(150f, 20f))
+            }
+            compose.runOnIdle { assertTrue(controls.contextual.isEmpty()) }
+            compose.onNodeWithText("Duplicate song").performTouchInput { up() }
+            compose.runOnIdle { assertEquals(listOf("exact-duplicate"), controls.contextual) }
+            compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
+            compose.onNodeWithText("Add to queue").performClick()
+            compose.runOnIdle {
+                assertEquals(listOf("exact-duplicate", "exact-duplicate"), controls.contextual)
+                assertTrue(controls.selected.isEmpty())
+                assertEquals(0, controls.playbackCalls)
+            }
+        }
+    }
+
+    @Test fun bothPresentationsUseExplicitPlayNextForMoreAndAccessibilityWithoutReorderFallback() {
+        val controls = QueueRecordingControls()
+        val compact = mutableStateOf(false)
+        val key = PlaybackInteractionKey()
+        val snapshot = mutableStateOf(PlaybackState(item = track, interactionKey = key,
+            upcoming = listOf(QueueEntry("exact-duplicate", track, 4))))
+        compose.setContent {
+            MaterialTheme {
+                Column(Modifier.size(400.dp, 500.dp)) {
+                    NativeUpcomingQueue(snapshot.value, controls, {}, { _, modifier -> Box(modifier) }, compact = compact.value)
+                }
+            }
+        }
+        fun actions() = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+            .fetchSemanticsNode().config[SemanticsActions.CustomActions]
+        for (presentation in listOf(false, true)) {
+            compose.runOnIdle {
+                compact.value = presentation
+                snapshot.value = snapshot.value.copy(interactionKey = key,
+                    upcoming = listOf(QueueEntry("exact-duplicate", track, 4)))
+                controls.playNexts.clear()
+            }
+            // Index zero remains executable: promotion can matter without a displayed move.
+            compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
+            compose.onNodeWithText("Play next").assertIsEnabled().performClick()
+            val accessible = actions().single { it.label == "Play next" }
+            compose.runOnIdle {
+                assertTrue(accessible.action())
+                assertEquals(listOf(key to "exact-duplicate", key to "exact-duplicate"), controls.playNexts)
+                assertTrue("Explicit Play next must not use arbitrary reorder", controls.moves.isEmpty())
+                assertTrue(controls.selected.isEmpty())
+                assertEquals(0, controls.playbackCalls)
+                snapshot.value = snapshot.value.copy(interactionKey = null)
+            }
+            assertTrue(actions().none { it.label == "Play next" })
+            compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
+            compose.onNodeWithText("Play next").assertIsNotEnabled()
+            // Opening a menu and losing availability cannot create a fallback mutation.
+            compose.runOnIdle {
+                snapshot.value = snapshot.value.copy(interactionKey = key,
+                    upcoming = listOf(QueueEntry("exact-duplicate", track.copy(hasAudio = false), 4)))
+            }
+            compose.onNodeWithText("Play next").assertDoesNotExist() // Changed binding dismissed the old menu.
+            compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
+            compose.onNodeWithText("Play next").assertIsNotEnabled()
+            compose.onNodeWithText("Remove from queue").performClick() // Dismiss without a playback action.
+            assertTrue(actions().none { it.label == "Play next" })
+            compose.runOnIdle { assertEquals(2, controls.playNexts.size); assertTrue(controls.moves.isEmpty()) }
+        }
+    }
+
+    @Test fun normalMoreDismissesOnBindingReplacementRatherThanRebinding() = checkMenuBinding(compact = false)
+
+    @Test fun compactMoreDismissesOnBindingReplacementRatherThanRebinding() = checkMenuBinding(compact = true)
+
+    private fun checkMenuBinding(compact: Boolean) {
+        val controls = QueueRecordingControls()
+        val initialKey = PlaybackInteractionKey()
+        val initial = PlaybackState(item = track, isPlaying = true, interactionKey = initialKey,
+            upcoming = listOf(QueueEntry("same-occurrence", track, 4)))
+        val snapshot = mutableStateOf(initial)
+        compose.setContent {
+            MaterialTheme {
+                Column(Modifier.size(400.dp, 500.dp)) {
+                    NativeUpcomingQueue(snapshot.value, controls, {}, { _, modifier -> Box(modifier) }, compact = compact)
+                }
+            }
+        }
+        compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
+        compose.runOnIdle { snapshot.value = initial.copy(positionMs = 1_000) }
+        compose.onNodeWithText("Add to queue").assertIsDisplayed()
+        compose.onNodeWithText("Play next").assertIsDisplayed()
+        compose.runOnIdle { snapshot.value = initial.copy(interactionKey = PlaybackInteractionKey()) }
+        compose.onNodeWithText("Add to queue").assertDoesNotExist()
+        compose.onNodeWithText("Play next").assertDoesNotExist()
+        // An equal-valued queue returning under another observed binding cannot revive More.
+        compose.runOnIdle { snapshot.value = initial.copy(interactionKey = PlaybackInteractionKey()) }
+        compose.onNodeWithText("Play next").assertDoesNotExist()
+        compose.runOnIdle {
+            assertTrue(controls.contextual.isEmpty())
+            assertTrue(controls.playNexts.isEmpty())
+            assertTrue(controls.selected.isEmpty())
+            assertTrue(controls.moves.isEmpty())
+        }
+        // A deliberate reopen belongs to the new binding and remains executable.
+        compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
+        compose.onNodeWithText("Play next").performClick()
+        compose.runOnIdle { assertEquals(snapshot.value.interactionKey to "same-occurrence", controls.playNexts.single()) }
+    }
+
+    @Test fun normalWrapperAcceptedIntentSurvivesSelfRowRemovalButNotQueueDisposal() =
+        checkAcceptedIntentLifetime(compact = false, parentHost = false)
+
+    @Test fun compactWrapperAcceptedIntentSurvivesSelfRowRemovalButNotQueueDisposal() =
+        checkAcceptedIntentLifetime(compact = true, parentHost = false)
+
+    @Test fun normalParentAcceptedIntentSurvivesSelfRowRemovalButNotQueueDisposal() =
+        checkAcceptedIntentLifetime(compact = false, parentHost = true)
+
+    @Test fun compactParentAcceptedIntentSurvivesSelfRowRemovalButNotQueueDisposal() =
+        checkAcceptedIntentLifetime(compact = true, parentHost = true)
+
+    private fun checkAcceptedIntentLifetime(compact: Boolean, parentHost: Boolean) {
+        val controls = QueueRecordingControls()
+        val key = PlaybackInteractionKey()
+        val selected = track.copy(name = "Selected queued song")
+        val shown = mutableStateOf(true)
+        val snapshot = mutableStateOf(PlaybackState(item = track, isPlaying = false, playWhenReady = false,
+            interactionKey = key, upcoming = listOf(QueueEntry("selected-occurrence", selected, 4))))
+        compose.setContent {
+            MaterialTheme {
+                Column(Modifier.size(400.dp, 500.dp)) {
+                    if (shown.value) {
+                        if (parentHost) {
+                            // Lifetime belongs to the Compose queue host, outside the lazy builder
+                            // and all lazy items, just as in the production sheet parent seam.
+                            val actionIsCurrent = rememberUpcomingQueueActionIsCurrent(controls)
+                            val listState = rememberLazyListState()
+                            LazyColumn(Modifier.size(400.dp, 500.dp), state = listState) {
+                                nativeUpcomingQueue(snapshot.value, controls, {}, { _, modifier -> Box(modifier) },
+                                    listState, actionIsCurrent = actionIsCurrent, compact = compact)
+                            }
+                        } else {
+                            NativeUpcomingQueue(snapshot.value, controls, {}, { _, modifier -> Box(modifier) }, compact = compact)
+                        }
+                    }
+                }
+            }
+        }
+        val stalePlayNext = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+            .fetchSemanticsNode().config[SemanticsActions.CustomActions].single { it.label == "Play next" }
+        compose.onNodeWithText("Selected queued song").performTouchInput {
+            down(Offset(60f, 20f)); moveTo(Offset(150f, 20f))
+        }
+        compose.runOnIdle { assertTrue("Held idle swipe is not yet accepted", controls.contextualPredicates.isEmpty()) }
+        compose.onNodeWithText("Selected queued song").performTouchInput { up() }
+        lateinit var acceptedIsCurrent: () -> Boolean
+        compose.runOnIdle {
+            assertEquals(listOf("selected-occurrence"), controls.contextual)
+            assertEquals(1, controls.contextualPredicates.size)
+            acceptedIsCurrent = controls.contextualPredicates.single()
+            assertTrue(acceptedIsCurrent())
+            // A real idle select/seek removes this exact occurrence from upcoming and publishes
+            // a new key. That accepted mutation must not invalidate the queue-owned predicate.
+            snapshot.value = snapshot.value.copy(item = selected, upcoming = emptyList(),
+                interactionKey = PlaybackInteractionKey())
+        }
+        compose.onNodeWithText("No upcoming songs").assertIsDisplayed()
+        compose.onNodeWithText("Selected queued song").assertDoesNotExist()
+        compose.runOnIdle {
+            assertTrue("Accepted intent survives its own row disposal and key publication", acceptedIsCurrent())
+            stalePlayNext.action()
+            assertTrue("Disposed row accessibility must not invoke Play next", controls.playNexts.isEmpty())
+            assertTrue("No stale request may reach the fake boundary", controls.playNextPredicates.isEmpty())
+            assertTrue(controls.moves.isEmpty())
+            assertTrue(controls.selected.isEmpty())
+            assertEquals(0, controls.playbackCalls)
+            shown.value = false
+        }
+        compose.waitForIdle()
+        compose.runOnIdle { assertFalse("Disposing the queue/sheet invalidates accepted caller lifetime", acceptedIsCurrent()) }
+    }
+
     private class QueueRecordingControls : PlaybackControls {
         override val state = MutableStateFlow(PlaybackState())
         var playbackCalls = 0
         var undos = 0
         val moves = mutableListOf<Pair<String, Int>>()
         val selected = mutableListOf<String>()
+        val contextual = mutableListOf<String>()
+        val contextualPredicates = mutableListOf<() -> Boolean>()
+        val playNexts = mutableListOf<Pair<PlaybackInteractionKey, String>>()
+        val playNextPredicates = mutableListOf<() -> Boolean>()
+        override fun playNextOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+            isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            playNextPredicates += isCurrent
+            assertTrue("Play next retains live queue-host authority", isCurrent())
+            playNexts += expectedKey to occurrenceId
+            onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+        }
+        override fun contextualOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+            isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            contextualPredicates += isCurrent
+            if (isCurrent()) contextual += occurrenceId
+            onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+        }
         override fun connect() { playbackCalls++ }
         override fun release() { playbackCalls++ }
         override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean,

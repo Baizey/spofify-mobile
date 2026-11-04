@@ -2,22 +2,16 @@ package dev.spofify.mobile.feature.library
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.RectangleShape
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
@@ -28,11 +22,8 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.LibraryItem
-import kotlin.math.abs
-import kotlin.math.roundToInt
 
 /** Host-supplied actual transport state; navigating never prepares or restores audio. */
 data class CatalogPlaybackFeedback(
@@ -40,7 +31,13 @@ data class CatalogPlaybackFeedback(
     val isPlaying: Boolean = false,
     val buffering: Boolean = false,
     val onToggle: (() -> Unit)? = null,
-)
+    val interactionKey: dev.spofify.mobile.playback.PlaybackInteractionKey? = null,
+    val playWhenReady: Boolean = false,
+    val onContextual: ((LibraryItem, dev.spofify.mobile.playback.PlaybackInteractionKey, () -> Boolean) -> Unit)? = null,
+) {
+    val activeIntent: Boolean get() = isPlaying || (buffering && playWhenReady)
+    val contextualLabel: String get() = if (activeIntent) "Add to queue" else "Play now"
+}
 
 /** Like state belongs to the account's shared personal-action owner, not each row. */
 data class CatalogLikeState(val liked: Boolean? = null, val pending: Boolean = false, val failed: Boolean = false)
@@ -63,7 +60,6 @@ fun MusicRow(
     like: CatalogLikeState? = null,
     onToggleLike: ((LibraryItem) -> Unit)? = null,
 ) {
-    val haptic = LocalHapticFeedback.current
     val typography = MaterialTheme.typography
     val titleStyle = typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
     val subtitleStyle = typography.bodySmall
@@ -87,58 +83,23 @@ fun MusicRow(
     val rowHeight = maxOf(72.dp, copyHeight + 20.dp)
     val subtitle = compactMusicSubtitle(item)
     val current = item.kind == "track" && playback.trackId == item.id
-    val playLabel = if (current && playback.isPlaying) "Pause ${item.name}" else "Play ${item.name}"
-    var drag by remember(item.id, item.entryId) { mutableFloatStateOf(0f) }
-    val enqueue by rememberUpdatedState(onEnqueueItem)
-    val rowItem by rememberUpdatedState(item)
-    Box(modifier.fillMaxWidth()) {
-        if (drag > 0f) Row(Modifier.matchParentSize().background(MaterialTheme.colorScheme.secondaryContainer).padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.AutoMirrored.Filled.QueueMusic, null)
-            if (drag > 90f) Text("Add to queue", style = MaterialTheme.typography.labelSmall)
-        }
-        val gesture = if (item.playable) Modifier.pointerInput(item.kind, item.id, item.entryId) {
-            val edge = 24.dp.toPx()
-            val threshold = 72.dp.toPx()
-            val maxDrag = 120.dp.toPx()
-            awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false)
-                // Leave Android edge Back untouched. Vertical movement wins until horizontal intent is clear.
-                if (down.position.x < edge || down.position.x > size.width - edge) return@awaitEachGesture
-                var x = 0f
-                var y = 0f
-                var horizontal = false
-                var cancelled = false
-                try {
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                        if (change.isConsumed) { cancelled = true; break }
-                        x += change.position.x - change.previousPosition.x
-                        y += change.position.y - change.previousPosition.y
-                        if (!horizontal && abs(y) > viewConfiguration.touchSlop && abs(y) >= abs(x)) { cancelled = true; break }
-                        if (!horizontal && x > viewConfiguration.touchSlop && x > abs(y) * 1.5f) horizontal = true
-                        if (event.changes.any { it.id != down.id && it.pressed }) { cancelled = true; break }
-                        if (horizontal) { change.consume(); drag = x.coerceIn(0f, maxDrag) }
-                        if (!change.pressed) break
-                    }
-                    if (!cancelled && horizontal && x >= threshold) {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        enqueue(rowItem)
-                    }
-                } finally { drag = 0f }
-            }
-        } else Modifier
-        Row(Modifier.offset { IntOffset(drag.roundToInt(), 0) }.background(
+    val contextualEnabled = item.playable && playback.interactionKey != null && playback.onContextual != null
+    dev.spofify.mobile.ui.ContextualSwipeRow(item, playback.interactionKey, contextualEnabled,
+        playback.contextualLabel, onCommit = { key, isCurrent -> playback.onContextual?.invoke(item, key, isCurrent) }, modifier = modifier) { swipeModifier, isCurrent ->
+        Row(swipeModifier.fillMaxWidth().background(
             if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background)
-            .then(gesture)
             .combinedClickable(onClick = { onOpenItem(item) }, onLongClickLabel = "More actions for ${item.name}",
                 onLongClick = { onShowActions(item) })
             .semantics {
                 if (current) stateDescription = if (playback.buffering) "Buffering" else if (playback.isPlaying) "Playing" else "Paused"
                 customActions = buildList {
                     add(CustomAccessibilityAction("More actions") { onShowActions(item); true })
-                    if (item.playable) add(CustomAccessibilityAction("Add to queue") { onEnqueueItem(item); true })
+                    if (item.playable) {
+                        add(CustomAccessibilityAction("Play now") { onPlayItem(item, false); true })
+                        if (contextualEnabled && playback.activeIntent) add(CustomAccessibilityAction(playback.contextualLabel) {
+                            if (isCurrent()) playback.onContextual?.invoke(item, playback.interactionKey!!, isCurrent); true
+                        })
+                    }
                     if (item.kind == "track" && onToggleLike != null && like?.pending != true) {
                         add(CustomAccessibilityAction(if (like?.liked == true) "Unlike song" else "Like song") {
                             onToggleLike(item); true
@@ -165,12 +126,6 @@ fun MusicRow(
                 if (subtitle.isNotBlank()) Text(subtitle, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, style = subtitleStyle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            IconButton(onClick = {
-                if (current && playback.onToggle != null) playback.onToggle.invoke() else onPlayItem(item, false)
-            }, enabled = item.playable, modifier = Modifier.size(48.dp).semantics { contentDescription = playLabel }) {
-                if (current && playback.buffering) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                else Icon(if (current && playback.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, null)
             }
             IconButton(onClick = { onShowActions(item) }, modifier = Modifier.size(48.dp)) {
                 Icon(Icons.Default.MoreVert, "More actions for ${item.name}")

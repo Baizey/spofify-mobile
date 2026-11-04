@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.Coverage
 import dev.spofify.mobile.core.LibraryItem
+import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.ui.theme.AppTypography
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -91,18 +92,18 @@ class MusicRowTest {
                     val row = compose.onNodeWithTag("row")
                     val art = compose.onNodeWithContentDescription(musicTypeLabel(fixture.kind), useUnmergedTree = true)
                     val title = compose.onNodeWithText(fixture.name, useUnmergedTree = true)
-                    val play = compose.onNodeWithContentDescription("Play ${fixture.name}")
                     val more = compose.onNodeWithContentDescription("More actions for ${fixture.name}")
                     row.assertWidthIsEqualTo(hostWidth).assertHeightIsAtLeast(72.dp)
                     art.assertWidthIsEqualTo(52.dp).assertHeightIsEqualTo(52.dp)
-                    play.assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
                     more.assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
-                    if (fixture.playable) play.assertIsEnabled() else play.assertIsNotEnabled()
+                    compose.onNodeWithContentDescription("Play ${fixture.name}").assertDoesNotExist()
+                    compose.onNodeWithContentDescription("Pause ${fixture.name}").assertDoesNotExist()
+                    compose.onAllNodes(hasClickAction()).assertCountEquals(2)
                     val context = "fixture=$fixtureIndex, kind=${fixture.kind}, credits=${fixture.artists.size}, " +
                         "playable=${fixture.playable}, fontScale=$fontScale, hostWidth=$hostWidth, " +
                         "subtitle=${compactMusicSubtitle(fixture)}"
                     val geometry = linkedMapOf("row" to row.bounds(), "art" to art.bounds(),
-                        "play" to play.bounds(), "more" to more.bounds())
+                        "more" to more.bounds())
                     val titleBounds = title.bounds()
                     expected?.let { baseline ->
                         for ((slot, after) in geometry) {
@@ -118,11 +119,9 @@ class MusicRowTest {
                     // fallback metrics can change how two text lines center inside the row.
                     val rowBounds = geometry.getValue("row")
                     val artBounds = geometry.getValue("art")
-                    val playBounds = geometry.getValue("play")
                     val moreBounds = geometry.getValue("more")
                     assertEquals("Artwork stays centered in the row: $context", rowBounds.center.y, artBounds.center.y, 1f)
-                    assertEquals(artBounds.center.y, playBounds.center.y, 1f)
-                    assertEquals(playBounds.center.y, moreBounds.center.y, 1f)
+                    assertEquals(artBounds.center.y, moreBounds.center.y, 1f)
                     for ((slot, bounds) in geometry.filterKeys { it != "row" }) {
                         assertTrue("Slot stays inside row: $context, slot=$slot, row=$rowBounds, actual=$bounds",
                             bounds.left >= rowBounds.left - 1f && bounds.top >= rowBounds.top - 1f &&
@@ -130,9 +129,9 @@ class MusicRowTest {
                     }
                     assertEquals("Reserved copy starts after artwork: $context", artBounds.right +
                         with(compose.density) { 10.dp.toPx() }, titleBounds.left, 1f)
-                    assertTrue("Text cannot overlap Play: $context", titleBounds.right <= playBounds.left)
-                    assertTrue(playBounds.right <= moreBounds.left)
-                    assertTrue(moreBounds.right <= rowBounds.right)
+                    assertEquals("Title reclaims the full removed playback slot up to More minus 10dp: $context",
+                        moreBounds.left - with(compose.density) { 10.dp.toPx() }, titleBounds.right, 1f)
+                    assertEquals("More stays flush with the row end: $context", rowBounds.right, moreBounds.right, 1f)
                     assertTrue(titleBounds.top >= rowBounds.top && titleBounds.bottom <= rowBounds.bottom)
                     val titleLayout = assertSingleLine(title, context, mustEllipsize = true)
                     baselineTitle?.let { baseline ->
@@ -143,7 +142,7 @@ class MusicRowTest {
                         }
                     } ?: run { baselineTitle = titleBounds }
                     if (fixture == cases.first()) println("MusicRow title metrics [$context]: " +
-                        "row=$rowBounds, artwork=$artBounds, play=$playBounds, more=$moreBounds, " +
+                        "row=$rowBounds, artwork=$artBounds, more=$moreBounds, " +
                         "intrinsicWidth=${titleLayout.multiParagraph.maxIntrinsicWidth}, " +
                         "paragraphWidth=${titleLayout.multiParagraph.width}, lineRight=${titleLayout.getLineRight(0)}, " +
                         "size=${titleLayout.size}, constraints=${titleLayout.layoutInput.constraints}, " +
@@ -156,7 +155,9 @@ class MusicRowTest {
                         val metadataBounds = metadata.bounds()
                         assertEquals(titleBounds.left, metadataBounds.left, 1f)
                         assertTrue(titleBounds.bottom <= metadataBounds.top + 1f)
-                        assertTrue(metadataBounds.right <= playBounds.left && metadataBounds.bottom <= rowBounds.bottom)
+                        assertTrue("Metadata respects the same reclaimed copy slot: $context",
+                            metadataBounds.right <= moreBounds.left - with(compose.density) { 10.dp.toPx() } + 1f &&
+                                metadataBounds.bottom <= rowBounds.bottom)
                     } else {
                         // The slot is reserved by layout, not a fake blank Text announcement.
                         compose.onAllNodes(hasText(" "), useUnmergedTree = true).assertCountEquals(0)
@@ -200,49 +201,70 @@ class MusicRowTest {
                 .assert(SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf(type)))
             compose.onNodeWithText(compactMusicSubtitle(item.value), useUnmergedTree = true).assertHasNoClickAction()
             credits.forEach { compose.onNodeWithText(it.name).assertDoesNotExist() }
-            compose.onAllNodes(hasClickAction()).assertCountEquals(3) // Open, Play, More; no inline Like/credit buttons.
+            compose.onAllNodes(hasClickAction()).assertCountEquals(2) // Open and More; no inline transport/Like/credit buttons.
         }
     }
 
-    @Test fun openPlayMoreLongPressAndAccessibleActionsRemainDistinctAndNeverAutoplay() {
+    @Test fun openMoreLongPressAndCustomPlaybackActionsRemainDistinctAndNeverAutoplay() {
         var opened: LibraryItem? = null
         val played = mutableListOf<Pair<LibraryItem, Boolean>>()
+        val key = PlaybackInteractionKey()
+        val contextual = mutableListOf<Pair<LibraryItem, PlaybackInteractionKey>>()
         var more = 0
-        var queued = 0
+        var legacyEnqueues = 0
         var liked = 0
         compose.setContent {
             MaterialTheme(typography = AppTypography) {
                 Box(Modifier.width(320.dp)) {
-                    MusicRow(track, { opened = it }, { item, shuffle -> played += item to shuffle }, { more++ }, { queued++ },
+                    MusicRow(track, { opened = it }, { item, shuffle -> played += item to shuffle }, { more++ }, { legacyEnqueues++ },
                         artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.testTag("row"),
+                        playback = CatalogPlaybackFeedback(isPlaying = true, interactionKey = key,
+                            onContextual = { item, binding, isCurrent ->
+                                assertTrue("Dispatched contextual action is still current", isCurrent())
+                                contextual += item to binding
+                            }),
                         like = CatalogLikeState(liked = false), onToggleLike = { liked++ })
                 }
             }
         }
-        compose.runOnIdle { assertTrue(played.isEmpty()); assertEquals(null, opened) }
+        compose.runOnIdle { assertTrue(played.isEmpty()); assertTrue(contextual.isEmpty()); assertEquals(null, opened) }
+        compose.onAllNodes(hasClickAction()).assertCountEquals(2)
         compose.onNodeWithText(track.name).performClick()
-        compose.runOnIdle { assertEquals(track, opened); assertTrue(played.isEmpty()) }
-        compose.onNodeWithContentDescription("Play ${track.name}").performClick()
+        compose.runOnIdle { assertEquals(track, opened); assertTrue(played.isEmpty()); assertTrue(contextual.isEmpty()) }
+        compose.onNodeWithContentDescription("Play ${track.name}").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Pause ${track.name}").assertDoesNotExist()
         compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
         compose.onNodeWithText(track.name).performTouchInput { longClick() }
         val actions = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
             .fetchSemanticsNode().config[SemanticsActions.CustomActions]
         compose.runOnIdle {
-            assertEquals(listOf(track to false), played)
+            assertTrue(played.isEmpty())
+            assertTrue(contextual.isEmpty())
             assertEquals(2, more)
+            assertTrue(actions.single { it.label == "Play now" }.action())
+            assertEquals(listOf(track to false), played)
+            assertTrue(contextual.isEmpty())
             assertTrue(actions.single { it.label == "Add to queue" }.action())
+            assertEquals(listOf(track to key), contextual)
             assertTrue(actions.single { it.label == "More actions" }.action())
             assertTrue(actions.single { it.label == "Like song" }.action())
-            assertEquals(1, queued); assertEquals(3, more); assertEquals(1, liked)
+            assertEquals(0, legacyEnqueues); assertEquals(3, more); assertEquals(1, liked)
         }
     }
 
-    @Test fun unavailableAndBufferingKeepNamedActionsAndStableGeometry() {
+    @Test fun unavailableCurrentAndBufferingKeepSemanticsWithoutTransportOrGeometryChanges() {
         val item = mutableStateOf(track)
-        val playback = mutableStateOf(CatalogPlaybackFeedback())
+        val key = PlaybackInteractionKey()
         var toggles = 0
         var plays = 0
         var more = 0
+        var contextual = 0
+        val feedback = CatalogPlaybackFeedback(track.id, isPlaying = true, onToggle = { toggles++ },
+            interactionKey = key, onContextual = { _, _, isCurrent ->
+                assertTrue("Dispatched contextual action is still current", isCurrent())
+                contextual++
+            })
+        val playback = mutableStateOf(feedback)
         compose.setContent {
             MaterialTheme(typography = AppTypography) {
                 Box(Modifier.width(320.dp)) {
@@ -252,23 +274,93 @@ class MusicRowTest {
                 }
             }
         }
+        fun actionNode() = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+        fun actions() = actionNode().fetchSemanticsNode().config[SemanticsActions.CustomActions]
         val before = compose.onNodeWithTag("row").bounds()
-        val playBefore = compose.onNodeWithContentDescription("Play ${track.name}").bounds()
+        val moreBefore = compose.onNodeWithContentDescription("More actions for ${track.name}").bounds()
+        val titleBefore = compose.onNodeWithText(track.name, useUnmergedTree = true).bounds()
         compose.runOnIdle { item.value = track.copy(hasAudio = false) }
-        compose.onNodeWithContentDescription("Play ${track.name}").assertIsNotEnabled()
         compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
-        val actions = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
-            .fetchSemanticsNode().config[SemanticsActions.CustomActions]
-        assertFalse(actions.any { it.label == "Add to queue" })
+        assertFalse(actions().any { it.label == "Play now" || it.label == "Add to queue" })
+        compose.onNodeWithText(compactMusicSubtitle(item.value), useUnmergedTree = true).assertHasNoClickAction()
         assertEquals(before, compose.onNodeWithTag("row").bounds())
-        assertEquals(playBefore, compose.onNodeWithContentDescription("Play ${track.name}").bounds())
-        compose.runOnIdle {
-            item.value = track
-            playback.value = CatalogPlaybackFeedback(track.id, isPlaying = true, buffering = true, onToggle = { toggles++ })
+        assertEquals(moreBefore, compose.onNodeWithContentDescription("More actions for ${track.name}").bounds())
+        val states = listOf(
+            feedback.copy(isPlaying = false) to "Paused",
+            feedback to "Playing",
+            feedback.copy(isPlaying = false, buffering = true, playWhenReady = true) to "Buffering",
+            feedback.copy(isPlaying = false, buffering = true, playWhenReady = false) to "Buffering",
+            feedback.copy(buffering = true) to "Buffering",
+        )
+        for ((state, description) in states) {
+            compose.runOnIdle { item.value = track; playback.value = state }
+            actionNode().assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, description))
+            assertEquals(1, actions().count { it.label == "Play now" })
+            compose.onNodeWithContentDescription("Play ${track.name}").assertDoesNotExist()
+            compose.onNodeWithContentDescription("Pause ${track.name}").assertDoesNotExist()
+            compose.onAllNodes(hasClickAction()).assertCountEquals(2)
+            assertEquals(before, compose.onNodeWithTag("row").bounds())
+            assertEquals(moreBefore, compose.onNodeWithContentDescription("More actions for ${track.name}").bounds())
+            assertEquals(titleBefore, compose.onNodeWithText(track.name, useUnmergedTree = true).bounds())
         }
-        compose.onNodeWithContentDescription("Pause ${track.name}").assertIsEnabled().performClick()
-        assertEquals(before, compose.onNodeWithTag("row").bounds())
-        compose.runOnIdle { assertEquals(1, toggles); assertEquals(0, plays); assertEquals(1, more) }
+        val playNow = actions().single { it.label == "Play now" }
+        compose.runOnIdle {
+            assertTrue(playNow.action())
+            assertEquals(0, toggles); assertEquals(1, plays); assertEquals(1, more); assertEquals(0, contextual)
+            playback.value = feedback.copy(trackId = "another-track")
+        }
+        assertFalse("Another track's playback state must not mark this row current",
+            actionNode().fetchSemanticsNode().config.contains(SemanticsProperties.StateDescription))
+    }
+
+    @Test fun contextualActionUsesActiveIntentAndRequiresInteractionKeyAndCallback() {
+        val key = PlaybackInteractionKey()
+        val contextual = mutableListOf<Pair<LibraryItem, PlaybackInteractionKey>>()
+        val base = CatalogPlaybackFeedback(interactionKey = key,
+            onContextual = { item, binding, isCurrent ->
+                assertTrue("Dispatched contextual action is still current", isCurrent())
+                contextual += item to binding
+            })
+        val playback = mutableStateOf(base)
+        var plays = 0
+        var legacyEnqueues = 0
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                MusicRow(track, {}, { _, _ -> plays++ }, {}, { legacyEnqueues++ },
+                    artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(320.dp),
+                    playback = playback.value)
+            }
+        }
+        val cases = listOf(
+            Triple(base, "Play now", false),
+            Triple(base.copy(buffering = true), "Play now", false),
+            Triple(base.copy(playWhenReady = true), "Play now", false),
+            Triple(base.copy(isPlaying = true), "Add to queue", true),
+            Triple(base.copy(buffering = true, playWhenReady = true), "Add to queue", true),
+            Triple(base.copy(isPlaying = true, interactionKey = null), "Add to queue", false),
+            Triple(base.copy(isPlaying = true, onContextual = null), "Add to queue", false),
+        )
+        var acceptedCallbacks = 0
+        for ((feedback, label, enabled) in cases) {
+            compose.runOnIdle { playback.value = feedback }
+            assertEquals(label, feedback.contextualLabel)
+            val actions = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+                .fetchSemanticsNode().config[SemanticsActions.CustomActions]
+            assertEquals("Play now remains one deliberate action regardless of output state", 1,
+                actions.count { it.label == "Play now" })
+            assertEquals("Contextual queue action needs active intent and a valid binding", enabled,
+                actions.any { it.label == "Add to queue" })
+            if (enabled) {
+                compose.runOnIdle { assertTrue(actions.single { it.label == "Add to queue" }.action()) }
+                acceptedCallbacks++
+            }
+            compose.onAllNodes(hasClickAction()).assertCountEquals(2)
+            compose.runOnIdle {
+                assertEquals(List(acceptedCallbacks) { track to key }, contextual)
+                assertEquals(0, plays)
+                assertEquals(0, legacyEnqueues)
+            }
+        }
     }
 
     @Test fun likeAccessibilityActionUsesCurrentStateAndIsSuppressedWhilePending() {
@@ -289,7 +381,7 @@ class MusicRowTest {
         compose.runOnIdle { assertEquals(1, toggles); like.value = CatalogLikeState(liked = true, pending = true) }
         assertFalse(actions().any { it.label == "Like song" || it.label == "Unlike song" })
         assertEquals(before, compose.onNodeWithTag("row").bounds())
-        compose.onAllNodes(hasClickAction()).assertCountEquals(3)
+        compose.onAllNodes(hasClickAction()).assertCountEquals(2)
     }
 
     @Test fun intentionalCreditsRetainDistinctOpaqueIdsAndMissingIdsStayPlainText() {

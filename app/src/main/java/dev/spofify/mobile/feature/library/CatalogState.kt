@@ -119,6 +119,10 @@ class CatalogStateHolder(
         kind = initialKind.takeIf { it in CatalogKinds || it == "all" } ?: "albums",
         query = cleanCatalogQuery(initialQuery), search = true, item = initialItem))))
     val state = mutable.asStateFlow()
+    /** Event-time presentation fence: conflated A→B→A navigation must not revive an intent.
+     * Read/progress/scroll publications do not advance it; it is never persisted or authority. */
+    internal var navigationVersion = 0L
+        private set
     private var serial = 0L
     private var generation = 0L
     private val jobs = mutableMapOf<String, Job>()
@@ -163,6 +167,7 @@ class CatalogStateHolder(
      * Focus and local IME draft reset belong to the caller's activation event.
      */
     fun activateSearchRoot(): Unit {
+        navigationVersion++
         cancelReads(markInterrupted = false)
         composing = false
         pendingRevision = null
@@ -172,6 +177,7 @@ class CatalogStateHolder(
 
     fun open(item: LibraryItem) {
         if (item.kind !in listOf("artist", "album", "track")) return
+        navigationVersion++
         cancelReads()
         mutable.value = mutable.value.copy(stack = mutable.value.stack + CatalogScreen(key = ++serial, item = item))
         loadVisible()
@@ -179,6 +185,7 @@ class CatalogStateHolder(
 
     fun back(): Boolean {
         if (!state.value.canGoBack) return false
+        navigationVersion++
         cancelReads()
         mutable.value = mutable.value.copy(stack = mutable.value.stack.dropLast(1))
         loadVisible()
@@ -217,6 +224,7 @@ class CatalogStateHolder(
             }
             return
         }
+        navigationVersion++
         cancelReads()
         update { it.copy(query = cleaned, search = true, item = null, sections = emptyMap(),
             scrollIndex = 0, scrollOffset = 0, detailResolved = false) }
@@ -244,6 +252,7 @@ class CatalogStateHolder(
     }
 
     private fun changeResults(change: (CatalogScreen) -> CatalogScreen) {
+        navigationVersion++
         cancelReads()
         update { change(it).copy(sections = emptyMap(), scrollIndex = 0, scrollOffset = 0) }
         loadVisible()
@@ -251,6 +260,7 @@ class CatalogStateHolder(
 
     fun selectReleaseGroup(group: String) {
         if (group !in ReleaseGroups.map { it.first } || group == state.value.current.releaseGroup) return
+        navigationVersion++
         cancelReads()
         update { it.copy(releaseGroup = group, sections = emptyMap(), scrollIndex = 0, scrollOffset = 0) }
         loadVisible()
@@ -424,7 +434,7 @@ class CatalogStateHolder(
         loadVisible()
     }
 
-    fun close() { visible = false; cancelReads() }
+    fun close() { navigationVersion++; visible = false; cancelReads() }
 }
 
 fun cleanCatalogQuery(value: String): String = buildString {

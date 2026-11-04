@@ -1,6 +1,7 @@
 package dev.spofify.mobile.feature.player
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,7 +21,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -29,6 +29,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -57,6 +58,20 @@ import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.playback.PlaybackControls
 import dev.spofify.mobile.playback.PlaybackState
 import dev.spofify.mobile.playback.QueueEntry
+import dev.spofify.mobile.ui.ContextualSwipeRow
+import dev.spofify.mobile.ui.RowActionLifetime
+
+/**
+ * Remember in the queue/sheet host, never in a lazy row/header. A committed action may remove its
+ * own originating row; only leaving the owning presentation invalidates this UI-side intent.
+ * Session/output/request/occurrence authority remains fenced by the service.
+ */
+@Composable
+internal fun rememberUpcomingQueueActionIsCurrent(controls: PlaybackControls): () -> Boolean {
+    val lifetime = remember(controls) { RowActionLifetime() }
+    DisposableEffect(lifetime) { onDispose { lifetime.invalidate() } }
+    return remember(lifetime) { lifetime::isCurrent }
+}
 
 /**
  * Existing bounded queue host: the header stays pinned and only rows scroll. A parent that already
@@ -73,10 +88,11 @@ internal fun ColumnScope.NativeUpcomingQueue(
     onClose: (() -> Unit)? = null,
     listState: LazyListState = rememberLazyListState(),
 ) {
+    val actionIsCurrent = rememberUpcomingQueueActionIsCurrent(controls)
     UpcomingQueueHeader(state, controls, compact, showStatus, onClose)
     LazyColumn(Modifier.fillMaxWidth().weight(1f).testTag("now-playing-queue")
         .semantics { contentDescription = "Upcoming queue" }, state = listState) {
-        nativeUpcomingQueueItems(state, controls, onOpenItem, artwork, listState, compact)
+        nativeUpcomingQueueItems(state, controls, onOpenItem, artwork, listState, actionIsCurrent, compact)
     }
 }
 
@@ -87,6 +103,8 @@ private enum class QueueContentKey { HEADER, EMPTY }
  * Header and occurrence-keyed rows for ONE parent scroller, including any preceding player items.
  * Pass that parent's active [listState]; future reorder geometry/autoscroll must use the same state
  * and its real item indices, not an independently remembered queue scroller or fixed header count.
+ * Remember [actionIsCurrent] with [rememberUpcomingQueueActionIsCurrent] in the owning composable
+ * queue/sheet host, outside this lazy content. It must survive an occurrence becoming current.
  */
 internal fun LazyListScope.nativeUpcomingQueue(
     state: PlaybackState,
@@ -94,6 +112,7 @@ internal fun LazyListScope.nativeUpcomingQueue(
     onOpenItem: (LibraryItem) -> Unit,
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
     listState: LazyListState,
+    actionIsCurrent: () -> Boolean,
     compact: Boolean = false,
     showStatus: Boolean = true,
     onClose: (() -> Unit)? = null,
@@ -101,7 +120,7 @@ internal fun LazyListScope.nativeUpcomingQueue(
     item(key = QueueContentKey.HEADER) {
         UpcomingQueueHeader(state, controls, compact, showStatus, onClose)
     }
-    nativeUpcomingQueueItems(state, controls, onOpenItem, artwork, listState, compact)
+    nativeUpcomingQueueItems(state, controls, onOpenItem, artwork, listState, actionIsCurrent, compact)
 }
 
 /** Rows-only seam also used by the pinned-header wrapper; this phase does not change drag behavior. */
@@ -112,6 +131,7 @@ internal fun LazyListScope.nativeUpcomingQueueItems(
     onOpenItem: (LibraryItem) -> Unit,
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
     listState: LazyListState,
+    actionIsCurrent: () -> Boolean,
     compact: Boolean = false,
 ) {
     if (state.upcoming.isEmpty()) item(key = QueueContentKey.EMPTY) {
@@ -119,8 +139,8 @@ internal fun LazyListScope.nativeUpcomingQueueItems(
             style = MaterialTheme.typography.bodyMedium)
     }
     itemsIndexed(state.upcoming, key = { _, entry -> entry.occurrenceId }) { index, entry ->
-        if (compact) CompactUpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem)
-        else UpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, artwork)
+        if (compact) CompactUpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, state, actionIsCurrent)
+        else UpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, artwork, state, actionIsCurrent)
     }
 }
 
@@ -177,34 +197,56 @@ private fun CompactUpcomingRow(
     count: Int,
     controls: PlaybackControls,
     onOpenItem: (LibraryItem) -> Unit,
+    state: PlaybackState,
+    actionIsCurrent: () -> Boolean,
 ) {
-    var menuOpen by remember(entry.occurrenceId) { mutableStateOf(false) }
-    Column(Modifier.fillMaxWidth().semantics {
+    // An open action menu belongs to the rendered queue binding, not a later publication.
+    // Progress keeps the key; queue/output/session replacement disposes the old menu.
+    var menuOpen by remember(entry.occurrenceId, state.interactionKey) { mutableStateOf(false) }
+    val label = if (state.isPlaying || (state.isBuffering && state.playWhenReady)) "Add to queue" else "Play now"
+    ContextualSwipeRow(entry, state.interactionKey, entry.item.playable && state.interactionKey != null, label,
+        onCommit = { key, rowIsCurrent ->
+            if (rowIsCurrent() && actionIsCurrent())
+                controls.contextualOccurrence(key, entry.occurrenceId, actionIsCurrent) {}
+        }) { swipeModifier, isCurrent ->
+    val playNext = {
+        if (isCurrent() && actionIsCurrent()) state.interactionKey?.let { expectedKey ->
+            controls.playNextOccurrence(expectedKey, entry.occurrenceId, actionIsCurrent) {}
+        }
+    }
+    Row(swipeModifier.fillMaxWidth().heightIn(min = 72.dp).background(MaterialTheme.colorScheme.surface).semantics {
         customActions = buildList {
-            add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
+            if (entry.item.playable) add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
+            if (entry.item.playable && label == "Add to queue" && state.interactionKey != null) add(CustomAccessibilityAction(label) {
+                if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}; true
+            })
+            if (entry.item.playable && state.interactionKey != null) add(CustomAccessibilityAction("Play next") { playNext(); true })
             if (index > 0) add(CustomAccessibilityAction("Move up") { controls.moveUpcoming(entry.occurrenceId, index - 1); true })
             if (index < count - 1) add(CustomAccessibilityAction("Move down") { controls.moveUpcoming(entry.occurrenceId, index + 1); true })
             add(CustomAccessibilityAction("Remove from queue") { controls.removeUpcoming(entry.occurrenceId); true })
         }
-    }) {
-        Text(entry.item.name, Modifier.fillMaxWidth().heightIn(min = 48.dp)
+    }, verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f).heightIn(min = 48.dp)
             .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(entry.item) }
-            .padding(vertical = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-            style = MaterialTheme.typography.bodyMedium)
-        Row(Modifier.fillMaxWidth().semantics {
-            contentDescription = "Reorder ${entry.item.name}"
-            stateDescription = "Position ${index + 1} of $count. Use queue actions to move up or down."
-        }, horizontalArrangement = Arrangement.End) {
-            IconButton(onClick = { controls.selectOccurrence(entry.occurrenceId) }, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.PlayArrow, "Play queued song ${entry.item.name}")
-            }
+            .padding(vertical = 8.dp)) {
+            Text(entry.item.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium)
+            Text(entry.item.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodySmall)
+        }
             Box {
                 IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
                     Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    DropdownMenuItem(text = { Text("Play next") }, enabled = index > 0,
-                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, 0) })
+                    DropdownMenuItem(text = { Text("Play now") }, enabled = entry.item.playable,
+                        onClick = { menuOpen = false; controls.selectOccurrence(entry.occurrenceId) })
+                    if (label == "Add to queue" && state.interactionKey != null) DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable,
+                        onClick = { menuOpen = false
+                            if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}
+                        })
+                    DropdownMenuItem(text = { Text("Play next") }, enabled = entry.item.playable && state.interactionKey != null,
+                        onClick = { menuOpen = false; playNext() })
                     DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
                         onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index - 1) })
                     DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,
@@ -225,8 +267,11 @@ private fun UpcomingRow(
     controls: PlaybackControls,
     onOpenItem: (LibraryItem) -> Unit,
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
+    state: PlaybackState,
+    actionIsCurrent: () -> Boolean,
 ) {
-    var menuOpen by remember(entry.occurrenceId) { mutableStateOf(false) }
+    // Progress preserves this menu; a new queue/output/session binding dismisses it.
+    var menuOpen by remember(entry.occurrenceId, state.interactionKey) { mutableStateOf(false) }
     var rowHeight by remember { mutableIntStateOf(80) }
     var dragY by remember(entry.occurrenceId) { mutableFloatStateOf(0f) }
     var dragging by remember(entry.occurrenceId) { mutableStateOf(false) }
@@ -236,18 +281,30 @@ private fun UpcomingRow(
     val haptics = LocalHapticFeedback.current
     val moveUp = { controls.moveUpcoming(entry.occurrenceId, (index - 1).coerceAtLeast(0)) }
     val moveDown = { controls.moveUpcoming(entry.occurrenceId, (index + 1).coerceAtMost(count - 1)) }
-    val playNext = { controls.moveUpcoming(entry.occurrenceId, 0) }
     val remove = { controls.removeUpcoming(entry.occurrenceId) }
+    val label = if (state.isPlaying || (state.isBuffering && state.playWhenReady)) "Add to queue" else "Play now"
+    ContextualSwipeRow(entry, state.interactionKey, entry.item.playable && state.interactionKey != null, label,
+        onCommit = { key, rowIsCurrent ->
+            if (rowIsCurrent() && actionIsCurrent())
+                controls.contextualOccurrence(key, entry.occurrenceId, actionIsCurrent) {}
+        },
+        excludeLeadingHandle = true) { swipeModifier, isCurrent ->
+    val playNext = {
+        if (isCurrent() && actionIsCurrent()) state.interactionKey?.let { expectedKey ->
+            controls.playNextOccurrence(expectedKey, entry.occurrenceId, actionIsCurrent) {}
+        }
+    }
     Row(
-        Modifier.fillMaxWidth().heightIn(min = 80.dp).onSizeChanged { rowHeight = it.height }
+        swipeModifier.fillMaxWidth().heightIn(min = 80.dp).background(MaterialTheme.colorScheme.surface).onSizeChanged { rowHeight = it.height }
             .playerSwipe(PlayerSwipeArea.UPCOMING) { remove() }
             .semantics {
                 customActions = buildList {
-                    add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
-                    if (index > 0) {
-                        add(CustomAccessibilityAction("Move up") { moveUp(); true })
-                        add(CustomAccessibilityAction("Play next") { playNext(); true })
-                    }
+                    if (entry.item.playable) add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
+                    if (entry.item.playable && label == "Add to queue" && state.interactionKey != null) add(CustomAccessibilityAction(label) {
+                        if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}; true
+                    })
+                    if (entry.item.playable && state.interactionKey != null) add(CustomAccessibilityAction("Play next") { playNext(); true })
+                    if (index > 0) add(CustomAccessibilityAction("Move up") { moveUp(); true })
                     if (index < count - 1) add(CustomAccessibilityAction("Move down") { moveDown(); true })
                     add(CustomAccessibilityAction("Remove from queue") { remove(); true })
                 }
@@ -260,7 +317,9 @@ private fun UpcomingRow(
                 stateDescription = if (dragging) "Move to position ${queueMoveTarget(index, dragY, rowHeight, count) + 1}"
                     else "Position ${index + 1} of $count. Use queue actions to move up or down."
             }
-            .pointerInput(entry.occurrenceId) {
+            .pointerInput(entry, state.interactionKey, state.canMoveUpcomingAbsolutely) {
+                val expectedKey = state.interactionKey
+                if (expectedKey == null || !state.canMoveUpcomingAbsolutely) return@pointerInput
                 detectVerticalDragGestures(
                     onDragStart = {
                         dragY = 0f
@@ -270,7 +329,7 @@ private fun UpcomingRow(
                     onDragCancel = { dragY = 0f; dragging = false },
                     onDragEnd = {
                         val target = queueMoveTarget(latestIndex, dragY, rowHeight, latestCount)
-                        if (target != latestIndex) latestControls.moveUpcoming(entry.occurrenceId, target)
+                        if (target != latestIndex) latestControls.moveUpcoming(expectedKey, entry.occurrenceId, target)
                         dragY = 0f
                         dragging = false
                     },
@@ -283,20 +342,23 @@ private fun UpcomingRow(
                 Modifier.fillMaxWidth().heightIn(min = 48.dp)
                     .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(entry.item) }
                     .padding(vertical = 8.dp),
-                maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
             Text(if (dragging) "Move to position ${queueMoveTarget(index, dragY, rowHeight, count) + 1}" else entry.item.subtitle,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        IconButton(onClick = { controls.selectOccurrence(entry.occurrenceId) }, modifier = Modifier.size(48.dp)) {
-            Icon(Icons.Default.PlayArrow, "Play queued song ${entry.item.name}")
         }
         Box {
             IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
                 Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(text = { Text("Play next") }, enabled = index > 0,
+                DropdownMenuItem(text = { Text("Play now") }, enabled = entry.item.playable,
+                    onClick = { menuOpen = false; controls.selectOccurrence(entry.occurrenceId) })
+                if (label == "Add to queue" && state.interactionKey != null) DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable,
+                    onClick = { menuOpen = false
+                        if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}
+                    })
+                DropdownMenuItem(text = { Text("Play next") }, enabled = entry.item.playable && state.interactionKey != null,
                     onClick = { menuOpen = false; playNext() })
                 DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
                     onClick = { menuOpen = false; moveUp() })
@@ -306,5 +368,6 @@ private fun UpcomingRow(
                     onClick = { menuOpen = false; remove() })
             }
         }
+    }
     }
 }

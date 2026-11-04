@@ -12,6 +12,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.SemanticsActions
+import dev.spofify.mobile.playback.PlaybackInteractionKey
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.dp
@@ -45,7 +47,10 @@ class LibraryUiTest {
         }
         compose.onNodeWithText("Song").performClick()
         compose.runOnIdle { assertEquals(1, opened); assertEquals(0, played) }
-        compose.onNodeWithContentDescription("Play Song").performClick()
+        compose.onNodeWithContentDescription("Play Song").assertDoesNotExist()
+        val play = compose.onNodeWithText("Song").fetchSemanticsNode().config[SemanticsActions.CustomActions]
+            .single { it.label == "Play now" }
+        compose.runOnIdle { assertTrue(play.action()) }
         compose.onNodeWithContentDescription("More actions for Song").performClick()
         compose.runOnIdle { assertEquals(1, played); assertEquals(1, actions) }
         compose.onNodeWithText("Song").performTouchInput { longClick() }
@@ -67,8 +72,10 @@ class LibraryUiTest {
                 }
             }
         }
-        val play = compose.onNodeWithContentDescription("Play Missing song")
-        play.assertIsNotEnabled().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithContentDescription("Play Missing song").assertDoesNotExist()
+        val actionsForMissing = compose.onNodeWithText("Missing song").fetchSemanticsNode().config[SemanticsActions.CustomActions]
+        assertTrue(actionsForMissing.none { it.label == "Play now" })
+        assertTrue(actionsForMissing.any { it.label == "More actions" })
         compose.onNodeWithText("First artist, Second artist", substring = true).assertExists()
         compose.onNodeWithText("First artist").assertDoesNotExist()
         compose.onNodeWithText("Second artist").assertDoesNotExist()
@@ -83,8 +90,10 @@ class LibraryUiTest {
     @Test fun shortHorizontalGestureQueuesOnceAndVerticalAndEdgeGesturesDoNot() {
         var queued = 0
         compose.setContent {
-            MaterialTheme(typography = AppTypography) { MusicRow(LibraryItem("track", "song", "Song", hasAudio = true), {}, { _, _ -> }, {}, { queued++ },
-                artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(360.dp).testTag("row")) }
+            MaterialTheme(typography = AppTypography) { MusicRow(LibraryItem("track", "song", "Song", hasAudio = true), {}, { _, _ -> }, {}, {},
+                artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(360.dp).testTag("row"),
+                playback = CatalogPlaybackFeedback(isPlaying = true, interactionKey = PlaybackInteractionKey(),
+                    onContextual = { _, _, isCurrent -> if (isCurrent()) queued++ })) }
         }
         compose.onNodeWithTag("row").performTouchInput { swipe(start = center.copy(x = width * .3f), end = center.copy(x = width * .8f)) }
         compose.runOnIdle { assertEquals(1, queued) }
@@ -152,6 +161,42 @@ class LibraryUiTest {
             more.assertHeightIsAtLeast(48.dp)
             more.performClick()
             compose.runOnIdle { assertEquals(2, holder.state.value.current.sections.getValue("artists").items.size) }
+        } finally { holder.close(); scope.cancel() }
+    }
+
+    @Test fun actualSearchResultsKeepMoreWithoutInlinePlayOrAutoplay() {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        val song = LibraryItem("track", "search-song", "Search song", hasAudio = true)
+        val reader = object : CatalogReader {
+            override suspend fun browse(request: CatalogRequest) = LibraryPage(listOf(song), 1, request.limit, request.offset, revision = 1)
+            override suspend fun detail(kind: String, id: String) = song
+            override suspend fun revision() = 1L
+        }
+        val holder = CatalogStateHolder(reader, scope, initialKind = "tracks", initialQuery = "song")
+        var plays = 0
+        var more = 0
+        var opened = 0
+        try {
+            compose.setContent {
+                MaterialTheme(typography = AppTypography) {
+                    val navigation by holder.state.collectAsState()
+                    LaunchedEffect(holder) { holder.setVisible(true) }
+                    CatalogScreenContent(navigation, holder, { opened++ }, { _, _ -> plays++ }, { more++ }, {},
+                        artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.size(360.dp, 640.dp))
+                }
+            }
+            compose.waitUntil(5_000) {
+                compose.waitForIdle()
+                compose.onAllNodesWithContentDescription("More actions for Search song").fetchSemanticsNodes().size == 1
+            }
+            compose.onNodeWithText("Search song").assertIsDisplayed()
+            compose.onNodeWithContentDescription("Play Search song").assertDoesNotExist()
+            compose.onNodeWithContentDescription("More actions for Search song").assertIsEnabled().performClick()
+            compose.runOnIdle {
+                assertEquals(1, more)
+                assertEquals("Rendering and deliberate More must not start playback", 0, plays)
+                assertEquals(0, opened)
+            }
         } finally { holder.close(); scope.cancel() }
     }
 

@@ -15,6 +15,18 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.Alignment
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.style.TextOverflow
+import dev.spofify.mobile.feature.library.CatalogPlaybackFeedback
+import dev.spofify.mobile.feature.library.compactMusicSubtitle
+import dev.spofify.mobile.playback.PlaybackInteractionKey
+import dev.spofify.mobile.playback.PlaybackListAction
+import dev.spofify.mobile.ui.ContextualSwipeRow
 import dev.spofify.mobile.core.*
 import dev.spofify.mobile.playback.PlaybackRequests
 import kotlinx.coroutines.CancellationException
@@ -36,6 +48,9 @@ internal class PlaylistPlaybackRequest(private val generation: PlaylistRequestGe
     }
 }
 
+private data class PlaylistRowSelection(val track: LibraryItem, val selectionToken: String? = null,
+    val entryId: String? = null, val interactionKey: PlaybackInteractionKey?, val isCurrent: () -> Boolean)
+
 /** Account-local navigation. Browsing never prepares or starts a queue. */
 @Composable
 fun PlaylistsRoute(
@@ -46,6 +61,10 @@ fun PlaylistsRoute(
     modifier: Modifier = Modifier,
     initialPlaylistId: String? = null,
     onMutationPendingChange: (Boolean) -> Unit = {},
+    playback: CatalogPlaybackFeedback = CatalogPlaybackFeedback(),
+    onPreparedAction: ((PlaybackQueue, String?, String?, PlaybackListAction, PlaybackInteractionKey?, () -> Boolean) -> Unit)? = null,
+    playbackEntryId: String? = null,
+    playbackContext: LibraryItem? = null,
 ) {
     key(client, client.currentSession()?.accountId) {
         var selectedId by remember { mutableStateOf(initialPlaylistId) }
@@ -72,7 +91,9 @@ fun PlaylistsRoute(
             }, modifier = modifier, onDiscard = { newDraft = PlaylistEditorDraft(); creating = false; refresh++ },
                 onMutationPendingChange = onMutationPendingChange)
             selectedId != null -> PlaylistDetail(client, selectedId!!, onOpenTrack, onPlayQueue, onShowTrackActions,
-                onBack = { selectedId = null; refresh++ }, modifier = modifier, onMutationPendingChange = onMutationPendingChange)
+                onBack = { selectedId = null; refresh++ }, modifier = modifier, onMutationPendingChange = onMutationPendingChange,
+                playback = playback, onPreparedAction = onPreparedAction,
+                playbackEntryId = playbackEntryId, playbackContext = playbackContext)
             else -> LazyColumn(modifier.fillMaxSize(), state = listState,
                 contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item {
@@ -133,6 +154,9 @@ private fun PlaylistDetail(
     client: SpofifyClient, id: String, onOpenTrack: (LibraryItem) -> Unit,
     onPlayQueue: (PlaybackQueue, String?, String?) -> Unit, onShowTrackActions: (LibraryItem) -> Unit,
     onBack: () -> Unit, modifier: Modifier, onMutationPendingChange: (Boolean) -> Unit,
+    playback: CatalogPlaybackFeedback,
+    onPreparedAction: ((PlaybackQueue, String?, String?, PlaybackListAction, PlaybackInteractionKey?, () -> Boolean) -> Unit)?,
+    playbackEntryId: String?, playbackContext: LibraryItem?,
 ) {
     val api = remember(client) { PersonalCollectionsApi(client) }
     val derived = remember(client) { DerivedPlaylistsApi(client) }
@@ -154,7 +178,8 @@ private fun PlaylistDetail(
     var metadata by remember(id) { mutableStateOf(false) }
     var deleting by remember(id) { mutableStateOf(false) }
     var removing by remember(id) { mutableStateOf<String?>(null) }
-    var derivedActions by remember(id) { mutableStateOf<LibraryItem?>(null) }
+    var occurrenceActions by remember(id) { mutableStateOf<PlaylistRowSelection?>(null) }
+    val latestInteractionKey by rememberUpdatedState(playback.interactionKey)
     var addingTrack by remember(id) { mutableStateOf<LibraryItem?>(null) }
     var editing by remember(id) { mutableStateOf(false) }
     var copying by remember(id) { mutableStateOf(false) }
@@ -198,11 +223,6 @@ private fun PlaylistDetail(
         if (!busy) when { editing -> editing = false; copying -> copying = false; snapshot != null -> snapshot = null; else -> onBack() }
     }
     val saved = summary
-    derivedActions?.let { track -> PlaylistOccurrenceActions(client, track,
-        onDismiss = { derivedActions = null },
-        onOpen = { derivedActions = null; onOpenTrack(track) },
-        onAdd = { derivedActions = null; addingTrack = track },
-        onPersonalChange = { stale = true; generation.invalidate() }) }
     addingTrack?.let { track -> AddToPlaylistSheet(client, track, onDismiss = {
         addingTrack = null; stale = true; generation.invalidate()
     }) }
@@ -251,8 +271,10 @@ private fun PlaylistDetail(
             summary = api.removeEntry(id, entry, saved.revision); removing = null; refreshAll()
         } }) { Text("Remove") } }, dismissButton = { TextButton(enabled = !busy, onClick = { removing = null }) { Text("Cancel") } })
 
-    fun play(selectionToken: String? = null, trackId: String? = null, entryId: String? = null) {
-        if (busy || stale || saved == null) return
+    fun play(selectionToken: String? = null, trackId: String? = null, entryId: String? = null,
+        action: PlaybackListAction? = null, expectedKey: PlaybackInteractionKey? = null, isCurrent: () -> Boolean = { true }) {
+        if (busy || stale || saved == null || !isCurrent()) return
+        if (action != null && (onPreparedAction == null || expectedKey == null || latestInteractionKey !== expectedKey)) return
         val result = evaluation
         val request = PlaylistPlaybackRequest(generation); busy = true
         scope.launch {
@@ -260,21 +282,47 @@ private fun PlaylistDetail(
                 if (saved.kind == PlaylistKind.DERIVED && result != null) {
                     val queue = derived.playback(id, saved.revision, result.fence, selectionToken)
                     request.deliver {
+                        if (!isCurrent()) return@deliver
                         message = when (queue.notice) { "CLICKED_OCCURRENCE_ONLY" -> "Only the selected occurrence was prepared because it is beyond the first 1,000 available occurrences."
                             "PLAYBACK_LIMIT" -> "Playback is limited to the first 1,000 available occurrences."; else -> null }
-                        onPlayQueue(queue.queue, null, queue.startOccurrenceId)
+                        if (action == null) onPlayQueue(queue.queue, null, queue.startOccurrenceId)
+                        else if (latestInteractionKey === expectedKey && isCurrent()) onPreparedAction?.invoke(queue.queue, null,
+                            queue.startOccurrenceId, action, expectedKey, isCurrent)
                     }
                 } else if (saved.kind == PlaylistKind.MANUAL) {
                     val queue = api.playback(id)
                     request.deliver {
+                        if (!isCurrent()) return@deliver
                         if (entryId != null && queue.items.none { it.entryId == entryId }) message = "This occurrence is outside the prepared playback limit. No queue was replaced."
-                        else onPlayQueue(queue.queue, trackId, entryId)
+                        else if (action == null) onPlayQueue(queue.queue, trackId, entryId)
+                        else if (latestInteractionKey === expectedKey && isCurrent()) onPreparedAction?.invoke(queue.queue, trackId, entryId, action, expectedKey, isCurrent)
                     }
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { request.deliver { message = playlistFailure(e); stale = true } }
+            catch (e: Exception) { request.deliver { if (isCurrent()) { message = playlistFailure(e); stale = true } } }
             finally { request.finish { busy = false } }
         }
+    }
+    occurrenceActions?.let { selection ->
+        val playable = !busy && !stale && selection.isCurrent() && selection.track.playable && saved?.capabilities?.play == true &&
+            (saved?.kind != PlaylistKind.DERIVED || selection.selectionToken != null)
+        fun perform(action: PlaybackListAction? = null) {
+            occurrenceActions = null
+            play(selectionToken = selection.selectionToken, trackId = selection.track.id,
+                entryId = selection.entryId, action = action, expectedKey = selection.interactionKey, isCurrent = selection.isCurrent)
+        }
+        val preparedEnabled = onPreparedAction != null && selection.interactionKey != null
+        PlaylistOccurrenceActions(client, selection.track,
+            onDismiss = { occurrenceActions = null },
+            onOpen = { occurrenceActions = null; onOpenTrack(selection.track) },
+            onAdd = { occurrenceActions = null; addingTrack = selection.track },
+            onPersonalChange = { stale = true; generation.invalidate() },
+            playbackEnabled = playable, contextualLabel = playback.contextualLabel,
+            onPlayNow = { perform() },
+            onContextual = if (preparedEnabled) ({ perform(PlaybackListAction.CONTEXTUAL) }) else null,
+            onEnqueue = if (preparedEnabled) ({ perform(PlaybackListAction.ADD_TO_QUEUE) }) else null,
+            onPlayNext = if (preparedEnabled) ({ perform(PlaybackListAction.PLAY_NEXT) }) else null,
+            onOpenItem = { occurrenceActions = null; onOpenTrack(it) })
     }
     LazyColumn(modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
@@ -370,9 +418,14 @@ private fun PlaylistDetail(
             }
         } else if (saved?.kind == PlaylistKind.DERIVED) {
             items(evaluation?.items.orEmpty(), key = { it.occurrenceId }) { entry ->
-                PlaylistTrackRow(entry.track, onOpenTrack, { derivedActions = it },
-                    enabled = !busy && !stale && entry.selectionToken != null,
-                    onPlay = { play(selectionToken = entry.selectionToken) }, actionsEnabled = !busy)
+                PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entry.selectionToken, interactionKey = playback.interactionKey, isCurrent = isCurrent) },
+                    enabled = !busy && !stale && saved.capabilities.play && entry.selectionToken != null,
+                    onPlay = { play(selectionToken = entry.selectionToken) }, actionsEnabled = !busy,
+                    playback = playback, occurrenceBinding = listOf(id, saved.revision, evaluation?.fence, entry),
+                    currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.DERIVED, entry.occurrenceId,
+                        entry.track.id, playback.trackId, playbackEntryId, playbackContext),
+                    onContextual = if (onPreparedAction != null) ({ expectedKey, isCurrent -> play(selectionToken = entry.selectionToken,
+                        action = PlaybackListAction.CONTEXTUAL, expectedKey = expectedKey, isCurrent = isCurrent) }) else null)
             }
             item {
                 Row {
@@ -385,8 +438,14 @@ private fun PlaylistDetail(
         } else {
             items(entries?.items.orEmpty(), key = { it.id }) { entry ->
                 Column {
-                    PlaylistTrackRow(entry.track, onOpenTrack, onShowTrackActions, enabled = !busy && !stale,
-                        onPlay = { play(trackId = entry.track.id, entryId = entry.id) })
+                    PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entryId = entry.id, interactionKey = playback.interactionKey, isCurrent = isCurrent) },
+                        enabled = !busy && !stale && saved?.capabilities?.play == true,
+                        onPlay = { play(trackId = entry.track.id, entryId = entry.id) }, playback = playback,
+                        occurrenceBinding = listOf(id, saved?.revision, entry),
+                        currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.MANUAL, entry.id,
+                            entry.track.id, playback.trackId, playbackEntryId, playbackContext),
+                        onContextual = if (onPreparedAction != null) ({ expectedKey, isCurrent -> play(trackId = entry.track.id,
+                            entryId = entry.id, action = PlaybackListAction.CONTEXTUAL, expectedKey = expectedKey, isCurrent = isCurrent) }) else null)
                     if (saved?.capabilities?.editEntries == true) TextButton(enabled = !busy && !blocked,
                         onClick = { removing = entry.id }) { Text("Remove this occurrence") }
                 }
@@ -399,17 +458,49 @@ private fun PlaylistDetail(
     }
 }
 
+/** Track equality is not occurrence equality: duplicates and other contexts must not all announce current. */
+internal fun playlistOccurrenceIsCurrent(
+    playlistId: String, kind: PlaylistKind, occurrenceId: String, trackId: String,
+    playbackTrackId: String?, playbackEntryId: String?, playbackContext: LibraryItem?,
+): Boolean = playbackTrackId == trackId && playbackEntryId == occurrenceId && playbackContext != null &&
+    playbackContext.id == playlistId && playbackContext.kind == (if (kind == PlaylistKind.DERIVED) "derived" else "playlist")
+
 @Composable
 internal fun PlaylistTrackRow(track: LibraryItem, onOpenTrack: (LibraryItem) -> Unit,
-    onShowTrackActions: (LibraryItem) -> Unit, enabled: Boolean, onPlay: () -> Unit, actionsEnabled: Boolean = true) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Column(Modifier.weight(1f).clickable { onOpenTrack(track) }.padding(vertical = 12.dp)) {
-            Text(track.name, style = MaterialTheme.typography.titleMedium)
-            Text(track.subtitle, style = MaterialTheme.typography.bodySmall)
-            if (!track.playable) Text("No recorded audio", style = MaterialTheme.typography.bodySmall)
+    onShowTrackActions: (LibraryItem, () -> Boolean) -> Unit, enabled: Boolean, onPlay: () -> Unit, actionsEnabled: Boolean = true,
+    playback: CatalogPlaybackFeedback = CatalogPlaybackFeedback(), occurrenceBinding: Any = track,
+    currentOccurrence: Boolean = false,
+    onContextual: ((PlaybackInteractionKey, () -> Boolean) -> Unit)? = null) {
+    val canPlay = enabled && track.playable
+    val canContextual = canPlay && playback.interactionKey != null && onContextual != null
+    ContextualSwipeRow(occurrenceBinding, playback.interactionKey, canContextual, playback.contextualLabel,
+        onCommit = { key, isCurrent -> onContextual?.invoke(key, isCurrent) }) { swipeModifier, isCurrent ->
+        Row(swipeModifier.fillMaxWidth().heightIn(min = 72.dp).background(
+            if (currentOccurrence) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background),
+            verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).clickable { onOpenTrack(track) }
+                .semantics {
+                    if (currentOccurrence) stateDescription = when {
+                        playback.buffering -> "Buffering"
+                        playback.isPlaying -> "Playing"
+                        else -> "Paused"
+                    }
+                    customActions = buildList {
+                        if (canPlay) add(CustomAccessibilityAction("Play now") { onPlay(); true })
+                        if (canContextual && playback.activeIntent) add(CustomAccessibilityAction(playback.contextualLabel) {
+                            if (isCurrent()) onContextual?.invoke(playback.interactionKey!!, isCurrent); true
+                        })
+                        if (actionsEnabled) add(CustomAccessibilityAction("More actions") { onShowTrackActions(track, isCurrent); true })
+                    }
+                }.padding(vertical = 10.dp, horizontal = 8.dp)) {
+                Text(track.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(compactMusicSubtitle(track), style = MaterialTheme.typography.bodySmall, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis)
+            }
+            IconButton(onClick = { onShowTrackActions(track, isCurrent) }, enabled = actionsEnabled, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Default.MoreVert, "More actions for ${track.name}")
+            }
         }
-        TextButton(onClick = onPlay, enabled = enabled && track.playable) { Text("Play") }
-        TextButton(onClick = { onShowTrackActions(track) }, enabled = actionsEnabled) { Text("More") }
     }
 }
 

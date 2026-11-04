@@ -89,6 +89,28 @@ class PlaybackService : MediaSessionService() {
             val service = active.get() ?: return "Unable to connect to playback. Try again."
             return service.requestEnqueue(items, client, first)
         }
+        fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?,
+            startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean = { true },
+            expectedKeyIsCurrent: () -> Boolean = { expectedKey == null || interactionKey() === expectedKey },
+            onResult: (PlaybackActionResult) -> Unit) {
+            val service = active.get()
+            if (service == null) onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE))
+            else service.requestListAction(queue, client, action, expectedKey, startTrackId, startEntryId, context,
+                isCurrent, expectedKeyIsCurrent, onResult)
+        }
+        fun contextualOccurrence(expectedKey: PlaybackInteractionKey, id: String, isCurrent: () -> Boolean = { true },
+            onResult: (PlaybackActionResult) -> Unit) {
+            val service = active.get()
+            if (service == null) onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE))
+            else service.requestContextualOccurrence(expectedKey, id, isCurrent, onResult)
+        }
+        fun playNextOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String, isCurrent: () -> Boolean = { true },
+            onResult: (PlaybackActionResult) -> Unit = {}) {
+            val service = active.get()
+            if (service == null) onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE))
+            else service.requestPlayNextOccurrence(expectedKey, occurrenceId, isCurrent, onResult)
+        }
         fun removeQueued(id: String) { active.get()?.localEdit { removeUpcoming(id) } }
         fun moveQueued(id: String, to: Int) { active.get()?.localEdit { moveUpcoming(id, to) } }
         fun moveQueued(expectedKey: PlaybackInteractionKey, id: String, to: Int) {
@@ -157,7 +179,26 @@ class PlaybackService : MediaSessionService() {
         val context: PlaybackContext?,
     )
 
+    private data class EmptyInteractionIdentity(
+        val client: PlaybackReference, val session: PlaybackReference, val owner: PlaybackReference,
+        val version: Triple<Long, Long, Long>, val epoch: Long, val requestEpoch: Long,
+    )
+
     private fun currentInteractionKey(): PlaybackInteractionKey? {
+        // A connected, authoritatively empty local output has no imported Media3 authority yet.
+        // Expose only a cancellation identity; the coordinator must still grant actual start
+        // authority at dispatch. Unknown/restorable nonempty queues do not get this capability.
+        val owner = (application as SpofifyApplication).graph.playbackCoordinator
+        val devices = owner?.state?.value
+        if (player?.mediaItemCount == 0 && client === (application as SpofifyApplication).graph.client &&
+            authenticatedSession != null && client?.currentSession() === authenticatedSession && devices != null &&
+            devices.connected && !devices.selectionUnconfirmed && devices.deviceId.isNotEmpty() &&
+            devices.activeDeviceId == devices.deviceId && devices.view?.transfer == null && devices.quarantineMs == 0L &&
+            devices.view?.state?.queue.isNullOrEmpty()) {
+            return interactionKeys.current(EmptyInteractionIdentity(PlaybackReference(requireNotNull(client)),
+                PlaybackReference(requireNotNull(authenticatedSession)), PlaybackReference(owner),
+                requireNotNull(owner).interactionVersion, devices.view?.epoch ?: 0, PlaybackRequests.epoch))
+        }
         val permit = authority
         val identity = if (permit != null && hasAuthority()) InteractionIdentity(
             PlaybackReference(requireNotNull(client)), PlaybackReference(requireNotNull(authenticatedSession)), permit.epoch, permit.generation,
@@ -188,6 +229,8 @@ class PlaybackService : MediaSessionService() {
     private var queueMessage: String? = null
     private var removed: Pair<PlaybackQueue.Removal, MediaItem>? = null
     private var removedTrack: PlaybackTrack? = null
+    private var removedWasManual = false
+    private val manualTier = PlaybackManualTier()
     private var arranging = false
     private val historyNonces = mutableMapOf<String, String>()
     private val wireKeys = mutableMapOf<String, Long>()
@@ -213,6 +256,7 @@ class PlaybackService : MediaSessionService() {
         wireKeys.keys.retainAll(activeOccurrences)
         wireTracks.keys.retainAll(activeOccurrences)
         progressRemainders.keys.retainAll(activeOccurrences)
+        manualTier.prune(traversalIds(), currentId())
         allowedAudioUrls.retainAll(activeUrls + pendingAudioUrls)
     }
 
@@ -293,7 +337,8 @@ class PlaybackService : MediaSessionService() {
                 // Shuffle only the future; played/current retain their positions.
                 val ids = physicalIds()
                 val at = exo.currentMediaItemIndex.coerceAtLeast(0)
-                setTraversal(ids.take(at + 1) + ids.drop(at + 1).shuffled())
+                val (manual, contextual) = manualTier.partitionFuture(ids, currentId())
+                setTraversal(ids.take(at + 1) + manual + contextual.shuffled())
                 removed = null
             }
 
@@ -302,6 +347,9 @@ class PlaybackService : MediaSessionService() {
                 interactionKeys.invalidate()
                 mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
                 if (importing) return
+                // Retire consumed/skipped manual occurrences at every transition, including
+                // A -> manual -> A before a deferred prune or another planner can sample it.
+                manualTier.prune(traversalIds(), PlaybackMedia.occurrence(mediaItem))
                 if (!hasAuthority() && exo.playWhenReady) suspendBufferedOutput()
                 // Repeat/returning is a new traversal; playlist moves are not.
                 if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED ||
@@ -494,6 +542,7 @@ class PlaybackService : MediaSessionService() {
         authority = null
         authenticatedSession = null
         history.clear()
+        manualTier.reset()
         historyNonces.clear()
         wireTracks.clear()
         wireContext = null
@@ -563,6 +612,7 @@ class PlaybackService : MediaSessionService() {
     private fun suspendBufferedOutput() {
         startAttempt = null
         interactionKeys.invalidate()
+        manualTier.reset()
         authority = null
         authorityRequestEpoch = -1
         admissions.clear()
@@ -606,7 +656,9 @@ class PlaybackService : MediaSessionService() {
             duration = if (current.duration == C.TIME_UNSET) importedDuration ?: (duration.coerceAtLeast(0) / 1000.0) else duration.coerceAtLeast(0) / 1000.0,
             playing = hasAuthority() && current.playWhenReady && current.playbackState != Player.STATE_ENDED && current.playerError == null && outputError.isEmpty(),
             waiting = hasAuthority() && current.playbackState == Player.STATE_BUFFERING,
-            error = if (current.playerError != null) "media" else outputError, occurrence = occurrence,
+            // A newer owned start failure must match its terminal ACK even if ExoPlayer
+            // retains the old media error until a permitted prepare can clear it.
+            error = outputError.ifEmpty { if (current.playerError != null) "media" else "" }, occurrence = occurrence,
             truncated = queueTruncated,
             notice = queueNoticeCode,
         ).validated()
@@ -721,7 +773,8 @@ class PlaybackService : MediaSessionService() {
 
     /** Activation is the only wire import. Validation/prepare never reaches this method. */
     private suspend fun importSnapshot(supplied: PlaybackSnapshot, value: PlaybackAuthority,
-        startGuard: () -> Boolean = { true }): PlaybackEndpointResult {
+        startGuard: () -> Boolean = { true },
+        onInstalled: (() -> Unit)? = null): PlaybackEndpointResult {
         val source = client ?: return PlaybackEndpointResult("rejected", exportPrepared())
         val plan = try { PlaybackSnapshotCodec.plan(supplied) }
             catch (_: IllegalArgumentException) { return PlaybackEndpointResult("rejected", exportPrepared()) }
@@ -732,6 +785,12 @@ class PlaybackService : MediaSessionService() {
         } catch (_: IllegalArgumentException) { return PlaybackEndpointResult("rejected", exportPrepared()) }
         if (!acceptAuthority(value)) return PlaybackEndpointResult("rejected", exportPrepared())
         val current = player ?: return PlaybackEndpointResult("rejected", PlaybackSnapshot())
+        // Idempotent silent initialization of a genuinely empty output must not invalidate a
+        // held empty-state contextual selection. No media/context/history is being installed.
+        if (current.mediaItemCount == 0 && snapshot == exportPrepared()) {
+            manualTier.reset()
+            return PlaybackEndpointResult("ok", exportPrepared())
+        }
         importing = true
         mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         startAttempt = null
@@ -741,6 +800,9 @@ class PlaybackService : MediaSessionService() {
             current.stop()
             audioFocus?.abandon()
             history.clear(); historyNonces.clear(); wireKeys.clear(); wireTracks.clear(); progressRemainders.clear()
+            // v1 imports carry exact traversal, not manual provenance. Preserve their order
+            // unchanged and conservatively treat all imported future entries as contextual.
+            manualTier.reset(); removedWasManual = false
             allowedAudioUrls.clear(); pendingAudioUrls.clear(); removed = null
             physical.forEachIndexed { index, track ->
                 val id = "wire-${track.key}"
@@ -785,6 +847,9 @@ class PlaybackService : MediaSessionService() {
         if (!snapshot.playing || snapshot.queue.isEmpty())
             foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem))
         if (snapshot.queue.isEmpty()) return PlaybackEndpointResult("ok", exportPrepared())
+        // Capture only this exact synchronous installation, before guarded startup can suspend.
+        // Generic imports do not opt in; terminal success still owns receipt publication.
+        onInstalled?.invoke()
         return startOwned(value, snapshot.playing, startGuard)
     }
 
@@ -899,6 +964,7 @@ class PlaybackService : MediaSessionService() {
                 audioFocus?.abandon(); current.pause(); current.stop(); current.clearMediaItems()
                 current.shuffleModeEnabled = false; current.repeatMode = Player.REPEAT_MODE_OFF
                 history.clear(); historyNonces.clear(); progressRemainders.clear(); wireKeys.clear(); wireTracks.clear()
+                manualTier.reset(); removedWasManual = false
                 allowedAudioUrls.clear(); pendingAudioUrls.clear(); removed = null; removedTrack = null
                 wireContext = null; contextIdentity = null; queueMessage = null; queueTruncated = false; queueNoticeCode = ""
                 importedDuration = null; importedElapsed = null; importedPositionMs = null; importedShuffle = null
@@ -929,7 +995,7 @@ class PlaybackService : MediaSessionService() {
                     "remove" -> removeUpcoming(id)
                     "move" -> {
                         val target = when (json["direction"]?.jsonPrimitive?.content) { "next" -> 0; "up" -> index - at - 2; "down" -> index - at; else -> -1 }
-                        moveUpcoming(id, target)
+                        moveUpcoming(id, target, playNext = json["direction"]?.jsonPrimitive?.content == "next")
                     }
                 }
             }
@@ -1010,6 +1076,266 @@ class PlaybackService : MediaSessionService() {
 
     private fun wireContext(item: LibraryItem?): PlaybackContext? = item?.let {
         PlaybackContext(it.kind, if (it.kind == "likes" && it.id.isEmpty()) "likes" else it.id, it.name)
+    }
+
+    private fun requestListAction(queue: dev.spofify.mobile.core.PlaybackQueue, requestedClient: SpofifyClient,
+        action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?, startEntryId: String?,
+        context: LibraryItem?, isCurrent: () -> Boolean, expectedKeyIsCurrent: () -> Boolean,
+        callback: (PlaybackActionResult) -> Unit) {
+        var completed = false
+        val onResult: (PlaybackActionResult) -> Unit = { result ->
+            if (!completed) { completed = true; callback(result) }
+        }
+        fun reject(status: PlaybackActionStatus) = onResult(PlaybackActionResult(status))
+        val request = PlaybackRequests.epoch
+        if (requestedClient !== client || requestedClient.currentSession() !== authenticatedSession) {
+            reject(PlaybackActionStatus.STALE); return
+        }
+        if (action == PlaybackListAction.CONTEXTUAL && expectedKey == null || !expectedKeyIsCurrent()) {
+            reject(PlaybackActionStatus.STALE); return
+        }
+        val prepared = try {
+            PlaybackSnapshotCodec.preparedQueue(queue, startTrackId, startEntryId, false, context)
+        } catch (_: IllegalArgumentException) { reject(PlaybackActionStatus.UNAVAILABLE); return }
+        val derived = prepared.context?.kind == "derived" ||
+            prepared.queue.getOrNull(prepared.position)?.playbackContext?.kind == "derived"
+        fun current() = isCurrent() && request == PlaybackRequests.epoch && requestedClient === client &&
+            requestedClient.currentSession() === authenticatedSession &&
+            expectedKeyIsCurrent() &&
+            (!derived || queue.selectionAuthority?.isValidFor(requestedClient, prepared) == true)
+        if (!current()) { reject(PlaybackActionStatus.STALE); return }
+        val owner = (application as SpofifyApplication).graph.playbackCoordinator
+        if (owner == null) { reject(PlaybackActionStatus.UNAVAILABLE); return }
+        val device = owner.state.value
+        if (device.activeDeviceId.isNotEmpty() && device.activeDeviceId != device.deviceId) {
+            // Only explicit single-selection Play next is representable by one v1 command.
+            // Contextual/manual-FIFO Add cannot be approximated by enqueue(false) or a chain.
+            if (action != PlaybackListAction.PLAY_NEXT || prepared.queue.size != 1 && startTrackId == null && startEntryId == null && !derived) {
+                reject(PlaybackActionStatus.UNSUPPORTED_REMOTE); return
+            }
+            val selected = prepared.queue[prepared.position]
+            val token = if (derived) queue.selectionAuthority?.selectionTokenFor(requestedClient, prepared) else null
+            if (derived && token == null) { reject(PlaybackActionStatus.STALE); return }
+            val single = PlaybackSnapshot(queue = listOf(selected.copy(playbackContext = selected.playbackContext ?: prepared.context)), position = 0)
+            val track = buildJsonObject {
+                single.toJson().getValue("queue").jsonArray.single().jsonObject.forEach { (name, value) -> put(name, value) }
+                token?.let { put("selectionToken", it) }
+            }
+            val command = PlaybackDeviceCommand.musical("enqueue", track = track, first = true)
+            val version = owner.interactionVersion
+            fun sameOwner() = active.get() === this && requestedClient === (application as SpofifyApplication).graph.client &&
+                (application as SpofifyApplication).graph.playbackCoordinator === owner &&
+                owner.state.value.deviceId == device.deviceId && owner.state.value.activeDeviceId == device.activeDeviceId &&
+                owner.state.value.view?.epoch == device.view?.epoch
+            owner.remoteCommandWithResult(command, isCurrent = { current() && sameOwner() && owner.interactionVersion == version }) { status ->
+                // The accepted enqueue naturally changes queue/current interaction binding.
+                // Its terminal result still requires the same session/output/request, not an
+                // unchanged pre-mutation queue revision or an optimistic pending response.
+                val now = owner.interactionVersion
+                val valid = isCurrent() && request == PlaybackRequests.epoch && requestedClient === client &&
+                    requestedClient.currentSession() === authenticatedSession && sameOwner() &&
+                    now.first == version.first && now.second == version.second
+                onResult(PlaybackActionResult(when {
+                    !valid -> PlaybackActionStatus.STALE
+                    status == "ok" -> PlaybackActionStatus.ADDED
+                    status == "blocked" -> PlaybackActionStatus.BLOCKED
+                    else -> PlaybackActionStatus.UNAVAILABLE
+                }, if (valid && status == "ok") 1 else 0))
+            }
+            return
+        }
+        var terminalResult = PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)
+        var transition: PlaybackAdditiveTransition? = null
+        val terminal: (PlaybackEndpointResult) -> Unit = {
+            // Receipt belongs to the exact mutation, not a later sampled/retargeted key.
+            val receipt = transition?.takeIf { currentInteractionKey() === it.after }
+            onResult(terminalResult.copy(additiveTransition = receipt))
+        }
+        val mutate: suspend (PlaybackAuthority) -> PlaybackEndpointResult = mutation@{ permit ->
+            if (!current() || !permit.isValid()) {
+                terminalResult = PlaybackActionResult(PlaybackActionStatus.STALE)
+                return@mutation PlaybackEndpointResult("rejected", exportPrepared())
+            }
+            // Recheck before acceptAuthority: a contextual edit must not resurrect lost ownership.
+            if (expectedKey != null && (permit.epoch != authority?.epoch || permit.generation != authority?.generation)) {
+                terminalResult = PlaybackActionResult(PlaybackActionStatus.STALE)
+                return@mutation PlaybackEndpointResult("rejected", exportPrepared())
+            }
+            if (!acceptAuthority(permit)) {
+                terminalResult = PlaybackActionResult(PlaybackActionStatus.STALE)
+                return@mutation PlaybackEndpointResult("rejected", exportPrepared())
+            }
+            if (action == PlaybackListAction.CONTEXTUAL && !hasActivePlaybackIntent()) {
+                // This is the normal explicit, authority-fenced prepared Play path. Allocate new
+                // wire keys only in the accepted serialized action; never replay delayed work.
+                val rekeyed = try {
+                    require(wireSerial <= 9007199254740991L - prepared.queue.size)
+                    val keys = prepared.queue.mapIndexed { index, track -> track.key to wireSerial + index + 1L }.toMap()
+                    prepared.copy(queue = prepared.queue.map { it.copy(key = keys.getValue(it.key)) }).publicationValidated()
+                } catch (_: IllegalArgumentException) {
+                    terminalResult = PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)
+                    return@mutation PlaybackEndpointResult("rejected", exportPrepared())
+                }
+                val before = currentInteractionKey()
+                val committedThrough = PlaybackListActionTickets.committedThrough
+                var installed: PlaybackInteractionKey? = null
+                val result = importSnapshot(rekeyed, permit, startGuard = isCurrent,
+                    onInstalled = { installed = currentInteractionKey() })
+                terminalResult = startActionResult(result)
+                val after = installed
+                if (terminalResult.status == PlaybackActionStatus.PLAYING && before != null && after != null && before !== after)
+                    transition = PlaybackAdditiveTransition(before, after, committedThrough)
+                result
+            } else {
+                // A row action means exactly its approved selection, not the surrounding album
+                // or derived result. Keep entryId, target/occurrence and per-track source context.
+                val selected = if (action != PlaybackListAction.CONTEXTUAL && startTrackId == null &&
+                    startEntryId == null && !derived) prepared.queue else listOf(prepared.queue[prepared.position])
+                val additions = selected.map { track ->
+                    if (track.playbackContext == null) track.copy(playbackContext = prepared.context) else track
+                }
+                val before = currentInteractionKey()
+                val committedThrough = PlaybackListActionTickets.committedThrough
+                var accepted = 0
+                var limited = false
+                val error = enqueueWire(additions, action == PlaybackListAction.PLAY_NEXT) { count, cap ->
+                    accepted = count; limited = cap
+                }
+                val status = when {
+                    error == "Queue is full." -> PlaybackActionStatus.FULL
+                    error != null -> PlaybackActionStatus.UNAVAILABLE
+                    accepted == 0 -> PlaybackActionStatus.NO_OP
+                    limited -> PlaybackActionStatus.LIMITED
+                    else -> PlaybackActionStatus.ADDED
+                }
+                terminalResult = PlaybackActionResult(status, accepted)
+                val after = currentInteractionKey()
+                if (error == null && accepted > 0 && before != null && after != null && before !== after)
+                    transition = PlaybackAdditiveTransition(before, after, committedThrough)
+                PlaybackEndpointResult(if (error == null) "ok" else "rejected", exportPrepared())
+            }
+        }
+        val rejected = { reject(if (current()) PlaybackActionStatus.UNAVAILABLE else PlaybackActionStatus.STALE) }
+        if (expectedKey != null && (player?.mediaItemCount != 0 || hasAuthority()))
+            owner.editPreparedQueue(::current, onRejected = rejected, onCompleted = terminal, action = mutate)
+        else owner.localAction(isCurrent = ::current, onRejected = rejected, onCompleted = terminal, action = mutate)
+    }
+
+    private fun hasActivePlaybackIntent(): Boolean {
+        val current = player ?: return false
+        return hasAuthority() && current.playWhenReady && current.playerError == null && outputError.isEmpty() &&
+            current.playbackState in setOf(Player.STATE_READY, Player.STATE_BUFFERING)
+    }
+
+    private fun startActionResult(result: PlaybackEndpointResult): PlaybackActionResult = PlaybackActionResult(when {
+        result.status == "ok" && result.snapshot.playing -> PlaybackActionStatus.PLAYING
+        result.status == "blocked" -> PlaybackActionStatus.BLOCKED
+        result.status == "rejected" -> PlaybackActionStatus.STALE
+        else -> PlaybackActionStatus.UNAVAILABLE
+    })
+
+    private fun requestContextualOccurrence(expectedKey: PlaybackInteractionKey, id: String,
+        isCurrent: () -> Boolean, callback: (PlaybackActionResult) -> Unit) {
+        var completed = false
+        val onResult: (PlaybackActionResult) -> Unit = { result ->
+            if (!completed) { completed = true; callback(result) }
+        }
+        if (!isCurrent() || currentInteractionKey() !== expectedKey) { onResult(PlaybackActionResult(PlaybackActionStatus.STALE)); return }
+        val owner = (application as SpofifyApplication).graph.playbackCoordinator
+        if (owner == null) { onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)); return }
+        var terminalResult = PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)
+        owner.editPreparedQueue(isCurrent = { isCurrent() && currentInteractionKey() === expectedKey },
+            onRejected = { onResult(PlaybackActionResult(if (isCurrent() && currentInteractionKey() === expectedKey)
+                PlaybackActionStatus.UNAVAILABLE else PlaybackActionStatus.STALE)) },
+            onCompleted = { onResult(terminalResult) }) { permit ->
+            if (!isCurrent() || currentInteractionKey() !== expectedKey || !permit.isValid() ||
+                permit.epoch != authority?.epoch || permit.generation != authority?.generation ||
+                id !in PlaybackQueue.upcoming(traversalIds(), currentId())) {
+                terminalResult = PlaybackActionResult(PlaybackActionStatus.STALE)
+                PlaybackEndpointResult("rejected", exportPrepared())
+            } else if (!hasActivePlaybackIntent()) {
+                val current = requireNotNull(player)
+                // Jump exact existing MediaItem; do not replace queue or duplicate an occurrence.
+                current.seekToDefaultPosition(physicalIds().indexOf(id))
+                val result = startOwned(permit, true, isCurrent = isCurrent)
+                terminalResult = startActionResult(result)
+                result
+            } else {
+                val order = traversalIds()
+                val promoted = manualTier.promoted(order, currentId(), id)
+                if (promoted == null) {
+                    terminalResult = PlaybackActionResult(PlaybackActionStatus.STALE)
+                    PlaybackEndpointResult("rejected", exportPrepared())
+                } else {
+                    // Preflight combined publication before changing provenance or traversal.
+                    val before = exportPrepared()
+                    val tracks = promoted.map { occurrence -> before.queue.first { it.key == wireKeys.getValue(occurrence) } }
+                    try {
+                        before.copy(queue = tracks, position = promoted.indexOf(currentId())).publicationValidated()
+                        manualTier.add(listOf(id))
+                        if (promoted != order) {
+                            removed = null
+                            preserveTraversal(promoted)
+                        }
+                        terminalResult = PlaybackActionResult(if (promoted == order) PlaybackActionStatus.NO_OP else PlaybackActionStatus.ADDED,
+                            if (promoted == order) 0 else 1)
+                        PlaybackEndpointResult("ok", exportPrepared())
+                    } catch (_: IllegalArgumentException) {
+                        terminalResult = PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)
+                        PlaybackEndpointResult("rejected", exportPrepared())
+                    }
+                }
+            }
+        }
+    }
+
+    private fun requestPlayNextOccurrence(expectedKey: PlaybackInteractionKey, id: String,
+        isCurrent: () -> Boolean, callback: (PlaybackActionResult) -> Unit) {
+        var completed = false
+        val onResult: (PlaybackActionResult) -> Unit = { result ->
+            if (!completed) { completed = true; callback(result) }
+        }
+        val owner = (application as SpofifyApplication).graph.playbackCoordinator
+        if (owner == null) { onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)); return }
+        fun current() = active.get() === this && isCurrent() && currentInteractionKey() === expectedKey
+        var terminalResult = PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)
+        owner.editPreparedQueue(isCurrent = ::current,
+            onRejected = { onResult(PlaybackActionResult(if (current()) PlaybackActionStatus.UNAVAILABLE else PlaybackActionStatus.STALE)) },
+            onCompleted = { onResult(terminalResult) }) { permit ->
+            val order = traversalIds()
+            if (!current() || !permit.isValid() || permit.epoch != authority?.epoch || permit.generation != authority?.generation ||
+                id !in PlaybackQueue.upcoming(order, currentId())) {
+                terminalResult = PlaybackActionResult(PlaybackActionStatus.STALE)
+                PlaybackEndpointResult("rejected", exportPrepared())
+            } else {
+                val promoted = PlaybackQueue.move(order, currentId(), id, 0) ?: order
+                val before = exportPrepared()
+                val tracks = promoted.map { occurrence -> before.queue.first { it.key == wireKeys.getValue(occurrence) } }
+                try {
+                    before.copy(queue = tracks, position = promoted.indexOf(currentId())).publicationValidated()
+                    val changed = promoted != order || !manualTier.contains(id)
+                    // Explicit Play next promotes this occurrence only. Generic drag/reorder
+                    // adopts the entire displayed future; using it here destroys manual FIFO.
+                    manualTier.add(listOf(id))
+                    if (promoted != order) { removed = null; preserveTraversal(promoted) }
+                    terminalResult = PlaybackActionResult(if (changed) PlaybackActionStatus.ADDED else PlaybackActionStatus.NO_OP,
+                        if (changed) 1 else 0)
+                    PlaybackEndpointResult("ok", exportPrepared())
+                } catch (_: IllegalArgumentException) {
+                    terminalResult = PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)
+                    PlaybackEndpointResult("rejected", exportPrepared())
+                }
+            }
+        }
+    }
+
+    /** Preserve the exported shuffle flag/baseline while changing only realized traversal. */
+    private fun preserveTraversal(ids: List<String>) {
+        val current = player ?: return
+        val shuffle = importedShuffle ?: current.shuffleModeEnabled
+        arranging = true
+        try { current.shuffleModeEnabled = true; setTraversal(ids); importedShuffle = shuffle }
+        finally { arranging = false }
     }
 
     private fun guardedMove(expectedKey: PlaybackInteractionKey, id: String, to: Int) {
@@ -1155,7 +1481,8 @@ class PlaybackService : MediaSessionService() {
             context = resolved.context, shuffle = resolved.shuffle, playing = true, truncated = resolved.truncated, notice = resolved.notice), value)
     }
 
-    private fun enqueueWire(tracks: List<PlaybackTrack>, first: Boolean): String? {
+    private fun enqueueWire(tracks: List<PlaybackTrack>, first: Boolean,
+        onAccepted: (Int, Boolean) -> Unit = { _, _ -> }): String? {
         val source = client ?: return "Playback is unavailable."
         val current = player ?: return "Playback is unavailable."
         if (!hasAuthority()) return "Playback permission expired."
@@ -1163,7 +1490,7 @@ class PlaybackService : MediaSessionService() {
         val additions = tracks.filter { track -> track.targetId.isEmpty() || wireTracks.values.none {
             it.targetId == track.targetId && it.occurrenceId == track.occurrenceId
         } }
-        if (additions.isEmpty()) return null
+        if (additions.isEmpty()) { onAccepted(0, false); return null }
         var order = traversalIds()
         val retained = PlaybackQueue.retainedForAdd(order, currentId(), additions.size)
         val room = PlaybackQueue.LIMIT - retained.size
@@ -1175,11 +1502,10 @@ class PlaybackService : MediaSessionService() {
         // live keys, replacing history/metadata or adding media. Individually safe batches
         // can exceed the 2MiB publication envelope when joined.
         val before = exportPrepared()
-        val insertion = if (first && currentId() != null) retained.indexOf(currentId()) + 1 else retained.size
+        val insertion = if (first) (retained.indexOf(currentId()) + 1).coerceAtLeast(0)
+            else manualTier.insertionIndex(retained, currentId())
         val retainedTracks = retained.map { id -> before.queue.first { it.key == wireKeys.getValue(id) } }
-        val prospective = retainedTracks.toMutableList().apply { addAll(insertion, accepted) }.let { tracks ->
-            if (importedShuffle ?: current.shuffleModeEnabled) tracks else tracks.mapIndexed { index, track -> track.copy(order = index.toLong()) }
-        }
+        val prospective = retainedTracks.toMutableList().apply { addAll(insertion, accepted) }
         try {
             before.copy(queue = prospective,
                 position = before.queue.getOrNull(before.position)?.key?.let { key -> prospective.indexOfFirst { it.key == key } } ?: 0,
@@ -1200,14 +1526,16 @@ class PlaybackService : MediaSessionService() {
             allowedAudioUrls.add(requireNotNull(media[index].localConfiguration).uri.toString())
         }
         val next = order.toMutableList().apply { addAll(insertion, added) }
+        manualTier.add(added)
         if (current.mediaItemCount == 0 || current.playbackState == Player.STATE_ENDED) current.pause()
         mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()
         current.addMediaItems(media)
         removed = null
-        if (importedShuffle ?: current.shuffleModeEnabled) setTraversal(next) else adoptDisplayedOrder(next)
+        preserveTraversal(next)
         if (accepted.size < additions.size) markQueueLimited()
         schedulePrune()
+        onAccepted(accepted.size, accepted.size < additions.size)
         return null
     }
 
@@ -1221,7 +1549,9 @@ class PlaybackService : MediaSessionService() {
         val current = player ?: return
         val order = traversalIds(); val at = order.indexOf(currentId())
         val enabled = !(importedShuffle ?: current.shuffleModeEnabled)
-        val future = order.drop(at + 1).let { ids -> if (enabled) ids.shuffled() else ids.sortedBy { wireTracks[it]?.order ?: physicalIds().indexOf(it).toLong() } }
+        val (manual, contextual) = manualTier.partitionFuture(order, currentId())
+        val future = manual + if (enabled) contextual.shuffled()
+            else contextual.sortedBy { wireTracks[it]?.order ?: physicalIds().indexOf(it).toLong() }
         arranging = true
         try { current.shuffleModeEnabled = true; setTraversal(order.take(at + 1) + future); importedShuffle = enabled }
         finally { arranging = false }
@@ -1303,6 +1633,8 @@ class PlaybackService : MediaSessionService() {
         val index = physicalIds().indexOf(id)
         val media = current.getMediaItemAt(index)
         removedTrack = wireTracks[id]
+        removedWasManual = manualTier.contains(id)
+        manualTier.remove(id)
         mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()
         current.removeMediaItem(index)
@@ -1327,15 +1659,22 @@ class PlaybackService : MediaSessionService() {
         removed = null
         removedTrack?.let { track -> wireKeys[removal.occurrence] = track.key; wireTracks[removal.occurrence] = track }
         removedTrack = null
+        if (removedWasManual) manualTier.add(listOf(removal.occurrence))
+        removedWasManual = false
         allowedAudioUrls.add(requireNotNull(media.localConfiguration).uri.toString())
         current.addMediaItem(media)
         if (current.shuffleModeEnabled) setTraversal(restored) else adoptDisplayedOrder(restored)
         schedulePrune()
     }
 
-    private fun moveUpcoming(id: String, to: Int) {
-        val moved = PlaybackQueue.move(traversalIds(), currentId(), id, to) ?: return
+    private fun moveUpcoming(id: String, to: Int, playNext: Boolean = false) {
+        val moved = PlaybackQueue.move(traversalIds(), currentId(), id, to)
+        if (moved == null) {
+            if (playNext && id in PlaybackQueue.upcoming(traversalIds(), currentId())) manualTier.add(listOf(id))
+            return
+        }
         removed = null
+        if (playNext) manualTier.add(listOf(id)) else manualTier.adoptReorder(moved, currentId())
         adoptDisplayedOrder(moved)
     }
 
@@ -1344,6 +1683,7 @@ class PlaybackService : MediaSessionService() {
         val future = PlaybackQueue.upcoming(traversalIds(), currentId()).toSet()
         if (future.isEmpty()) return
         val remaining = traversalIds().filterNot { it in future }
+        manualTier.reset(); removedWasManual = false
         removed = null
         mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
         PlaybackRequests.queueChanged()

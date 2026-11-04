@@ -223,7 +223,8 @@ class PlaybackStartAttemptTest {
         guard: () -> Boolean): PlaybackEndpointResult = suspendCoroutineUninterceptedOrReturn { continuation ->
         val method = PlaybackService::class.java.declaredMethods.single { it.name == "importSnapshot" }
         method.isAccessible = true
-        try { method.invoke(fixture.service, snapshot, permit, guard, continuation) }
+        // List playback adds an optional installation observer; generic imports opt out.
+        try { method.invoke(fixture.service, snapshot, permit, guard, null, continuation) }
         catch (failure: InvocationTargetException) { throw failure.targetException }
     }
 

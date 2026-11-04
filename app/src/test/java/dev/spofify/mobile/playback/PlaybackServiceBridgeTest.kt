@@ -851,9 +851,11 @@ class PlaybackServiceBridgeTest {
         val track = PlaybackSnapshot(queue = listOf(ordinary), position = 0).toJson().getValue("queue") as kotlinx.serialization.json.JsonArray
         val added = endpoint.execute(PlaybackDeviceCommand.musical("enqueue", track = track.single() as kotlinx.serialization.json.JsonObject, first = false), permit)
         assertEquals("ok", added.status)
-        assertEquals(501L, added.snapshot.queue.last().key) // Rejected speculative allocation consumed NO live keys.
+        // Imported future has unknown/manual-free provenance. A fresh manual Add belongs
+        // immediately after current, ahead of that contextual tail—not at the total tail.
+        assertEquals(501L, added.snapshot.queue[1].key) // Rejected speculative allocation consumed NO live keys.
         assertEquals(original.occurrence, added.snapshot.occurrence)
-        assertEquals(original.queue, added.snapshot.queue.take(500))
+        assertEquals(original.queue, added.snapshot.queue.filterNot { it.key == 501L })
         assertSilent()
     }
 

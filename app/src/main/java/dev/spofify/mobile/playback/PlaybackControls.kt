@@ -19,6 +19,26 @@ interface PlaybackControls {
         play(queue.items, client, startTrackId, shuffle, startEntryId)
         setContext(queue.context?.let { LibraryItem(it.kind, it.id, it.name) } ?: context)
     }
+    /** Captured expectedKey must precede asynchronous preparation. Unknown controls fail closed. */
+    fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
+        action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String? = null,
+        startEntryId: String? = null, context: LibraryItem? = null, isCurrent: () -> Boolean = { true },
+        onResult: (PlaybackActionResult) -> Unit) {
+        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+    }
+    /** Contextual selection of one existing upcoming occurrence; never a catalog duplicate. */
+    fun contextualOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+        isCurrent: () -> Boolean = { true }, onResult: (PlaybackActionResult) -> Unit = {}) {
+        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+    }
+    /** Explicit promotion of one exact upcoming occurrence, not an arbitrary reorder of the
+     * entire future. Capture expectedKey before dispatch; caller guard belongs to the owning
+     * queue/sheet, not a lazy row that can disappear because its own action selected it.
+     */
+    fun playNextOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+        isCurrent: () -> Boolean = { true }, onResult: (PlaybackActionResult) -> Unit = {}) {
+        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+    }
     /** Prepared items only: fetching a collection remains an explicit host action. Never autoplays. */
     fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean = false) {}
     fun removeUpcoming(occurrenceId: String) {}

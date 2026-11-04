@@ -94,6 +94,17 @@ class PlaybackCoordinator(
     private var intent: Selection? = null
     private var pendingCommand: String? = null
     private var observedPendingCommand: String? = null
+    private data class CommandResult(val id: String, val callback: (String) -> Unit)
+    private var commandResult: CommandResult? = null
+    private var commandResultTimeout: Job? = null
+    private fun finishCommandResult(id: String?, status: String) {
+        val result = commandResult ?: return
+        if (id != null && result.id != id) return
+        commandResult = null
+        commandResultTimeout?.cancel(); commandResultTimeout = null
+        try { result.callback(status) }
+        catch (_: Exception) { /* An observer must never interrupt authority/output cleanup. */ }
+    }
     private val deliveries = LinkedHashSet<String>()
     private val acks = ArrayList<PlaybackAck>()
     private var ackState: PlaybackSnapshot? = null
@@ -107,6 +118,7 @@ class PlaybackCoordinator(
         try { awaitCancellation() }
         finally {
             withContext(NonCancellable) {
+                finishCommandResult(null, "cancelled")
                 if (managedOutput) {
                     lifecycle++; generation++; leaseDeadline = 0; released = true
                     revokeAuthority()
@@ -176,6 +188,7 @@ class PlaybackCoordinator(
         generation++; leaseDeadline = 0; released = true; activatedEpoch = 0; recoverPaused = true
         revokeAuthority()
         if (invalidateActions) {
+            finishCommandResult(null, "cancelled")
             actionVersion++
             endpointJob?.cancel()
         }
@@ -193,6 +206,7 @@ class PlaybackCoordinator(
         commandJob?.cancel(); endpointJob?.cancel()
         // An explicit Pause also cancels a pre-bind request before this coordinator owns output.
         endpoint.suspendOutput()
+        finishCommandResult(null, "cancelled")
         pendingCommand = null
         // Execution ACK and its final snapshot are one atomic protocol item. In particular,
         // a source already released cannot reconstruct state from live authority afterward.
@@ -245,6 +259,9 @@ class PlaybackCoordinator(
         uncertainConnection = false
         intent = selection
         pendingCommand = null
+        // A remote pending write's coroutine may already be complete. Retire its observer
+        // with the command identity, before an unchanged-epoch selection permits a successor.
+        finishCommandResult(null, "cancelled")
         if (pendingLocalExecution || targetDeviceId != state.value.deviceId && activating) {
             // Cancel only unfinished endpoint work. A healthy source must remain able
             // to execute and ACK the server's release at its exact final position.
@@ -295,6 +312,12 @@ class PlaybackCoordinator(
     /** Route ALL app/notification actions here, not straight to a controller that bypasses ownership. */
     fun remoteCommand(command: PlaybackDeviceCommand, isCurrent: () -> Boolean = { true }) = submitAction(command, isCurrent = isCurrent)
 
+    /** One command, terminal acknowledgement only. Kept separate so legacy trailing-lambda
+     * admission predicates can never silently bind to a new completion callback.
+     */
+    internal fun remoteCommandWithResult(command: PlaybackDeviceCommand, isCurrent: () -> Boolean,
+        onResult: (String) -> Unit) = submitAction(command, isCurrent = isCurrent, onCommandResult = onResult)
+
     /** System transport can operate prepared output, never initialize/import a queue for Play.
      * Pause still interrupts synchronously before this prepared-only dispatch gate. Remote
      * transport retains its normal authority routing; it never initializes local output.
@@ -303,36 +326,51 @@ class PlaybackCoordinator(
         submitAction(command = command, isCurrent = isCurrent, initialize = false)
 
     /** Only a NEW explicit user action, never startup/restoration or deferred reconnect autoplay. */
-    fun localAction(action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) = submitAction(action = action)
+    fun localAction(isCurrent: () -> Boolean = { true }, onRejected: (() -> Unit)? = null,
+        onCompleted: ((PlaybackEndpointResult) -> Unit)? = null,
+        action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) =
+        submitAction(action = action, isCurrent = isCurrent, onRejected = onRejected, onCompleted = onCompleted)
 
     /** Existing prepared queue only: a cancelled edit must NEVER initialize/import output. */
-    internal fun editPreparedQueue(isCurrent: () -> Boolean, action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) =
-        submitAction(action = action, isCurrent = isCurrent, initialize = false)
+    internal fun editPreparedQueue(isCurrent: () -> Boolean, onRejected: (() -> Unit)? = null,
+        onCompleted: ((PlaybackEndpointResult) -> Unit)? = null,
+        action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) =
+        submitAction(action = action, isCurrent = isCurrent, initialize = false, onRejected = onRejected,
+            onCompleted = onCompleted)
 
     private fun submitAction(
         command: PlaybackDeviceCommand? = null,
         action: (suspend (PlaybackAuthority) -> PlaybackEndpointResult)? = null,
         isCurrent: () -> Boolean = { true },
         initialize: Boolean = true,
+        onRejected: (() -> Unit)? = null,
+        onCommandResult: ((String) -> Unit)? = null,
+        onCompleted: ((PlaybackEndpointResult) -> Unit)? = null,
     ) {
-        if (closed || !isCurrent()) return
+        fun rejectEarly() { onRejected?.invoke(); onCommandResult?.invoke("rejected") }
+        if (closed || !isCurrent()) { rejectEarly(); return }
         val interrupt = command?.type in setOf("pause", "close")
         if (interrupt) interruptLocal()
-        if (!serviceActive) { message("Connect the playback service and choose this phone before pressing Play."); return }
+        if (!serviceActive) { message("Connect the playback service and choose this phone before pressing Play."); rejectEarly(); return }
         if (!interrupt && selectionPending()) {
-            message("Finish selecting a playback device before changing playback."); return
+            message("Finish selecting a playback device before changing playback."); rejectEarly(); return
         }
-        if (pendingCommand != null && pendingFinalClose == null) { message("An action is awaiting confirmation. Pause or Stop can interrupt it."); return }
+        if (pendingCommand != null && pendingFinalClose == null) { message("An action is awaiting confirmation. Pause or Stop can interrupt it."); rejectEarly(); return }
         // A queued NEW intent only holds disposal. It may become stale/rejected while waiting;
         // job completion must return the cleanup obligation unless real replacement state won.
         val heldClose = pendingFinalClose?.also {
             it.holdForReplacement(); pendingFinalClose = null; pendingCommand = null
         }
         val id = nonce(); pendingCommand = id; observedPendingCommand = null
+        // No retired observer may be overwritten, including a held final-close replacement.
+        finishCommandResult(null, "cancelled")
+        onCommandResult?.let { commandResult = CommandResult(id, it) }
         val life = lifecycle; val version = selectionVersion; val revision = actionVersion
         // This waits once behind an in-flight initial registration, never across a failed reconnect.
+        var actionCompleted = false
+        var endpointResult: PlaybackEndpointResult? = null
+        var awaitingRemoteOutcome = false
         commandJob = work.launch {
-            var awaitingRemoteOutcome = false
             try {
                 transport.withLock {
                     if (life != lifecycle || version != selectionVersion || (!interrupt && revision != actionVersion) || pendingCommand != id || !isCurrent()) return@withLock
@@ -361,6 +399,8 @@ class PlaybackCoordinator(
                                 if (!authority.isValid() || !isCurrent()) return@endpointAction null
                                 if (action != null) action(authority) else endpoint.execute(requireNotNull(command), authority)
                             } ?: return@exchange
+                            actionCompleted = true
+                            endpointResult = result
                             if (result.finalClose != null) {
                                 if (authority.isValid() && life == lifecycle && version == selectionVersion &&
                                     (interrupt || revision == actionVersion)) publishFinalClose(result)
@@ -380,6 +420,12 @@ class PlaybackCoordinator(
                             if (!isCurrent()) return@exchange
                             request { api.command(state.value.deviceId, epoch, id, requireNotNull(command)) }
                             awaitingRemoteOutcome = true
+                            if (commandResult?.id == id) commandResultTimeout = work.launch {
+                                delay(8_000)
+                                // The write has already happened. Timeout reports uncertainty,
+                                // never clears/replays it or permits a second pending mutation.
+                                finishCommandResult(id, "timeout")
+                            }
                         } else {
                             message("Choose this phone as an available output before playing local music.")
                         }
@@ -390,7 +436,20 @@ class PlaybackCoordinator(
             }
         }.also { task ->
             // Also runs if cancellation prevents the coroutine body from ever starting.
-            task.invokeOnCompletion { heldClose?.finishReplacement() }
+            task.invokeOnCompletion {
+                // Cancellation can prevent the body (and its finally) from ever running.
+                // Completion is an admission-readiness boundary, after releasing transport
+                // and attempting exact result publication; never deliver it inside mutation.
+                if (!awaitingRemoteOutcome && pendingCommand == id) pendingCommand = null
+                heldClose?.finishReplacement()
+                // Includes pre-dispatch cancellation, rejected authority/selection and errors
+                // while waiting. Existing callers remain source compatible; list actions can
+                // complete truthfully instead of announcing optimistic enqueue success.
+                if (!actionCompleted) onRejected?.invoke()
+                if (it != null || !awaitingRemoteOutcome) finishCommandResult(id,
+                    endpointResult?.status ?: if (it is CancellationException) "cancelled" else "rejected")
+                endpointResult?.let { result -> onCompleted?.invoke(result) }
+            }
         }
     }
 
@@ -508,9 +567,9 @@ class PlaybackCoordinator(
         val outcome = view.commands.find { it.commandId == pendingCommand }
         val outcomeForgotten = outcome == null && pendingCommand != null && observedPendingCommand == pendingCommand
         if (outcome?.status == "pending") observedPendingCommand = outcome.commandId
-        if (outcome != null && outcome.status != "pending" || outcomeForgotten) {
-            pendingCommand = null; observedPendingCommand = null
-        }
+        val terminal = outcome != null && outcome.status != "pending" || outcomeForgotten
+        val completedCommand = pendingCommand.takeIf { terminal }
+        if (terminal) { pendingCommand = null; observedPendingCommand = null }
         val connectedMessage = when {
             view.quarantineMs > 0 -> "Waiting for previous playback permission to expire. The selected output will be prepared paused."
             view.transfer != null -> "Switching playback; waiting for the players to confirm."
@@ -523,6 +582,7 @@ class PlaybackCoordinator(
             intent?.target ?: view.transfer?.targetDeviceId.orEmpty(), intent != null, grantAuthority, false,
             authorizedFor(id, view), view.activeDeviceId == id && view.state?.error == "blocked", connectedMessage)
         publishAuthority()
+        if (terminal) finishCommandResult(completedCommand, outcome?.status ?: "cancelled")
         leaseTimer?.cancel()
         if (grantAuthority && view.activeDeviceId == id) leaseTimer = work.launch {
             while (clockMs() < leaseDeadline) delay((leaseDeadline - clockMs()).coerceAtLeast(1))

@@ -8,6 +8,8 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
@@ -67,6 +69,37 @@ class MusicActionsContentTest {
         compose.runOnIdle { assertEquals(2, toggles); assertEquals(1, retries) }
     }
 
+    @Test fun explicitAddAndSeparatelyNamedContextualActionNeverDispatchEachOthersIntent() {
+        val contextualLabel = mutableStateOf("Play now")
+        val events = mutableListOf<String>()
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                MusicActionsContent(LibraryItem("track", "song", "Song", hasAudio = true),
+                    liked = false, likePending = false, likeFailed = false,
+                    onPlay = { events += "play-now" }, onPlayNext = { events += "play-next" },
+                    onEnqueue = { events += "enqueue" }, onToggleLike = {}, onRetryLike = {},
+                    onAddToPlaylist = {}, onOpenItem = {}, contextualLabel = contextualLabel.value,
+                    onContextual = { events += "contextual" })
+            }
+        }
+        for (label in listOf("Play now", "Add to queue")) {
+            compose.runOnIdle { contextualLabel.value = label; events.clear() }
+            val swipeLabel = "$label (swipe action)"
+            // Exact labels keep explicit non-starting Add distinguishable in either output state.
+            compose.onAllNodesWithText("Add to queue").assertCountEquals(1)
+            compose.onAllNodesWithText("Play now").assertCountEquals(1)
+            compose.onAllNodesWithText(swipeLabel).assertCountEquals(1)
+            val otherLabel = if (label == "Play now") "Add to queue" else "Play now"
+            compose.onNodeWithText("$otherLabel (swipe action)").assertDoesNotExist()
+            compose.onNodeWithText("Add to queue").performScrollTo().assertIsDisplayed()
+                .assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
+            compose.runOnIdle { assertEquals(listOf("enqueue"), events) }
+            compose.onNodeWithText(swipeLabel).performScrollTo().assertIsDisplayed()
+                .assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
+            compose.runOnIdle { assertEquals(listOf("enqueue", "contextual"), events) }
+        }
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     private fun checkReachability(fontScale: Float) {
         val item = LibraryItem("track", "song", "A long song title with many individually navigable music credits",
@@ -100,7 +133,7 @@ class MusicActionsContentTest {
             compose.runOnIdle { assertEquals(expected, events.last()) }
         }
         // Traverse back through the actual actions, not a duplicate test-only menu.
-        for (label in listOf("Open details", "Add to playlist", "Add to queue", "Play next", "Play", "Like song")) {
+        for (label in listOf("Open details", "Add to playlist", "Add to queue", "Play next", "Play now", "Like song")) {
             val action = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
             val viewport = compose.onNodeWithTag("music-actions").getUnclippedBoundsInRoot()
             val target = action.getUnclippedBoundsInRoot()

@@ -1,11 +1,15 @@
 package dev.spofify.mobile.feature.playlists
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.SpofifyClient
@@ -17,6 +21,9 @@ import kotlinx.coroutines.launch
 internal fun PlaylistOccurrenceActions(
     client: SpofifyClient, track: LibraryItem, onDismiss: () -> Unit,
     onOpen: () -> Unit, onAdd: () -> Unit, onPersonalChange: () -> Unit,
+    playbackEnabled: Boolean, contextualLabel: String, onPlayNow: () -> Unit,
+    onContextual: (() -> Unit)?, onEnqueue: (() -> Unit)?, onPlayNext: (() -> Unit)?,
+    onOpenItem: (LibraryItem) -> Unit,
 ) {
     var liked by remember(client, track.id) { mutableStateOf<Boolean?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -31,12 +38,21 @@ internal fun PlaylistOccurrenceActions(
         finally { busy = false }
     }
     AlertDialog(onDismissRequest = { if (!busy) onDismiss() }, title = { Text(track.name) }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Use the playlist row’s Play button to select this exact occurrence. Generic track playback cannot select a signed rules occurrence.")
-            TextButton(onClick = onOpen, enabled = !busy) { Text("Open track details") }
-            TextButton(onClick = onAdd, enabled = !busy) { Text("Add to playlist") }
-            if (liked == null) TextButton(onClick = { statusRefresh++ }, enabled = !busy) { Text("Check like status") }
-            else TextButton(enabled = !busy, onClick = {
+        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onPlayNow, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Play now") }
+            onContextual?.let { action ->
+                TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("$contextualLabel (swipe action)") }
+            }
+            onPlayNext?.let { action -> TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Play next") } }
+            // Explicit Add remains non-starting even if playback ends during preparation.
+            // The separately named swipe action carries contextual start-or-queue intent.
+            onEnqueue?.let { action ->
+                TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Add to queue") }
+            }
+            TextButton(onClick = onOpen, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Open track details") }
+            TextButton(onClick = onAdd, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Add to playlist") }
+            if (liked == null) TextButton(onClick = { statusRefresh++ }, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Check like status") }
+            else TextButton(enabled = !busy, modifier = Modifier.heightIn(min = 48.dp), onClick = {
                 val wanted = !liked!!
                 busy = true
                 scope.launch {
@@ -50,7 +66,8 @@ internal fun PlaylistOccurrenceActions(
                     } finally { busy = false }
                 }
             }) { Text(if (liked == true) "Unlike song" else "Like song") }
+            dev.spofify.mobile.feature.library.MusicCredits(track, onOpenItem)
             message?.let { Text(it) }
         }
-    }, confirmButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Done") } })
+    }, confirmButton = { TextButton(onClick = onDismiss, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Done") } })
 }

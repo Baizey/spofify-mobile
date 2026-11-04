@@ -20,6 +20,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertHeightIsEqualTo
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertWidthIsEqualTo
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -50,6 +51,9 @@ import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.playback.PlaybackControls
+import dev.spofify.mobile.playback.PlaybackInteractionKey
+import dev.spofify.mobile.playback.PlaybackActionResult
+import dev.spofify.mobile.playback.PlaybackActionStatus
 import dev.spofify.mobile.playback.PlaybackState
 import dev.spofify.mobile.playback.QueueEntry
 import dev.spofify.mobile.ui.theme.AppTypography
@@ -358,7 +362,8 @@ class NativePlayerTest {
     @Test fun duplicateQueueTracksUseOccurrenceActionsAndUpcomingPositionsNotTimelineIndices() {
         val controls = RecordingControls()
         val duplicate = track.copy(id = "duplicate", name = "Duplicate song")
-        val snapshot = PlaybackState(item = track, canUndoQueueRemoval = true,
+        val interactionKey = PlaybackInteractionKey()
+        val snapshot = PlaybackState(item = track, interactionKey = interactionKey, canUndoQueueRemoval = true,
             upcoming = listOf(QueueEntry("first", duplicate, 19), QueueEntry("second", duplicate, 3)))
         setNowPlaying(snapshot, controls)
         compose.onNodeWithContentDescription("Upcoming queue").assertIsDisplayed()
@@ -372,13 +377,16 @@ class NativePlayerTest {
         compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1]
             .performScrollTo().performClick()
         compose.onNodeWithText("Remove from queue").performClick()
-        compose.onAllNodesWithContentDescription("Play queued song Duplicate song")[1]
+        compose.onAllNodesWithContentDescription("Play queued song Duplicate song").assertCountEquals(0)
+        compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1]
             .performScrollTo().performClick()
+        compose.onNodeWithText("Play now").performClick()
         compose.onNodeWithText("Undo").performClick()
         compose.onNodeWithContentDescription("Upcoming queue actions").performClick()
         compose.onNodeWithText("Clear upcoming").performClick()
         compose.runOnIdle {
-            assertEquals(listOf("second" to 0, "first" to 1), controls.moves)
+            assertEquals(listOf("first" to 1), controls.moves)
+            assertEquals(listOf(interactionKey to "second"), controls.playNexts)
             assertEquals(listOf("second"), controls.removed)
             assertEquals(listOf("second"), controls.selected)
             assertEquals(1, controls.undos)
@@ -389,9 +397,11 @@ class NativePlayerTest {
 
     @Test fun dedicatedHandleDragAndLeftSwipeEditOnlyTheUpcomingOccurrence() {
         val controls = RecordingControls()
+        val interactionKey = PlaybackInteractionKey()
         val first = track.copy(id = "first-track", name = "First queued")
         val second = track.copy(id = "second-track", name = "Second queued")
-        setNowPlaying(PlaybackState(item = track, upcoming = listOf(
+        setNowPlaying(PlaybackState(item = track, interactionKey = interactionKey,
+            canMoveUpcomingAbsolutely = true, upcoming = listOf(
             QueueEntry("first-occurrence", first, 8), QueueEntry("second-occurrence", second, 2),
         )), controls)
         compose.onNodeWithContentDescription("Upcoming queue").assertIsDisplayed()
@@ -403,6 +413,7 @@ class NativePlayerTest {
         }
         compose.runOnIdle {
             assertEquals(listOf("first-occurrence" to 1), controls.moves)
+            assertEquals(listOf(Triple(interactionKey, "first-occurrence", 1)), controls.guardedMoves)
             assertEquals(listOf("first-occurrence"), controls.removed)
             assertEquals(0, controls.prepares)
             assertEquals(0, controls.stops)
@@ -519,11 +530,11 @@ class NativePlayerTest {
             val range = initialNode.config[SemanticsProperties.VerticalScrollAxisRange]
             val initialOffset = range.value()
             assertEquals("Actually at terminal queue offset at $case", range.maxValue(), initialOffset, .01f)
-            val lastAction = compose.onNodeWithContentDescription("Play queued song Queued song 30")
+            val lastAction = compose.onNodeWithContentDescription("Queue actions for Queued song 30")
                 .assertIsDisplayed().fetchSemanticsNode().boundsInRoot
             org.junit.Assert.assertTrue("A complete last-row action fits at $case: $lastAction in $queueBounds",
                 lastAction.height >= 48f && lastAction.top >= queueBounds.top && lastAction.bottom <= queueBounds.bottom)
-            val initialLast = compose.onNodeWithContentDescription("Reorder Queued song 30")
+            val initialLast = compose.onNodeWithContentDescription("Queue actions for Queued song 30")
                 .fetchSemanticsNode().positionInRoot
             compose.mainClock.autoAdvance = false
             repeat(60) { frame ->
@@ -537,7 +548,7 @@ class NativePlayerTest {
                     queue.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value(), .01f)
                 assertEquals("Queue bounds stable at $case frame $frame", queueBounds, queue.fetchSemanticsNode().boundsInRoot)
                 assertEquals("Last occurrence stable at $case frame $frame", initialLast,
-                    compose.onNodeWithContentDescription("Reorder Queued song 30").fetchSemanticsNode().positionInRoot)
+                    compose.onNodeWithContentDescription("Queue actions for Queued song 30").fetchSemanticsNode().positionInRoot)
                 listOf("Play", "Previous song", "Next song").forEachIndexed { index, label ->
                     assertEquals("Pinned $label at $case frame $frame", controlsBefore[index],
                         compose.onNodeWithContentDescription(label).fetchSemanticsNode().boundsInRoot)
@@ -545,11 +556,11 @@ class NativePlayerTest {
             }
             compose.mainClock.autoAdvance = true
             queue.performScrollToIndex(0)
-            compose.onNodeWithContentDescription("Reorder Queued song 1").assertIsDisplayed()
+            compose.onNodeWithContentDescription("Queue actions for Queued song 1").assertIsDisplayed()
             if (disclosed) {
                 assertSingleLineFits("Queued song 1")
                 val firstTitle = compose.onNodeWithText("Queued song 1").fetchSemanticsNode().boundsInRoot
-                val firstAction = compose.onNodeWithContentDescription("Play queued song Queued song 1").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+                val firstAction = compose.onNodeWithContentDescription("Queue actions for Queued song 1").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
                 org.junit.Assert.assertTrue("One complete readable queue row at $case", firstTitle.top >= queueBounds.top && firstAction.bottom <= queueBounds.bottom)
                 org.junit.Assert.assertTrue("Queue cannot overlap pinned transport at $case", controlsBefore.all { it.top >= queueBounds.bottom })
                 if (case == Triple(320, 320, 2f)) captureComponent(case, "-queue")
@@ -730,6 +741,8 @@ class NativePlayerTest {
         var undos = 0
         var clears = 0
         val moves = mutableListOf<Pair<String, Int>>()
+        val guardedMoves = mutableListOf<Triple<PlaybackInteractionKey, String, Int>>()
+        val playNexts = mutableListOf<Pair<PlaybackInteractionKey, String>>()
         val removed = mutableListOf<String>()
         val selected = mutableListOf<String>()
         override fun connect() { connects++ }
@@ -745,6 +758,16 @@ class NativePlayerTest {
         override fun cycleRepeat() { repeats++ }
         override fun stop() { stops++ }
         override fun moveUpcoming(occurrenceId: String, toIndex: Int) { moves += occurrenceId to toIndex }
+        override fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int) {
+            guardedMoves += Triple(expectedKey, occurrenceId, toIndex)
+            moves += occurrenceId to toIndex
+        }
+        override fun playNextOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+            isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            org.junit.Assert.assertTrue("Play next retains the originating row guard", isCurrent())
+            playNexts += expectedKey to occurrenceId
+            onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+        }
         override fun removeUpcoming(occurrenceId: String) { removed += occurrenceId }
         override fun selectOccurrence(occurrenceId: String) { selected += occurrenceId }
         override fun undoQueueRemoval() { undos++ }

@@ -49,9 +49,7 @@ internal object PlaybackQueue {
         return Removal(occurrence, index, current, order.filterNot { it == occurrence })
     }
 
-    /** Capacity pressure may retire played entries, never current or upcoming entries. */
-    fun retainedForAdd(order: List<String>, current: String?, additions: Int): List<String> {
-        val currentIndex = order.indexOf(current)
-        return if (order.size + additions > LIMIT && currentIndex > 0) order.drop(currentIndex) else order
-    }
+    /** Admission never destroys history/current/future to make room. Report limited/full instead. */
+    @Suppress("UNUSED_PARAMETER")
+    fun retainedForAdd(order: List<String>, current: String?, additions: Int): List<String> = order
 }

@@ -513,6 +513,12 @@ class NativeUiSmokeTest {
                 assertQueueSnapshot(originalQueue)
                 assertOverflowingQueueBottomStable(originalQueue, fixture, "14a-large-font-released-bottom")
                 screenshot("14-large-font-queue")
+                // Feature-owned physical gesture/More/queue coverage. All earlier continuity
+                // checks are complete before deliberately changing the listening selection.
+                assertContextualListPlayback(fixture)
+                shell("settings put system font_scale 2.0")
+                waitForFont(2.0f)
+                assertContextualListFont2()
                 assertEquals("No query-free catalog reads are allowed", 0, fixture.emptyGlobalBrowseCalls.get())
                 assertEquals("Real auth cookie and CSRF must reach the fixture", 0, fixture.authenticationFailures.get())
                 assertTrue("Unexpected fixture routes: ${fixture.unexpectedRoutes.joinToString()}", fixture.unexpectedRoutes.isEmpty())
@@ -543,6 +549,118 @@ class NativeUiSmokeTest {
                     if (primary != null) primary.addSuppressed(error) else throw error
                 }
             }
+        }
+    }
+
+    private fun assertContextualListPlayback(fixture: UiFixtureServer) {
+        collapsePlayer()
+        waitUntilAbsent(playerSheet)
+        compose.onNodeWithText("Search").performClick()
+        waitFor(hasTestTag("search-query"))
+        search("Orbit")
+        scrollToCatalogItem(UiFixtureServer.TRACK_NAMES[8])
+        val before = readPlaybackState()
+        val witness = capturePlaying(fixture)
+        val initialFuture = before.upcoming.map { it.occurrenceId }
+        val additions = UiFixtureServer.TRACK_NAMES.subList(6, 9)
+        additions.take(2).forEachIndexed { index, name ->
+            swipeCatalogRowRight(name)
+            compose.waitUntil(15_000) { readPlaybackState().upcoming.size == initialFuture.size + index + 1 }
+            assertPlayingTransition(witness, fixture, "contextual FIFO swipe $index")
+        }
+        val more = "More actions for ${additions.last()}"
+        scrollToCatalogItem(additions.last())
+        compose.onNodeWithContentDescription(more).performClick()
+        waitFor(hasTestTag("music-actions"))
+        screenshot("15-list-more")
+        compose.onNodeWithText("Add to queue").performScrollTo().assertHeightIsAtLeast(48.dp).performClick()
+        waitUntilAbsent(hasTestTag("music-actions"))
+        compose.waitUntil(15_000) { readPlaybackState().upcoming.size == initialFuture.size + 3 }
+        val added = readPlaybackState()
+        assertEquals(additions, added.upcoming.take(3).map { it.item.name })
+        assertEquals("Manual FIFO must precede the untouched context tail", initialFuture,
+            added.upcoming.drop(3).map { it.occurrenceId })
+        assertPlayingTransition(witness, fixture, "explicit Add and FIFO")
+        screenshot("15a-list-after-swipes")
+
+        compose.onNode(expandPlayer).performClick()
+        waitFor(playerSheet)
+        openQueueForInspection()
+        val queue = compose.onNodeWithTag("now-playing-queue")
+        val selected = added.upcoming.last()
+        val queueRow = SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions) and
+            hasAnyDescendant(hasText(selected.item.name)) and
+            hasAnyDescendant(hasContentDescription("Queue actions for ${selected.item.name}"))
+        queue.performScrollToNode(queueRow)
+        compose.onNode(queueRow).performTouchInput {
+            swipe(Offset(width * .4f, center.y), Offset(width - 60.dp.toPx(), center.y), 350)
+        }
+        val expectedPromotion = added.upcoming.take(3).map { it.occurrenceId } + selected.occurrenceId +
+            added.upcoming.drop(3).filterNot { it.occurrenceId == selected.occurrenceId }.map { it.occurrenceId }
+        compose.waitUntil(15_000) { readPlaybackState().upcoming.map { it.occurrenceId } == expectedPromotion }
+        assertEquals("Upcoming promotion must not duplicate an occurrence", added.upcoming.size,
+            readPlaybackState().upcoming.map { it.occurrenceId }.toSet().size)
+        val handle = hasContentDescription("Reorder ${additions[1]}")
+        queue.performScrollToNode(handle)
+        val beforeDrag = readPlaybackState().upcoming.map { it.occurrenceId }
+        compose.onNode(handle).performTouchInput {
+            swipe(center, center.copy(y = center.y - 110.dp.toPx()), 500)
+        }
+        compose.waitUntil(15_000) { readPlaybackState().upcoming.map { it.occurrenceId } != beforeDrag }
+        assertEquals(beforeDrag.toSet(), readPlaybackState().upcoming.map { it.occurrenceId }.toSet())
+        assertPlayingTransition(witness, fixture, "upcoming promotion and handle drag")
+        screenshot("16-queue-promoted-and-dragged")
+        collapsePlayer()
+        waitUntilAbsent(playerSheet)
+
+        // Explicit Add remains nonstarting when paused; the subsequent physical-right
+        // selection is deliberate Play now, not a resume of the previously audible song.
+        compose.onNode(playingButton()).performClick()
+        waitFor(pausedButton())
+        val paused = readPlaybackState()
+        scrollToCatalogItem(additions.last())
+        compose.onNodeWithContentDescription(more).performClick()
+        waitFor(hasTestTag("music-actions"))
+        compose.onNodeWithText("Add to queue").performScrollTo().performClick()
+        waitUntilAbsent(hasTestTag("music-actions"))
+        compose.waitUntil(15_000) { readPlaybackState().upcoming.size == paused.upcoming.size + 1 }
+        assertFalse(readPlaybackState().playWhenReady)
+        assertEquals(paused.currentEntryId, readPlaybackState().currentEntryId)
+        swipeCatalogRowRight(additions.first())
+        compose.waitUntil(20_000) {
+            val state = readPlaybackState()
+            state.item?.name == additions.first() && state.isPlaying
+        }
+        screenshot("17-paused-swipe-starts-selected")
+    }
+
+    private fun assertContextualListFont2() {
+        val before = readPlaybackState()
+        val name = UiFixtureServer.TRACK_NAMES[7]
+        assertCompactSearchRows()
+        screenshot("18-font2-list")
+        scrollToCatalogItem(name)
+        compose.onNodeWithContentDescription("More actions for $name").performClick()
+        waitFor(hasTestTag("music-actions"))
+        compose.onNodeWithText("Add to queue").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        screenshot("18a-font2-list-more")
+        pressBack()
+        waitUntilAbsent(hasTestTag("music-actions"))
+        compose.onNode(expandPlayer).performClick()
+        waitFor(playerSheet)
+        screenshot("19-font2-now-playing")
+        openQueueForInspection()
+        screenshot("19a-font2-queue")
+        val after = readPlaybackState()
+        assertEquals(before.currentEntryId, after.currentEntryId)
+        assertEquals(before.upcoming.map { it.occurrenceId }, after.upcoming.map { it.occurrenceId })
+        assertTrue("Font2 presentation/More/Back must not stop playback", after.playWhenReady)
+    }
+
+    private fun swipeCatalogRowRight(name: String) {
+        scrollToCatalogItem(name).performTouchInput {
+            // Avoid the Android Back edge and the independent trailing 48dp More target.
+            swipe(Offset(width * .3f, center.y), Offset(width - 60.dp.toPx(), center.y), 350)
         }
     }
 
@@ -728,10 +846,12 @@ class NativeUiSmokeTest {
             val row = scrollToCatalogItem(name)
             val bounds = row.getUnclippedBoundsInRoot()
             val height = (bounds.bottom - bounds.top).value
-            // The row destination has only separate Play and More targets; metadata is plain
-            // text, not one credit/Like button per artist. Custom accessibility actions remain.
-            assertEquals("Unexpected inline metadata/actions for $name", 2,
+            // A's compact row retains only More beside its identity destination. Play now
+            // remains intentional in More/custom accessibility actions, never an inline slot.
+            assertEquals("Unexpected inline metadata/actions for $name", 1,
                 compose.onAllNodes(hasClickAction() and hasAnyAncestor(catalogItem(name))).fetchSemanticsNodes().size)
+            compose.onNodeWithContentDescription("More actions for $name")
+                .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
             height
         }
         assertTrue("One/four-artist rows must share pitch at the same font scale: $heights",
@@ -912,10 +1032,11 @@ class NativeUiSmokeTest {
 
     /**
      * Isolated AVD setup through the EXISTING real controls, not a fixture-total change or a
-     * second player. Keep the original five occurrence IDs and current audio intact; append enough
-     * real synthetic-track occurrences that even a tall viewport must scroll, then remove only
-     * those temporary IDs. The final current-song duplicate has a unique title within Up next,
-     * so the terminal action assertion cannot accidentally select a preceding duplicate row.
+     * second player. Keep the original five occurrence IDs and current audio intact; insert enough
+     * real synthetic-track occurrences in the manual FIFO tier that even a tall viewport must
+     * scroll, then remove only their fresh IDs. Original contextual occurrences need not be a
+     * prefix: manual additions precede that tail. Repeating only the first upcoming/current songs
+     * keeps the original terminal song's action label unique for the bottom-boundary assertion.
      */
     private fun assertOverflowingQueueBottomStable(
         original: List<QueueOccurrence>, fixture: UiFixtureServer, evidenceName: String,
@@ -944,10 +1065,14 @@ class NativeUiSmokeTest {
         }
         compose.waitUntil(10_000) { upcomingOccurrences().size == original.size + addedCount }
         val overflowing = upcomingOccurrences()
-        assertEquals("Enqueue preserves original upcoming identities and order", original, overflowing.take(original.size))
-        val added = overflowing.drop(original.size)
+        val originalIds = original.map { it.id }.toSet()
+        assertEquals("Enqueue preserves original upcoming identities and relative order", original,
+            overflowing.filter { it.id in originalIds })
+        val added = overflowing.filter { it.id !in originalIds }
+        assertEquals("All and only the temporary occurrences are identified", addedCount, added.size)
         assertEquals("Each temporary occurrence has a fresh unique ID", addedCount, added.map { it.id }.toSet().size)
-        assertTrue("Temporary IDs must not replace originals", added.none { extra -> original.any { it.id == extra.id } })
+        assertEquals("The terminal action label remains unique", 1,
+            overflowing.count { it.title == overflowing.last().title })
         assertPlayingTransition(before, fixture, "temporary overflow enqueue without preparation")
         assertReleasedQueueBottomStable(overflowing, fixture, evidenceName)
         compose.runOnIdle {
@@ -998,7 +1123,7 @@ class NativeUiSmokeTest {
                 it.config.getOrNull(SemanticsProperties.StateDescription)?.startsWith("Position ${expected.size} of ${expected.size}.") == true
             }
         val lastPosition = compose.onNode(lastOrdinal).assertIsDisplayed().fetchSemanticsNode().positionInRoot
-        val lastAction = compose.onNodeWithContentDescription("Play queued song ${expected.last().title}")
+        val lastAction = compose.onNodeWithContentDescription("Queue actions for ${expected.last().title}")
             .assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).fetchSemanticsNode().boundsInRoot
         assertTrue("Complete last queue action must be reachable", lastAction.top >= queueBounds.top && lastAction.bottom <= queueBounds.bottom)
         val pinned = listOf("Previous song", "Pause", "Next song").associateWith {

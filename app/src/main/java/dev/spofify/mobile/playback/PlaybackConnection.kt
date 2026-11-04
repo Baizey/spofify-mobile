@@ -76,6 +76,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         if (releaseAfterPending) releaseInternal()
     }
     private var connectionError: String? = null
+    private var actionNotice: String? = null
+    private var actionNoticeIsCurrent: (() -> Boolean)? = null
     private var queueSnapshot: List<LibraryItem> = emptyList()
     private var requestedContext: LibraryItem? = null
     private var observing = false
@@ -291,6 +293,96 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             remotePlaybackState(prepared).notice, preparedState = prepared, selectionAuthority = queue.selectionAuthority)
         connectInternal()
         if (controller != null) applyPlay()
+    }
+
+    override fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
+        action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?,
+        startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+        dispatchListAction(expectedKey, client, isCurrent, onResult, publishNotice = false,
+            allowRemote = action == PlaybackListAction.PLAY_NEXT) { live, complete ->
+            if (action == PlaybackListAction.CONTEXTUAL && expectedKey == null) {
+                complete(PlaybackActionResult(PlaybackActionStatus.STALE))
+            } else PlaybackService.performPreparedAction(queue, client, action, expectedKey,
+                startTrackId, startEntryId, context, live,
+                expectedKeyIsCurrent = { expectedKey == null ||
+                    (if (hasRemoteOutput()) currentRemoteInteractionKey() else PlaybackService.interactionKey()) === expectedKey },
+                onResult = complete)
+        }
+    }
+
+    override fun contextualOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+        isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+        dispatchListAction(expectedKey, (this.context as SpofifyApplication).graph.client, isCurrent, onResult) { live, complete ->
+            PlaybackService.contextualOccurrence(expectedKey, occurrenceId, live, complete)
+        }
+    }
+
+    override fun playNextOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+        isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+        dispatchListAction(expectedKey, (context as SpofifyApplication).graph.client, isCurrent, onResult,
+            allowRemote = true) { live, complete ->
+            if (!hasRemoteOutput()) PlaybackService.playNextOccurrence(expectedKey, occurrenceId, live, complete)
+            else {
+                val owner = coordinator
+                val snapshot = remoteSnapshot()
+                val key = snapshot?.let { remoteUpcomingKey(it, occurrenceId) }
+                if (owner == null || snapshot == null || key == null || currentRemoteInteractionKey() !== expectedKey) {
+                    complete(PlaybackActionResult(PlaybackActionStatus.STALE))
+                } else if (snapshot.queue.getOrNull(snapshot.position + 1)?.key == key) {
+                    complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+                } else owner.remoteCommandWithResult(PlaybackDeviceCommand.queue("move", key, "next"),
+                    isCurrent = { live() && owner === coordinator && currentRemoteInteractionKey() === expectedKey }) { status ->
+                    complete(PlaybackActionResult(when (status) {
+                        "ok" -> PlaybackActionStatus.ADDED
+                        "blocked" -> PlaybackActionStatus.BLOCKED
+                        else -> PlaybackActionStatus.UNAVAILABLE
+                    }, if (status == "ok") 1 else 0))
+                }
+            }
+        }
+    }
+
+    private fun dispatchListAction(expectedKey: PlaybackInteractionKey?, client: SpofifyClient?, isCurrent: () -> Boolean,
+        onResult: (PlaybackActionResult) -> Unit, publishNotice: Boolean = true, allowRemote: Boolean = false,
+        dispatch: (() -> Boolean, (PlaybackActionResult) -> Unit) -> Unit) {
+        val epoch = PlaybackRequests.epoch
+        val session = client?.currentSession()
+        val owner = coordinator
+        val output = owner?.state?.value?.activeDeviceId
+        val authorityVersion = owner?.interactionVersion?.let { it.first to it.second }
+        // Unlike legacy posted transport, rejected/cancelled calls must also complete exactly once.
+        handler.post {
+            var finished = false
+            fun authorityCurrent() = epoch == PlaybackRequests.epoch && client != null &&
+                client === (context as SpofifyApplication).graph.client && client.currentSession() === session &&
+                session != null && owner === coordinator && output == owner?.state?.value?.activeDeviceId &&
+                authorityVersion == owner?.interactionVersion?.let { it.first to it.second }
+            fun current() = isCurrent() && authorityCurrent()
+            val complete: (PlaybackActionResult) -> Unit = completion@{ result ->
+                if (finished) return@completion
+                finished = true
+                val valid = current()
+                val actual = if (valid) result else PlaybackActionResult(PlaybackActionStatus.STALE)
+                // Never publish an old-account notice. A successful mutation naturally changes
+                // its interaction key; the service checked the old key at actual dispatch.
+                // Prepared host actions publish their route-fenced callback in the ViewModel;
+                // only Up next needs an application-owned notice without host route plumbing.
+                if (valid && publishNotice) {
+                    actionNotice = actual.userMessage
+                    actionNoticeIsCurrent = ::authorityCurrent
+                    publish(refreshQueue = true)
+                }
+                onResult(actual)
+            }
+            when {
+                !current() -> complete(PlaybackActionResult(PlaybackActionStatus.STALE))
+                hasRemoteOutput() && !allowRemote -> complete(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED_REMOTE))
+                controller == null -> complete(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE))
+                expectedKey != null && (if (hasRemoteOutput()) currentRemoteInteractionKey() else PlaybackService.interactionKey()) !== expectedKey ->
+                    complete(PlaybackActionResult(PlaybackActionStatus.STALE))
+                else -> dispatch({ !finished && current() }, complete)
+            }
+        }
     }
 
     private fun applyPlay() {
@@ -520,6 +612,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             pendingPlay = null
             pendingEnqueues.clear()
             requestedContext = null
+            actionNotice = null
+            actionNoticeIsCurrent = null
             releaseInternal()
             PlaybackService.stopActivePlayback()
             context.stopService(Intent(context, PlaybackService::class.java))
@@ -539,11 +633,17 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
 
     private fun publish(refreshQueue: Boolean = false) {
+        if (actionNoticeIsCurrent?.invoke() != true) {
+            actionNotice = null
+            actionNoticeIsCurrent = null
+        }
         // Do not read the local queue/history at all while displaying another output.
         if (hasRemoteOutput()) {
             displayingRemote = true
-            mutableState.value = remotePlaybackState(remoteSnapshot() ?: PlaybackSnapshot(), connectionError).copy(
+            val remote = remotePlaybackState(remoteSnapshot() ?: PlaybackSnapshot(), connectionError)
+            mutableState.value = remote.copy(
                 interactionKey = currentRemoteInteractionKey(),
+                notice = actionNotice ?: remote.notice,
             )
             return
         }
@@ -577,7 +677,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             currentEntryId = PlaybackMedia.occurrence(connected.currentMediaItem),
             context = PlaybackService.queueContext(),
             canUndoQueueRemoval = PlaybackService.canUndoRemoval(),
-            notice = PlaybackService.queueNotice(),
+            notice = actionNotice ?: PlaybackService.queueNotice(),
             interactionKey = PlaybackService.interactionKey(),
             canMoveUpcomingAbsolutely = PlaybackService.interactionKey() != null,
         )
