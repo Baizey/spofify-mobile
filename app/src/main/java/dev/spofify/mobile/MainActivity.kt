@@ -283,7 +283,7 @@ private fun LikedSongs(
             }
             if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             state.error?.let { LoadError(it, "Retry liked songs", model::refresh) }
-            if (!state.loading && state.items.isEmpty() && state.error == null) Text("Songs you like will find a home here. Use a heart on any song.")
+            if (!state.loading && state.items.isEmpty() && state.error == null) Text("No liked songs yet.")
         }
         itemsIndexed(state.items, key = { index, item -> "${item.id}:$index" }) { _, item ->
             MusicRow(item, onOpen, onPlay, onMore, onQueue, artwork, playback = feedback,

@@ -207,17 +207,12 @@ internal fun CatalogScreenContent(
         if (detail == null && !screen.emptySearch && screen.sections.values.any { it.loading }) item(key = "search-loading") {
             LinearProgressIndicator(Modifier.fillMaxWidth().semantics { contentDescription = "Searching saved music" })
         }
-        if (detail == null) {
-            if (screen.emptySearch) item(key = "prompt") {
-                Text("Find an artist, album or song in your saved music. Start typing to search.",
-                    Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        } else if (screen.detailUnavailable) {
+        if (detail != null && screen.detailUnavailable) {
             item(key = "missing-detail") {
                 Text(detail.name, style = MaterialTheme.typography.headlineSmall)
                 LoadError(screen.detailError ?: "This music is no longer saved.", "Retry details", holder::retryDetail)
             }
-        } else {
+        } else if (detail != null) {
             item(key = "hero") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {

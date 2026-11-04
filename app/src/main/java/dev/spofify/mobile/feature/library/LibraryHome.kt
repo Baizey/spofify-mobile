@@ -169,11 +169,10 @@ fun LibraryHome(
             if (state.likedCount.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             state.likedCount.error?.let { LoadError(it, "Retry liked count") { holder.refresh("likes") } }
         }
-        item {
+        if (state.recent.loading || state.recent.error != null || !state.recent.value.isNullOrEmpty()) item {
             Text("Recently played", style = MaterialTheme.typography.titleLarge)
             if (state.recent.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             state.recent.error?.let { LoadError(it, "Retry recently played") { holder.refresh("recent") } }
-            if (state.recent.value?.isEmpty() == true) Text("Your recent listening will appear here. Search for your first song.")
         }
         items(state.recent.value.orEmpty(), key = { "recent:${it.id}" }) { item ->
             MusicRow(item, onOpenItem, onPlayItem, onShowActions, onEnqueueItem, artwork,
@@ -184,7 +183,6 @@ fun LibraryHome(
             TextButton(onClick = { onOpenPlaylists(null) }) { Text("All playlists") }
             if (state.playlists.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             state.playlists.error?.let { LoadError(it, "Retry playlists") { holder.refresh("playlists") } }
-            if (state.playlists.value?.isEmpty() == true) Text("Create a playlist to collect your music.")
         }
         items(state.playlists.value.orEmpty(), key = { "playlist:${it.id}" }) { playlist ->
             ElevatedCard(onClick = { onOpenPlaylists(playlist.id) }, modifier = Modifier.fillMaxWidth()) {

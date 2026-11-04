@@ -115,7 +115,8 @@ class LibraryUiTest {
             val query = compose.onNodeWithTag("search-query").fetchSemanticsNode().boundsInRoot
             assertTrue(query.center.y > viewport.top + viewport.height * .65f)
             assertTrue(query.bottom <= viewport.bottom)
-            compose.onNodeWithText("Find an artist, album or song in your saved music. Start typing to search.").assertExists()
+            compose.onNodeWithText("Find an artist, album or song in your saved music. Start typing to search.").assertDoesNotExist()
+            compose.onNodeWithContentDescription("Search your music").assertExists()
         } finally { holder.close(); scope.cancel() }
     }
 

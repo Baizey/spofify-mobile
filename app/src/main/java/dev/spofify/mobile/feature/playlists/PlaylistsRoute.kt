@@ -76,7 +76,6 @@ fun PlaylistsRoute(
             else -> LazyColumn(modifier.fillMaxSize(), state = listState,
                 contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item {
-                    Text("Your playlists", style = MaterialTheme.typography.headlineMedium)
                     Row {
                         Button(onClick = { creating = true }) { Text("Create playlist") }
                         TextButton(onClick = { refresh++ }, enabled = !loading) { Text("Refresh") }
@@ -87,8 +86,7 @@ fun PlaylistsRoute(
                 items(page?.items.orEmpty(), key = { it.id }) { playlist ->
                     PlaylistCard(playlist, onClick = { selectedId = playlist.id })
                 }
-                item {
-                    if (!loading && page?.total == 0) Text("Make a playlist to collect your music, or choose live rules.")
+                if (offset > 0 || offset + (page?.items?.size ?: 0) < (page?.total ?: 0)) item {
                     Row {
                         TextButton(onClick = { offset = (offset - 40).coerceAtLeast(0) }, enabled = offset > 0 && !loading) { Text("Previous") }
                         TextButton(onClick = { offset += 40 }, enabled = !loading && offset + (page?.items?.size ?: 0) < (page?.total ?: 0)) { Text("Next playlists") }

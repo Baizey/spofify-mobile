@@ -105,6 +105,11 @@ class NativeUiSmokeTest {
                 waitFor(hasText("Recently played"))
                 waitFor(hasText(UiFixtureServer.TRACK_NAMES.first()))
                 screenshot("02-home")
+                compose.onNodeWithText("Liked songs").performClick()
+                waitFor(hasText("Liked songs") and !hasClickAction())
+                screenshot("02b-liked-songs-root")
+                pressBack()
+                waitFor(hasText("Recently played"))
                 assertEquals(0, fixture.emptyGlobalBrowseCalls.get())
 
                 // The actual bottom-tab tap itself must focus the empty root and open the IME.
@@ -112,6 +117,7 @@ class NativeUiSmokeTest {
                 activateSearchAndAssertEmpty(fixture, "04-search-keyboard")
                 dismissSearchImeAndAssertEmptyRoot()
                 assertSearchInThumbZone()
+                compose.onAllNodes(hasText("Start typing to search.", substring = true)).assertCountEquals(0)
                 assertCompactSearchFieldTargets()
                 assertCompactNavigationTargets()
                 screenshot("03-search-empty")
@@ -235,6 +241,7 @@ class NativeUiSmokeTest {
                 assertSearchStartsAtFirstResult()
                 compose.onNodeWithContentDescription("Clear search").performClick()
                 compose.waitUntil(10_000) { queryText().isEmpty() }
+                compose.onAllNodes(hasText("Start typing to search.", substring = true)).assertCountEquals(0)
                 if (isImeVisible()) pressBack()
                 waitForIme(false)
                 assertListeningChrome(editing = false)
@@ -566,8 +573,8 @@ class NativeUiSmokeTest {
         assertEquals("Activation must clear accepted text and the visible local draft", "", queryText())
         compose.onAllNodes(hasContentDescription("More actions for ", substring = true)).assertCountEquals(0)
         compose.onAllNodes(hasText("See more ", substring = true)).assertCountEquals(0)
-        // This extraction retains baseline empty-Search prose; copy removal is feature 02.
-        compose.onNodeWithText("Start typing to search.", substring = true).assertIsDisplayed()
+        // The empty field identifies Search; redundant empty-query prose stays absent.
+        compose.onAllNodes(hasText("Start typing to search.", substring = true)).assertCountEquals(0)
         compose.onAllNodes(hasText("No music matches this search.")).assertCountEquals(0)
         compose.onAllNodes(hasContentDescription("Searching saved music")).assertCountEquals(0)
     }

@@ -189,7 +189,7 @@ class SearchNavigationHostTest {
         assertText("")
         compose.onNodeWithTag("primary-navigation").assertDoesNotExist()
         compose.onNodeWithTag("app-actions").assertDoesNotExist()
-        compose.onNodeWithText("Find an artist, album or song", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("Find an artist, album or song", substring = true).assertDoesNotExist()
         compose.runOnIdle {
             assertEquals(Tab.SEARCH, model.state.value.tab)
             assertEquals(Page.Search(), model.state.value.page)
@@ -218,6 +218,7 @@ class SearchNavigationHostTest {
     @Test fun actualHomeAndPlaylistsSearchTapsStartFocusedEmptySearch() {
         mount()
         compose.waitUntil(5_000) {
+            compose.waitForIdle()
             model.homeHolder()?.state?.value?.let { it.recent.value != null && it.playlists.value != null } == true
         }
         compose.onNodeWithText("Liked songs").assertIsDisplayed()
