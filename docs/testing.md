@@ -1,6 +1,6 @@
 # Validation
 
-Read [mobile-ux.md](mobile-ux.md) and [ui-validation.md](ui-validation.md) before changing a screen. Follow [worktree-review.md](worktree-review.md) for dedicated worktrees, exact-SHA review, separate advisory-locked shared-cache builds, standing conditional assigned-scope self-integration in **main**, and evidence-preserving cleanup after scoped/combined validation. Temporary integration branches are optional, not the final destination. **Automated checks and rendered native validation are separate gates.**
+Read [mobile-ux.md](mobile-ux.md) and [ui-validation.md](ui-validation.md) before changing a screen. Follow [worktree-review.md](worktree-review.md) for dedicated worktrees, exact-SHA review, separate guarded/advisory-locked shared-cache builds, standing conditional assigned-scope self-integration in **main**, and evidence-preserving cleanup after scoped/combined validation. Temporary integration branches are optional, not the final destination. **Automated checks and rendered native validation are separate gates.**
 
 ## Storage preflight and cleanup
 
@@ -8,7 +8,7 @@ Read [mobile-ux.md](mobile-ux.md) and [ui-validation.md](ui-validation.md) befor
 
 ## Automated gate
 
-Use the provisioned API 37.0 compile platform via the worktree's local SDK configuration; minimum Android remains API 26 and target SDK remains 36. Assigned leads may acquire the exclusive `spofify-gradle.lock` advisory lease under the absolute Git common directory themselves (see worktree policy), verify no uncoordinated build is active, then run from their own worktree while continuously holding it:
+Use the provisioned API 37.0 compile platform via the worktree's local SDK configuration; minimum Android remains API 26 and target SDK remains 36. Assigned leads may acquire BUILD themselves: successfully atomic-`mkdir` the absolute common-directory `spofify-build.guard`, record their owner token, then acquire exclusive `spofify-gradle.lock` under the [guard/lease protocol](worktree-review.md#shared-resource-guards-and-advisory-leases). Flock alone does not coordinate across pi.lot Bash mounts. Verify no uncoordinated build is active, then run from their own worktree while continuously holding both:
 
 ```sh
 GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
@@ -16,7 +16,7 @@ GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
     :app:assembleDebugAndroidTest :app:lintDebug --offline --no-daemon --console=plain
 ```
 
-The absolute cache above is shared and its use must be serialized; indexes and build outputs remain worktree-local. Release the build lease after recording results; no overlapping builds. This lease is separate from `spofify-main.lock` and does not authorize main writes. Own-worktree builds hold **BUILD only** and release it before attempting MAIN. Root/main post-integration Gradle acquires **MAIN then BUILD**, holds both to freeze main source throughout compilation and releases BUILD before MAIN. Never acquire build→main or overlap integration with root compilation. CI uses JDK 21; local validation uses JDK 25. APK paths can be under `outputs/` or `intermediates/`, depending on AGP; the native runner finds the actual artifacts.
+The absolute cache above is shared and its use must be serialized; Git indexes and build outputs remain worktree-local. Release BUILD only after actual build/daemon writers stop and results are recorded, with owner-token-checked guard removal; preserve interrupted/uncertain ownership for explicit recovery. No overlapping builds. BUILD is separate from MAIN (`spofify-main.guard` plus `spofify-main.lock`) and does not authorize main writes. Own-worktree builds hold **BUILD only** and release it before attempting MAIN. Root/main post-integration Gradle acquires **MAIN then BUILD**, holds both to freeze main source throughout compilation and releases BUILD before MAIN. Never acquire build→main or overlap integration with root compilation. CI uses JDK 21; local validation uses JDK 25. APK paths can be under `outputs/` or `intermediates/`, depending on AGP; the native runner finds the actual artifacts.
 
 Core tests use MockWebServer, never the live backend or real accounts. Synthetic in-process/loopback fixtures are allowed; they do not authorize external network diagnosis or live-backend access. They cover exact origins/IP policy, opaque IDs, authentication/CSRF, cookies, redirect refusal, one-shot writes, session-generation races, cancellation, transport bounds, catalog paging/revisions and personal/derived collections.
 
@@ -26,7 +26,7 @@ Re-run the gate for each candidate and use its current XML reports, APKs and lin
 
 ## Required native AVD gate
 
-Normal isolated synthetic AVD validation is allowed. After the leased automated build above, reuse those exact APKs (verify their recorded hashes):
+Normal isolated synthetic AVD validation is allowed. After the guarded automated build above and release of BUILD/MAIN, acquire standalone NATIVE (`spofify-native.guard` plus `spofify-native.lock`) under the same owner/recovery protocol; never nest NATIVE inside BUILD or MAIN. Reuse those exact APKs (verify their recorded hashes):
 
 ```sh
 tools/ui/validate-native.sh --skip-build

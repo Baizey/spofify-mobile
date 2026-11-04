@@ -21,30 +21,34 @@ Temporary artifacts also require explicit ownership and bounded retention under 
 3. Fix non-nit findings in a new scoped commit, run gates, and re-review the new full SHA until clean. Approval never transfers to changed content or a new base. Record reviewer identity, exact SHA, findings and disposition outside the frozen candidate if necessary to avoid self-reference.
 4. Clean source review may permit landing with explicitly blocked native gates, but never claiming rendered/audio/background completion. Feature done requires actual applicable completion evidence.
 
-## Two separate OS advisory leases
+## Shared-resource guards and advisory leases
 
-`flock` is installed. Resolve the **absolute shared Git common directory**, not a per-worktree gitdir or cwd-relative `.git`. Every participating writer uses these same two persistent lock paths; never unlink/replace lock files (that creates split locks). Locks release with process/descriptor lifetime, including crashes; lock-file existence is not ownership.
+Resolve `COMMON=$(git rev-parse --path-format=absolute --git-common-dir)`: the **absolute shared Git common directory**, not a per-worktree gitdir or cwd-relative `.git`. Installed pi.lot `docs/security.md` and `docs/policy.md` state that backing-file POSIX/`flock` locks do **not** coordinate with host processes or separate Bash mounts. Thus `flock` alone is insufficient here. Outside that harness, ordinary OS `flock` remains a cooperative descriptor-lifetime lock; neither mechanism excludes nonparticipants. Shared-cache corruption was observed, but concurrency is only a plausible cause, not an established one.
 
-```sh
-COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
-# Run each lease in one shell so its descriptor remains open throughout work.
-(
-  flock -x 9
-  # Main fences, exact-candidate checks, squash inspection and commit HERE.
-) 9>"$COMMON/spofify-main.lock"
-# Separate shell/lease for Gradle, not inside the main lease:
-(
-  flock -x 8
-  GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
-    ./gradlew <assigned-tasks> --offline --no-daemon --console=plain
-) 8>"$COMMON/spofify-gradle.lock"
-```
+Every participating writer, including host-side writers, must acquire **both** the host-atomic directory guard and the persistent exclusive flock for each resource:
 
-Use finite/nonblocking acquisition if coordination is uncertain; stop/report rather than waiting blindly. No overlapping Gradle builds, including implicitly building native runners. Assigned leads may acquire the build lease themselves, only for own-worktree outputs and the absolute cache above. **Lock order is mandatory:** own-worktree Gradle holds **only BUILD**, releases it before attempting MAIN, and never waits for MAIN while holding BUILD. Root/main post-integration Gradle must freeze main source by acquiring **MAIN first, then BUILD**, hold both throughout the build and release BUILD before MAIN. Never acquire build→main; that can deadlock against main→build and lets compilation read changing main source. Keep main's tree/index/source fenced and unchanged during root validation; no parallel integration. Record command/candidate/results and release; parent/coordinator still owns combined validation accounting. No build or native run is required for documentation-only changes that do not affect app behavior. See [testing.md](testing.md).
+| Resource | Guard under `$COMMON` | Persistent flock under `$COMMON` |
+| --- | --- | --- |
+| BUILD: shared Gradle cache/build activity | `spofify-build.guard` | `spofify-gradle.lock` |
+| MAIN: root source/index/integration transaction | `spofify-main.guard` | `spofify-main.lock` |
+| NATIVE: shared AVD/ADB/test ports and runner state | `spofify-native.guard` | `spofify-native.lock` |
+
+1. Acquire the guard first with a **successful atomic `mkdir "$COMMON/<resource>.guard"`**, never `mkdir -p` or a check-then-create. Existing guard means busy, not ownership: use a bounded wait/retry or stop/report; do not steal, rename or remove another owner's guard. Other acquisition failures also stop work.
+2. After successful creation, record a unique owner/run token in the guard with worktree, candidate and command identification; retain that token in the owner's evidence. Then acquire the corresponding flock with a finite/nonblocking wait (for example `flock -x -w 60 <fd>`), keeping its descriptor open in the working shell. No protected work starts until **both** acquisitions succeed and uncoordinated writers have been excluded.
+3. Keep both throughout the protected operation and all descendant writers. Before release, confirm the actual Gradle/daemon, Git or native/ADB/emulator writers for that operation have stopped; launcher exit, timeout or cancellation alone does not prove shutdown. Release the flock, then compare the guard's recorded token to the retained own token and remove only that matching own record and empty guard directory. Never unlink/replace persistent lock files: that creates split locks; their existence is not ownership.
+4. On interruption, uncertain child shutdown, missing/mismatched token or unknown ownership, preserve the guard and evidence and stop/report for **explicit coordinated recovery**. Age, PID absence in one tool namespace and apparent inactivity do not authorize stale-guard removal. A failed flock acquisition permits only the same owner-checked guard release after confirming no protected writers started/remain; no unconditional cleanup trap.
+
+**Resource order is mandatory** (each resource means guard **plus** flock):
+
+- Own-worktree Gradle holds **BUILD only**, for its own outputs and the absolute cache in [testing.md](testing.md); release BUILD before attempting MAIN. No overlapping builds, including implicit runner builds.
+- Root/main post-integration Gradle acquires **MAIN then BUILD**, holds both to freeze main source throughout compilation, and releases **BUILD then MAIN**. Never acquire build→main or compile changing root source; keep all main fences below.
+- Native validation runs **standalone after the build**, reusing exact APKs with `--skip-build` under **NATIVE only**; do not nest it inside BUILD or MAIN. Release build/main resources first, and retain NATIVE until the runner's actual native processes stop.
+
+Record ownership, command/candidate/results and release/recovery status. Parent/coordinator still owns combined validation accounting; these shared-resource requirements do not batch individual feature delivery. No build or native run is required for documentation-only changes that do not affect app behavior. See [testing.md](testing.md).
 
 ## Main lease: continuously fenced squash transaction
 
-Destination is `/var/home/lsm/repos/spofify-mobile`, branch `main`. Before acquiring, identify the reviewed candidate, **main base validated and reviewed**, scope, checks and independent review identity. Hold exclusive `spofify-main.lock` **continuously from before all destination fences through squash staged inspection, commit and immediate verification**. A brief lock around commit alone is unsafe.
+Destination is `/var/home/lsm/repos/spofify-mobile`, branch `main`. Before acquiring, identify the reviewed candidate, **main base validated and reviewed**, scope, checks and independent review identity. Hold the owner-token `spofify-main.guard` **and** exclusive `spofify-main.lock` **continuously from before all destination fences through squash staged inspection, commit and immediate verification**. A brief lock around commit alone is unsafe.
 
 1. Verify destination's exact absolute path, `main` branch, full HEAD equal the validated/reviewed expected base, and completely clean tree/index (`git status --porcelain --untracked-files=all`). Check for unknown writers. Unexpected dirt/branch/index: stop without cleanup. If main has moved, do **not** squash the stale candidate.
 2. On moved main, release the lease. In the lead's **own** topic worktree normally merge current main (no rebase/history rewriting). Resolve only owned scoped conflicts; stop/escalate other conflicts. Re-run appropriate gates and obtain independent exact-SHA review of the new candidate against the new base; then reacquire and repeat all fences. Never fix/merge source into main to catch up.

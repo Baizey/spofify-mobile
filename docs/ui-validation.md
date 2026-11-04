@@ -12,7 +12,7 @@ Do not use personal AVD data, existing accounts, the live backend, production cr
 
 ## Required gates
 
-1. Assigned leads acquire the separate exclusive Gradle advisory lease under [worktree-review.md](worktree-review.md), then run the automated gate from their own worktree (not shared build outputs). Unassigned helpers coordinate with their lead:
+1. Assigned leads acquire BUILD (successful atomic `spofify-build.guard` mkdir, recorded owner token **and** exclusive `spofify-gradle.lock`) under the [guard/lease protocol](worktree-review.md#shared-resource-guards-and-advisory-leases), then run the automated gate from their own worktree (not shared build outputs). Unassigned helpers coordinate with their lead:
 
    ```sh
    GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle \
@@ -20,7 +20,7 @@ Do not use personal AVD data, existing accounts, the live backend, production cr
        --offline --no-daemon --console=plain
    ```
 
-2. Run the isolated synthetic AVD journey against the APKs built from the same SHA in step 1. Use `--skip-build` because the runner's default build does not supply `--offline`; do not bypass the shared-cache lease or offline requirements. Coordinate use of the runner's fixed test ports so native runs do not collide:
+2. Run the isolated synthetic AVD journey against the APKs built from the same SHA in step 1. Use `--skip-build` because the runner's default build does not supply `--offline`; do not bypass the shared-cache lease or offline requirements. Release BUILD/MAIN first, then acquire standalone NATIVE (`spofify-native.guard` plus exclusive `spofify-native.lock`) under that same protocol to serialize the shared AVD/ADB state and fixed test ports; never nest NATIVE in BUILD or MAIN. Flock alone is insufficient across pi.lot Bash mounts; retain NATIVE until actual native processes stop and release only the token-matching own guard, preserving interrupted/uncertain ownership for explicit recovery:
 
    ```sh
    tools/ui/validate-native.sh --skip-build
@@ -29,7 +29,7 @@ Do not use personal AVD data, existing accounts, the live backend, production cr
    Verify recorded APK hashes match those just built. This is deliberate build reuse, not permission to validate stale artifacts.
 
 3. **Open and inspect the resulting screenshots.** Source code, view trees and a passing instrumentation result are insufficient. Answer the [rendered-review questions](mobile-ux.md#rendered-review-questions--answer-with-evidence-not-source-assertions) with image paths and measurements/observations, compare before/after when a baseline exists, fix regressions and re-run. An independent read-only reviewer must inspect the affected renders and constraints; address non-nit findings and repeat review until clean.
-4. Record the evidence and remaining limitations. Assigned leads land reviewed work in main under the standing conditional authority, serialized MAIN lease and clean-tree/exact-base fences in [worktree-review.md](worktree-review.md); temporary integration is optional staging only. The parent owns the combined automated/native smoke gate after parallel edits settle, not only separate component tests. Preserve dirty/ignored evidence and verify main content/patch accounting before authorized worktree/ref cleanup; see [worktree-review.md](worktree-review.md#evidence-accounting-and-non-forced-cleanup). Landing or cleanup never converts blocked AVD validation into a pass.
+4. Record the evidence and remaining limitations. Assigned leads land reviewed work in main under the standing conditional authority, serialized MAIN guard plus flock and clean-tree/exact-base fences in [worktree-review.md](worktree-review.md); temporary integration is optional staging only. The parent owns the combined automated/native smoke gate after parallel edits settle, not only separate component tests. Preserve dirty/ignored evidence and verify main content/patch accounting before authorized worktree/ref cleanup; see [worktree-review.md](worktree-review.md#evidence-accounting-and-non-forced-cleanup). Landing or cleanup never converts blocked AVD validation into a pass.
 
 Do not change or regenerate a baseline just to approve a regression. Generic stock-control density is not an acceptable replacement for coherent music-first design.
 
