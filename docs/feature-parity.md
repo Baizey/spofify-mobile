@@ -4,7 +4,7 @@
 
 Target the website's **music/listening experience**, not its management shell. Native Android UX should provide equivalent capabilities, not duplicate desktop layout or browser-specific limitations.
 
-Quick source scan observed spofify-go main at `ebb604a` and mobile at `fb075a3` plus local draft changes. The backend is being developed live: this is a planning snapshot, not a deployment claim or frozen API specification. Both code and domain docs were checked; `docs/specs` tracking can lag integrated code. Recheck affected contracts before implementation. No backend files, accounts, services or data were modified.
+The original planning scan observed spofify-go at `ebb604a` and mobile at `fb075a3`. The backend is being developed live: this is a planning snapshot, not a deployment claim, current gap inventory or frozen API specification. Recheck affected source/contracts before implementation; old task status can lag integrated code. Backend source is read-only and source inspection does not authorize service/account/data access.
 
 Primary evidence in spofify-go:
 - `docs/frontend.md` — Personal Library, search and playback sections.
@@ -23,22 +23,22 @@ The server can contain far too much music for an all-artists/albums/songs landin
 - **Playlists:** manual and rules-based personal listening collections, not every album on the server.
 - Artist, album and track details remain reachable intentionally from search, recent listening, playlists and linked credits. Release groups and complete playback contexts remain useful there.
 
-## Existing website features to bring across
+## Listener parity requirements
 
-The table records the initial-draft baseline. Implementation is now proceeding in parallel; it is not a claim that every listed gap has already passed integration or device validation.
+These are capability and safety requirements, not an implementation-status table. Check current source and candidate-specific validation evidence for what is implemented and approved. Presentation follows the newer product decisions in [mobile-ux.md](mobile-ux.md), not an older desktop control inventory.
 
-| Area | Android draft | Remaining listener parity |
-| --- | --- | --- |
-| Home | Recent songs and shortcuts | Real playlist shelves and liked count; independently recovering shelves; successful-write invalidation without replacing usable content. No fabricated recommendations. |
-| Search | One mixed, available-only result page | Artists / Albums / Songs groups, independent totals/pagination/retry, explicit type choice and Include missing. Keep IME/debounce/cancellation and selected state coherent. No admin tracking/download filters. |
-| Music details/navigation | Basic artist/album child lists | Open track details independently from Play; navigable artist/album credits; meaningful year/duration/availability; artist Albums / Singles & EPs / Appears on groups; retained Back/page/scroll state. |
-| Personal actions | Like in expanded Now Playing | Like/unlike and Add to playlist from rows, details and player; create a playlist from the add flow; current playing/paused row feedback. |
-| Manual playlists | Read and play | Create, rename/describe, delete, add/remove/reorder entries. Keep duplicate occurrence IDs, expectedRevision conflicts and uncertain-write recovery. Reorder requires the complete bounded order, not one visible page. |
-| Rules/derived playlists | Hidden by kind=manual | List and consume existing rules playlists first: evaluation cursors, stale state, signed occurrence selection and fenced POST playback. Then builder, preview, edit rules and editable manual copy. These features exist in current website code. |
-| Queue | Replace context, select timeline index | Play next / Add to queue from tracks and contexts; remove/reorder upcoming occurrences; clear remainder without dropping the current song. First make Up next reflect actual shuffle traversal rather than the original full timeline. |
-| Now Playing | Seek/shuffle/repeat/likes and local transport | Context identity distinct from track credits, linked credits, Add to playlist, richer queue actions and playing-state feedback. Retain native system volume rather than copying every desktop control. |
-| Playback devices | Local Media3 only | Same-account player registration/naming, selected-output controls and acknowledged handoff of the exact prepared queue/position/shuffle/history occurrence. This is the existing coordination protocol, not a Chromecast picker or a fresh playlist fetch. |
-| Freshness/lifecycle | Request guards and service ownership exist | Catalog revision revalidation and targeted personal collection updates; preserve usable views, scroll, selection and playback across background refresh/navigation. |
+| Area | Required behavior |
+| --- | --- |
+| Home | Real playlist shelves and liked count; independently recovering shelves; successful-write invalidation without replacing usable content. No fabricated recommendations. |
+| Search | Query-required Artists → Albums → Songs ordering, independent paging/retry and generous See more. No visible main-Search type/count rows, persistent filters or Include missing checkbox. Preserve IME/debounce/cancellation and selection; intentional detail views may use supported API filters. |
+| Music details/navigation | Open track details independently from Play; navigable artist/album credits; meaningful year/duration/availability; artist Albums / Singles & EPs / Appears on groups; retained Back/page/scroll state. |
+| Personal actions | Like/unlike and Add to playlist from rows, details and player; create a playlist from the add flow; current playing/paused row feedback. |
+| Manual playlists | Create, rename/describe, delete, add/remove/reorder entries. Keep duplicate occurrence IDs, expectedRevision conflicts and uncertain-write recovery. Reorder requires the complete bounded order, not one visible page. |
+| Rules/derived playlists | Evaluation cursors, stale state, signed occurrence selection and fenced POST playback; builder, preview, rules editing and editable manual copy use agreed derived contracts. |
+| Queue | Play next / Add to queue from tracks and contexts; remove/reorder upcoming occurrences; clear remainder without dropping the current song. Up next reflects actual shuffle traversal, not the original full timeline. |
+| Now Playing | Context identity distinct from track credits, linked credits, Add to playlist, queue actions and playing-state feedback. Use the expanded sheet contract; retain native system volume rather than copying every desktop control. |
+| Playback devices | Same-account player registration/naming, selected-output controls and acknowledged handoff of the exact prepared queue/position/shuffle/history occurrence. This is the coordination protocol, not a Chromecast picker or a fresh playlist fetch. Enabled source is not native runtime acceptance; see [device-playback.md](device-playback.md). |
+| Freshness/lifecycle | Catalog revision revalidation and targeted personal collection updates; preserve usable views, scroll, selection and playback across background refresh/navigation. |
 
 Embedded artwork and generated fallback already exist on both sides. Authenticated notification/lock-screen artwork is an additional Android gap; do not give a bare protected URL to an unauthenticated system image loader.
 
@@ -76,6 +76,8 @@ Evidence: mobile `core/ServerAddress.kt`, sign-in UI, `res/xml/network_security_
 
 ## Future website direction — do not mistake specs for shipped APIs
 
+The FEAT identifiers here name backend planning areas, not required files in the mobile `docs/specs/` directory. Source snapshots are not deployed capability verification.
+
 | Spec area | Current boundary / mobile preparation |
 | --- | --- |
 | FEAT-001 / FEAT-015 playlist/source integration | Manual and derived personal playlists already exist. Saved-source copy and linked one-way synchronization are separate proposed contracts with ownership/provider/retention gates. Do not expose admin source routes as a listener substitute. |
@@ -92,15 +94,15 @@ The old HTTP acknowledgement checkbox is not a remember-me control. It is replac
 
 ## Parallel implementation and integration gates
 
-The user requested all independently implementable lanes in parallel. Each lead uses an actual dedicated worktree/topic branch with its own index and build outputs, not file assignments inside a shared checkout. Scope boundaries cover core catalog/shared transport; search/home/details and root UI integration; personal/derived collections; local player/queue/gestures; device protocol/coordination; encrypted login storage. Follow [worktree-review.md](worktree-review.md): coordinate shared interfaces, independently review the exact committed candidate (and re-review corrections), request serialized build and main squash slots, then let the granted lead squash into **main** only with an explicit candidate/scope/expected-HEAD grant and clean checkout/index checks. Temporary integration branches are optional staging, not the final destination. The parent owns combined automated/native validation and evidence-preserving, content-accounted cleanup of finished/idle/crashed lanes; a source checkpoint does not waive the native gate. Backend-blocked feature contracts remain coordination work, not fabricated UI capabilities.
+Each assigned lead uses a dedicated worktree/topic branch with its own index and build outputs, not file assignments inside a shared checkout. Follow [worktree-review.md](worktree-review.md): coordinate shared interfaces, independently review the exact committed candidate and corrections, and use the separate BUILD and MAIN advisory leases under standing conditional assigned-scope authority. Main integration requires the reviewed exact base and a clean destination; stop on another lane's dirt rather than staging, stashing or deleting it. The parent owns combined automated/native validation and evidence-preserving, content-accounted cleanup; a source checkpoint does not waive the native gate. Backend-blocked feature contracts remain coordination work, not fabricated UI capabilities.
 
-Dependency order within and between lanes:
+Capability dependencies to consider when assigning work (not a current task queue):
 
-1. **Daily listening foundation:** richer details/credit navigation, artist release groups, search filters/grouping, retained navigation; shared More menus and correct upcoming/shuffle representation.
+1. **Daily listening foundation:** richer details/credit navigation, artist release groups, query-driven grouped search, retained navigation; shared More menus and correct upcoming/shuffle representation.
 2. **Contextual actions and native gestures:** enqueue/play-next, queue editing, row likes/Add to playlist; expand/collapse, cover transport and non-destructive queue gestures with explicit alternatives.
 3. **Manual playlist editing:** end-to-end create/add/edit/reorder/remove, duplicate identity and conflict/uncertain-write UX.
 4. **Derived playlist parity:** consumption/playback before rules authoring/preview/edit/copy.
 5. **Cross-device playback:** a separate Media3/service integration with ownership, handoff, disconnect and background tests—not just a picker screen.
 6. **New backend-backed music features:** consume artwork/lyrics/waveform/similarity/top-track contracts as they actually land and are coordinated.
 
-Offline downloads, Android Auto and durable queue recovery are separate possible Android enhancements, not existing website parity requirements. Real-device gesture, accessibility, background audio and Bluetooth testing remain necessary; source scan and JVM/UI unit tests do not establish them.
+Offline downloads, Android Auto and durable queue recovery are separate possible Android enhancements, not existing website parity requirements. Native gestures, accessibility and background audio need isolated AVD evidence; source scans and JVM/UI unit tests do not establish them. Report genuinely hardware-specific Bluetooth/codec/vendor limits separately and coordinate any exceptional check through the user, never direct agent access to real phones.

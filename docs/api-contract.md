@@ -42,7 +42,7 @@ Administrative source playlists are **not** personal playlists. Personal owners 
 
 The native protocol adapter consumes GET /api/me/player and its existing POST actions (register, poll, rename, command, transfer, leave). Requests are bounded and one-shot; 404/409 reconciliation may preserve only a strictly validated listener-safe view, never arbitrary server error bodies. Prepared snapshots preserve exact queue keys/order, context, duplicate occurrences and history qualification—not URLs or a freshly fetched playlist.
 
-The application owns the coordinator and ties it to real service lifecycle/authentication. **The current Media3 bridge does not yet advertise exact handoff capability:** notification/system transport routing and exact authority-fenced import are still required. The device sheet can show authenticated devices read-only; native registration, output selection/commands and handoff remain disabled rather than claiming unsafe parity.
+The application owns the coordinator and ties it to service lifecycle/authentication. The production `Media3PlaybackEndpoint` advertises exact handoff capability, and the device sheet exposes selection/rename controls when registered; it remains view-only without a device registration. These are source-level capabilities, not proof of native audio/background acceptance. Preserve authority-fenced import and app/notification/system transport routing; see [device-playback.md](device-playback.md) for the safety requirements and unverified runtime boundary.
 
 ## Connection persistence
 

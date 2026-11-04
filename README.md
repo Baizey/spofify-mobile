@@ -10,15 +10,15 @@ A native **Android** listener for your own [spofify-go](../spofify-go) server. K
 - Create/edit manual personal playlists and build/evaluate server-supported derived playlists.
 - Persistent mini-player, expanded Now Playing, seeking, occurrence-aware queue editing, shuffle and repeat.
 - MediaSessionService-owned audio with notification/system controls, audio focus, headphone-disconnect handling and progress-qualified listening history.
-- Read-only playback-device visibility; native output registration, remote control and exact handoff remain disabled until the native authority boundary is complete.
+- Service-lifecycle playback-device registration, selected-output controls and exact-snapshot handoff are enabled in source; native runtime/audio/background acceptance remains unverified. See [device playback](docs/device-playback.md).
 - Android Keystore-encrypted sessions and optional remembered server/username/password, without automatic password sign-in or autoplay.
 - Bundled **JetBrains Mono** typography, including its full offline font-license notice on Sign-in and in Account. Provenance and SIL OFL license: [third_party/jetbrains-mono](third_party/jetbrains-mono/).
 
-**This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory; the current environment's emulator crashes before app launch, so **UI validation is blocked / not complete**. The supplied screenshot was inspected as a before-only baseline; no after-render is approved. See [docs/ui-validation.md](docs/ui-validation.md) and [docs/testing.md](docs/testing.md). No live backend was changed or exercised.
+**This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory. Earlier isolated emulator attempts failed before app launch; those failures do not establish the current environment's condition. Normal isolated synthetic AVD validation is allowed, but no successful after-render is established by this documentation cleanup: **UI validation remains not complete**. See [docs/ui-validation.md](docs/ui-validation.md) and [docs/testing.md](docs/testing.md).
 
-## Feature contracts and task board
+## Task contracts and review
 
-The repository-owned [mobile feature board](docs/specs/README.md) records discovery, implementation, ownership, dependencies and evidence. It is not a hosted system, automated claim mechanism or lock. `python3 scripts/specs.py board` shows the inventory; `ready` lists eligible todo work and `check` validates metadata (each supports `--json`). Python is standard-library-only development tooling, not an Android runtime dependency. New UI contracts remain drafts until assigned/reviewed; blocked native validation is not a blanket source-work dependency. Assigned leads follow [exact-SHA review and leased self-integration](docs/worktree-review.md), never self-approval or parallel main writes.
+Follow the assigned task specs, when present under `docs/specs/`, and the roles in [AGENT_BEHAVIOUR.md](AGENT_BEHAVIOUR.md). Deleted historical specs and board metadata are not required scaffolding. Assigned leads follow [exact-SHA review and leased self-integration](docs/worktree-review.md), never self-approval or parallel main writes. Blocked native validation is not a blanket source-work dependency.
 
 ## Run
 
@@ -29,15 +29,15 @@ Open this directory in Android Studio and install the **Android API 37.0 compile
 ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug \
   :app:assembleDebugAndroidTest :app:lintDebug
 
-# Isolated synthetic AVD only: build, boot, install, exercise and capture evidence.
-tools/ui/validate-native.sh
+# Isolated synthetic AVD only: reuse the APKs just built, then inspect the captures.
+tools/ui/validate-native.sh --skip-build
 ```
 
 Agents must not target real phones, personal AVDs or live accounts. The runner disables ADB mDNS/wireless discovery and USB transports, verifies the selected virtual device, and never downloads a system image automatically. See [the native workflow](docs/ui-validation.md) for installed-image prerequisites and screenshot review.
 
 Depending on AGP, the debug APK is under `app/build/outputs/apk/debug/` or `app/build/intermediates/apk/debug/`; the runner locates the actual artifact. Debug builds are not store releases; no release signing key is included.
 
-On this machine, ignored SDK and Gradle tooling live under `.tooling/`. Agents use the absolute shared `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle` with own-worktree outputs, `--offline --no-daemon` and the separate exclusive Gradle advisory lease described in [docs/worktree-review.md](docs/worktree-review.md); do not overlap builds.
+The repository's local tooling convention uses ignored `.tooling/` directories; verify installed SDK/JDK prerequisites rather than assuming an old run's environment still exists. Agents use the absolute shared `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle` with own-worktree outputs, `--offline --no-daemon` and the separate exclusive Gradle advisory lease described in [docs/worktree-review.md](docs/worktree-review.md); do not overlap builds.
 
 ## Connect your server
 
@@ -63,7 +63,7 @@ One exact-origin OkHttp client supplies API calls, artwork and **every audio/ran
 
 ## Deliberately not included yet
 
-Offline downloads, server management/acquisition, Android Auto, exact native cross-device playback handoff, persistent queue recovery after process death, and release/store packaging. Lyrics, waveform/analysis, similarity and provider-backed artist top tracks need approved backend contracts; see [backend coordination](docs/backend-feature-coordination.md). System media controls currently show text metadata without embedded artwork; in-app artwork is authenticated. The server streams original files without transcoding, so device codec support varies. Large playback contexts honor the server's 1,000-song cap. Duplicate playlist entries retain their occurrence identity, so selecting the same song twice in a playlist does not collapse its ordering.
+Offline downloads, server management/acquisition, Android Auto, persistent queue recovery after process death, and release/store packaging. Lyrics, waveform/analysis, similarity and provider-backed artist top tracks need approved backend contracts; see [backend coordination](docs/backend-feature-coordination.md). System media controls currently show text metadata without embedded artwork; in-app artwork is authenticated. The server streams original files without transcoding, so device codec support varies. Large playback contexts honor the server's 1,000-song cap. Duplicate playlist entries retain their occurrence identity, so selecting the same song twice in a playlist does not collapse its ordering.
 
 ## Backend coordination
 

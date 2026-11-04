@@ -2,7 +2,7 @@
 
 ## Standing requirement — coordinator and every lead
 
-The user requires agents to clean up after themselves **and ensure their subagents do the same**. Temporary storage is a shared resource: serialized Gradle alone does not prevent accumulated Robolectric runtime extractions from exhausting a quota. This policy applies to builds, unit tests, component captures, diagnostics and recovery artifacts. It does not authorize native execution under [BUG-001](specs/BUG-001-native-validation-environment.md).
+The user requires agents to clean up after themselves **and ensure their subagents do the same**. Temporary storage is a shared resource: serialized Gradle alone does not prevent accumulated Robolectric runtime extractions from exhausting a quota. This policy applies to builds, unit tests, native AVD validation, component captures, diagnostics and recovery artifacts. Follow [ui-validation.md](ui-validation.md) for isolated synthetic AVD safety checks.
 
 ### Before artifact-heavy work
 
@@ -21,7 +21,7 @@ The user requires agents to clean up after themselves **and ensure their subagen
 
 ### Delegation and handoff contract
 
-Every assignment must explicitly include this policy and require the child to read `AGENTS.md` and this document. Pi.lot children do not automatically load ambient repository instruction files; supplying a path is not proof it was read. Name scratch ownership, resource budget, allowed evidence retention and cleanup responsibility in the assignment.
+Every assignment must explicitly include this policy and require the child to read `AGENTS.md` and this document. Do not assume delegated agents have read ambient repository instructions; supplying a path is not proof it was read. Name scratch ownership, resource budget, allowed evidence retention and cleanup responsibility in the assignment.
 
 Every lead's final handoff must report:
 
@@ -32,21 +32,8 @@ Every lead's final handoff must report:
 
 The coordinator verifies the combined accounting. A completed task or an idle agent is not proof of cleanup. Do not mark cleanup complete merely because a process exited or a directory was moved.
 
-## Incident learning — 2026-11-04
+## Historical incident lesson
 
-### Confirmed in this investigation
+A 2026-11-04 investigation reported accumulated Robolectric runtime extractions and write failures surfaced as `Unknown system error -122, write`. Linux errno **122** is **EDQUOT: Disk quota exceeded**, distinct from disk-full `ENOSPC`. Temporary-output capture can fail too, so keep diagnostic output bounded. Incident-time directory counts, free-space readings and harness-source observations do not establish today's quota headroom or a single proven crash cause.
 
-- Linux errno **122** is **EDQUOT: Disk quota exceeded**. Pi/Node surfaced it as `Unknown system error -122, write`; this is distinct from ordinary disk-full `ENOSPC`.
-- `~/.pi/agent/crashes.json` records three Pi **1.5.0** uncaught write exceptions on 2026-11-04 at **16:38:05, 16:41:00 and 16:42:36 UTC**. Their stacks identify only the write error, not a specific file/caller.
-- The installed `dist/core/tools/output-accumulator.js` calls `stream.write(...)` during `append`/`ensureTempFile`, but attaches its stream error listener only in `closeTempFile`. `dist/utils/output-files.js` creates that stream in `os.tmpdir()` without an earlier listener. A streaming quota error therefore has a credible unhandled-error path. This is source inspection, **not** an intentional crash reproduction or proof that this writer caused every recorded crash. No harness patch was made.
-- A tool in this session also failed to save truncated diagnostic output with errno -122, demonstrating that the impact was not limited to terminal presentation.
-
-### Historical report versus current measurement
-
-The preceding investigation reported `/tmp` mounted with `usrquota`, **146 Robolectric native-runtime directories totaling about 23.1 GiB**, and a runtime write roughly 100 ms before the crash. These are incident-time reported findings, not a permanent current count or independently re-established timing correlation here.
-
-The bounded follow-up found **23** `/tmp/robolectric-nativeruntime*` directories totaling **4,092,207,104 allocated bytes (about 3.81 GiB)**. Its sandbox view showed `/tmp` at about **5.5 GiB used / 26 GiB available**, while the home disk had terabytes free. `findmnt` exposed a FUSE-mediated view and `quota -s` did not provide a usable quota report, so current host per-user quota headroom was **not established**. No runtime directories were deleted by this investigation; counts may change as other work runs.
-
-### Operational conclusion
-
-Accumulated temporary runtime extractions are a credible quota-pressure source, and Pi's streamed-output error handling is a separate robustness concern. Prevent recurrence through bounded owned scratch and verified cleanup, not repeated builds or a blanket `/tmp` purge. Quota recovery does not prove the harness defect is fixed. If a crash report is desired, Pi's interactive `pi -r` then `/bug` workflow attaches the saved crash details; do not claim a report was submitted automatically.
+The durable lesson is bounded owned scratch, current capacity/quota checks and verified cleanup—not repeated builds, moving unbounded growth elsewhere or a blanket `/tmp` purge. Safe storage recovery does not by itself prove any harness defect fixed. Preserve small relevant evidence and report current uncertainty.

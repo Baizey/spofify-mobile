@@ -50,7 +50,7 @@ These are this app's requirements, not claims that every Android app must use th
 
 ## Website lessons, adapted rather than copied
 
-The live Go repository is **read-only**. Its [AGENTS shared UI standards](../../spofify-go/AGENTS.md#shared-ui-standards) and [frontend contract](../../spofify-go/docs/frontend.md#shared-music-item-ui-standard) establish reusable principles, not Android pixel values or a layout to clone. `docs/style-guide.md` was not present in that checkout at this review; do not invent its contents or edit the backend to supply it.
+The live Go repository is **read-only**. Its [AGENTS shared UI standards](../../spofify-go/AGENTS.md#shared-ui-standards) and [frontend contract](../../spofify-go/docs/frontend.md#shared-music-item-ui-standard) establish reusable principles, not Android pixel values or a layout to clone. These are sibling-repository references, not files supplied by this checkout; verify affected contracts before relying on them.
 
 | Concrete website lesson | Native application / what not to generate |
 | --- | --- |
@@ -69,14 +69,14 @@ The live Go repository is **read-only**. Its [AGENTS shared UI standards](../../
 
 ### Expanded Now Playing sheet
 
-This corrected user decision supersedes the fixed-fullscreen, always-pinned transport and dedicated queue-disclosure guidance from main4183. The user liked the familiar **sheet**, not the fullscreen replacement. See [FEAT-002](specs/FEAT-002-expanded-player-sheet.md) for the accepted implementation contract. Historical fullscreen/disclosure validation instructions describe the superseded implementation, not the desired after-state.
+Use the familiar **sheet**, not a fixed-fullscreen replacement. The requirements below supersede older always-pinned transport and dedicated queue-disclosure guidance.
 
 - Restore a native expanded sheet with a drag handle, deliberate collapse/dismiss and system Back. Keep its expanded viewport externally determined and independent of queue length/offset, playback progress, feedback and artwork completion. Do not substitute a fixed fullscreen player Dialog or reuse content-driven competing sheet anchors.
 - On every deliberate opening, title **and credits**, seek, elapsed/duration and Previous / Play-Pause / Next fit the **initial view without scrolling**, including supported short/narrow, landscape and font2 windows. Preserve 48dp targets, production typography and Unicode fallback. Artwork and secondary controls/copy yield first; relevant errors remain visible without replacing the credits.
 - Use one coherent parent lazy flow: core header, secondary information, Up next header and occurrence rows. Normal scrolling reveals extras/queue; after intentional scrolling the core may naturally go offscreen. No always-pinned primary requirement, mandatory dedicated queue screen/disclosure or nested queue scroller. Share the parent's list state/finite viewport with queue autoscroll and preserve exact occurrence keys.
 - Handle system/gesture/IME insets exactly once. Dismiss underlying Search IME/focus on expansion; transient menus/IME dismiss before the sheet, then subsequent Back resumes underlying navigation without double-pop. Preserve underlying query/results/scroll and the flat mini-player.
 - Expansion, scrolling, collapse, Back, resize and ordinary queue/progress publications are presentation only: never prepare, autoplay, stop, seek, replace or reorder playback. Preserve exact current occurrence, queue and elapsed continuity. Secondary capabilities remain intentional More actions.
-- Regressions must prove genuine long-queue overflow and actual touch-driven index/offset movement, reach the terminal boundary and release, then observe stable sheet viewport, list offsets and visible terminal rows through many progress frames and delayed visible artwork completion. Do not require offscreen/disposed core bounds at the bottom. Distinguish finite overscroll/entry settling from continuous few-pixel oscillation; source theory is not proven native causality. Production sheet Back/insets, gestures, rendering, audio and background evidence remain **blocked / not complete** under the native diagnostic stop. Native-graphics component PNGs are development evidence only.
+- Regressions must prove genuine long-queue overflow and actual touch-driven index/offset movement, reach the terminal boundary and release, then observe stable sheet viewport, list offsets and visible terminal rows through many progress frames and delayed visible artwork completion. Do not require offscreen/disposed core bounds at the bottom. Distinguish finite overscroll/entry settling from continuous few-pixel oscillation; source theory is not proven native causality. Validate the production sheet's Back/insets, gestures, rendering, audio and background behavior on an isolated synthetic AVD; native-graphics component PNGs are development evidence only, not native acceptance.
 
 ## Established mobile implementation principles
 
@@ -146,7 +146,7 @@ For each affected layout, the implementer and an independent reviewer must inspe
 - With long/Unicode credits and large fonts, do text, 48dp targets, More menus and last-row reachability remain usable? Is the full-width mini-player flat and unobscuring?
 - Which inspected image paths show the after-state, and which taps/Back/scroll actions were exercised? If there is no after-render, report **blocked / not complete**, not “pass.”
 
-The supplied `/tmp/Spectacle.uTAxWI/Screenshot_20261104_011326.png` is **before-only evidence**, not an approved design or after-validation. It shows visible Artists/Albums count rows, artist-dependent album height with vertically stacked credits, unused top chrome and a rounded inset mini-player. Use those concrete failures to guide the comparison; no after-render has been approved by this documentation change.
+The historical user-supplied baseline was **before-only evidence**, not an approved design or after-validation. Reported issues included visible Artists/Albums count rows, artist-dependent row height with stacked credits, unused top chrome and a rounded inset mini-player. If that baseline is retained, use it for comparison; this documentation cleanup supplies no approved after-render. See [the evidence status](testing.md#native-evidence-status).
 
 ## Android references
 

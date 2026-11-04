@@ -6,10 +6,11 @@ Proposal only: coordinate contracts with the backend owner before implementing n
 production requests, DTO assumptions or backend-dependent UI claims.
 Backend inspection snapshot: spofify-go `10cc74c`; deployed capability is unverified.
 Spec tracking can lag code. A discovery document or benchmark is not a shipped API.
-This document does not change `api-contract.md` or the parent-owned parity plan.
+This document does not change `api-contract.md` or the product requirements in
+[feature-parity.md](feature-parity.md). Feature identifiers below refer to backend
+planning areas, not required mobile spec files.
 
-Native catalog/search/playlists/player/devices lanes may proceed in parallel.
-Future-feature lanes can prepare transport-free UI, bounded parsers and synthetic
+Future-feature work can prepare transport-free UI, bounded parsers and synthetic
 contract fixtures, but must not enable speculative requests or fake results.
 Backend implementation, migrations, provider enrollment and runtime installation
 belong to separately coordinated backend work.
@@ -34,8 +35,8 @@ belong to separately coordinated backend work.
 Current listener routing allows Library list/detail/revision, artist/album playback,
 track audio and entity artwork. Personal routes provide likes, history, manual
 playlists and implemented derived/rules evaluation/copy protocols.
-Derived support exists in the backend. The initial mobile client filtered manual
-playlists; native derived parity is now being implemented in its own parallel lane.
+Derived support exists in the inspected backend contract and the mobile client;
+recheck affected source and contracts before extending it.
 
 Current playlist summaries already expose `kind`, `countState`, `revision` and
 per-playlist `capabilities`; unevaluated derived counts are null, not zero.
@@ -176,6 +177,7 @@ Rights to independently retain Spotify-derived ordering/metadata remain a blocke
 6. Keep gestures non-destructive: expand/collapse, accessible contextual menus and
    optional upcoming-queue drag handles; no destructive swipe requirement.
 
-Authority checked: backend `internal/web/{listening,personal,derived,library_artwork}.go`,
-relevant domain docs and FEAT-001/004–008/015 specs; mobile `docs/api-contract.md`.
-No Gradle runs, tests, services, real data, backend edits or Git mutations performed.
+Snapshot sources: backend `internal/web/{listening,personal,derived,library_artwork}.go`,
+relevant domain docs and backend FEAT-001/004–008/015 planning specs; mobile
+`docs/api-contract.md`. These historical source observations do not verify today's
+deployed capabilities or authorize backend access.
