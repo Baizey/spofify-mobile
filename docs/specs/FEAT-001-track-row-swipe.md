@@ -2,22 +2,22 @@
 
 ## Tracking
 - ID: FEAT-001
-- Status: todo
-- Phase: discovery
-- Spec readiness: draft
-- Owner: unassigned
-- Branch: unassigned
-- Worktree: unassigned
+- Status: in-progress
+- Phase: implementation
+- Spec readiness: ready
+- Owner: track-list interaction lead
+- Branch: feat/track-swipe-next
+- Worktree: /var/home/lsm/repos/spofify-mobile-worktrees/track-swipes
 - Depends on: none
 - Discovery depends on: none
 - Touchpoints: MusicRow.kt; LibraryHome.kt; SearchRoute.kt; MainActivity.kt; LibraryViewModel.kt; NativePlayerGestures.kt; planned NativeUpcomingQueue.kt; PlaybackControls.kt; PlaybackQueue.kt
-- Next action: inventory every track-row caller and agree gesture/action wiring; schedule queue-row work after FEAT-003 extraction and before its drag implementation
+- Next action: implement shared catalog rows and tests; obtain occurrence/context-safe enqueue API from FEAT-004 owner and extracted queue-row handoff from FEAT-003 before playlist/Up next integration
 
 ## Outcome and scope
 
 Give titles back the width currently occupied by inline Play/Pause and make a physical rightward swipe mean **Play next** consistently. This covers **all track rows**: Search, Home/Recent, Up next (including compact/disclosed variants), playlists, album/artist/track details and any other track-list surface. Audit custom rows as well as shared `MusicRow` callers. Mini-player and expanded transport Play/Pause remain deliberate controls; collection-level playback is not removed by this contract.
 
-This is an initial contract, not implemented or accepted behavior. It specifically supersedes the requirement to reserve an inline Play/Pause slot on track rows in older row guidance. More and any necessary reorder handle keep their real targets; the deleted playback slot must not survive as invisible padding, spacer or reserved width.
+This contract is accepted for implementation under the coordinator's discovery-and-implementation assignment; it is not evidence of implemented or completed behavior. It specifically supersedes the requirement to reserve an inline Play/Pause slot on track rows in older row guidance. More and any necessary reorder handle keep their real targets; the deleted playback slot must not survive as invisible padding, spacer or reserved width.
 
 ## Behavior contract
 
@@ -52,7 +52,23 @@ This feature can discover and implement shared catalog-row/all-list wiring indep
 
 ## Risks, open discovery and completion gate
 
-Open discovery: complete the all-track-row inventory, occurrence-safe Play next mapping and shared-player extraction handoff.
+### Grounded discovery and bounded delivery
+
+Discovery base: `3ae4417fd0cb3dd337e310d57ec6a0c690c77c20` (normal refresh of assigned `5c6cf00e42b28e1ebc74a5d892cbbf5e1916263d`). Independent discovery review is required before this accepted implementation contract lands; exact candidate/base review records live outside the frozen candidate.
+
+Inventory of current production row surfaces:
+
+- `MusicRow`: Home/Recently played in `LibraryHome`; Search results, progressive results and nested artist/album/track detail groups through `SearchRoute` / `CatalogContent`; `MainActivity.LikedSongs`. Track identity opens details; intentional collection Play remains. Only track inline transport is removed, reclaiming its full 48dp without replacement padding.
+- `PlaylistsRoute.PlaylistTrackRow`: manual saved occurrences and derived evaluated occurrences are bespoke rows. The complete-order editor is also a bespoke track presentation, with a separate reorder handle and Move up/down controls; its identity/actions must remain deliberate and must not turn the handle into a swipe target.
+- `NativePlayer.UpcomingRow` and `CompactUpcomingRow`: FEAT-003 must first extract these to `NativeUpcomingQueue`; FEAT-001 temporarily owns extracted row/action/swipe work, then returns the file before drag work begins. Neither FEAT-002 host nor the pre-extraction queue block is edited here.
+- `PlaylistOccurrenceActions` is a separate derived-occurrence More surface: preserve personal actions while adding equivalent intentional playback actions using the same selected-occurrence resolution as swipe.
+- `PlaylistEditor` recipe-preview occurrences are intentionally read-only draft evidence, not authoritative playable selections: no inline playback, queue action or swipe is added there. Complete-order editor rows keep navigation/More but disable occurrence playback/queue mutation while the editable order is unsaved; the dedicated handle and Move controls retain ownership.
+
+Concrete decisions: physical-right direction is independent of layout direction; exclude 24dp at both physical edges; lock only after platform touch slop with rightward distance greater than 1.5 times vertical distance; commit on an observed final release at 72dp minimum; cap feedback translation at 120dp. A backward reversal exceeding touch slop after horizontal lock cancels the whole gesture, even if subsequently dragged right again. Vertical intent, consumption by another gesture, any second pointer, pointer loss/cancel, replacement of the full bound item or session/authority loss cancel and reset. More/custom actions share the same callback, not a different append implementation.
+
+Service/API barrier: `LibraryViewModel.enqueueFrom` currently clears `entryId`; playlist-specific occurrence selection and queue context cannot be honestly preserved by simply routing the existing generic callback. `PlaybackControls.enqueue` accepts items but no per-occurrence source context; global context must not be overwritten to simulate this. Derived occurrence IDs are not manual entry IDs; do not force a potentially 4,096-character derived identity through a 512-character manual-entry field. FEAT-004 owns playback/core/LibraryViewModel until explicit transfer. Request a generation/client/account-fenced prepared single-occurrence enqueue entry point that accepts the selected prepared `PlaybackQueue` item and its source context, preserves derived/manual occurrence metadata, and inserts without prepare/start in empty or paused state. Derived selection must resolve the exact rendered revision/fence/selection token once using existing preparation, select the exact returned occurrence and enqueue only that single new local occurrence, not the complete prepared collection. Do not refetch mutable selection, guess IDs or invent backend APIs. Signed selection authority stays transient and out of snapshots. UI may prepare read-only metadata, but never invoke Play to implement enqueue. Stale/busy/unavailable selections expose no successful queue action. Service capacity/shuffle/history policy remains service-owned; UI must not retire history or toggle shuffle to implement swipe. Empty-queue pending representation and mutation-result truthfulness must be verified with that owner, not invented in the UI.
+
+Delivery slices are shared catalog row/gesture and measured development renders; prepared playlist occurrence wiring after service API; extracted Up next occurrence move wiring before FEAT-003 drag; combined gates and exact-SHA independent review/integration. Native acceptance remains blocked, so an integrated source slice is never marked done.
 
 Discover the exact swipe threshold/feedback and caller-specific context mapping; validate them with the eventual rendered interaction, not just source. Principal risks are append accidentally substituted for Play next, duplicate queue entries, stale indices/authority, lingering blank width and horizontal interception of vertical/Back/drag gestures.
 
