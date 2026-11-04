@@ -7,6 +7,8 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.WindowInsets
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
@@ -50,7 +52,8 @@ class NativeUiSmokeTest {
         it.config.getOrNull(SemanticsActions.OnClick)?.label == "Expand Now Playing"
     }
 
-    private val playerSheet = hasContentDescription("Playback position")
+    private val playerSheet = hasTestTag("now-playing")
+    private val playerPosition = hasContentDescription("Playback position") and inPlayerSheet()
 
     @Test fun syntheticListenerJourneyAndRenderedEvidence() {
         VirtualAvdOnly.requireVerified()
@@ -229,35 +232,40 @@ class NativeUiSmokeTest {
                 waitFor(playingButton())
                 compose.onNode(expandPlayer).performClick()
                 waitFor(playerSheet)
+                assertPlayerPresentation()
+                assertPlayerMenusPreservePlayback(fixture)
                 screenshot("09-now-playing")
-                compose.onNode(sheetTransport("Pause")).performScrollTo()
+                compose.onNode(sheetTransport("Pause")).assertIsDisplayed()
                 screenshot("09b-now-playing-controls")
                 compose.onNode(sheetTransport("Pause")).performClick()
                 waitFor(pausedButton() and inPlayerSheet())
-                compose.onNode(sheetTransport("Play")).performScrollTo().performClick()
+                compose.onNode(sheetTransport("Play")).assertIsDisplayed().performClick()
                 waitFor(playingButton() and inPlayerSheet())
                 // An intentional seek gives reset detection a substantial baseline while the
                 // fixture's WAV and metadata leave ten minutes for the rest of the journey.
-                compose.onNode(playerSheet).performSemanticsAction(SemanticsActions.SetProgress) { action ->
+                compose.onNode(playerPosition).performSemanticsAction(SemanticsActions.SetProgress) { action ->
                     assertTrue(action(30_000f))
                 }
                 compose.waitUntil(10_000) { positionMs() in 29_000f..33_000f }
-                compose.onNodeWithText("Clear upcoming").performScrollTo()
-                compose.onNodeWithContentDescription("Upcoming queue").performScrollTo()
+                openQueueForInspection()
                 waitFor(hasText("Up next · 5"))
                 screenshot("10-queue")
                 val originalQueue = captureQueueSnapshot()
                 assertEquals(UiFixtureServer.TRACK_NAMES.subList(1, 6), originalQueue.map { it.title })
+                assertOverflowingQueueBottomStable(originalQueue, fixture, "10a-queue-released-bottom")
                 compose.onNodeWithContentDescription("Queue actions for ${UiFixtureServer.TRACK_NAMES[1]}").performScrollTo().performClick()
                 compose.onNodeWithText("Remove from queue").performClick()
                 waitUntilAbsent(hasText("Remove from queue") and hasClickAction())
                 waitFor(hasText("Up next · 4"))
-                compose.onNodeWithText("Undo").performScrollTo().performClick()
+                if (exists(hasTestTag("now-playing-queue-view"))) {
+                    compose.onNodeWithContentDescription("Upcoming queue actions").performClick()
+                }
+                compose.onNodeWithText("Undo").assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
                 waitFor(hasText("Up next · 5"))
                 waitUntilAbsent(hasText("Undo") and hasClickAction())
                 assertQueueSnapshot(originalQueue)
                 val beforeCollapse = capturePlaying(fixture)
-                pressBack() // Dismiss the player sheet first; playlist stays beneath it.
+                collapsePlayer() // Queue disclosure first if open, then player; playlist stays beneath it.
                 waitUntilAbsent(playerSheet)
                 assertPlayingTransition(beforeCollapse, fixture, "native Back collapse")
                 compose.onNode(expandPlayer).assertExists().assertTextContains(UiFixtureServer.TRACK_NAMES.first())
@@ -271,14 +279,14 @@ class NativeUiSmokeTest {
                 }
                 waitFor(playerSheet)
                 assertPlayingTransition(beforeGestureExpand, fixture, "gesture expansion")
-                compose.onNodeWithText("Clear upcoming").performScrollTo()
+                assertPlayerPresentation()
                 compose.onNodeWithText("Up next · 5").assertExists()
                 assertQueueSnapshot(originalQueue)
                 // Collapsing a paused player must not turn pause into resume either.
-                compose.onNode(sheetTransport("Pause")).performScrollTo().performClick()
+                compose.onNode(sheetTransport("Pause")).assertIsDisplayed().performClick()
                 waitFor(pausedButton() and inPlayerSheet())
                 val beforePausedCollapse = readPlaybackWitness(fixture)
-                pressBack()
+                collapsePlayer()
                 waitUntilAbsent(playerSheet)
                 assertPausedTransition(beforePausedCollapse, fixture)
                 val beforePausedExpand = readPlaybackWitness(fixture)
@@ -286,10 +294,10 @@ class NativeUiSmokeTest {
                 waitFor(playerSheet)
                 assertPausedTransition(beforePausedExpand, fixture)
                 assertQueueSnapshot(originalQueue)
-                compose.onNode(sheetTransport("Play")).performScrollTo().performClick()
+                compose.onNode(sheetTransport("Play")).assertIsDisplayed().performClick()
                 waitFor(playingButton() and inPlayerSheet())
                 val beforeResumedCollapse = capturePlaying(fixture)
-                pressBack()
+                collapsePlayer()
                 waitUntilAbsent(playerSheet)
                 assertPlayingTransition(beforeResumedCollapse, fixture, "resumed player collapse")
                 val beforePlaylistBack = capturePlaying(fixture)
@@ -344,11 +352,12 @@ class NativeUiSmokeTest {
                 waitFor(playerSheet)
                 assertPlayingTransition(beforeLargePlayerExpand, fixture, "large-font player expansion")
                 assertEquals("Font recreation must not prepare another queue", preparationsBeforeSearchEditing, fixture.playbackPreparations.get())
+                assertPlayerPresentation()
                 screenshot("13-large-font-now-playing")
-                compose.onNodeWithText("Clear upcoming").performScrollTo()
-                compose.onNodeWithContentDescription("Upcoming queue").performScrollTo()
+                openQueueForInspection()
                 compose.onNodeWithText("Up next · 5").assertExists()
                 assertQueueSnapshot(originalQueue)
+                assertOverflowingQueueBottomStable(originalQueue, fixture, "14a-large-font-released-bottom")
                 screenshot("14-large-font-queue")
                 assertEquals("No query-free catalog reads are allowed", 0, fixture.emptyGlobalBrowseCalls.get())
                 assertEquals("Real auth cookie and CSRF must reach the fixture", 0, fixture.authenticationFailures.get())
@@ -378,6 +387,14 @@ class NativeUiSmokeTest {
     private fun pressBack() {
         VirtualAvdOnly.requireVerified()
         instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+    }
+    private fun collapsePlayer() {
+        if (exists(hasTestTag("now-playing-queue-view"))) {
+            pressBack()
+            waitUntilAbsent(hasTestTag("now-playing-queue-view"))
+            compose.onNode(playerSheet).assertIsDisplayed()
+        }
+        pressBack()
     }
     private fun search(query: String) {
         val field = compose.onNodeWithTag("search-query")
@@ -547,6 +564,180 @@ class NativeUiSmokeTest {
         assertEquals("Browsing and liking must not request audio", 0, fixture.audioRequests.get())
         assertEquals("Browsing must not report audible history", 0, fixture.historyWrites.get())
     }
+    private fun assertPlayerPresentation() {
+        val viewport = compose.onNode(playerSheet).assertIsDisplayed().fetchSemanticsNode()
+        assertFalse("The whole player must not scroll", viewport.config.contains(SemanticsActions.ScrollBy))
+        val scrollers = compose.onAllNodes(hasScrollAction() and inPlayerSheet()).fetchSemanticsNodes()
+        val queueDisclosed = exists(hasTestTag("now-playing-show-queue"))
+        assertEquals("Only an intentionally visible Up next scrolls inside the player", if (queueDisclosed) 0 else 1, scrollers.size)
+        if (!queueDisclosed) assertEquals("The queue owns player scrolling", "now-playing-queue", scrollers.single().config[SemanticsProperties.TestTag])
+        if (exists(playerPosition)) compose.onNode(playerPosition).assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        else compose.onNode(hasContentDescription("Queue playback progress") and inPlayerSheet()).assertIsDisplayed()
+        val bounds = viewport.boundsInRoot
+        listOf("Previous song", if (exists(playingButton() and inPlayerSheet())) "Pause" else "Play", "Next song").forEach { label ->
+            val control = compose.onNode(sheetTransport(label)).assertIsDisplayed()
+                .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).fetchSemanticsNode().boundsInRoot
+            assertTrue("Pinned $label must fit within the safe player viewport: $control in $bounds",
+                control.left >= bounds.left && control.right <= bounds.right && control.top >= bounds.top && control.bottom <= bounds.bottom)
+        }
+    }
+
+    private fun assertPlayerMenusPreservePlayback(fixture: UiFixtureServer) {
+        val before = capturePlaying(fixture)
+        val queue = upcomingOccurrences()
+        val initiallyDisclosed = exists(hasTestTag("now-playing-show-queue"))
+        compose.onNodeWithContentDescription("Now Playing actions").performClick()
+        compose.onNodeWithText("Add to playlist").assertExists()
+        compose.onNodeWithText("Shuffle:", substring = true).assertExists()
+        compose.onNodeWithText("Repeat:", substring = true).assertExists()
+        pressBack() // Dropdown first; not the fullscreen dialog and not the underlying route.
+        compose.onNode(playerSheet).assertIsDisplayed()
+        openQueueForInspection()
+        compose.onNodeWithContentDescription("Upcoming queue actions").performClick()
+        compose.onNodeWithText("Clear upcoming").assertIsDisplayed().assertIsEnabled()
+        pressBack()
+        if (initiallyDisclosed) {
+            pressBack()
+            waitUntilAbsent(hasTestTag("now-playing-queue-view"))
+        }
+        assertPlayerPresentation()
+        assertEquals("Opening/dismissing secondary actions preserves exact occurrences", queue, upcomingOccurrences())
+        assertPlayingTransition(before, fixture, "player action menus and native Back")
+    }
+
+    private fun openQueueForInspection() {
+        if (exists(hasTestTag("now-playing-show-queue"))) {
+            compose.onNodeWithTag("now-playing-show-queue").assertIsDisplayed().performClick()
+            waitFor(hasTestTag("now-playing-queue-view"))
+        }
+        compose.onNodeWithTag("now-playing-queue").assertIsDisplayed()
+    }
+
+    /**
+     * Isolated AVD setup through the EXISTING real controls, not a fixture-total change or a
+     * second player. Keep the original five occurrence IDs and current audio intact; append enough
+     * real synthetic-track occurrences that even a tall viewport must scroll, then remove only
+     * those temporary IDs. The final current-song duplicate has a unique title within Up next,
+     * so the terminal action assertion cannot accidentally select a preceding duplicate row.
+     */
+    private fun assertOverflowingQueueBottomStable(
+        original: List<QueueOccurrence>, fixture: UiFixtureServer, evidenceName: String,
+    ) {
+        assertEquals("Overflow setup starts with the original occurrences", original, upcomingOccurrences())
+        openQueueForInspection()
+        if (exists(hasTestTag("now-playing-queue-view"))) {
+            val beforeQueueBack = capturePlaying(fixture)
+            pressBack()
+            waitUntilAbsent(hasTestTag("now-playing-queue-view"))
+            compose.onNode(playerSheet).assertIsDisplayed()
+            assertPlayerPresentation()
+            assertPlayingTransition(beforeQueueBack, fixture, "queue Back dismissal without player collapse")
+            openQueueForInspection()
+            assertPlayingTransition(beforeQueueBack, fixture, "explicit queue redisclosure")
+        }
+        val before = capturePlaying(fixture)
+        val addedCount = 30
+        compose.runOnIdle {
+            val model = ViewModelProvider(compose.activity)[LibraryViewModel::class.java]
+            val state = model.playback.state.value
+            val queuedTrack = state.upcoming.first().item.copy(entryId = null)
+            val finalTrack = checkNotNull(state.item).copy(entryId = null)
+            model.playback.enqueue(List(addedCount - 1) { queuedTrack } + finalTrack,
+                checkNotNull(model.graph.client))
+        }
+        compose.waitUntil(10_000) { upcomingOccurrences().size == original.size + addedCount }
+        val overflowing = upcomingOccurrences()
+        assertEquals("Enqueue preserves original upcoming identities and order", original, overflowing.take(original.size))
+        val added = overflowing.drop(original.size)
+        assertEquals("Each temporary occurrence has a fresh unique ID", addedCount, added.map { it.id }.toSet().size)
+        assertTrue("Temporary IDs must not replace originals", added.none { extra -> original.any { it.id == extra.id } })
+        assertPlayingTransition(before, fixture, "temporary overflow enqueue without preparation")
+        assertReleasedQueueBottomStable(overflowing, fixture, evidenceName)
+        compose.runOnIdle {
+            val controls = ViewModelProvider(compose.activity)[LibraryViewModel::class.java].playback
+            added.forEach { controls.removeUpcoming(it.id) }
+        }
+        compose.waitUntil(10_000) { upcomingOccurrences() == original }
+        assertQueueSnapshot(original)
+        assertPlayingTransition(before, fixture, "overflow regression and occurrence-only cleanup")
+    }
+
+    /** Future working-AVD regression for the reported persistent released-bottom oscillation. */
+    private fun assertReleasedQueueBottomStable(
+        expected: List<QueueOccurrence>, fixture: UiFixtureServer, evidenceName: String,
+    ) {
+        assertTrue("Bottom-boundary regression needs a populated queue", expected.isNotEmpty())
+        val before = capturePlaying(fixture)
+        val queue = compose.onNodeWithTag("now-playing-queue").assertIsDisplayed()
+        queue.performScrollToIndex(0)
+        val startRange = queue.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
+        val startOffset = startRange.value()
+        assertEquals("Begin genuine scroll at queue start", 0f, startOffset, .000001f)
+        assertTrue("The regression requires a genuinely overflowing queue", startRange.maxValue() > 0f)
+        queue.performTouchInput {
+            swipe(Offset(width * .55f, height * .8f), Offset(width * .55f, height * .2f), durationMillis = 300)
+        }
+        compose.waitUntil(5_000) {
+            queue.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value() > startOffset
+        }
+        val movedOffset = queue.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value()
+        assertTrue("A real touch scroll must change the visible-index/offset range", movedOffset > startOffset)
+        queue.performScrollToIndex(expected.lastIndex)
+        queue.performTouchInput {
+            swipe(Offset(width * .55f, height * .8f), Offset(width * .55f, 2f), durationMillis = 300)
+        }
+        // Let the intentional fling finish, then observe untouched frames while real service
+        // progress repeatedly publishes. Do not issue a corrective scroll inside this window.
+        compose.waitUntil(5_000) {
+            val range = queue.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
+            range.value() > 0f && kotlin.math.abs(range.maxValue() - range.value()) < .000001f
+        }
+        compose.waitForIdle()
+        val queueBounds = queue.fetchSemanticsNode().boundsInRoot
+        val initialOffset = queue.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value()
+        assertTrue("Terminal visible-index/offset must differ from the initial viewport", initialOffset > startOffset)
+        val lastOrdinal = hasContentDescription("Reorder ", substring = true) and
+            hasAnyAncestor(hasTestTag("now-playing-queue")) and SemanticsMatcher("last upcoming ordinal") {
+                it.config.getOrNull(SemanticsProperties.StateDescription)?.startsWith("Position ${expected.size} of ${expected.size}.") == true
+            }
+        val lastPosition = compose.onNode(lastOrdinal).assertIsDisplayed().fetchSemanticsNode().positionInRoot
+        val lastAction = compose.onNodeWithContentDescription("Play queued song ${expected.last().title}")
+            .assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).fetchSemanticsNode().boundsInRoot
+        assertTrue("Complete last queue action must be reachable", lastAction.top >= queueBounds.top && lastAction.bottom <= queueBounds.bottom)
+        val pinned = listOf("Previous song", "Pause", "Next song").associateWith {
+            compose.onNode(sheetTransport(it)).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        }
+        val progress = mutableSetOf<Float>()
+        repeat(90) { frame ->
+            SystemClock.sleep(24)
+            compose.waitForIdle()
+            assertRectStable("Queue viewport after release frame $frame", queueBounds, queue.fetchSemanticsNode().boundsInRoot)
+            assertEquals("No spontaneous queue offset after release frame $frame", initialOffset,
+                queue.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value(), .000001f)
+            val last = compose.onNode(lastOrdinal).fetchSemanticsNode().positionInRoot
+            assertEquals("Last occurrence x after release frame $frame", lastPosition.x, last.x, .5f)
+            assertEquals("Last occurrence y after release frame $frame", lastPosition.y, last.y, .5f)
+            pinned.forEach { (label, bounds) ->
+                assertRectStable("Pinned $label after release frame $frame", bounds,
+                    compose.onNode(sheetTransport(label)).assertIsDisplayed().fetchSemanticsNode().boundsInRoot)
+            }
+            progress += positionMs()
+            assertEquals("Exact occurrence order survives progress frames", expected, upcomingOccurrences())
+            assertEquals("Bottom scrolling must not prepare playback", before.preparations, fixture.playbackPreparations.get())
+        }
+        assertTrue("Observe repeated real playback progress updates, not a frozen frame", progress.size >= 3)
+        assertPlayingTransition(before, fixture, "released queue bottom stability")
+        screenshot(evidenceName)
+        queue.performScrollToIndex(0) // Explicit test cleanup only, after the stability window.
+    }
+
+    private fun assertRectStable(label: String, expected: Rect, actual: Rect) {
+        assertEquals("$label left", expected.left, actual.left, .5f)
+        assertEquals("$label top", expected.top, actual.top, .5f)
+        assertEquals("$label right", expected.right, actual.right, .5f)
+        assertEquals("$label bottom", expected.bottom, actual.bottom, .5f)
+    }
+
     private data class QueueOccurrence(val id: String, val title: String)
     // Read the Activity's EXISTING UI-facing state on main; do not create a second connection,
     // export a handoff snapshot (which samples history), or send player/queue commands.
@@ -557,10 +748,11 @@ class NativeUiSmokeTest {
         QueueOccurrence(it.occurrenceId, it.item.name)
     }
     private fun captureQueueSnapshot(count: Int = 5): List<QueueOccurrence> {
+        openQueueForInspection()
         compose.onNodeWithText("Up next · $count").assertExists()
         val expected = upcomingOccurrences()
         assertEquals("Actual upcoming occurrence count", count, expected.size)
-        val queue = compose.onNodeWithContentDescription("Upcoming queue").performScrollTo()
+        val queue = compose.onNodeWithTag("now-playing-queue").assertIsDisplayed()
         // The native queue is a bounded LazyColumn, NOT an eagerly composed Column. Inspect
         // actual list indices and each handle's native ordinal, never seek expected track names.
         val occurrences = (0 until count).map { index ->
@@ -611,13 +803,12 @@ class NativeUiSmokeTest {
         assertEquals("Actual player duration must agree with synthetic metadata/WAV", UiFixtureServer.AUDIO_DURATION_MS, state.durationMs)
         val position: Float
         val duration: Float
-        if (exists(playerSheet)) {
-            val range = compose.onNode(playerSheet).fetchSemanticsNode().config[SemanticsProperties.ProgressBarRangeInfo]
+        if (exists(playerPosition)) {
+            val range = compose.onNode(playerPosition).fetchSemanticsNode().config[SemanticsProperties.ProgressBarRangeInfo]
             position = range.current
             duration = range.range.endInclusive
         } else {
-            val progress = compose.onNodeWithContentDescription("Playback progress").fetchSemanticsNode()
-                .config[SemanticsProperties.ProgressBarRangeInfo]
+            val progress = renderedProgress().fetchSemanticsNode().config[SemanticsProperties.ProgressBarRangeInfo]
             assertEquals(0f, progress.range.start, .001f)
             assertEquals(1f, progress.range.endInclusive, .001f)
             duration = state.durationMs.toFloat()
@@ -670,7 +861,7 @@ class NativeUiSmokeTest {
         assertPlayingTransition(beforeExpand, fixture, "queue inspection expansion")
         assertQueueSnapshot(expected)
         val beforeCollapse = capturePlaying(fixture)
-        pressBack()
+        collapsePlayer()
         waitUntilAbsent(playerSheet)
         assertPlayingTransition(beforeCollapse, fixture, "queue inspection collapse")
     }
@@ -679,10 +870,15 @@ class NativeUiSmokeTest {
     private fun waitUntilAbsent(matcher: SemanticsMatcher) { compose.waitUntil(15_000) { !exists(matcher) } }
     private fun playingButton() = hasContentDescription("Pause") and SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "Playing")
     private fun pausedButton() = hasContentDescription("Play") and SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "Paused")
-    private fun inPlayerSheet() = hasAnyAncestor(hasScrollAction())
-    private fun sheetTransport(description: String) = hasContentDescription(description) and hasClickAction() and inPlayerSheet()
-    private fun positionMs(): Float = compose.onNode(playerSheet).fetchSemanticsNode()
+    private fun inPlayerSheet() = hasAnyAncestor(hasTestTag("now-playing"))
+    private fun sheetTransport(description: String) = hasContentDescription(description) and hasClickAction() and
+        hasAnyAncestor(hasTestTag("now-playing-controls"))
+    private fun renderedProgress(): SemanticsNodeInteraction = if (exists(hasTestTag("now-playing-queue-view")))
+        compose.onNode(hasContentDescription("Queue playback progress") and inPlayerSheet())
+        else compose.onNodeWithContentDescription("Playback progress")
+    private fun positionMs(): Float = if (exists(playerPosition)) compose.onNode(playerPosition).fetchSemanticsNode()
         .config[SemanticsProperties.ProgressBarRangeInfo].current
+        else renderedProgress().fetchSemanticsNode().config[SemanticsProperties.ProgressBarRangeInfo].current * readPlaybackState().durationMs
 
     private fun assertSearchInThumbZone(imeVisible: Boolean = false) {
         waitForIme(imeVisible)

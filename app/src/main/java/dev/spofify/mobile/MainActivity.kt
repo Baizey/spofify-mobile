@@ -33,6 +33,7 @@ import dev.spofify.mobile.feature.library.*
 import dev.spofify.mobile.feature.devices.PlaybackDevicesSheet
 import dev.spofify.mobile.feature.player.NativeMiniPlayer
 import dev.spofify.mobile.feature.player.NativeNowPlaying
+import dev.spofify.mobile.feature.player.NativeNowPlayingDialog
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
 import dev.spofify.mobile.ui.ListeningChrome
@@ -196,12 +197,16 @@ private fun SpofifyApp(model: LibraryViewModel) {
         if (expanded && player.item != null) {
             val item = player.item!!
             LaunchedEffect(item.id) { model.checkLike(item) }
-            ModalBottomSheet(onDismissRequest = { expanded = false },
-                sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = Background) {
-                NativeNowPlaying(player, model.playback, state.likes[item.id], item.id in state.pendingLikes,
-                    item.id in state.failedLikeStatus, { model.toggleLike(item) }, { model.checkLike(item) },
-                    onAddToPlaylist = { expanded = false; addToPlaylist = it }, onOpenItem = openExternal,
-                    artwork = art, modifier = Modifier.fillMaxWidth().fillMaxHeight(.94f))
+            // No draggable sheet/nested-scroll anchors: the player has stable window bounds and
+            // only its queue scrolls. Dialog Back dismisses presentation, never playback.
+            NativeNowPlayingDialog(onCollapse = { expanded = false }) { presentation ->
+                Surface(Modifier.fillMaxSize(), color = Background) {
+                    NativeNowPlaying(player, model.playback, state.likes[item.id], item.id in state.pendingLikes,
+                        item.id in state.failedLikeStatus, { model.toggleLike(item) }, { model.checkLike(item) },
+                        onAddToPlaylist = { expanded = false; addToPlaylist = it }, onOpenItem = openExternal,
+                        artwork = art, modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
+                        presentation = presentation)
+                }
             }
         }
         more?.let { item ->

@@ -4,21 +4,22 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
@@ -34,7 +35,6 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.IconToggleButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
@@ -42,6 +42,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -57,16 +58,21 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.media3.common.Player
 import dev.spofify.mobile.LikeButton
 import dev.spofify.mobile.core.LibraryItem
@@ -120,9 +126,31 @@ fun NativeMiniPlayer(
     }
 }
 
+/** Dialog-owned presentation only; Back dismisses a disclosed queue before the player itself. */
+class NowPlayingPresentationState {
+    var queueOpen by mutableStateOf(false)
+        private set
+
+    fun openQueue() { queueOpen = true }
+    fun dismissQueue(): Boolean {
+        if (!queueOpen) return false
+        queueOpen = false
+        return true
+    }
+}
+
+/** Production window and Back path, shared with focused Dialog-dispatch regression tests. */
+@Composable
+fun NativeNowPlayingDialog(onCollapse: () -> Unit, content: @Composable (NowPlayingPresentationState) -> Unit) {
+    val presentation = remember { NowPlayingPresentationState() }
+    Dialog(onDismissRequest = { if (!presentation.dismissQueue()) onCollapse() }, properties = DialogProperties(
+        usePlatformDefaultWidth = false, decorFitsSystemWindows = false,
+    )) { content(presentation) }
+}
+
 /**
- * The root sheet owns collapse/Back handling. This content deliberately has no dismiss or stop
- * action, and only consumes horizontal transport gestures over the cover itself.
+ * Fixed viewport content: only Up next scrolls. The fullscreen host owns system Back; expanding,
+ * layout changes, artwork completion and progress publication never issue playback commands.
  */
 @Composable
 fun NativeNowPlaying(
@@ -137,105 +165,160 @@ fun NativeNowPlaying(
     onOpenItem: (LibraryItem) -> Unit,
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
     modifier: Modifier = Modifier,
+    presentation: NowPlayingPresentationState = remember { NowPlayingPresentationState() },
 ) {
     val item = state.item ?: return
-    Column(
-        modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text("NOW PLAYING", style = MaterialTheme.typography.labelMedium)
-        state.context?.let { context ->
-            TextButton(onClick = { onOpenItem(context) }, modifier = Modifier.heightIn(min = 48.dp)) {
-                Text("Playing from ${context.name}", maxLines = 2, overflow = TextOverflow.Ellipsis)
+    BoxWithConstraints(modifier.fillMaxSize().testTag("now-playing")
+        .semantics { paneTitle = "Now Playing" }.padding(8.dp)) {
+        val landscape = maxWidth >= 480.dp && maxHeight < 420.dp
+        val short = maxHeight < 480.dp
+        val cramped = !landscape && maxHeight < 360.dp
+        val showArtwork = maxHeight >= 560.dp && LocalDensity.current.fontScale < 1.8f
+        LaunchedEffect(cramped) { if (!cramped) presentation.dismissQueue() }
+        val feedback = state.error ?: state.notice
+        val identity: @Composable () -> Unit = {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).heightIn(min = 48.dp)
+                    .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(item) }
+                    .padding(horizontal = 8.dp, vertical = if (cramped) 0.dp else 4.dp)) {
+                    Text(item.name, style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    // In the shortest view feedback replaces the credit line rather than adding
+                    // height or hiding current playback failures behind the queue disclosure.
+                    Text(if (cramped) feedback ?: item.subtitle else item.subtitle,
+                        modifier = Modifier.semantics { if (cramped && feedback != null) liveRegion = LiveRegionMode.Polite },
+                        color = if (cramped && state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                LikeButton(liked, likePending, likeFailed, onToggleLike, onRetryLike)
+                PlayerMore(state, controls, onAddToPlaylist, onOpenItem)
             }
         }
-        Spacer(Modifier.height(12.dp))
-        Box(
-            Modifier.widthIn(max = 360.dp).fillMaxWidth().aspectRatio(1f)
-                .playerSwipe(PlayerSwipeArea.COVER) { action ->
-                    when (action) {
-                        PlayerSwipeAction.NEXT -> controls.next()
-                        PlayerSwipeAction.PREVIOUS -> controls.previous()
-                        else -> Unit
-                    }
-                },
-        ) { artwork(item, Modifier.matchParentSize()) }
-        Spacer(Modifier.height(12.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(item.name,
-                Modifier.weight(1f).clickable(role = Role.Button, onClickLabel = "Open song details") {
-                    onOpenItem(item)
-                }.heightIn(min = 48.dp).padding(vertical = 8.dp),
-                style = MaterialTheme.typography.headlineSmall)
-            LikeButton(liked, likePending, likeFailed, onToggleLike, onRetryLike)
-        }
-        Column(Modifier.fillMaxWidth()) {
-            item.artists.forEach { credit ->
-                if (credit.id.isNotBlank()) {
-                    TextButton(onClick = { onOpenItem(LibraryItem("artist", credit.id, credit.name)) },
-                        modifier = Modifier.heightIn(min = 48.dp)) {
-                        Text(credit.name)
-                    }
-                } else {
-                    Text(credit.name, Modifier.padding(horizontal = 12.dp, vertical = 12.dp))
+        val transport: @Composable () -> Unit = {
+            Row(Modifier.then(if (cramped) Modifier.fillMaxWidth() else Modifier).testTag("now-playing-controls"), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceEvenly) {
+                IconButton(onClick = controls::previous, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.SkipPrevious, "Previous song")
+                }
+                PlayPauseButton(state, controls::toggle, large = !short)
+                IconButton(onClick = controls::next, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.SkipNext, "Next song")
                 }
             }
-            val albumId = item.albumId?.takeIf { it.isNotBlank() }
-            if (albumId != null) {
-                TextButton(onClick = {
-                    onOpenItem(LibraryItem("album", albumId, item.albumName ?: "Album", artists = item.artists))
-                }, modifier = Modifier.heightIn(min = 48.dp)) {
-                    Text(item.albumName ?: "Open album")
+        }
+        val pinned: @Composable ColumnScope.() -> Unit = {
+            identity()
+            if (showArtwork) {
+                BoxWithConstraints(Modifier.fillMaxWidth().weight(0.8f), contentAlignment = Alignment.Center) {
+                    val side = minOf(maxWidth, maxHeight, 360.dp)
+                    Box(Modifier.size(side).playerSwipe(PlayerSwipeArea.COVER) { action ->
+                        when (action) {
+                            PlayerSwipeAction.NEXT -> controls.next()
+                            PlayerSwipeAction.PREVIOUS -> controls.previous()
+                            else -> Unit
+                        }
+                    }) { artwork(item, Modifier.matchParentSize()) }
+                }
+            }
+            if (short && !landscape) {
+                // A short narrow window spends height on the queue, not decorative cover/chrome.
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f).padding(end = 4.dp)) { PlaybackSeekBar(state, controls) }
+                    transport()
                 }
             } else {
-                item.albumName?.takeIf { it.isNotBlank() }?.let { albumName ->
-                    Text(albumName, Modifier.padding(horizontal = 12.dp, vertical = 12.dp))
+                PlaybackSeekBar(state, controls)
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { transport() }
+            }
+        }
+        if (cramped) {
+            if (presentation.queueOpen) {
+                Column(Modifier.fillMaxSize().testTag("now-playing-queue-view")) {
+                    // A stable full-width status/identity slot remains visible in both views.
+                    Text(feedback ?: item.name, Modifier.fillMaxWidth().semantics {
+                        if (feedback != null) liveRegion = LiveRegionMode.Polite
+                    }, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.bodySmall)
+                    UpcomingQueue(state, controls, onOpenItem, artwork, compact = true,
+                        showStatus = false, onClose = { presentation.dismissQueue() })
+                    transport()
+                    LinearProgressIndicator(
+                        progress = { if (state.durationMs > 0) (state.positionMs.toFloat() / state.durationMs).coerceIn(0f, 1f) else 0f },
+                        modifier = Modifier.fillMaxWidth().height(2.dp).semantics { contentDescription = "Queue playback progress" },
+                        strokeCap = StrokeCap.Butt, gapSize = 0.dp, drawStopIndicator = {},
+                    )
+                }
+            } else {
+                Column(Modifier.fillMaxSize().testTag("now-playing-main-view")) {
+                    identity()
+                    PlaybackSeekBar(state, controls)
+                    Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { transport() }
+                    TextButton(onClick = presentation::openQueue, contentPadding = PaddingValues(horizontal = 8.dp),
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("now-playing-show-queue")) {
+                        Text("Up next · ${state.upcoming.size}", maxLines = 1,
+                            style = MaterialTheme.typography.titleSmall)
+                    }
                 }
             }
-        }
-        TextButton(onClick = { onAddToPlaylist(item) }, modifier = Modifier.heightIn(min = 48.dp)) {
-            Text("Add to playlist")
-        }
-        PlaybackSeekBar(state, controls)
-        Row(Modifier.fillMaxWidth().padding(vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-            IconToggleButton(checked = state.shuffle, onCheckedChange = { controls.toggleShuffle() },
-                modifier = Modifier.size(48.dp).semantics {
-                    stateDescription = if (state.shuffle) "On" else "Off"
-                }) { Icon(Icons.Default.Shuffle, "Shuffle") }
-            IconButton(onClick = controls::previous, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.SkipPrevious, "Previous song")
+        } else if (landscape) {
+            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) { pinned() }
+                Column(Modifier.weight(1f).fillMaxHeight()) { UpcomingQueue(state, controls, onOpenItem, artwork) }
             }
-            PlayPauseButton(state, controls::toggle, large = true)
-            IconButton(onClick = controls::next, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.SkipNext, "Next song")
-            }
-            IconButton(onClick = controls::cycleRepeat, modifier = Modifier.size(48.dp).semantics {
-                stateDescription = when (state.repeatMode) {
-                    Player.REPEAT_MODE_ONE -> "One song"
-                    Player.REPEAT_MODE_ALL -> "All songs"
-                    else -> "Off"
-                }
-            }) {
-                Icon(if (state.repeatMode == Player.REPEAT_MODE_ONE) Icons.Default.RepeatOne else Icons.Default.Repeat,
-                    "Repeat: ${when (state.repeatMode) {
-                        Player.REPEAT_MODE_ONE -> "one"
-                        Player.REPEAT_MODE_ALL -> "all"
-                        else -> "off"
-                    }}")
+        } else {
+            Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+                pinned()
+                UpcomingQueue(state, controls, onOpenItem, artwork)
             }
         }
-        state.notice?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite })
+    }
+}
+
+/** Secondary capabilities retain every real credit ID without making transport scroll away. */
+@Composable
+private fun PlayerMore(
+    state: PlaybackState,
+    controls: PlaybackControls,
+    onAddToPlaylist: (LibraryItem) -> Unit,
+    onOpenItem: (LibraryItem) -> Unit,
+) {
+    val item = state.item ?: return
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }, modifier = Modifier.size(48.dp)) {
+            Icon(Icons.Default.MoreVert, "Now Playing actions")
         }
-        state.error?.let {
-            Text(it, color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite })
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            state.context?.let { context ->
+                DropdownMenuItem(text = { Text("Playing from ${context.name}") },
+                    onClick = { expanded = false; onOpenItem(context) })
+            }
+            item.artists.forEach { credit ->
+                DropdownMenuItem(text = { Text(credit.name) }, enabled = credit.id.isNotBlank(),
+                    onClick = { expanded = false; onOpenItem(LibraryItem("artist", credit.id, credit.name)) })
+            }
+            if (!item.albumId.isNullOrBlank() || !item.albumName.isNullOrBlank()) {
+                val name = item.albumName?.takeIf { it.isNotBlank() } ?: "Open album"
+                DropdownMenuItem(text = { Text(name) }, enabled = !item.albumId.isNullOrBlank(),
+                    onClick = { expanded = false; onOpenItem(LibraryItem("album", item.albumId!!, name, artists = item.artists)) })
+            }
+            DropdownMenuItem(text = { Text("Add to playlist") },
+                onClick = { expanded = false; onAddToPlaylist(item) })
+            DropdownMenuItem(text = { Text(if (state.shuffle) "Shuffle: on" else "Shuffle: off") },
+                leadingIcon = { Icon(Icons.Default.Shuffle, null) },
+                onClick = { controls.toggleShuffle() })
+            val repeat = when (state.repeatMode) {
+                Player.REPEAT_MODE_ONE -> "one song"
+                Player.REPEAT_MODE_ALL -> "all songs"
+                else -> "off"
+            }
+            DropdownMenuItem(text = { Text("Repeat: $repeat") },
+                leadingIcon = { Icon(if (state.repeatMode == Player.REPEAT_MODE_ONE) Icons.Default.RepeatOne else Icons.Default.Repeat, null) },
+                onClick = { controls.cycleRepeat() })
+            state.notice?.let { Text(it, Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
+            state.error?.let { Text(it, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.error) }
         }
-        UpcomingQueue(state, controls, onOpenItem, artwork)
-        Spacer(Modifier.height(24.dp))
     }
 }
 
@@ -273,42 +356,111 @@ private fun PlaybackSeekBar(state: PlaybackState, controls: PlaybackControls) {
         }, valueRange = 0f..duration, enabled = state.durationMs > 0,
         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).semantics { contentDescription = "Playback position" })
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(playerTime(position.toLong()), style = MaterialTheme.typography.bodySmall)
-        Text(playerTime(state.durationMs), style = MaterialTheme.typography.bodySmall)
+        Text(playerTime(position.toLong()), maxLines = 1, style = MaterialTheme.typography.bodySmall)
+        Text(playerTime(state.durationMs), maxLines = 1, style = MaterialTheme.typography.bodySmall)
     }
 }
 
 @Composable
-private fun UpcomingQueue(
+private fun ColumnScope.UpcomingQueue(
     state: PlaybackState,
     controls: PlaybackControls,
     onOpenItem: (LibraryItem) -> Unit,
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
+    compact: Boolean = false,
+    showStatus: Boolean = true,
+    onClose: (() -> Unit)? = null,
 ) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically) {
-        Text("Up next · ${state.upcoming.size}", style = MaterialTheme.typography.titleMedium)
-        TextButton(onClick = controls::clearUpcoming, enabled = state.upcoming.isNotEmpty(),
-            modifier = Modifier.heightIn(min = 48.dp)) { Text("Clear upcoming") }
+    var menuOpen by remember { mutableStateOf(false) }
+    // Keep failures visible without a wall of prose above transport; More retains the full text.
+    (state.error ?: state.notice)?.takeIf { showStatus }?.let { message ->
+        Text(message, Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },
+            maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
+            color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
     }
-    Text("Reordering turns shuffle off", style = MaterialTheme.typography.bodySmall)
-    if (state.canUndoQueueRemoval) {
-        Row(Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },
-            verticalAlignment = Alignment.CenterVertically) {
-            Text("Queue item removed", Modifier.weight(1f))
-            TextButton(onClick = controls::undoQueueRemoval, modifier = Modifier.heightIn(min = 48.dp)) {
-                Text("Undo")
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("Up next · ${state.upcoming.size}",
+            Modifier.weight(1f).semantics { stateDescription = "${state.upcoming.size} upcoming songs" }, maxLines = 1,
+            overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
+        onClose?.let { close ->
+            IconButton(onClick = close, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Default.Close, "Close upcoming queue")
+            }
+        }
+        if (state.canUndoQueueRemoval && !compact) {
+            TextButton(onClick = controls::undoQueueRemoval, modifier = Modifier.heightIn(min = 48.dp)) { Text("Undo") }
+        }
+        Box {
+            IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Default.MoreVert, "Upcoming queue actions")
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                if (state.canUndoQueueRemoval && compact) {
+                    DropdownMenuItem(text = { Text("Undo") }, onClick = { menuOpen = false; controls.undoQueueRemoval() })
+                }
+                DropdownMenuItem(text = { Text("Clear upcoming") }, enabled = state.upcoming.isNotEmpty(),
+                    onClick = { menuOpen = false; controls.clearUpcoming() })
+                Text("Reordering turns shuffle off", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
             }
         }
     }
-    if (state.upcoming.isEmpty()) {
-        Text("No upcoming songs", Modifier.fillMaxWidth().padding(vertical = 24.dp))
-    } else {
-        // Explicit finite bounds: nested scrolling cooperates with the root sheet and this page.
-        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 320.dp)
-            .semantics { contentDescription = "Upcoming queue" }) {
-            itemsIndexed(state.upcoming, key = { _, entry -> entry.occurrenceId }) { index, entry ->
-                UpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, artwork)
+    // One finite scroll owner, independent of artwork/progress and without sheet drag anchors.
+    LazyColumn(Modifier.fillMaxWidth().weight(1f).testTag("now-playing-queue")
+        .semantics { contentDescription = "Upcoming queue" }) {
+        if (state.upcoming.isEmpty()) item {
+            Text("No upcoming songs", Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                style = MaterialTheme.typography.bodyMedium)
+        }
+        itemsIndexed(state.upcoming, key = { _, entry -> entry.occurrenceId }) { index, entry ->
+            if (compact) CompactUpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem)
+            else UpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, artwork)
+        }
+    }
+}
+
+/** Extreme short/narrow windows disclose reordering in More, keeping real 48dp actions. */
+@Composable
+private fun CompactUpcomingRow(
+    entry: QueueEntry,
+    index: Int,
+    count: Int,
+    controls: PlaybackControls,
+    onOpenItem: (LibraryItem) -> Unit,
+) {
+    var menuOpen by remember(entry.occurrenceId) { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().semantics {
+        customActions = buildList {
+            add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
+            if (index > 0) add(CustomAccessibilityAction("Move up") { controls.moveUpcoming(entry.occurrenceId, index - 1); true })
+            if (index < count - 1) add(CustomAccessibilityAction("Move down") { controls.moveUpcoming(entry.occurrenceId, index + 1); true })
+            add(CustomAccessibilityAction("Remove from queue") { controls.removeUpcoming(entry.occurrenceId); true })
+        }
+    }) {
+        Text(entry.item.name, Modifier.fillMaxWidth().heightIn(min = 48.dp)
+            .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(entry.item) }
+            .padding(vertical = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodyMedium)
+        Row(Modifier.fillMaxWidth().semantics {
+            contentDescription = "Reorder ${entry.item.name}"
+            stateDescription = "Position ${index + 1} of $count. Use queue actions to move up or down."
+        }, horizontalArrangement = Arrangement.End) {
+            IconButton(onClick = { controls.selectOccurrence(entry.occurrenceId) }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Default.PlayArrow, "Play queued song ${entry.item.name}")
+            }
+            Box {
+                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(text = { Text("Play next") }, enabled = index > 0,
+                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, 0) })
+                    DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
+                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index - 1) })
+                    DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,
+                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index + 1) })
+                    DropdownMenuItem(text = { Text("Remove from queue") },
+                        onClick = { menuOpen = false; controls.removeUpcoming(entry.occurrenceId) })
+                }
             }
         }
     }

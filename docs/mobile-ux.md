@@ -67,6 +67,15 @@ The live Go repository is **read-only**. Its [AGENTS shared UI standards](../../
 - The mini-player is a **full-width flat dock**, not a floating rounded card with outer gutters/shadow. It shares the shell's inset budget and never obscures the last result.
 - Improve information hierarchy before growing fonts, padding or chrome. Compact visuals must still retain **48dp** hit targets and readable text, not tiny buttons.
 
+### Fullscreen Now Playing
+
+- Give the expanded player fixed fullscreen bounds. Pin identity, seek/times and primary Previous / Play-Pause / Next above any queue scrolling; preserve 48dp targets and production font scaling. Adapt or hide decorative artwork first, rather than making Pause/Next require scrolling.
+- Use one bounded queue scroller, not a draggable-sheet + whole-player-scroll + nested-queue chain. A released terminal boundary must remain still while progress ticks and artwork completes; do not mistake ordinary overscroll or entry animation for evidence about persistent shaking.
+- In an extreme **short and narrow** window, retain full-width primary controls and intentionally disclose **Up next / count** into a dedicated bounded queue view. Do not permanently cram transport and queue into two tiny panes merely to expose every capability. Genuine landscape may use a two-column arrangement.
+- A disclosed queue keeps useful transport reachable. System Back dismisses the queue view before collapsing the fullscreen player, then resumes the underlying route's normal Back behavior. Current playback failure/notice must remain visible without opening the queue, using a stable compact metadata/status slot instead of another wall of text or layout jitter.
+- Presentation changes, queue disclosure/dismissal and player collapse must not prepare, start, stop, seek, replace or reorder playback. Preserve the audible occurrence, queue and elapsed position; secondary capabilities remain intentional More actions.
+- Regressions must prove genuine overflow and actual scrolling before reaching the terminal boundary, releasing, and observing stable queue offsets and control geometry through repeated progress publications. A default queue that entirely fits is not a bottom-scroll test. Native Dialog Back/insets and the rendered result still require actual AVD validation; component PNGs are development aids only, and the current native gate remains **blocked / not complete**.
+
 ## Established mobile implementation principles
 
 ### Hierarchy, reach and touch
