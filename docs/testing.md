@@ -2,6 +2,10 @@
 
 Read [mobile-ux.md](mobile-ux.md) and [ui-validation.md](ui-validation.md) before changing a screen. Follow [worktree-review.md](worktree-review.md) for dedicated worktrees, exact-SHA review, separate advisory-locked shared-cache builds, standing conditional assigned-scope self-integration in **main**, and evidence-preserving cleanup after scoped/combined validation. Temporary integration branches are optional, not the final destination. **Automated checks and rendered native validation are separate gates.**
 
+## Storage preflight and cleanup
+
+[Storage hygiene](storage-hygiene.md) is part of every build/test/capture run, including delegated work. Before starting, check temporary/output capacity and visible quota, assign bounded owned scratch, and verify the forked test JVM temporary directory (`TMPDIR` alone is not enough). Preserve necessary reports/evidence, then clean verified disposable scratch after all owning processes stop; account for failure/cancellation/crashed descendants. Keep logs and tool output bounded. EDQUOT/ENOSPC stops artifact generation pending investigation and safe cleanup, not blind retries. The incident record and mandatory handoff checklist are in that document. These obligations do not relax the separate build lease or native diagnostic stop.
+
 ## Automated gate
 
 Use the provisioned API 37.0 compile platform via the worktree's local SDK configuration; minimum Android remains API 26 and target SDK remains 36. Assigned leads may acquire the exclusive `spofify-gradle.lock` advisory lease under the absolute Git common directory themselves (see worktree policy), verify no uncoordinated build is active, then run from their own worktree while continuously holding it:

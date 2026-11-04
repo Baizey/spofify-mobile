@@ -20,6 +20,12 @@ Native Android only: Kotlin, Jetpack Compose, Media3. No WebView, Node, Expo or 
 - Separate OS advisory leases are `spofify-main.lock` and `spofify-gradle.lock` under the **absolute Git common directory**, held with `flock`; never delete/replace lock files. Locks are cooperative, not protection from nonparticipating writers. Assigned leads may acquire the Gradle lease for the absolute shared `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle`, own-worktree outputs and `--offline --no-daemon`; no overlapping builds. Own-worktree builds hold BUILD only, releasing before MAIN; root/main Gradle holds MAIN then BUILD to freeze source, never build→main. The parent/coordinator owns combined validation accounting. After post-checks, preserve tests/reviews/candidate/recovery bundles outside the worktree and verify source/patch accounting before non-forced removal and expected-tip topic deletion. Do not mark unintegrated candidates done. No push/deploy.
 - Preserve existing/concurrent commits and staged work. Never reset, revert, stash, restore snapshots or rewrite/amend external work. No history rewriting.
 
+## Temporary storage and cleanup — every agent
+
+- Follow [storage hygiene](docs/storage-hygiene.md) before artifact-heavy work. Check `/tmp` and output bytes/inodes/quota separately; home-disk free space does not prove temporary quota headroom. Stop on EDQUOT/ENOSPC rather than retrying or flooding logs.
+- Own a bounded per-run scratch directory and verify the actual test JVM temporary location; `TMPDIR` alone is insufficient for Java/Robolectric. Clean verified disposable scratch after processes stop, including failure/cancellation and crashed descendants, while preserving required source/review/test evidence. Never blanket-delete `/tmp`, another lane's files or active runtimes.
+- Explicitly pass this policy to every subagent and require it to read the repo guidance; ambient files are not automatically loaded by Pi.lot children. Every handoff reports generated paths, cleanup performed, retained evidence and unresolved cleanup. The coordinator verifies all lanes.
+
 ## Mobile product and interaction rules
 
 Read `docs/mobile-ux.md` before changing a screen. Native Android UX is not a compressed website.

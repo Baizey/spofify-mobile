@@ -12,6 +12,8 @@ Stop on an unknown/uncoordinated writer, dirty destination, unexpected branch/in
 
 Inventory commits/dirty/staged/untracked/needed ignored evidence before migration/reassignment. Owners preserve agreed dirty work in scoped checkpoints; never sweep another lane into a commit, lose changes or replay already-captured deltas. Outputs (`app/build`, `core/build`, root build) stay worktree-local. Do not modify shared SDK or sibling checkout configuration. Never reset/revert/stash/restore snapshots, rewrite/amend external work or force cleanup. Do not make source fixes in main.
 
+Temporary artifacts also require explicit ownership and bounded retention under [storage hygiene](storage-hygiene.md). Every lead and descendant must preflight temporary/output quota, use verified owned scratch, preserve required evidence and clean disposable files only after their processes stop. Include generated paths, cleanup and retained/unresolved artifacts in handoffs; the coordinator accounts for abandoned/crashed runs. Worktree isolation and BUILD serialization alone do not prevent shared `/tmp` quota exhaustion.
+
 ## Independent exact-SHA review
 
 1. Run scoped checks and `git diff --check`; commit only assigned paths. Record full candidate and validated main-base SHAs, scope and evidence. A source checkpoint is not native acceptance.
