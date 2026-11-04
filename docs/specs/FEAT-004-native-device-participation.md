@@ -15,7 +15,7 @@
 
 ## Current state and evidence boundary
 
-Implementation/recovery is active, **not complete**. The supplied checkpoint is device-lane HEAD `77d45be`, already merged into `main4183`. This records reported lineage, not a new Git verification or a new implementation in this documentation task.
+Implementation/recovery is active, **not complete**. At the supplied historical device-lane checkpoint `77d45be`, the device topic had merged main `4183ed3` **into itself**. The device implementation was **not integrated into main `4183ed3`**, nor shipped by the foundation landing. Git ancestry confirms `4183ed3` is an ancestor of `77d45be`, not the reverse. The test/review observations below describe that historical checkpoint, not a live gate or a new implementation in this documentation task.
 
 At that checkpoint, **114 core + 344 app tests and debug/instrumentation APK builds passed**; **lint has 1 error**. Critical independent-review findings remain on **close-ACK handling** and **long-derived occurrence preservation**. The new recovery effort is actively fixing these findings; do not describe it as idle, awaiting a lane, or reviewed clean. Report fresh exact-SHA evidence after corrections rather than carrying forward historical counts as a current pass.
 
@@ -54,7 +54,7 @@ Main risks are split authority between app/system controls, ACK loss during tear
 
 ## Evidence and completion gate
 
-After correction, record exact candidate/base SHAs, the two critical regression results, current core/app counts, APK hashes and a clean lint result or explicit remaining blocker. Obtain independent read-only review of the **new exact SHA**; a changed candidate requires re-review. Integration follows standing assignment-bound conditional self-integration authority, separate exclusive advisory build and main-squash leases, and independent exact-SHA review per [worktree-review.md](../worktree-review.md). Meet its preconditions before acting; the merged checkpoint is not a completion certificate.
+After correction, record exact candidate/base SHAs, the two critical regression results, current core/app counts, APK hashes and a clean lint result or explicit remaining blocker. Obtain independent read-only review of the **new exact SHA**; a changed candidate requires re-review. Integration follows standing assignment-bound conditional self-integration authority, separate exclusive advisory build and main-squash leases, and independent exact-SHA review per [worktree-review.md](../worktree-review.md). Meet its preconditions before acting; merging main into the device topic is not main integration or a completion certificate.
 
 [BUG-001](BUG-001-native-validation-environment.md) is the **completion/validation gate only, never a hard source dependency**. Native AFTER-render, audio and background validation are **BLOCKED / NOT COMPLETE**. No successful native handoff/background/audio behavior is claimed. A future authorized isolated synthetic AVD journey must exercise device status, transfer/lease loss, app/system controls, lifecycle and inspected renders; genuine hardware-only limits remain explicitly unverified, not a reason to access a phone.
 
