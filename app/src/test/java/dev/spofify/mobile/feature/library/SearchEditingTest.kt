@@ -6,10 +6,15 @@ import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.Column
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.input.key.Key
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
@@ -20,13 +25,20 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performKeyInput
+import androidx.compose.ui.test.pressKey
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.semantics.SemanticsActions
 import dev.spofify.mobile.ui.theme.AppTypography
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.junit.rules.ExternalResource
+import org.junit.rules.TestWatcher
+import org.junit.runner.Description
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
@@ -35,9 +47,13 @@ import org.robolectric.annotation.Config
 class SearchEditingTest {
     // Compose test clicks dispatch to the owner view, bypassing ViewRoot's touch-mode entry.
     // Set the window-session mode before the activity attaches; a later @Before is too late.
-    @get:Rule(order = 0) val touchMode = object : ExternalResource() {
-        override fun before() { InstrumentationRegistry.getInstrumentation().setInTouchMode(true) }
-        override fun after() { InstrumentationRegistry.getInstrumentation().setInTouchMode(false) }
+    @get:Rule(order = 0) val touchMode = object : TestWatcher() {
+        override fun starting(description: Description) {
+            InstrumentationRegistry.getInstrumentation().setInTouchMode(!description.methodName.startsWith("nonTouch"))
+        }
+        override fun finished(description: Description) {
+            InstrumentationRegistry.getInstrumentation().setInTouchMode(false)
+        }
     }
     @get:Rule(order = 1) val compose = createComposeRule()
 
@@ -76,6 +92,105 @@ class SearchEditingTest {
         compose.runOnIdle { dispatchIme(false) }
         query.assertIsFocused()
         compose.runOnIdle { assertEquals(listOf(true, false, true), events) }
+    }
+
+    @Test fun nonTouchBackActuallyEndsEditingWhenTheQueryIsTheOnlyFocusTarget() {
+        assertNonTouchEditingEnds(submit = false)
+    }
+
+    @Test fun nonTouchSubmitActuallyEndsEditingWhenTheQueryIsTheOnlyFocusTarget() {
+        assertNonTouchEditingEnds(submit = true)
+    }
+
+    @Test fun nonTouchRouteFocusClearActuallyEndsEditingWhenTheQueryIsTheOnlyFocusTarget() {
+        assertNonTouchEditingEnds(submit = null)
+    }
+
+    private fun assertNonTouchEditingEnds(submit: Boolean?) {
+        val events = mutableListOf<Boolean>()
+        var dispatcher: OnBackPressedDispatcher? = null
+        var view: View? = null
+        var clearFocus: (() -> Unit)? = null
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                val currentDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
+                val currentView = LocalView.current
+                SideEffect { dispatcher = currentDispatcher; view = currentView }
+                val focus = LocalFocusManager.current
+                SideEffect { clearFocus = { focus.clearFocus() } }
+                // Empty Search has no clear action; while editing, the shell also hides its bars.
+                // Do not add another focus target that would conceal Android owner's refocus.
+                CommittedSearchField("", onSearchEditingChanged = { events += it }) { _, _ -> }
+            }
+        }
+        val query = compose.onNodeWithContentDescription("Search your music")
+        compose.runOnIdle { assertTrue("Hardware-keyboard editing must run outside touch mode", !checkNotNull(view).isInTouchMode) }
+        query.performSemanticsAction(SemanticsActions.RequestFocus) { it() }
+        query.assertIsFocused()
+        compose.runOnIdle { assertEquals(true, events.last()) }
+        when (submit) {
+            true -> query.performImeAction()
+            false -> compose.runOnIdle {
+                assertTrue("IME-hidden Back handler must be active", checkNotNull(dispatcher).hasEnabledCallbacks())
+                checkNotNull(dispatcher).onBackPressed()
+            }
+            null -> compose.runOnIdle { checkNotNull(clearFocus).invoke() }
+        }
+        query.assertIsNotFocused()
+        compose.runOnIdle {
+            assertEquals(false, events.last())
+            assertTrue("Ending editing must not switch a hardware keyboard into touch mode", !checkNotNull(view).isInTouchMode)
+        }
+        query.performSemanticsAction(SemanticsActions.RequestFocus) { it() }
+        query.assertIsFocused()
+        compose.runOnIdle { assertEquals(true, events.last()) }
+    }
+
+    @Test fun nonTouchTabTraversalSkipsRestingAncestorBeforeAndAfterEditingEnds() {
+        var dispatcher: OnBackPressedDispatcher? = null
+        var view: View? = null
+        val events = mutableListOf<Boolean>()
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                val currentDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
+                val currentView = LocalView.current
+                SideEffect { dispatcher = currentDispatcher; view = currentView }
+                Column {
+                    Button(onClick = {}) { Text("Before") }
+                    CommittedSearchField("", onSearchEditingChanged = { events += it }) { _, _ -> }
+                    Button(onClick = {}) { Text("After") }
+                }
+            }
+        }
+        compose.runOnIdle { assertTrue(!checkNotNull(view).isInTouchMode) }
+        val before = compose.onNodeWithText("Before")
+        val after = compose.onNodeWithText("After")
+        val query = compose.onNodeWithContentDescription("Search your music")
+        fun tab(backward: Boolean = false) {
+            compose.onRoot().performKeyInput {
+                if (backward) keyDown(Key.ShiftLeft)
+                pressKey(Key.Tab)
+                if (backward) keyUp(Key.ShiftLeft)
+            }
+        }
+        before.performSemanticsAction(SemanticsActions.RequestFocus) { it() }
+        before.assertIsFocused()
+        tab(); query.assertIsFocused()
+        tab(); after.assertIsFocused()
+        tab(backward = true); query.assertIsFocused()
+        tab(backward = true); before.assertIsFocused()
+        tab(); query.assertIsFocused()
+        compose.runOnIdle { checkNotNull(dispatcher).onBackPressed() }
+        query.assertIsNotFocused()
+        compose.runOnIdle { assertEquals(false, events.last()) }
+        tab(); query.assertIsFocused()
+        tab(); after.assertIsFocused()
+        tab(backward = true); query.assertIsFocused()
+        compose.runOnIdle { checkNotNull(dispatcher).onBackPressed() }
+        query.assertIsNotFocused()
+        tab(backward = true); before.assertIsFocused()
+        tab(); query.assertIsFocused()
+        tab(backward = true); before.assertIsFocused()
     }
 
     @Test fun focusSurvivesInitialHiddenImeAndCallbackReplacementUntilBackOrSubmit() {

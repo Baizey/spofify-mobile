@@ -17,6 +17,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalDensity
@@ -293,7 +298,16 @@ internal fun CommittedSearchField(
     var editing by remember { mutableStateOf(false) }
     var imeShownForFocus by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
-    val focus = LocalFocusManager.current
+    val restingFocus = remember { FocusRequester() }
+    var requestingRest by remember { mutableStateOf(false) }
+    var resting by remember { mutableStateOf(false) }
+    fun endEditing() {
+        // Clearing the Android owner can immediately refocus its sole field outside touch mode.
+        // Keep focus inside Compose instead, without introducing a keyboard traversal stop.
+        requestingRest = true
+        try { restingFocus.requestFocus(FocusDirection.Exit) }
+        finally { requestingRest = false }
+    }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val editingChanged by rememberUpdatedState(onSearchEditingChanged)
     val compositionChanged by rememberUpdatedState(onCompositionChanged)
@@ -301,13 +315,21 @@ internal fun CommittedSearchField(
     LaunchedEffect(editing, imeVisible) {
         if (!editing) imeShownForFocus = false
         else if (imeVisible) imeShownForFocus = true
-        else if (imeShownForFocus) focus.clearFocus()
+        else if (imeShownForFocus) endEditing()
     }
     // With a hardware keyboard there is no IME to dismiss; Back first ends field editing.
-    BackHandler(editing && !imeVisible) { focus.clearFocus() }
+    BackHandler(editing && !imeVisible) { endEditing() }
     LaunchedEffect(query) {
         if (field.text != query && field.composition == null) field = TextFieldValue(query, TextRange(query.length))
     }
+    Box(Modifier.fillMaxWidth().focusRequester(restingFocus)
+        .onFocusChanged { resting = it.isFocused }
+        .focusProperties {
+            canFocus = requestingRest || resting
+            // Route actions also clear focus before Play/More/navigation. Redirect only exits,
+            // never ordinary Tab/arrow traversal, while the query is the active descendant.
+            onExit = { if (requestedFocusDirection == FocusDirection.Exit && editing) endEditing() }
+        }.focusTarget()) {
     OutlinedTextField(value = field, onValueChange = { next ->
         if (next.text.codePointCount(0, next.text.length) <= 200) {
             field = next
@@ -319,7 +341,7 @@ internal fun CommittedSearchField(
         trailingIcon = { if (field.text.isNotEmpty()) IconButton(onClick = { field = TextFieldValue(""); commit("", true); compositionChanged(false) }) { Icon(Icons.Default.Close, "Clear search") } },
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
         keyboardActions = KeyboardActions(onSearch = {
-            commit(field.text, true); compositionChanged(false); focus.clearFocus(); keyboard?.hide()
+            commit(field.text, true); compositionChanged(false); endEditing(); keyboard?.hide()
         }), modifier = Modifier.fillMaxWidth().testTag("search-query")
             .onFocusChanged { state ->
                 if (editing != state.isFocused) {
@@ -328,6 +350,7 @@ internal fun CommittedSearchField(
                     editingChanged(state.isFocused)
                 }
             }.semantics { contentDescription = "Search your music" })
+    }
 }
 
 @Composable
