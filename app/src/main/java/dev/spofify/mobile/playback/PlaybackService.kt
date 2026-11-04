@@ -89,6 +89,10 @@ class PlaybackService : MediaSessionService() {
         }
         fun removeQueued(id: String) { active.get()?.localEdit { removeUpcoming(id) } }
         fun moveQueued(id: String, to: Int) { active.get()?.localEdit { moveUpcoming(id, to) } }
+        fun moveQueued(expectedKey: PlaybackInteractionKey, id: String, to: Int) {
+            active.get()?.guardedMove(expectedKey, id, to)
+        }
+        fun interactionKey(): PlaybackInteractionKey? = active.get()?.currentInteractionKey()
         fun clearQueued() { active.get()?.routeCommand(PlaybackDeviceCommand.transport("clear")) }
         fun undoQueuedRemoval() { active.get()?.localEdit { undoRemoval() } }
         fun queuedKey(id: String): Long? = active.get()?.let { it.exportPrepared(); it.wireKeys[id] }
@@ -136,6 +140,21 @@ class PlaybackService : MediaSessionService() {
     @Volatile private var authority: PlaybackAuthority? = null
     @Volatile private var authorityRequestEpoch = -1L
     private var authenticatedSession: Session? = null
+    private val interactionKeys = PlaybackInteractionKeys()
+    private data class InteractionIdentity(
+        val client: PlaybackReference, val session: PlaybackReference, val epoch: Long, val generation: Long,
+        val requestEpoch: Long, val queueEpoch: Long, val current: String?, val traversal: List<String>,
+        val context: PlaybackContext?,
+    )
+
+    private fun currentInteractionKey(): PlaybackInteractionKey? {
+        val permit = authority
+        val identity = if (permit != null && hasAuthority()) InteractionIdentity(
+            PlaybackReference(requireNotNull(client)), PlaybackReference(requireNotNull(authenticatedSession)), permit.epoch, permit.generation,
+            PlaybackRequests.epoch, PlaybackRequests.queueEpoch, currentId(), traversalIds(), wireContext,
+        ) else null
+        return interactionKeys.current(identity)
+    }
     private var explicitBackgroundPermit: PlaybackAuthority? = null
     private var importing = false
     private var wireContext: PlaybackContext? = null
@@ -265,6 +284,8 @@ class PlaybackService : MediaSessionService() {
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                // Record transitions even between UI samples (including A -> B -> A).
+                interactionKeys.invalidate()
                 if (importing) return
                 if (!hasAuthority() && exo.playWhenReady) suspendBufferedOutput()
                 // Repeat/returning is a new traversal; playlist moves are not.
@@ -294,6 +315,8 @@ class PlaybackService : MediaSessionService() {
                 newPosition: Player.PositionInfo,
                 reason: Int,
             ) {
+                if (oldPosition.mediaItem?.let(PlaybackMedia::occurrence) != newPosition.mediaItem?.let(PlaybackMedia::occurrence))
+                    interactionKeys.invalidate()
                 if (importing) return
                 importedElapsed = null; importedPositionMs = null
                 // oldPosition is before a seek, never the artificial forward jump.
@@ -496,6 +519,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun suspendBufferedOutput() {
+        interactionKeys.invalidate()
         authority = null
         authorityRequestEpoch = -1
         admissions.clear()
@@ -870,6 +894,27 @@ class PlaybackService : MediaSessionService() {
 
     private fun wireContext(item: LibraryItem?): PlaybackContext? = item?.let {
         PlaybackContext(it.kind, if (it.kind == "likes" && it.id.isEmpty()) "likes" else it.id, it.name)
+    }
+
+    private fun guardedMove(expectedKey: PlaybackInteractionKey, id: String, to: Int) {
+        // Early rejection is only an optimization. The callback below runs after the
+        // coordinator's serialized wait; it must validate AGAIN before accepting authority
+        // or editing. In particular, it must not reacquire a stale gesture's permission.
+        if (currentInteractionKey() !== expectedKey) return
+        if (PlaybackQueue.move(traversalIds(), currentId(), id, to) == null) return
+        (application as SpofifyApplication).graph.playbackCoordinator?.editPreparedQueue(
+            isCurrent = { currentInteractionKey() === expectedKey },
+        ) { permit ->
+            if (currentInteractionKey() !== expectedKey || !permit.isValid() ||
+                permit.epoch != authority?.epoch || permit.generation != authority?.generation ||
+                PlaybackQueue.move(traversalIds(), currentId(), id, to) == null) {
+                PlaybackEndpointResult("rejected", exportPrepared())
+            } else {
+                // No suspension between final identity/occurrence/index check and mutation.
+                moveUpcoming(id, to)
+                PlaybackEndpointResult("ok", exportPrepared())
+            }
+        }
     }
 
     private fun localEdit(edit: PlaybackService.() -> Unit) {

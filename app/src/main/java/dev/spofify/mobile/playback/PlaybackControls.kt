@@ -24,6 +24,11 @@ interface PlaybackControls {
     fun removeUpcoming(occurrenceId: String) {}
     /** Zero-based index within the displayed upcoming list. Manual moves exit shuffle. */
     fun moveUpcoming(occurrenceId: String, toIndex: Int) {}
+    /** Guarded at serialized service/coordinator dispatch. Local: arbitrary upcoming index.
+     * Remote: one up/down/Play-next command only; never an absolute drag or a step chain.
+     * Check state.canMoveUpcomingAbsolutely before enabling drag. Capture expectedKey at
+     * gesture start; preview, cancel and same-index drops do not edit. No legacy fallback. */
+    fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int) {}
     fun clearUpcoming() {}
     fun undoQueueRemoval() {}
     fun selectOccurrence(occurrenceId: String) {}

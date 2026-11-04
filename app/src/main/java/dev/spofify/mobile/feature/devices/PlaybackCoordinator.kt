@@ -48,6 +48,26 @@ class PlaybackCoordinator(
     private var generation = 0L
     private var epoch = 0L
     private var sequence = 0L
+    private var interactionRevision = 0L
+    private data class InteractionBinding(
+        val deviceId: String, val outputId: String, val epoch: Long,
+        val queue: List<PlaybackTrack>?, val position: Int?, val context: PlaybackContext?, val shuffle: Boolean?,
+        val available: Boolean, val transfer: PlaybackTransfer?, val quarantined: Boolean,
+    )
+    private var interactionBinding: InteractionBinding? = null
+
+    private fun observeInteractionBinding(id: String, view: PlaybackDevicesView) {
+        // Observe EVERY accepted publication, not just UI samples: A -> B -> A must
+        // cancel a held gesture too. Deliberately exclude progress and lease metadata.
+        val binding = InteractionBinding(id, view.activeDeviceId, view.epoch,
+            view.state?.queue, view.state?.position, view.state?.context, view.state?.shuffle,
+            view.devices.any { it.deviceId == view.activeDeviceId && it.available },
+            view.transfer, view.quarantineMs > 0)
+        if (binding != interactionBinding) {
+            interactionBinding = binding
+            interactionRevision++
+        }
+    }
     private var leaseDeadline = 0L
     private data class AuthorityPermit(val lifecycle: Long, val epoch: Long, val generation: Long, val deadlineMs: Long)
     private val authorityPermit = AtomicReference<AuthorityPermit?>(null)
@@ -91,6 +111,9 @@ class PlaybackCoordinator(
             }
         }
     }
+
+    /** Transient main-dispatcher identity for held UI interactions, not wire authority. */
+    internal val interactionVersion: Triple<Long, Long, Long> get() = Triple(lifecycle, generation, interactionRevision)
 
     /** For endpoint/local Media3 guards. A remote display never grants this authority. */
     fun currentAuthority(): PlaybackAuthority? = if (activatedEpoch == epoch) executionAuthority() else null
@@ -269,10 +292,15 @@ class PlaybackCoordinator(
     /** Only a NEW explicit user action, never startup/restoration or deferred reconnect autoplay. */
     fun localAction(action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) = submitAction(action = action)
 
+    /** Existing prepared queue only: a cancelled edit must NEVER initialize/import output. */
+    internal fun editPreparedQueue(isCurrent: () -> Boolean, action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) =
+        submitAction(action = action, isCurrent = isCurrent, initialize = false)
+
     private fun submitAction(
         command: PlaybackDeviceCommand? = null,
         action: (suspend (PlaybackAuthority) -> PlaybackEndpointResult)? = null,
         isCurrent: () -> Boolean = { true },
+        initialize: Boolean = true,
     ) {
         if (closed || !isCurrent()) return
         val interrupt = command?.type in setOf("pause", "close")
@@ -313,8 +341,11 @@ class PlaybackCoordinator(
                         val authority = executionAuthority()
                         if (authority != null) {
                             val result = endpointAction {
-                                if (!initializePaused(authority)) return@endpointAction null
-                                if (!authority.isValid()) return@endpointAction null
+                                if (!isCurrent()) return@endpointAction null
+                                if (initialize) {
+                                    if (!initializePaused(authority)) return@endpointAction null
+                                } else if (activatedEpoch != epoch) return@endpointAction null
+                                if (!authority.isValid() || !isCurrent()) return@endpointAction null
                                 if (action != null) action(authority) else endpoint.execute(requireNotNull(command), authority)
                             } ?: return@exchange
                             if (result.finalClose != null) {
@@ -474,6 +505,7 @@ class PlaybackCoordinator(
             outcomeForgotten || outcome?.status in setOf("timeout", "cancelled", "rejected", "media") -> "The action could not be confirmed. It was not replayed."
             else -> ""
         }
+        observeInteractionBinding(id, view)
         mutableState.value = PlaybackDevicesState(id, view,
             intent?.target ?: view.transfer?.targetDeviceId.orEmpty(), intent != null, grantAuthority, false,
             authorizedFor(id, view), view.activeDeviceId == id && view.state?.error == "blocked", connectedMessage)

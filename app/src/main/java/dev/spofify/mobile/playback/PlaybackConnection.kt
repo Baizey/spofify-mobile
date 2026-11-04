@@ -46,6 +46,10 @@ data class PlaybackState(
     /** Exact remote wire metadata, including each occurrence's playbackContext and baseline order.
      * LibraryItem is only a display projection; this snapshot is never imported into local audio. */
     val remoteSnapshot: PlaybackSnapshot? = null,
+    /** Transient queue/client/session/output identity. Never save or persist this key. */
+    val interactionKey: PlaybackInteractionKey? = null,
+    /** Absolute-index drop is local only. Unknown implementations fail closed. */
+    val canMoveUpcomingAbsolutely: Boolean = false,
 )
 
 /**
@@ -76,6 +80,13 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     private var requestedContext: LibraryItem? = null
     private var observing = false
     private var displayingRemote = false
+    private val remoteInteractionKeys = PlaybackInteractionKeys()
+    private data class RemoteInteractionIdentity(
+        val client: PlaybackReference, val session: PlaybackReference, val coordinator: PlaybackReference,
+        val deviceId: String, val outputId: String, val epoch: Long, val version: Triple<Long, Long, Long>, val requestEpoch: Long,
+        val queue: List<dev.spofify.mobile.core.PlaybackTrack>, val position: Int,
+        val context: dev.spofify.mobile.core.PlaybackContext?, val shuffle: Boolean,
+    )
     private val coordinator get() = (context as SpofifyApplication).graph.playbackCoordinator
 
     // Always defer delivery: LibraryViewModel attaches setContext immediately AFTER play().
@@ -209,6 +220,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         controllerFuture?.let { MediaController.releaseFuture(it) }
         controllerFuture = null
         releaseAfterPending = false
+        remoteInteractionKeys.invalidate()
+        mutableState.value = mutableState.value.copy(interactionKey = null, canMoveUpcomingAbsolutely = false)
     }
 
     /** Latest explicit play wins if multiple taps arrive while connecting. */
@@ -383,6 +396,28 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         publish(true)
     }
 
+    override fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int) = onMainQueue {
+        if (hasRemoteOutput()) {
+            val owner = coordinator ?: return@onMainQueue
+            val snapshot = remoteSnapshot() ?: return@onMainQueue
+            if (currentRemoteInteractionKey() !== expectedKey) return@onMainQueue
+            val future = snapshot.queue.drop(snapshot.position + 1)
+            val from = future.indexOfFirst { PlaybackSnapshotCodec.occurrenceId(it) == occurrenceId }
+            if (from < 0 || toIndex !in future.indices || from == toIndex) return@onMainQueue
+            val direction = remoteMoveDirection(from, toIndex) ?: return@onMainQueue
+            val wireKey = future[from].key
+            // One representable command only. Recheck after coordinator transport waits;
+            // never retarget a held occurrence/index onto a new owner or replacement queue.
+            owner.remoteCommand(PlaybackDeviceCommand.queue("move", wireKey, direction)) {
+                owner === coordinator && hasRemoteOutput() && currentRemoteInteractionKey() === expectedKey
+            }
+        } else {
+            if (controller == null) return@onMainQueue
+            PlaybackService.moveQueued(expectedKey, occurrenceId, toIndex)
+        }
+        publish(true)
+    }
+
     override fun clearUpcoming() = onMainQueue {
         if (hasRemoteOutput()) send(PlaybackDeviceCommand.transport("clear"))
         else { connectionError = null; PlaybackService.clearQueued() }
@@ -458,6 +493,24 @@ class PlaybackConnection(context: Context) : PlaybackControls {
 
     private fun remoteSnapshot(): PlaybackSnapshot? = coordinator?.state?.value?.view?.state
 
+    private fun currentRemoteInteractionKey(): PlaybackInteractionKey? {
+        val owner = coordinator
+        val devices = owner?.state?.value
+        val graphClient = (context as SpofifyApplication).graph.client
+        val session = graphClient?.currentSession()
+        val snapshot = devices?.view?.state
+        val available = devices != null && devices.connected && !devices.selectionUnconfirmed &&
+            devices.deviceId.isNotEmpty() && devices.activeDeviceId.isNotEmpty() &&
+            devices.activeDeviceId != devices.deviceId && devices.view?.transfer == null &&
+            devices.quarantineMs == 0L && devices.devices.any { it.deviceId == devices.activeDeviceId && it.available }
+        val identity = if (available && graphClient != null && session != null && snapshot != null) {
+            RemoteInteractionIdentity(PlaybackReference(graphClient), PlaybackReference(session), PlaybackReference(owner),
+                devices.deviceId, devices.activeDeviceId, devices.view.epoch, owner.interactionVersion, PlaybackRequests.epoch,
+                snapshot.queue, snapshot.position, snapshot.context, snapshot.shuffle)
+        } else null
+        return remoteInteractionKeys.current(identity)
+    }
+
     /** Explicit logout/server-switch stop, unlike release(). Works before connect completes. */
     override fun stop() {
         // Invalidate synchronously, even if called by an OkHttp auth callback off-main.
@@ -481,6 +534,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         if (hasRemoteOutput()) publish()
         else mutableState.value = mutableState.value.copy(
             isPlaying = false, playWhenReady = false, isBuffering = false, error = connectionError,
+            interactionKey = null, canMoveUpcomingAbsolutely = false,
         )
     }
 
@@ -488,9 +542,12 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         // Do not read the local queue/history at all while displaying another output.
         if (hasRemoteOutput()) {
             displayingRemote = true
-            mutableState.value = remotePlaybackState(remoteSnapshot() ?: PlaybackSnapshot(), connectionError)
+            mutableState.value = remotePlaybackState(remoteSnapshot() ?: PlaybackSnapshot(), connectionError).copy(
+                interactionKey = currentRemoteInteractionKey(),
+            )
             return
         }
+        remoteInteractionKeys.invalidate()
         val wasRemote = displayingRemote
         displayingRemote = false
         val connected = controller ?: run {
@@ -521,6 +578,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             context = PlaybackService.queueContext(),
             canUndoQueueRemoval = PlaybackService.canUndoRemoval(),
             notice = PlaybackService.queueNotice(),
+            interactionKey = PlaybackService.interactionKey(),
+            canMoveUpcomingAbsolutely = PlaybackService.interactionKey() != null,
         )
     }
 
