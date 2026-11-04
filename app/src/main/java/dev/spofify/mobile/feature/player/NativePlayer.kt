@@ -1,7 +1,6 @@
 package dev.spofify.mobile.feature.player
 
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -16,11 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -44,27 +39,18 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
@@ -78,7 +64,6 @@ import dev.spofify.mobile.LikeButton
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.playback.PlaybackControls
 import dev.spofify.mobile.playback.PlaybackState
-import dev.spofify.mobile.playback.QueueEntry
 
 /** UI only: expanding does not select, prepare, reconnect, or restart playback. */
 @Composable
@@ -240,7 +225,7 @@ fun NativeNowPlaying(
                     }, maxLines = 1, overflow = TextOverflow.Ellipsis,
                         color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.bodySmall)
-                    UpcomingQueue(state, controls, onOpenItem, artwork, compact = true,
+                    NativeUpcomingQueue(state, controls, onOpenItem, artwork, compact = true,
                         showStatus = false, onClose = { presentation.dismissQueue() })
                     transport()
                     LinearProgressIndicator(
@@ -264,12 +249,12 @@ fun NativeNowPlaying(
         } else if (landscape) {
             Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) { pinned() }
-                Column(Modifier.weight(1f).fillMaxHeight()) { UpcomingQueue(state, controls, onOpenItem, artwork) }
+                Column(Modifier.weight(1f).fillMaxHeight()) { NativeUpcomingQueue(state, controls, onOpenItem, artwork) }
             }
         } else {
             Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                 pinned()
-                UpcomingQueue(state, controls, onOpenItem, artwork)
+                NativeUpcomingQueue(state, controls, onOpenItem, artwork)
             }
         }
     }
@@ -358,202 +343,5 @@ private fun PlaybackSeekBar(state: PlaybackState, controls: PlaybackControls) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(playerTime(position.toLong()), maxLines = 1, style = MaterialTheme.typography.bodySmall)
         Text(playerTime(state.durationMs), maxLines = 1, style = MaterialTheme.typography.bodySmall)
-    }
-}
-
-@Composable
-private fun ColumnScope.UpcomingQueue(
-    state: PlaybackState,
-    controls: PlaybackControls,
-    onOpenItem: (LibraryItem) -> Unit,
-    artwork: @Composable (LibraryItem, Modifier) -> Unit,
-    compact: Boolean = false,
-    showStatus: Boolean = true,
-    onClose: (() -> Unit)? = null,
-) {
-    var menuOpen by remember { mutableStateOf(false) }
-    // Keep failures visible without a wall of prose above transport; More retains the full text.
-    (state.error ?: state.notice)?.takeIf { showStatus }?.let { message ->
-        Text(message, Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },
-            maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
-            color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("Up next · ${state.upcoming.size}",
-            Modifier.weight(1f).semantics { stateDescription = "${state.upcoming.size} upcoming songs" }, maxLines = 1,
-            overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
-        onClose?.let { close ->
-            IconButton(onClick = close, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.Close, "Close upcoming queue")
-            }
-        }
-        if (state.canUndoQueueRemoval && !compact) {
-            TextButton(onClick = controls::undoQueueRemoval, modifier = Modifier.heightIn(min = 48.dp)) { Text("Undo") }
-        }
-        Box {
-            IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.MoreVert, "Upcoming queue actions")
-            }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                if (state.canUndoQueueRemoval && compact) {
-                    DropdownMenuItem(text = { Text("Undo") }, onClick = { menuOpen = false; controls.undoQueueRemoval() })
-                }
-                DropdownMenuItem(text = { Text("Clear upcoming") }, enabled = state.upcoming.isNotEmpty(),
-                    onClick = { menuOpen = false; controls.clearUpcoming() })
-                Text("Reordering turns shuffle off", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
-            }
-        }
-    }
-    // One finite scroll owner, independent of artwork/progress and without sheet drag anchors.
-    LazyColumn(Modifier.fillMaxWidth().weight(1f).testTag("now-playing-queue")
-        .semantics { contentDescription = "Upcoming queue" }) {
-        if (state.upcoming.isEmpty()) item {
-            Text("No upcoming songs", Modifier.fillMaxWidth().padding(vertical = 16.dp),
-                style = MaterialTheme.typography.bodyMedium)
-        }
-        itemsIndexed(state.upcoming, key = { _, entry -> entry.occurrenceId }) { index, entry ->
-            if (compact) CompactUpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem)
-            else UpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, artwork)
-        }
-    }
-}
-
-/** Extreme short/narrow windows disclose reordering in More, keeping real 48dp actions. */
-@Composable
-private fun CompactUpcomingRow(
-    entry: QueueEntry,
-    index: Int,
-    count: Int,
-    controls: PlaybackControls,
-    onOpenItem: (LibraryItem) -> Unit,
-) {
-    var menuOpen by remember(entry.occurrenceId) { mutableStateOf(false) }
-    Column(Modifier.fillMaxWidth().semantics {
-        customActions = buildList {
-            add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
-            if (index > 0) add(CustomAccessibilityAction("Move up") { controls.moveUpcoming(entry.occurrenceId, index - 1); true })
-            if (index < count - 1) add(CustomAccessibilityAction("Move down") { controls.moveUpcoming(entry.occurrenceId, index + 1); true })
-            add(CustomAccessibilityAction("Remove from queue") { controls.removeUpcoming(entry.occurrenceId); true })
-        }
-    }) {
-        Text(entry.item.name, Modifier.fillMaxWidth().heightIn(min = 48.dp)
-            .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(entry.item) }
-            .padding(vertical = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-            style = MaterialTheme.typography.bodyMedium)
-        Row(Modifier.fillMaxWidth().semantics {
-            contentDescription = "Reorder ${entry.item.name}"
-            stateDescription = "Position ${index + 1} of $count. Use queue actions to move up or down."
-        }, horizontalArrangement = Arrangement.End) {
-            IconButton(onClick = { controls.selectOccurrence(entry.occurrenceId) }, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.PlayArrow, "Play queued song ${entry.item.name}")
-            }
-            Box {
-                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
-                    Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
-                }
-                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    DropdownMenuItem(text = { Text("Play next") }, enabled = index > 0,
-                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, 0) })
-                    DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
-                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index - 1) })
-                    DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,
-                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index + 1) })
-                    DropdownMenuItem(text = { Text("Remove from queue") },
-                        onClick = { menuOpen = false; controls.removeUpcoming(entry.occurrenceId) })
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun UpcomingRow(
-    entry: QueueEntry,
-    index: Int,
-    count: Int,
-    controls: PlaybackControls,
-    onOpenItem: (LibraryItem) -> Unit,
-    artwork: @Composable (LibraryItem, Modifier) -> Unit,
-) {
-    var menuOpen by remember(entry.occurrenceId) { mutableStateOf(false) }
-    var rowHeight by remember { mutableIntStateOf(80) }
-    var dragY by remember(entry.occurrenceId) { mutableFloatStateOf(0f) }
-    var dragging by remember(entry.occurrenceId) { mutableStateOf(false) }
-    val latestIndex by rememberUpdatedState(index)
-    val latestCount by rememberUpdatedState(count)
-    val latestControls by rememberUpdatedState(controls)
-    val haptics = LocalHapticFeedback.current
-    val moveUp = { controls.moveUpcoming(entry.occurrenceId, (index - 1).coerceAtLeast(0)) }
-    val moveDown = { controls.moveUpcoming(entry.occurrenceId, (index + 1).coerceAtMost(count - 1)) }
-    val playNext = { controls.moveUpcoming(entry.occurrenceId, 0) }
-    val remove = { controls.removeUpcoming(entry.occurrenceId) }
-    Row(
-        Modifier.fillMaxWidth().heightIn(min = 80.dp).onSizeChanged { rowHeight = it.height }
-            .playerSwipe(PlayerSwipeArea.UPCOMING) { remove() }
-            .semantics {
-                customActions = buildList {
-                    add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
-                    if (index > 0) {
-                        add(CustomAccessibilityAction("Move up") { moveUp(); true })
-                        add(CustomAccessibilityAction("Play next") { playNext(); true })
-                    }
-                    if (index < count - 1) add(CustomAccessibilityAction("Move down") { moveDown(); true })
-                    add(CustomAccessibilityAction("Remove from queue") { remove(); true })
-                }
-            },
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(Modifier.size(48.dp)
-            .semantics {
-                contentDescription = "Reorder ${entry.item.name}"
-                stateDescription = if (dragging) "Move to position ${queueMoveTarget(index, dragY, rowHeight, count) + 1}"
-                    else "Position ${index + 1} of $count. Use queue actions to move up or down."
-            }
-            .pointerInput(entry.occurrenceId) {
-                detectVerticalDragGestures(
-                    onDragStart = {
-                        dragY = 0f
-                        dragging = true
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                    },
-                    onDragCancel = { dragY = 0f; dragging = false },
-                    onDragEnd = {
-                        val target = queueMoveTarget(latestIndex, dragY, rowHeight, latestCount)
-                        if (target != latestIndex) latestControls.moveUpcoming(entry.occurrenceId, target)
-                        dragY = 0f
-                        dragging = false
-                    },
-                ) { change, amount -> change.consume(); dragY += amount }
-            }, contentAlignment = Alignment.Center,
-        ) { Icon(Icons.Default.DragHandle, null) }
-        artwork(entry.item, Modifier.size(40.dp))
-        Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
-            Text(entry.item.name,
-                Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                    .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(entry.item) }
-                    .padding(vertical = 8.dp),
-                maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-            Text(if (dragging) "Move to position ${queueMoveTarget(index, dragY, rowHeight, count) + 1}" else entry.item.subtitle,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        IconButton(onClick = { controls.selectOccurrence(entry.occurrenceId) }, modifier = Modifier.size(48.dp)) {
-            Icon(Icons.Default.PlayArrow, "Play queued song ${entry.item.name}")
-        }
-        Box {
-            IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
-            }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(text = { Text("Play next") }, enabled = index > 0,
-                    onClick = { menuOpen = false; playNext() })
-                DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
-                    onClick = { menuOpen = false; moveUp() })
-                DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,
-                    onClick = { menuOpen = false; moveDown() })
-                DropdownMenuItem(text = { Text("Remove from queue") },
-                    onClick = { menuOpen = false; remove() })
-            }
-        }
     }
 }
