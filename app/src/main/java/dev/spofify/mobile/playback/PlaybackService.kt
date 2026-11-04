@@ -156,6 +156,7 @@ class PlaybackService : MediaSessionService() {
         return interactionKeys.current(identity)
     }
     private var explicitBackgroundPermit: PlaybackAuthority? = null
+    private var startAttempt: Any? = null // One asynchronous readiness/start owner; never a successor's cleanup.
     private var importing = false
     private var wireContext: PlaybackContext? = null
     private val wireTracks = mutableMapOf<String, PlaybackTrack>()
@@ -440,6 +441,7 @@ class PlaybackService : MediaSessionService() {
         cancelCloseDisposal()
         handler.removeCallbacksAndMessages(null)
         admissions.clear()
+        startAttempt = null
         foreground?.close()
         foreground = null
         if (noisyRegistered) { unregisterReceiver(noisyReceiver); noisyRegistered = false }
@@ -519,6 +521,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun suspendBufferedOutput() {
+        startAttempt = null
         interactionKeys.invalidate()
         authority = null
         authorityRequestEpoch = -1
@@ -641,7 +644,8 @@ class PlaybackService : MediaSessionService() {
     }
 
     /** Activation is the only wire import. Validation/prepare never reaches this method. */
-    private suspend fun importSnapshot(supplied: PlaybackSnapshot, value: PlaybackAuthority): PlaybackEndpointResult {
+    private suspend fun importSnapshot(supplied: PlaybackSnapshot, value: PlaybackAuthority,
+        startGuard: () -> Boolean = { true }): PlaybackEndpointResult {
         val source = client ?: return PlaybackEndpointResult("rejected", exportPrepared())
         val plan = try { PlaybackSnapshotCodec.plan(supplied) }
             catch (_: IllegalArgumentException) { return PlaybackEndpointResult("rejected", exportPrepared()) }
@@ -653,6 +657,7 @@ class PlaybackService : MediaSessionService() {
         if (!acceptAuthority(value)) return PlaybackEndpointResult("rejected", exportPrepared())
         val current = player ?: return PlaybackEndpointResult("rejected", PlaybackSnapshot())
         importing = true
+        startAttempt = null
         PlaybackRequests.queueChanged()
         try {
             current.pause()
@@ -698,62 +703,94 @@ class PlaybackService : MediaSessionService() {
         } finally { importing = false }
         if (current.mediaItemCount > 0) cancelCloseDisposal() // Actual replacement state, even if blocked/paused.
         schedulePrune()
+        // This replacement owns the old promotion now; its invalidated predecessor must
+        // never demote it later. Paused/empty imports have no foreground audio lifetime.
+        if (!snapshot.playing || snapshot.queue.isEmpty())
+            foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem))
         if (snapshot.queue.isEmpty()) return PlaybackEndpointResult("ok", exportPrepared())
-        return startOwned(value, snapshot.playing)
+        return startOwned(value, snapshot.playing, startGuard)
     }
 
     private var importedShuffle: Boolean? = null
 
     /** Returns actual READY/playing or an honest failure; receiving a directive is not a success ACK. */
-    private suspend fun startOwned(value: PlaybackAuthority, play: Boolean): PlaybackEndpointResult {
+    private suspend fun startOwned(value: PlaybackAuthority, play: Boolean,
+        isCurrent: () -> Boolean = { true }): PlaybackEndpointResult {
         val current = player ?: return PlaybackEndpointResult("rejected", PlaybackSnapshot())
         if (!acceptAuthority(value)) return PlaybackEndpointResult("rejected", exportPrepared())
+        val attempt = Any()
+        startAttempt = attempt
         val requestEpoch = authorityRequestEpoch
-        fun owned() = authority === value && authorityRequestEpoch == requestEpoch && hasAuthority()
+        val occurrence = currentId()
+        fun sameAttempt() = active.get() === this && player === current && startAttempt === attempt &&
+            authority === value && authorityRequestEpoch == requestEpoch && currentId() == occurrence
+        fun owned() = sameAttempt() && isCurrent() && hasAuthority()
         fun valid() = owned() && audioFocus?.isGranted == true
-        outputError = ""
-        if (!play) return PlaybackEndpointResult("ok", exportPrepared().paused())
-        if (!mayStartForegroundPlayback(value) || session?.let { foreground?.promote(it, current.currentMediaItem?.let(PlaybackMedia::libraryItem), true) } != true) {
-            outputError = "blocked"; current.pause(); current.stop(); audioFocus?.abandon()
-            foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem))
-            return PlaybackEndpointResult("blocked", exportPrepared().paused().copy(error = "blocked"))
+        fun silenceAttempt() {
+            // A rejected predicate is not just a paused copy of a possibly still-playing
+            // snapshot. Drain OUR output and focus/FGS ownership, but never touch a successor.
+            fun clean(action: () -> Unit) {
+                if (!sameAttempt()) return
+                try { action() } catch (_: RuntimeException) {
+                    // A broken player/platform cleanup stage must not strand focus or FGS.
+                    // Recheck identity before every stage in case a callback replaced us.
+                }
+            }
+            clean { current.pause() }
+            clean { current.stop() }
+            clean { audioFocus?.abandon() }
+            clean {
+                historyWasPlaying = false
+                resetHistoryAnchor(current.currentMediaItem)
+            }
+            clean { foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem)) }
+            if (sameAttempt()) startAttempt = null
         }
-        if (audioFocus?.requestForExplicitStart() != true) {
-            outputError = "blocked"; current.pause(); current.stop()
-            foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem))
-            return PlaybackEndpointResult("blocked", exportPrepared().paused().copy(error = "blocked"))
+        fun rejected(): PlaybackEndpointResult {
+            silenceAttempt()
+            return PlaybackEndpointResult("rejected", exportPrepared())
         }
-        if (!valid()) return PlaybackEndpointResult("rejected", exportPrepared().paused())
-        // Keep the one service started while its foreground notification owns audio lifetime.
-        startService(Intent(this, PlaybackService::class.java).setAction(ACTION_KEEP_ALIVE))
-        current.playWhenReady = false
-        current.prepare()
-        val ready = withTimeoutOrNull(3_000) {
-            while (valid() && current.playerError == null && current.playbackState != Player.STATE_READY) delay(20)
-            valid() && current.playerError == null && current.playbackState == Player.STATE_READY
-        } == true
-        if (!owned()) return PlaybackEndpointResult("rejected", exportPrepared().paused())
-        if (!ready) {
-            outputError = "media"; current.pause(); current.stop(); audioFocus?.abandon()
-            foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem))
-            return PlaybackEndpointResult("media", exportPrepared().paused().copy(error = "media"))
+        fun failure(status: String): PlaybackEndpointResult {
+            if (!sameAttempt()) return rejected()
+            outputError = status
+            silenceAttempt()
+            return PlaybackEndpointResult(status, exportPrepared())
         }
-        if (play) {
-            if (!valid()) return PlaybackEndpointResult("rejected", exportPrepared().paused())
+        var completed = false
+        try {
+            if (!owned()) return rejected()
+            outputError = ""
+            if (!play) { completed = true; return PlaybackEndpointResult("ok", exportPrepared().paused()) }
+            if (!mayStartForegroundPlayback(value) || session?.let { foreground?.promote(it, current.currentMediaItem?.let(PlaybackMedia::libraryItem), true) } != true)
+                return failure("blocked")
+            if (audioFocus?.requestForExplicitStart() != true) return failure("blocked")
+            if (!valid()) return rejected()
+            // Keep the one service started while its foreground notification owns audio lifetime.
+            try { startService(Intent(this, PlaybackService::class.java).setAction(ACTION_KEEP_ALIVE)) }
+            catch (_: RuntimeException) { return failure("blocked") }
+            current.playWhenReady = false
+            current.prepare()
+            val ready = withTimeoutOrNull(3_000) {
+                while (valid() && current.playerError == null && current.playbackState != Player.STATE_READY) delay(20)
+                valid() && current.playerError == null && current.playbackState == Player.STATE_READY
+            } == true
+            if (!owned()) return rejected()
+            if (!ready) return failure("media")
+            if (!valid()) return rejected()
             current.play()
             val started = withTimeoutOrNull(500) {
                 while (valid() && !current.isPlaying && current.playerError == null && outputError.isEmpty()) delay(10)
-                valid() && current.isPlaying && outputError.isEmpty()
+                valid() && current.isPlaying && current.playerError == null && outputError.isEmpty()
             } == true
-            if (!owned()) return PlaybackEndpointResult("rejected", exportPrepared().paused())
-            if (!started) {
-                outputError = if (current.playerError == null) "blocked" else "media"
-                current.pause(); current.stop(); audioFocus?.abandon()
-                foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem))
-                return PlaybackEndpointResult(outputError, exportPrepared().paused().copy(error = outputError))
-            }
+            if (!owned()) return rejected()
+            if (!started) return failure(if (current.playerError == null) "blocked" else "media")
+            completed = true
+            return PlaybackEndpointResult("ok", exportPrepared())
+        } finally {
+            // Covers caller disposal, cancellation and thrown platform errors as well as every
+            // early rejected return. A newer import/start/service changes the attempt identity.
+            if (!completed) silenceAttempt()
         }
-        return PlaybackEndpointResult("ok", exportPrepared())
     }
 
     private fun mayStartForegroundPlayback(value: PlaybackAuthority): Boolean {
