@@ -4,7 +4,9 @@ plugins {
 }
 android {
     namespace = "dev.spofify.mobile"
-    compileSdk = 36
+    // Current Compose/Coil releases require API 37; runtime compatibility remains unchanged.
+    compileSdk = 37
+    compileSdkMinor = 0
     defaultConfig {
         applicationId = "dev.spofify.mobile"
         minSdk = 26
@@ -23,7 +25,9 @@ android {
 }
 dependencies {
     implementation(project(":core"))
-    implementation(platform("androidx.compose:compose-bom:2026.09.00"))
+    val composeBom = platform("androidx.compose:compose-bom:2026.09.00")
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
