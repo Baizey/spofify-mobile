@@ -23,18 +23,20 @@ These are this app's requirements, not claims that every Android app must use th
 
 ### Thumb-first search, without ten knobs
 
-- Place the Search input in the **lower thumb zone**, above the navigation/mini-player area, not automatically at the top because that is common on the web.
-- Keep the field reachable while the keyboard opens. Let results use the space above it; do not cover the field, last result or transport with IME/navigation insets.
+- Place the Search input in the **lower thumb zone**, above the persistent chrome when not editing, rather than copying a website's top search bar.
+- While actively editing the query, **hide bottom navigation and unnecessary top toolbar chrome, including its blank reserved space**. Restore them when editing ends; a nonempty query alone is not editing. Keep query/results/scroll and playback intact across the transition.
+- Keep the field reachable with the IME open. Let results use the space above it; do not cover the field, last result or transport with insets or retain invisible chrome spacers.
 - Start with one query and sensibly ordered grouped results. Do not require users to tune type, scope and availability controls first.
 - No persistent filter-chip strip, Include missing checkbox or small Previous/Next control cluster on the main search screen. Internal API filters can still support intentional detail views.
-- Use bounded useful matches and generous progressive **See more** actions. Group labels describe results; they are not an extra configuration panel.
+- Use bounded useful matches and generous progressive **See more** actions. Keep Artists → Albums → Songs ordering, but main Search has **no visible result-type title/count rows**. Use existing artwork geometry or small overlay icons to distinguish types without extra height; retain type in TalkBack context. This supersedes earlier guidance to keep visible search group labels.
+- Show concise contextual loading and a clear retry for a failed/partial read without hiding healthy matches. When matches exist, omit a wall of per-empty-group messages. Recovery controls must remain generous and reachable.
 - Stable exact/prefix/name matching can improve a bounded candidate set. Do not claim global relevance ranking from one alphabetically paged response, invent unsupported server sort parameters or scan the whole catalog on the phone. Coordinate backend ranking improvements if needed.
 
 ### Context without redundant titles
 
 - Selected navigation and surrounding content often already explain where the user is. Avoid repeating `spofify`, Home, Search or Playlists as large generic headings/app bars.
 - Remove decorative filler headings that push music and primary actions away from the user's hand.
-- Keep meaningful **song, album, artist and playlist names**, useful result-group labels and action-dialog context. “No titles” is not a rule to remove identity or accessibility labels.
+- Keep meaningful **song, album, artist and playlist names**, necessary detail-group headers and action-dialog context. Main Search's type/count rows are the specific exception above, not a ban on identity or accessible labels.
 - Empty chrome is not a solution: removing an app-bar title should not leave an unnecessary blank bar. Account and other necessary actions must remain discoverable.
 
 ### Android navigation is native
@@ -45,6 +47,25 @@ These are this app's requirements, not claims that every Android app must use th
 - Preserve the preceding query, results, paging and scroll when returning from details or switching destinations. Returning is not a new search or full reset.
 - Do not install competing BackHandlers that double-pop, swallow root navigation or jump behind an open sheet. Prefer platform/Compose navigation behavior; support predictive Back correctly where applicable.
 - Previous/restart in the **music transport** is not navigation Back and remains a visible playback control. Cancel/Save in an editor are also distinct actions.
+
+## Website lessons, adapted rather than copied
+
+The live Go repository is **read-only**. Its [AGENTS shared UI standards](../../spofify-go/AGENTS.md#shared-ui-standards) and [frontend contract](../../spofify-go/docs/frontend.md#shared-music-item-ui-standard) establish reusable principles, not Android pixel values or a layout to clone. `docs/style-guide.md` was not present in that checkout at this review; do not invent its contents or edit the backend to supply it.
+
+| Concrete website lesson | Native application / what not to generate |
+| --- | --- |
+| Shared `mediaCard`/`--music-*` tokens, square repeated surfaces and artwork; reserved action slots even without Play ([music-item standard](../../spofify-go/docs/frontend.md#shared-music-item-ui-standard)) | Share Compose media primitives across screens, not per-view geometry. Keep square collections/rows/artwork and coherent focus/ripple surfaces; native circular artist avatars are the explicit artwork exception. Reserve action space for unavailable items; no random card shadows or floating pill rows. Android targets are **48dp**, not the website's 44px slots. |
+| Compact grouped rows and one scrolling flow ([search](../../spofify-go/docs/frontend.md#library-search)) | One compact row rhythm with aligned art/title and **one inline credit/metadata line**. Do not turn every artist into a TextButton or vertical row. Artist typography is modest, not title-sized. Do not copy web heading/count rows, multi-column layouts, row heights or pagination knobs. |
+| Whole-item padded focus/hit surface, independent listening actions ([music-item standard](../../spofify-go/docs/frontend.md#shared-music-item-ui-standard)) | Give the main row destination coherent Android focus/ripple feedback; Play and More are deliberate separate targets. No fragmented metadata hover/ripple patches or nested competing click targets. Preserve every known artist/album ID through intentional details/More; missing IDs remain honest text. |
+| Contextual loading, retained usable content, stable controls and reduced motion ([loading](../../spofify-go/docs/frontend.md#shared-loading-ui-standard)) | Shared native progress with accessible context; concise inline error/retry, not explanatory paragraphs or endless spinners. Keep geometry/focus through refresh and availability changes. Do not infer success, emptiness or identity from absent data. |
+| Listening-first details; management disclosed separately; no fake content or redundant chrome ([collections](../../spofify-go/docs/frontend.md#personal-library-and-collection-navigation)) | One clear primary path with secondary capabilities in More/details. Backend capability inventory is not an on-screen button inventory. No fake recommendations or prose explaining obvious controls; retain necessary warnings, uncertainty and accessible alternatives. |
+
+### Compact music geometry
+
+- Use a common compact **two-line** media-row primitive for comparable list presentations: aligned square art (native artist avatars may be circular), title, **one inline credit/metadata line**, trailing listening action and More. Do not stack one button/line per artist, add an extra type line, or enlarge padding/font on each iteration to imply hierarchy.
+- Reserve action geometry and bounded copy slots regardless of artist cardinality, missing artwork/audio, Play/Pause or background refresh. A large font scale may change the shared row pitch; it must change consistently, not only for multi-artist items. Long secondary credits can ellipsize, with complete names and all ID-backed actions available intentionally in details/More and accessibility.
+- The mini-player is a **full-width flat dock**, not a floating rounded card with outer gutters/shadow. It shares the shell's inset budget and never obscures the last result.
+- Improve information hierarchy before growing fonts, padding or chrome. Compact visuals must still retain **48dp** hit targets and readable text, not tiny buttons.
 
 ## Established mobile implementation principles
 
@@ -102,6 +123,19 @@ These are this app's requirements, not claims that every Android app must use th
 For each change, run the automated gate **and** exercise the current installed APK on an explicitly selected isolated Android virtual device. Capture and inspect affected screens and states; compare before/after when possible. Check narrow and large-font layouts, keyboard interaction, system Back, scrolling and relevant music gestures. Parent integration requires a combined native smoke pass after parallel agents finish.
 
 Do not regenerate a baseline merely to accept a regression. Record device/API/viewport/font scale, APK revision, screenshots, exercised flows, problems and fixes. If native testing cannot run, completion is **blocked**, not silently replaced by Robolectric. Screenshots demonstrate rendering, not every hardware/vendor behavior. Routine development uses emulators; any exceptional real-device verification goes through the user, not direct agent access.
+
+### Rendered-review questions — answer with evidence, not source assertions
+
+For each affected layout, the implementer and an independent reviewer must inspect actual screenshots and record:
+
+- At the same narrow viewport/font scale, how many complete music rows are visible before/after? If fewer, what necessary information or action justifies the cost?
+- Are art/title/credit baselines, row pitch and action slots uniform for one/many artists, unavailable items and refresh states? Are metadata targets compact rather than stacked buttons, with rich identity actions still reachable?
+- What is the total top/bottom chrome height with IME closed and open? Does active query editing actually remove navigation and empty toolbar space, keep the field reachable and restore chrome afterward?
+- Does main Search omit visible type/count rows while keeping ordering, non-verbal type cues and accessible type context? Are partial errors recoverable without empty-group message walls?
+- With long/Unicode credits and large fonts, do text, 48dp targets, More menus and last-row reachability remain usable? Is the full-width mini-player flat and unobscuring?
+- Which inspected image paths show the after-state, and which taps/Back/scroll actions were exercised? If there is no after-render, report **blocked / not complete**, not “pass.”
+
+The supplied `/tmp/Spectacle.uTAxWI/Screenshot_20261104_011326.png` is **before-only evidence**, not an approved design or after-validation. It shows visible Artists/Albums count rows, artist-dependent album height with vertically stacked credits, unused top chrome and a rounded inset mini-player. Use those concrete failures to guide the comparison; no after-render has been approved by this documentation change.
 
 ## Android references
 

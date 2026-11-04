@@ -2,39 +2,38 @@
 
 A native **Android** listener for your own [spofify-go](../spofify-go) server. Kotlin, Jetpack Compose and Media3—not a website wrapper, and no server-management screens.
 
-## First slice
+## Current listener scope
 
 - Enter your server URL and sign in with an existing Spofify account.
-- Browse albums, artists and songs; search saved music with pagination.
-- Return to recently played songs, listen to Liked songs and existing **manual personal playlists**.
-- Play album/artist/playlist contexts, not just the currently visible page.
-- Persistent mini-player, expanded Now Playing, seeking, queue selection, shuffle and repeat.
-- MediaSessionService-owned audio with foreground notification, lock-screen controls, audio focus and headphone-disconnect handling.
-- Like/unlike the current song; report listening history after actual playback progress.
-- Android Keystore-encrypted sessions and optional remembered server/username/password for quicker testing and sign-in.
+- **Home / Search / Playlists**: bounded personal shelves, Liked Songs, bottom-positioned query entry, grouped results and progressive See more actions. Empty Search does not fetch the global catalog. The [mobile UX contract](docs/mobile-ux.md) requires editing-focused chrome, compact inline credits, no main-Search type/count heading rows and a flat full-width mini-player; these are rendered acceptance requirements, not a claim of visual approval.
+- Open artist/album/song details and play complete contexts, not just the visible page.
+- Create/edit manual personal playlists and build/evaluate server-supported derived playlists.
+- Persistent mini-player, expanded Now Playing, seeking, occurrence-aware queue editing, shuffle and repeat.
+- MediaSessionService-owned audio with notification/system controls, audio focus, headphone-disconnect handling and progress-qualified listening history.
+- Read-only playback-device visibility; native output registration, remote control and exact handoff remain disabled until the native authority boundary is complete.
+- Android Keystore-encrypted sessions and optional remembered server/username/password, without automatic password sign-in or autoplay.
+- Bundled **JetBrains Mono** typography, including its full offline font-license notice on Sign-in and in Account. Provenance and SIL OFL license: [third_party/jetbrains-mono](third_party/jetbrains-mono/).
 
-**This is an initial implementation, not a production release.** The API contract tests, Robolectric sign-in UI checks, debug APK build and Android lint can run locally. Physical-device playback/background/codec behavior still needs the checklist in [docs/testing.md](docs/testing.md). No live backend was changed or exercised during development.
+**This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory; the current environment's emulator crashes before app launch, so **UI validation is blocked / not complete**. The supplied screenshot was inspected as a before-only baseline; no after-render is approved. See [docs/ui-validation.md](docs/ui-validation.md) and [docs/testing.md](docs/testing.md). No live backend was changed or exercised.
 
 ## Run
 
-Open this directory in Android Studio, install **Android SDK 36**, and run the `app` configuration on Android **8.0 / API 26 or later**. The Gradle wrapper is pinned. JDK 17+ is required; development validation used JDK 25.
-
-Command line:
+Open this directory in Android Studio and install the **Android API 37.0 compile platform** (`platforms;android-37.0`). Minimum Android remains **8.0 / API 26** and target SDK remains **36**. The Gradle wrapper is pinned; local validation used JDK 25 and CI uses JDK 21.
 
 ```sh
 # Set ANDROID_HOME to your SDK, or let Android Studio write local.properties.
-./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug \
+  :app:assembleDebugAndroidTest :app:lintDebug
+
+# Isolated synthetic AVD only: build, boot, install, exercise and capture evidence.
+tools/ui/validate-native.sh
 ```
 
-The build produces **app/build/outputs/apk/debug/app-debug.apk**. Debug builds are for local testing, not store distribution. No release signing key is included.
+Agents must not target real phones, personal AVDs or live accounts. The runner disables ADB mDNS/wireless discovery and USB transports, verifies the selected virtual device, and never downloads a system image automatically. See [the native workflow](docs/ui-validation.md) for installed-image prerequisites and screenshot review.
 
-On this development machine, ignored tooling was provisioned under `.tooling/`. To reuse it:
+Depending on AGP, the debug APK is under `app/build/outputs/apk/debug/` or `app/build/intermediates/apk/debug/`; the runner locates the actual artifact. Debug builds are not store releases; no release signing key is included.
 
-```sh
-GRADLE_USER_HOME="$PWD/.tooling/gradle" ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
-.tooling/android-sdk/platform-tools/adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
+On this machine, ignored SDK and Gradle tooling live under `.tooling/`. Prefix the Gradle command with `GRADLE_USER_HOME="$PWD/.tooling/gradle"` to reuse that cache.
 
 ## Connect your server
 
@@ -60,7 +59,7 @@ One exact-origin OkHttp client supplies API calls, artwork and **every audio/ran
 
 ## Deliberately not included yet
 
-Offline downloads, playlist creation/editing, derived-playlist evaluation, server management/acquisition, Android Auto, cross-device player synchronization, persistent queue recovery after process death, and release/store packaging. System media controls currently show text metadata without embedded artwork; in-app artwork is authenticated. The server streams original files without transcoding, so device codec support varies. Large playback contexts honor the server's 1,000-song cap. Duplicate playlist entries retain their occurrence identity, so selecting the same song twice in a playlist does not collapse its ordering.
+Offline downloads, server management/acquisition, Android Auto, exact native cross-device playback handoff, persistent queue recovery after process death, and release/store packaging. Lyrics, waveform/analysis, similarity and provider-backed artist top tracks need approved backend contracts; see [backend coordination](docs/backend-feature-coordination.md). System media controls currently show text metadata without embedded artwork; in-app artwork is authenticated. The server streams original files without transcoding, so device codec support varies. Large playback contexts honor the server's 1,000-song cap. Duplicate playlist entries retain their occurrence identity, so selecting the same song twice in a playlist does not collapse its ordering.
 
 ## Backend coordination
 
