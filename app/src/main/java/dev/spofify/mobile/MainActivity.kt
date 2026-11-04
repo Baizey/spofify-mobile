@@ -33,6 +33,7 @@ import dev.spofify.mobile.feature.player.NativeMiniPlayer
 import dev.spofify.mobile.feature.player.NativeNowPlaying
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
+import dev.spofify.mobile.ui.theme.AppFontLicenseDialog
 import dev.spofify.mobile.ui.theme.AppTypography
 import java.util.Locale
 
@@ -62,11 +63,13 @@ private fun SpofifyApp(model: LibraryViewModel) {
     val player by model.playback.state.collectAsStateWithLifecycle()
     var expanded by rememberSaveable { mutableStateOf(false) }
     var account by remember { mutableStateOf(false) }
+    var fontLicense by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.notice) { state.notice?.let { snackbar.showSnackbar(it); model.clearNotice() } }
     LaunchedEffect(state.session) { if (state.session == null) expanded = false }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     BackHandler(state.canGoBack && !expanded && state.session != null && !imeVisible) { model.back() }
+    if (fontLicense) AppFontLicenseDialog(onDismiss = { fontLicense = false })
 
     if (state.restoring) {
         Box(Modifier.fillMaxSize().background(Background), contentAlignment = Alignment.Center) {
@@ -75,7 +78,8 @@ private fun SpofifyApp(model: LibraryViewModel) {
         return
     }
     if (state.session == null) {
-        SignIn(state, model.rememberedLogin, model::signIn, model::reconnect, model::setRememberLogin, model::forgetSavedLogin)
+        SignIn(state, model.rememberedLogin, model::signIn, model::reconnect, model::setRememberLogin,
+            model::forgetSavedLogin, onShowFontLicense = { fontLicense = true })
         return
     }
     val client = model.graph.client ?: return
@@ -176,6 +180,7 @@ private fun SpofifyApp(model: LibraryViewModel) {
                     Text("Sign out keeps your saved login on this device for next time.", style = MaterialTheme.typography.bodySmall)
                     TextButton(enabled = !state.busy, onClick = model::forgetSavedLogin) { Text("Forget saved login") }
                 }
+                TextButton(onClick = { account = false; fontLicense = true }) { Text("Font license") }
             } }, confirmButton = { TextButton(enabled = !state.busy, onClick = { account = false; model.logout() }) { Text("Sign out") } },
             dismissButton = { TextButton(onClick = { account = false }) { Text("Done") } })
         if (expanded && player.item != null) {

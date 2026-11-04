@@ -19,6 +19,15 @@ ttfautohint (v1.8.4.7-5d5b)`. No subsetting, re-encoding, variable-font conversi
 new dependencies, font providers or runtime network downloads are involved.
 Retain the original `OFL.txt` and notices when redistributing these assets.
 
+The APK also packages the **complete, byte-identical** license and copyright
+notice at `app/src/main/assets/licenses/jetbrains-mono/OFL.txt` (asset path
+`licenses/jetbrains-mono/OFL.txt`), not only the repository copy or the short
+embedded font metadata. `AppFontLicenseDialog(onDismiss: () -> Unit)` in
+`dev.spofify.mobile.ui.theme` displays this local UTF-8 asset as bounded,
+scrollable plain text with a Done action and standard native dialog Back
+behavior. It needs no network access, URL viewer, account or sign-in. The parent
+owns wiring secondary Font license entries in Account and the Sign-in footer.
+
 ## Exact upstream files and Android resources
 
 | Weight | Android resource / path relative to `app/src/main/res/font/` | Bytes | Exact official download |
@@ -42,9 +51,11 @@ Each TTF has sfnt magic `00 01 00 00`, 17 bounded tables including `head`, `cmap
 The actual downloaded upstream `OFL.txt` includes the copyright notice and full
 SIL OFL 1.1 text; it has not been reconstructed or replaced with a summary.
 
-[`SHA256SUMS`](SHA256SUMS) records SHA-256 for all four fonts and the original
-license, using paths relative to the repository root. Verify locally from that
-root without network access:
+[`SHA256SUMS`](SHA256SUMS) records SHA-256 for all four fonts, the original
+license and its byte-identical packaged asset copy, using paths relative to the
+repository root. Both license copies have SHA-256
+`30f0c136e3c88e422d0791acd97238870f9054a9729bc34cf2ff0d4ed8cac4ad`.
+Verify locally from that root without network access:
 
 ```sh
 sha256sum --check third_party/jetbrains-mono/SHA256SUMS
@@ -76,9 +87,12 @@ pixels in a JVM test.
 
 `app/src/test/java/dev/spofify/mobile/ui/theme/TypographyTest.kt` checks all 15
 styles use the bundled family, all other default style properties are unchanged,
-and the four normal-style resource names and weights map as intended. These
-focused tests have **not been run** in this scoped task: the parent owns the
-Gradle build slot. No Gradle/dependency changes are needed.
+and the four normal-style resource names and weights map as intended.
+`FontLicenseTest.kt` in the same directory checks the packaged asset's exact
+known SHA-256, size, copyright and complete OFL sections, plus full-notice dialog
+semantics and Done dismissal on Robolectric SDK 35. The new license tests have
+**not been run** in this scoped task: the parent owns the Gradle build slot and
+will rerun the gate after this addition. No Gradle/dependency changes are needed.
 
 **UI validation blocked / not complete:** the reported AVD startup fails with a
 TCG crash. No emulator or ADB operation was attempted in this scoped task. The

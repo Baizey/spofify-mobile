@@ -1,0 +1,4 @@
+# Keep the pinned upstream font license byte-identical on every platform.
+# Its original line-end whitespace is verified by the SHA-256 tests.
+third_party/jetbrains-mono/OFL.txt -text whitespace=-blank-at-eol
+app/src/main/assets/licenses/jetbrains-mono/OFL.txt -text whitespace=-blank-at-eol

@@ -68,6 +68,7 @@ internal fun SignIn(
     reconnect: () -> Unit,
     setRememberLogin: (Boolean) -> Unit,
     forgetSavedLogin: () -> Unit,
+    onShowFontLicense: () -> Unit,
 ) {
     val form = remember(state.server) { SignInForm(state.server, rememberedLogin) }
     val address = runCatching { ServerAddress.parse(form.server) }
@@ -130,6 +131,7 @@ internal fun SignIn(
             }
             Text("Use an existing Spofify account. No Spotify sign-in required.", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+            TextButton(onClick = onShowFontLicense) { Text("Font license") }
         }
     }
 }
