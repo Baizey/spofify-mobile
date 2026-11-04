@@ -90,6 +90,28 @@ class PlaybackDevicesApiTest {
         try { PlaybackDeviceCommand.musical("enqueue", track = buildJsonObject { }, first = true, context = PlaybackContext("album", "a", "A")); fail() } catch (_: IllegalArgumentException) { }
     }
 
+    @Test fun legacyIncomingToggleIsStrictButNativeOutgoingTransportRemainsExplicit() {
+        val toggle = buildJsonObject { put("type", "toggle") }
+        assertEquals(toggle, PlaybackDeviceCommand.fromJson(toggle).json)
+        try { PlaybackDeviceCommand.transport("toggle"); fail("Native toggle must remain forbidden") } catch (_: IllegalArgumentException) { }
+        try { PlaybackDeviceCommand.fromJson(buildJsonObject { put("type", "toggle"); put("value", 1) }); fail("Extra toggle fields accepted") } catch (_: IllegalArgumentException) { }
+        val directiveView = Json.parseToJsonElement(view().replace("\"directives\":[]",
+            "\"directives\":[{\"deliveryId\":\"legacy-toggle\",\"epoch\":2,\"type\":\"command\",\"command\":{\"type\":\"toggle\"}}]")).jsonObject
+        assertEquals("toggle", PlaybackDevicesView.fromJson(directiveView).directives.single().command?.get("type")?.jsonPrimitive?.content)
+    }
+
+    @Test fun musicalCommandDiagnosticStringNeverExposesSelectionAuthority() {
+        val current = snapshot().queue.first()
+        val track = snapshot().toJson().getValue("queue").jsonArray.first().jsonObject
+        val command = PlaybackDeviceCommand.musical("play", track = track,
+            context = PlaybackContext("derived", "rules", "Rules", 4, "original-fence"),
+            occurrenceId = current.occurrenceId, selectionToken = "original-signed-selection")
+        assertFalse(command.toString().contains("original-signed-selection"))
+        assertFalse(command.toString().contains("original-fence"))
+        assertTrue(command.toString().contains("play"))
+        assertEquals("original-signed-selection", command.json["selectionToken"]?.jsonPrimitive?.content)
+    }
+
     @Test fun invalidLeasesUnknownCommandsAndPreparedTokenAreRejected() {
         try { PlaybackDevicesView.fromJson(Json.parseToJsonElement(view().replace("8000", "8001")).jsonObject); fail() } catch (_: IllegalArgumentException) { }
         try { PlaybackDeviceCommand.fromJson(buildJsonObject { put("type", "resume"); put("url", "https://attacker") }); fail() } catch (_: IllegalArgumentException) { }

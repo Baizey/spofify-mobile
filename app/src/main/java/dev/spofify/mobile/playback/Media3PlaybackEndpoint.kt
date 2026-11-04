@@ -7,17 +7,9 @@ import dev.spofify.mobile.feature.devices.NativePlaybackEndpoint
 import dev.spofify.mobile.feature.devices.PlaybackAuthority
 import dev.spofify.mobile.feature.devices.PlaybackEndpointResult
 
-/**
- * Conservative service bridge. Export and suspension are real, not a screen's cached state.
- *
- * Registration/handoff intentionally remains disabled: MediaSession notification commands still
- * act directly on Media3, so advertising an exclusive-output capability would be unsafe. Enabling
- * this requires routing those commands through coordinator authority and implementing fenced,
- * exact import (including per-derived-occurrence contexts) before ANY asynchronous prepare/start.
- * No incoming snapshot is ever loaded as a fallback, and no saved playlist is fetched here.
- */
+/** Same-process bridge to the single service output. Preparation is a pure exact-import plan. */
 class Media3PlaybackEndpoint : NativePlaybackEndpoint {
-    override val supportsExactHandoff: Boolean = false
+    override val supportsExactHandoff: Boolean = true
 
     override fun suspendOutput() {
         checkMain()
@@ -31,22 +23,22 @@ class Media3PlaybackEndpoint : NativePlaybackEndpoint {
     }
 
     override suspend fun prepare(snapshot: PlaybackSnapshot): Boolean {
-        snapshot.validated()
-        // Validation has no playback/history/network side effects. No false capability ACK.
-        return false
+        checkMain()
+        // No service call, media loading, queue mutation, history sampling, or network request.
+        return runCatching { PlaybackSnapshotCodec.plan(snapshot); true }.getOrDefault(false)
     }
 
     override suspend fun activate(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult {
         checkMain()
         snapshot.validated()
-        return PlaybackEndpointResult("rejected", exportSnapshot())
+        if (!authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())
+        return PlaybackService.activateSnapshot(snapshot, authority)
     }
 
     override suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority): PlaybackEndpointResult {
         checkMain()
-        // Safety interruptions remain available even though musical remote execution is disabled.
-        if (command.type == "pause" || command.type == "close") suspendOutput()
-        return PlaybackEndpointResult("rejected", exportSnapshot())
+        if (!authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())
+        return PlaybackService.executeCommand(command, authority)
     }
 
     private fun checkMain() = check(Looper.myLooper() == Looper.getMainLooper()) {

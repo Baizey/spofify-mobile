@@ -156,14 +156,40 @@ data class DerivedPlayback(
     val fence: String,
     val startOccurrenceId: String?,
     val notice: String?,
+    internal val preparedSelectionAuthority: PreparedPlaybackAuthority? = null,
 ) {
     val startIndex: Int? get() = startOccurrenceId?.let { id -> items.indexOfFirst { it.entryId == id }.takeIf { it >= 0 } }
     /** Shared queue counts saturate at Int.MAX_VALUE; the exact Long count remains in this envelope. */
-    fun toPlaybackQueue() = PlaybackQueue(
-        items, total = total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), limit = limit, truncated = truncated,
-        context = LibraryPlaybackContext(context.kind, context.id, context.name), revision = revision,
-    )
+    fun toPlaybackQueue(): PlaybackQueue = toPlaybackQueue(selectionAuthority = preparedSelectionAuthority)
+
+    internal fun toPlaybackQueue(selectionAuthority: PreparedPlaybackAuthority?): PlaybackQueue {
+        require(context.kind == "derived" && context.revision == revision && context.fence == fence)
+        val preparedContext = PlaybackContext(context.kind, context.id, context.name, revision, fence)
+        val tracks = items.mapIndexed { index, item ->
+            require(item.kind == "track" && item.playable && item.durationMs >= 0)
+            PlaybackTrack(
+                id = item.id, name = item.name, artists = item.artists.map { PlaybackArtist(it.id, it.name) },
+                albumName = item.albumName.orEmpty(), albumId = item.albumId.orEmpty(), duration = item.durationMs / 1000.0,
+                // Derived occurrence identity is not a manual-playlist entry ID (and has a larger wire bound).
+                targetId = context.id, occurrenceId = requireNotNull(item.entryId), playbackContext = preparedContext,
+                key = index + 1L, order = index.toLong(),
+            )
+        }
+        val position = if (tracks.isEmpty()) -1 else requireNotNull(startIndex)
+        val prepared = PlaybackSnapshot(
+            queue = tracks, position = position, context = preparedContext,
+            duration = tracks.getOrNull(position)?.duration ?: 0.0,
+            truncated = truncated, notice = notice.orEmpty(),
+        ).publicationValidated()
+        return PlaybackQueue(
+            items, total = total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), limit = limit, truncated = truncated,
+            context = LibraryPlaybackContext(context.kind, context.id, context.name), revision = revision,
+            preparedState = prepared, selectionAuthority = selectionAuthority,
+        )
+    }
     val queue: PlaybackQueue get() = toPlaybackQueue()
+
+    override fun toString(): String = "DerivedPlayback(total=$total, limit=$limit, truncated=$truncated, [redacted])"
 }
 
 /** Opaque signed cursors/selections are passed unchanged, never decoded or reconstructed here. */
@@ -220,6 +246,7 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
         requirePersonalRevision(expectedRevision)
         requireOpaqueToken(fence, 4096)
         selectionToken?.let { requireOpaqueToken(it, 8192) }
+        val preparedSource = PreparedPlaybackSource.capture(transport.client)
         val wire: DerivedPlaybackWire = personalDecode(personalRequired(transport.send("POST", derivedPath(id, "playback"), buildJsonObject {
             put("expectedRevision", expectedRevision); put("fence", fence)
             selectionToken?.let { put("selectionToken", it) }
@@ -241,7 +268,10 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
             item.occurrenceId to item.selectionToken
         }
         return DerivedPlayback(wire.context, items.map { it.track.copy(entryId = it.occurrenceId) }, tokens,
-            wire.total, wire.limit, wire.truncated, wire.revision, wire.fence, wire.startOccurrenceId, wire.notice)
+            wire.total, wire.limit, wire.truncated, wire.revision, wire.fence, wire.startOccurrenceId, wire.notice,
+            preparedSelectionAuthority = preparedSource.bind(selectionToken,
+                PlaybackContext(wire.context.kind, wire.context.id, wire.context.name, wire.revision, wire.fence),
+                items.firstOrNull { it.occurrenceId == wire.startOccurrenceId }?.track?.id, wire.startOccurrenceId))
     }
 
     suspend fun copy(id: String, name: String, description: String? = null, expectedRevision: Long, fence: String): PersonalPlaylistSummary {

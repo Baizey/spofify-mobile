@@ -18,6 +18,8 @@ import dev.spofify.mobile.playback.PlaybackService
 import dev.spofify.mobile.playback.Media3PlaybackEndpoint
 import dev.spofify.mobile.core.PlaybackDevicesApi
 import dev.spofify.mobile.feature.devices.PlaybackCoordinator
+import dev.spofify.mobile.feature.devices.PlaybackDeviceIdentityStore
+import dev.spofify.mobile.playback.PlaybackRequests
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -97,10 +99,13 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         expired.value = false
         val next = SpofifyClient(server, lease)
         next.onUnauthorized = {
+            // Invalidate pending continuations synchronously on the auth callback thread.
+            // Player mutation remains confined to its main looper below.
+            if (client === next && next.currentSession() == null) PlaybackRequests.invalidate()
             // Range/image requests can fail without an Activity. Stop buffered audio too;
             // stopService alone cannot destroy a still-bound MediaSessionService.
             Handler(Looper.getMainLooper()).post {
-                if (client === next) {
+                if (client === next && next.currentSession() == null) {
                     playbackCoordinator?.authLost()
                     PlaybackService.stopActivePlayback()
                     context.stopService(Intent(context, PlaybackService::class.java))
@@ -110,14 +115,15 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         }
         client = next
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        val coordinator = PlaybackCoordinator(PlaybackDevicesApi(next), Media3PlaybackEndpoint(), scope)
+        val coordinator = PlaybackCoordinator(PlaybackDevicesApi(next), Media3PlaybackEndpoint(), scope,
+            identity = { next.currentSession()?.let { PlaybackDeviceIdentityStore(context, next.server, it.accountId) } })
         coordinationScope = scope
         playbackCoordinator = coordinator
         PlaybackService.onServiceActiveChanged = { active ->
             if (client === next && playbackCoordinator === coordinator) coordinator.setServiceActive(active)
         }
-        // The bridge does not advertise output capability until exact handoff and every system
-        // transport start are authority-fenced. A read-only picker remains useful and truthful.
+        // One application-owned coordinator survives screen/activity reattachment. Only local
+        // installation/name metadata persists; registration and output authority never do.
         imageLoader = ImageLoader.Builder(context)
             .components { add(OkHttpNetworkFetcherFactory(callFactory = { next.httpClient })) }
             .diskCache(null).memoryCache(null).build()

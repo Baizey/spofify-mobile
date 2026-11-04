@@ -1,0 +1,49 @@
+# Native playback devices
+
+## Status and validation boundary
+
+The production endpoint capability is **enabled**: the application-owned coordinator uses the real Media3 service endpoint and authenticated player API, with service-lifecycle registration rather than a test-only capability override. Final source integration is subject to exact-candidate independent review and full automated gates. Enabled source is not a claim that this phone has passed native handoff/audio/background acceptance; see the explicit boundary below and [FEAT-004](specs/FEAT-004-native-device-participation.md).
+
+**Native handoff runtime / rendered-app validation is blocked / not complete.** The isolated AVD previously segfaulted before launch and its diagnostic budget is exhausted. No further AVD starts, physical phones, personal AVDs, live accounts or backend services were used. API35 Robolectric and compiled instrumentation are development evidence, not actual Android audio, screen-lock, power-management or vendor-background approval. Only API35's Robolectric runtime is cached offline; API31/32's pinned Media3 continuation path is additionally source/bytecode reviewed, not runtime approved.
+
+## One output, same-account coordination
+
+The application owns one coordinator per authenticated client, and `PlaybackService` owns the only Media3/ExoPlayer output. Activity recreation, picker dismissal, player collapse and controller release do not create a second player or reregister a still-valid service connection.
+
+The existing authenticated `GET/POST /api/me/player` protocol coordinates available same-account players. Selecting an output uses acknowledged **prepare → release → activate**, not an arbitrary URL or a freshly fetched saved playlist. A remote display is only display/control state; it is never local audible progress or local history. Native outgoing transport uses explicit Pause/Resume. Legacy incoming Toggle is resolved by the actual authoritative output, not a possibly stale remote display.
+
+Preparation validates the complete snapshot without replacing a queue, opening audio, starting playback or writing history. Activation requires current coordinator authority and session/generation checks. Actual readiness/start results determine `ok`, `blocked`, `media` or `rejected`; receiving a directive alone is not a successful playback ACK.
+
+## What persists — and what does not
+
+Android Keystore-encrypted local metadata stores an installation UUID and accepted device name, bound to the exact server origin and immutable account ID and excluded from app backup/transfer. This makes the local installation/name more persistent than a screen or login session. It stores no credentials, playback intent, queue or server-issued device authority.
+
+The server accepts **`register {name}`** and returns a **fresh, login-session-bound, ephemeral device ID**. A local installation UUID is not that protocol ID. Expired, revoked, logged-out or reconnected sessions cannot reuse a previous registration as authority. The application coordinator survives UI reattachment, polls while its service lifecycle is valid, bounds requests, backs off uncertain registration and never blindly replays an uncertain write.
+
+Restoration, process/service recreation, lease loss and uncertain reconnection stay **paused**. There is no startup autoplay, deferred old Play, offline autoplay or durable queue-resume promise. A new explicit Play or transfer may activate only after current server acceptance and fresh authority. A dead/restricted app is not advertised as magically reachable.
+
+## Queue, progress and history safety
+
+Exact snapshot import/export retains duplicate occurrences, queue keys, realized traversal, unshuffled baseline order, context and per-occurrence context, current position, repeat/shuffle, notices and truncation, and current history nonce/progress/reported state. Complete state must be publication-safe: the existing player protocol permits a 2MiB outbound body; admission reserves 16KiB for worst escaped envelope/history/context/scalar growth. Per-field-valid oversized input is decoded but rejected before queue/history/media mutation, never truncated. Final rekeyed replacements and combined enqueue/undo candidates are preflighted; two individually safe batches cannot silently create an unpublishable queue. Media3 uses millisecond seeks; unchanged paused wire elapsed and imported progress retain their fractional precision rather than inventing local audible credit.
+
+Audio URLs are rebuilt only from track IDs through the current exact-origin authenticated client. Incoming metadata cannot supply a network URL, cookie, private path or mutable playlist refresh during handoff. New explicit musical selections may use the existing authenticated playback endpoints; restoration/import/Resume do not refetch collections. Positive Play of the already-current occurrence preserves its prepared queue, position and history traversal.
+
+Pause, output revocation, logout, focus loss and becoming-noisy events invalidate stale starts and stop/discard buffered output. Upstream ViewModel and manual/derived playlist fetches capture the cancellation generation before awaiting their queue; an old response cannot return as a new Play or enqueue intent. Posted transport/queue callbacks and notification tokens are fenced, including queue changes and service identity. Imported position is not locally listened progress. History qualification still requires genuinely new observed audible progress, preserves the transferred event nonce and never retries an uncertain history write.
+
+Internal Close silences and empties output, releases focus and removes foreground/notification synchronously. The matching final execution ACK and exact empty snapshot get **one bounded publication attempt** before service disposal. Publication failure, cancellation or timeout never replay Close. A service-instance-scoped fail-safe retains cleanup if result delivery is lost. A newer queued intent holds rather than abandons that cleanup; a stale/rejected replacement returns it, and only installed nonempty replacement state protects the new queue. A retained bounded watchdog cancels stalled uninstalled work before disposal. Held old completions/timers cannot stop a successor service or installed queue.
+
+## Android background limits
+
+Foreground promotion and audio focus are distinct prerequisites, not substitutes for coordinator authority. Android remains responsible for enforcing foreground-service/background-start and notification restrictions. Unsolicited background handoff to an idle/restricted phone reports **Needs a tap / blocked** rather than claiming playback. A currently running foreground output can continue; a freshly fenced notification/system-media user action may ask Android to evaluate its permitted user-interaction exemption, and still fails safely if Android refuses.
+
+ExoPlayer's internal focus-gain auto-resume is disabled. Focus is requested only for an authorized explicit start; denied/delayed focus does not schedule later autoplay. Loss/transient loss/ducking and noisy events stop local output. A subsequent gain never resumes it. Terminal playback/error relinquishes focus and foreground ownership; bound UI may retain paused state, but an unbound stopped service is disposable.
+
+This is not Chromecast, synchronized multi-room audio, a relay, a wake service for a killed app, an exemption from Doze/battery limits, or a guarantee that registrations survive login changes. Notification/headset/Bluetooth, real background/lock-screen delivery, audio decoder/device behavior and OEM power limits remain unverified until an approved isolated native journey (and only genuinely hardware-specific checks separately coordinated through the user) can run.
+
+## Recovery evidence
+
+Phase-A correction candidate `755860290fdfcaa04aaba28e26da71a550639de1` passed independent exact-SHA protocol/native-critical source reviews and a leased full gate: **114 core + 358 app**, both APK tasks, lint **0 errors** (13 warnings + 1 hint). This is historical phase-A evidence, not automatic approval of later source.
+
+Enablement commit `311b9db` turns on the actual endpoint and removes test-only capability overrides from service bridge regressions. `AppGraphPlaybackParticipationTest` uses the production graph, real `PlaybackDevicesApi`, coordinator callback and service against authenticated loopback fixtures: login alone does not register; service startup/recreation registers fresh and stays silent; enqueue does not autoplay; positive current Play preserves its occurrence/history and honestly publishes foreground denial; server Pause/Close reach the real service and return ACK/state. The focused enabled graph + real service gate passed **37 tests**. Final cumulative candidate/base/reviewer identities, full-gate results and APK hashes are recorded in the owned feature spec and preserved ignored evidence. Native completion remains blocked.
+
+Synthetic `UiFixtureServer` device routes use the shipped player API with authentication/CSRF, strict state/ACK rules and existing long audio/alias-ID fixtures. Instrumentation tests are compiled evidence until an isolated AVD is available; no runtime pass is implied. Final evidence must record exact SHA, automated results, independent reviewer findings/corrections and the blocked native-render boundary.

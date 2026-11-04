@@ -5,6 +5,10 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 
 private const val MAX_SAFE = 9007199254740991L
+internal const val MAX_PLAYBACK_BODY_BYTES = 2 * 1024 * 1024
+// Maximum escaped context/history growth + poll identity/sequence and 16 maximum ACKs.
+// PlaybackPublicationTest proves this reserve; exact API body-size enforcement remains below.
+internal const val PLAYBACK_PUBLICATION_RESERVE_BYTES = 16 * 1024
 private val playbackJson = Json { ignoreUnknownKeys = false; encodeDefaults = true; explicitNulls = true }
 
 @Serializable data class PlaybackArtist(val id: String = "", val name: String)
@@ -34,6 +38,13 @@ private val playbackJson = Json { ignoreUnknownKeys = false; encodeDefaults = tr
         occurrence?.let {
             require(position >= 0 && it.key == queue[position].key && it.trackId == queue[position].id)
             require(it.eventId.isNotEmpty() && it.eventId.length <= 128 && it.eventId.all { c -> c.code in 33..126 } && number(it.progress))
+        }
+    }
+    /** Wire-valid input may exceed the outbound player-body limit. Reject it BEFORE owning
+     * output, not after installing/starting a queue and discovering that its ACK cannot fit. */
+    fun publicationValidated(): PlaybackSnapshot = validated().apply {
+        require(toJson().toString().toByteArray(Charsets.UTF_8).size <= MAX_PLAYBACK_BODY_BYTES - PLAYBACK_PUBLICATION_RESERVE_BYTES) {
+            "Prepared playback state exceeds the publication limit"
         }
     }
     fun toJson(): JsonObject = playbackJson.encodeToJsonElement(serializer(), validated()).jsonObject
@@ -93,10 +104,13 @@ private fun PlaybackTrack.validate() {
     playbackContext?.validate()
 }
 
-/** Explicit commands; resume and pause are intent, never a toggle against stale remote display. */
+/** Native outgoing transport is explicit intent. Decode legacy toggle only for owner-side resolution. */
 @ConsistentCopyVisibility
 data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
     val type: String get() = json.getValue("type").jsonPrimitive.content
+    // Musical commands may carry ephemeral signed selection authority. Serialize only via
+    // the intentional wire json boundary, never via a generated diagnostic data-class string.
+    override fun toString(): String = "PlaybackDeviceCommand(type=$type, payload=<redacted>)"
     companion object {
         fun transport(type: String): PlaybackDeviceCommand {
             require(type in setOf("pause", "resume", "next", "previous", "retry", "shuffle", "repeat", "close", "clear"))
@@ -140,6 +154,9 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
             requireWireTypes(value)
             val type = value["type"]?.jsonPrimitive?.content ?: error("Missing command type")
             val result = when (type) {
+                // Shipped web clients still send toggle. It is incoming-only: transport("toggle")
+                // stays forbidden so native controls never toggle against a stale remote display.
+                "toggle" -> PlaybackDeviceCommand(buildJsonObject { put("type", "toggle") })
                 "seek" -> seek(value.getValue("value").jsonPrimitive.double)
                 "jump", "remove", "move" -> queue(type, value.getValue("key").jsonPrimitive.long, value["direction"]?.jsonPrimitive?.content)
                 "play", "playCollection", "enqueue", "enqueueContext" -> musical(type, value["track"]?.jsonObject,
@@ -205,7 +222,7 @@ class PlaybackDevicesApi(client: SpofifyClient) : PlaybackDevicesProtocol {
     private val path = listOf("api", "me", "player")
     private suspend fun post(action: String, fields: JsonObjectBuilder.() -> Unit): PlaybackDevicesView = withTimeout(4000) {
         val body = buildJsonObject { put("action", action); fields() }
-        require(body.toString().toByteArray(Charsets.UTF_8).size <= 2 * 1024 * 1024) { "Queue is too large to share" }
+        require(body.toString().toByteArray(Charsets.UTF_8).size <= MAX_PLAYBACK_BODY_BYTES) { "Queue is too large to share" }
         PlaybackDevicesView.fromJson(requireNotNull(transport.send("POST", path, body)))
     }
     override suspend fun view() = withTimeout(4000) { PlaybackDevicesView.fromJson(transport.get(path)) }

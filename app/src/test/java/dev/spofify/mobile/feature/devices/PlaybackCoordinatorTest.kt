@@ -20,35 +20,61 @@ class PlaybackCoordinatorTest {
         override var supportsExactHandoff = true
         var snapshot = PlaybackSnapshot()
         var stops = 0
+        var onSuspend: (() -> Unit)? = null
         var starts = mutableListOf<PlaybackSnapshot>()
         var authority: PlaybackAuthority? = null
         var preparing = 0
-        override fun suspendOutput() { stops++; snapshot = snapshot.paused() }
+        var activateGate: CompletableDeferred<Unit>? = null
+        var executeGate: CompletableDeferred<Unit>? = null
+        var cancelledActions = 0
+        var nextStatus = "ok"
+        val executed = mutableListOf<String>()
+        override fun suspendOutput() { stops++; onSuspend?.invoke(); snapshot = snapshot.paused() }
         override fun exportSnapshot() = snapshot
         override suspend fun prepare(snapshot: PlaybackSnapshot): Boolean { snapshot.validated(); preparing++; return true }
         override suspend fun activate(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult {
+            try { activateGate?.await() } catch (error: CancellationException) { cancelledActions++; throw error }
             check(authority.isValid()); this.snapshot = snapshot; starts += snapshot; this.authority = authority
             return PlaybackEndpointResult("ok", snapshot)
         }
         override suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority): PlaybackEndpointResult {
-            check(authority.isValid()); this.authority = authority
-            snapshot = when (command.type) { "resume", "retry" -> snapshot.copy(playing = true); "pause", "close" -> snapshot.paused(); else -> snapshot }
-            return PlaybackEndpointResult("ok", snapshot)
+            if (command.type !in setOf("pause", "close")) {
+                try { executeGate?.await() } catch (error: CancellationException) { cancelledActions++; throw error }
+            }
+            check(authority.isValid()); this.authority = authority; executed += command.type
+            snapshot = when (command.type) { "resume", "retry" -> snapshot.copy(playing = true, error = ""); "pause" -> snapshot.paused(); "close" -> snapshot.paused().copy(error = ""); else -> snapshot }
+            val status = nextStatus; nextStatus = "ok"
+            if (status in setOf("blocked", "media")) snapshot = snapshot.paused().copy(error = status)
+            return PlaybackEndpointResult(status, snapshot)
         }
     }
     private class Protocol(var current: PlaybackDevicesView) : PlaybackDevicesProtocol {
         var registers = 0; var polls = 0; var leaves = 0
         var lastState: PlaybackSnapshot? = null
         val sentAcks = mutableListOf<PlaybackAck>()
+        val ackStates = mutableListOf<Pair<List<PlaybackAck>, PlaybackSnapshot?>>()
         val selections = mutableListOf<String>()
         var transferGate: CompletableDeferred<Unit>? = null
         var pollGate: CompletableDeferred<Unit>? = null
         var lateRenameFailure: CompletableDeferred<Unit>? = null
         var failPoll = false
+        var failRegister = false
+        var registerGate: CompletableDeferred<Unit>? = null
+        var pollFailure: Exception? = null
+        val commands = mutableListOf<Pair<Long, String>>()
+        var echoPendingCommand = false
         override suspend fun view() = current.copy(directives = emptyList())
-        override suspend fun register(name: String): PlaybackDevicesView { registers++; return current }
+        override suspend fun register(name: String): PlaybackDevicesView {
+            registers++; registerGate?.await(); if (failRegister) error("synthetic unknown registration")
+            return current
+        }
         override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView {
-            polls++; pollGate?.await(); if (failPoll) error("synthetic network failure")
+            polls++; pollGate?.await(); pollFailure?.let { throw it }; if (failPoll) error("synthetic network failure")
+            if (acks.any { it.deliveryId.startsWith("release-") }) requireNotNull(state) { "Execution ACK requires actual state" }
+            acks.filter { it.status in setOf("blocked", "media") }.forEach {
+                requireNotNull(state); require(!state.playing && state.error == it.status) { "Outcome does not match state" }
+            }
+            if (acks.isNotEmpty()) ackStates += acks to state
             lastState = state; sentAcks += acks
             val result = current; current = current.copy(directives = emptyList()); return result
         }
@@ -56,7 +82,10 @@ class PlaybackCoordinatorTest {
             lateRenameFailure?.let { gate -> withContext(NonCancellable) { gate.await(); error("synthetic late failure") } }
             return current
         }
-        override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand) = current
+        override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView {
+            commands += epoch to command.type
+            return if (echoPendingCommand) current.copy(commands = listOf(PlaybackOutcome(commandId, "pending"))) else current
+        }
         override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView {
             selections += targetDeviceId; transferGate?.await(); return current
         }
@@ -69,6 +98,26 @@ class PlaybackCoordinatorTest {
         runCurrent(); assertEquals(0, api.registers)
         endpoint.supportsExactHandoff = false; c.setServiceActive(true); runCurrent()
         assertEquals(0, api.registers); assertFalse(c.state.value.exclusiveOwner)
+        c.close()
+    }
+
+    @Test fun firstRegistrationPreservesTheGenuinePreBindPlaybackGeneration() = runTest {
+        val api = Protocol(view()).apply { registerGate = CompletableDeferred() }
+        val endpoint = Endpoint().apply { onSuspend = { dev.spofify.mobile.playback.PlaybackRequests.invalidate() } }
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        val tapEpoch = dev.spofify.mobile.playback.PlaybackRequests.epoch
+        c.setServiceActive(true); runCurrent()
+        var accepted = false
+        c.localAction { permit ->
+            accepted = tapEpoch == dev.spofify.mobile.playback.PlaybackRequests.epoch && permit.isValid()
+            PlaybackEndpointResult(if (accepted) "ok" else "rejected", endpoint.snapshot)
+        }
+        runCurrent(); assertFalse(accepted)
+        api.registerGate!!.complete(Unit); runCurrent()
+        assertTrue(accepted)
+        assertEquals(tapEpoch, dev.spofify.mobile.playback.PlaybackRequests.epoch)
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
+        assertTrue(dev.spofify.mobile.playback.PlaybackRequests.epoch > tapEpoch)
         c.close()
     }
 
@@ -100,6 +149,24 @@ class PlaybackCoordinatorTest {
         c.close()
     }
 
+    @Test fun incomingLegacyToggleUsesActualOutputInsteadOfStaleRemoteView() = runTest {
+        val api = Protocol(view(snapshot = prepared.paused())); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+        assertTrue(endpoint.snapshot.playing)
+        // Server display incorrectly still says paused: the owner must pause, not resume.
+        val toggle = kotlinx.serialization.json.buildJsonObject { put("type", kotlinx.serialization.json.JsonPrimitive("toggle")) }
+        api.current = view(snapshot = prepared.paused(), directives = listOf(PlaybackDirective("toggle-pause", 1, "command", command = toggle)))
+        c.retry(); runCurrent()
+        assertEquals("pause", endpoint.executed.last()); assertFalse(endpoint.snapshot.playing)
+        // Conversely, stale playing display must not prevent an explicit legacy resume.
+        api.current = view(snapshot = prepared, directives = listOf(PlaybackDirective("toggle-resume", 1, "command", command = toggle)))
+        c.retry(); runCurrent()
+        assertEquals("resume", endpoint.executed.last()); assertTrue(endpoint.snapshot.playing)
+        c.close()
+    }
+
     @Test fun releaseStopsBufferedOutputAndAckCarriesExactFinalIntentAndPosition() = runTest {
         val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
         val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
@@ -114,6 +181,50 @@ class PlaybackCoordinatorTest {
         assertTrue(api.sentAcks.any { it.deliveryId == "release" && it.status == "ok" })
         assertEquals(prepared, api.lastState) // playing intent retained, but output is actually stopped
         c.close()
+    }
+
+    @Test fun blockedAndMediaDirectiveResultsAreAckedBeforeNewCloseOrSuccessfulRetry() = runTest {
+        for (failure in listOf("blocked", "media")) for (next in listOf("close", "retry")) {
+            val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+            endpoint.nextStatus = failure
+            api.current = view(snapshot = prepared, directives = listOf(PlaybackDirective("failed-$failure-$next", 1,
+                "command", command = PlaybackDeviceCommand.transport("resume").json)))
+            c.retry(); runCurrent()
+            assertEquals(failure, endpoint.snapshot.error)
+            c.remoteCommand(PlaybackDeviceCommand.transport(next)); runCurrent()
+            val paired = api.ackStates.single { (acks, _) -> acks.any { it.deliveryId == "failed-$failure-$next" } }
+            assertEquals(failure, paired.second?.error)
+            assertFalse(paired.second!!.playing)
+            assertEquals(next, endpoint.executed.last())
+            assertEquals("", endpoint.snapshot.error)
+            assertTrue(c.state.value.connected)
+            c.close()
+        }
+    }
+
+    @Test fun pauseAndCloseAfterReleaseKeepTheRequiredAckSnapshotAtomic() = runTest {
+        for (interruption in listOf("pause", "close")) {
+            val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+            api.current = view(snapshot = prepared, transfer = PlaybackTransfer("switch", "phone", "pc", "releasing"),
+                directives = listOf(PlaybackDirective("release-$interruption", 1, "release", "switch")))
+            c.retry(); runCurrent()
+            assertFalse(endpoint.snapshot.playing)
+            // Interruption lands after execution but BEFORE the poll that transmits the ACK.
+            c.remoteCommand(PlaybackDeviceCommand.transport(interruption)); runCurrent()
+            c.retry(); runCurrent()
+            val paired = api.ackStates.single { (acks, _) -> acks.any { it.deliveryId == "release-$interruption" } }
+            assertNotNull(paired.second)
+            assertEquals(prepared.paused(), paired.second)
+            // Subsequent polls are no longer the owner and correctly carry no state.
+            assertNull(api.lastState)
+            c.close()
+        }
     }
 
     @Test fun leaseExpiresDuringBoundedStalledPollAndStopsActualOutput() = runTest {
@@ -142,6 +253,20 @@ class PlaybackCoordinatorTest {
         c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
         assertEquals(1, endpoint.starts.size); assertFalse(endpoint.starts.single().playing)
         assertTrue(endpoint.snapshot.playing)
+        c.close()
+    }
+
+    @Test fun anObservedRemoteOutcomeDisappearingDoesNotLockControlsOrReplayIt() = runTest {
+        val api = Protocol(view(owner = "pc", snapshot = prepared)).apply { echoPendingCommand = true }
+        val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("next")); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("next")); runCurrent()
+        assertEquals(1, api.commands.size)
+        c.retry(); runCurrent() // Successful view no longer retains the observed outcome.
+        assertTrue(c.state.value.message.contains("not replayed"))
+        c.remoteCommand(PlaybackDeviceCommand.transport("previous")); runCurrent()
+        assertEquals(listOf("next", "previous"), api.commands.map { it.second })
         c.close()
     }
 
@@ -252,6 +377,284 @@ class PlaybackCoordinatorTest {
         assertFalse("Buffered output must stop before the blocked child completes", endpoint.snapshot.playing)
         assertFalse(parent.isCompleted)
         gate.complete(Unit); runCurrent()
+        c.close()
+    }
+
+    @Test fun initialBindingPreservesPendingPlayButStoppingBeforeRegistrationStillFences() = runTest {
+        val api = Protocol(view()).apply { registerGate = CompletableDeferred() }; val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true)
+        assertEquals("Binding must not invalidate a pre-bind user request", 0, endpoint.stops)
+        runCurrent(); assertEquals("", c.state.value.deviceId)
+        c.setServiceActive(false)
+        assertTrue(endpoint.stops > 0)
+        assertNull(c.currentAuthority())
+        c.close()
+    }
+
+    @Test fun pauseBeforeServiceBindingCancelsPendingNativeIntent() = runTest {
+        val endpoint = Endpoint().apply { snapshot = prepared }
+        val c = PlaybackCoordinator(Protocol(view()), endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause"))
+        assertEquals(1, endpoint.stops); assertFalse(endpoint.snapshot.playing)
+        c.close()
+    }
+
+    @Test fun changingSelectionCancelsSuspendedLocalActionAndInvalidatesItsAuthority() = runTest {
+        val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        var held: PlaybackAuthority? = null
+        var cancelled = false
+        c.localAction { authority ->
+            held = authority
+            try { awaitCancellation() } finally { cancelled = true }
+        }
+        runCurrent(); assertTrue(held!!.isValid())
+        c.select("pc")
+        assertFalse(held!!.isValid())
+        runCurrent(); assertTrue(cancelled)
+        assertEquals(listOf("pc"), api.selections)
+        c.close()
+    }
+
+    @Test fun heartbeatRetriesUnknownRegistrationWithBoundedBackoffAndManualRetryCannotStorm() = runTest {
+        val api = Protocol(view()).apply { failRegister = true }; val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent(); assertEquals(1, api.registers)
+        repeat(10) { c.retry(); runCurrent() }
+        advanceTimeBy(7999); runCurrent(); assertEquals(1, api.registers)
+        advanceTimeBy(1); runCurrent(); assertEquals(2, api.registers)
+        advanceTimeBy(15999); runCurrent(); assertEquals(2, api.registers)
+        advanceTimeBy(1); runCurrent(); assertEquals(3, api.registers)
+        api.failRegister = false
+        advanceTimeBy(29999); runCurrent(); assertEquals(3, api.registers)
+        advanceTimeBy(1); runCurrent(); assertEquals(4, api.registers)
+        assertEquals("phone", c.state.value.deviceId)
+        assertTrue(endpoint.starts.isEmpty())
+        c.close()
+    }
+
+    @Test fun forgottenServerIdIsRegisteredAgainByHeartbeatWithoutAutoplay() = runTest {
+        val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        api.pollFailure = ApiException(404, "gone")
+        c.retry(); runCurrent(); assertEquals("", c.state.value.deviceId)
+        api.pollFailure = null
+        advanceTimeBy(1000); runCurrent()
+        assertEquals(2, api.registers); assertEquals("phone", c.state.value.deviceId)
+        assertTrue(endpoint.starts.isEmpty()); assertFalse(endpoint.snapshot.playing)
+        c.close()
+    }
+
+    @Test fun explicitLocalActionWaitsOnceForRegistrationInitializesPausedAndPublishesExactResult() = runTest {
+        val api = Protocol(view(snapshot = prepared)).apply { registerGate = CompletableDeferred() }
+        val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        var calls = 0
+        val result = prepared.copy(elapsed = 42.0)
+        c.setServiceActive(true); runCurrent()
+        c.localAction { authority ->
+            assertTrue(authority.isValid()); assertFalse(endpoint.starts.single().playing)
+            calls++; PlaybackEndpointResult("ok", result)
+        }
+        c.localAction { fail("Only one pending action is admitted"); PlaybackEndpointResult("ok", prepared) }
+        runCurrent(); assertEquals(0, calls)
+        api.registerGate!!.complete(Unit); runCurrent()
+        assertEquals(1, calls); assertEquals(result, api.lastState)
+        assertTrue(api.commands.isEmpty())
+        c.close()
+    }
+
+    @Test fun localActionRejectsRemoteOutputAndNeverRunsAfterFailedInitialRegistration() = runTest {
+        val api = Protocol(view(owner = "pc")); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.localAction { fail("Remote output cannot grant local authority"); PlaybackEndpointResult("ok", prepared) }
+        runCurrent(); assertTrue(c.state.value.message.contains("this phone")); assertTrue(api.commands.isEmpty())
+        c.close()
+        val failingApi = Protocol(view()).apply { failRegister = true; registerGate = CompletableDeferred() }
+        val next = PlaybackCoordinator(failingApi, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        next.setServiceActive(true); runCurrent()
+        next.localAction { fail("Failed registration must not replay user intent"); PlaybackEndpointResult("ok", prepared) }
+        failingApi.registerGate!!.complete(Unit); runCurrent()
+        failingApi.failRegister = false
+        advanceTimeBy(8000); runCurrent()
+        assertEquals("phone", next.state.value.deviceId); assertTrue(endpoint.starts.isEmpty())
+        next.close()
+    }
+
+    @Test fun pauseBeforeRegistrationCompletesInvalidatesQueuedPlaySynchronously() = runTest {
+        val api = Protocol(view(snapshot = prepared)).apply { registerGate = CompletableDeferred() }; val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.localAction { fail("Paused pre-registration Play must not run"); PlaybackEndpointResult("ok", prepared) }
+        val stops = endpoint.stops
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause"))
+        assertTrue(endpoint.stops > stops)
+        api.registerGate!!.complete(Unit); runCurrent()
+        assertFalse(endpoint.snapshot.playing); assertEquals(listOf("pause"), endpoint.executed)
+        c.close()
+    }
+
+    @Test fun pauseCancelsSuspendedExplicitActionWithoutCancellingHeartbeat() = runTest {
+        val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        var cancelled = false
+        var held: PlaybackAuthority? = null
+        c.localAction { authority ->
+            held = authority
+            try { awaitCancellation() } finally { cancelled = true }
+        }
+        runCurrent(); assertTrue(held!!.isValid())
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause"))
+        assertFalse(held!!.isValid()); assertFalse(endpoint.snapshot.playing)
+        runCurrent(); assertTrue(cancelled); assertEquals(listOf("pause"), endpoint.executed)
+        val polls = api.polls
+        advanceTimeBy(1000); runCurrent(); assertTrue(api.polls > polls)
+        c.close()
+    }
+
+    @Test fun pauseCancelsSuspendedEndpointResumeAndCloseCancelsAnotherAction() = runTest {
+        val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint().apply { executeGate = CompletableDeferred() }
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
+        assertEquals(1, endpoint.cancelledActions); assertEquals(listOf("pause"), endpoint.executed)
+        var cancelled = false
+        c.localAction { try { awaitCancellation() } finally { cancelled = true } }; runCurrent()
+        val stops = endpoint.stops
+        c.close(); assertTrue(endpoint.stops > stops)
+        runCurrent(); assertTrue(cancelled)
+    }
+
+    @Test fun pausedInFlightResponseCannotStartActivationOrResumeWithNewAuthority() = runTest {
+        for (directive in listOf(
+            PlaybackDirective("late-start", 2, "activate", "switch", state = prepared),
+            PlaybackDirective("late-command", 2, "command", command = PlaybackDeviceCommand.transport("resume").json),
+        )) {
+            val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            val gate = CompletableDeferred<Unit>(); api.pollGate = gate
+            c.retry(); runCurrent()
+            c.remoteCommand(PlaybackDeviceCommand.transport("pause"))
+            api.current = view(epoch = 2, snapshot = prepared,
+                transfer = PlaybackTransfer("switch", "pc", "phone", "activating"), directives = listOf(directive))
+            gate.complete(Unit); runCurrent()
+            assertTrue(endpoint.starts.isEmpty()); assertFalse(endpoint.snapshot.playing)
+            c.retry(); runCurrent()
+            assertTrue(api.sentAcks.any { it.deliveryId == directive.deliveryId && it.status == "rejected" })
+            assertFalse(api.sentAcks.any { it.deliveryId == directive.deliveryId && it.status == "ok" })
+            c.close()
+        }
+    }
+
+    @Test fun pauseCancelsHeartbeatActivationChildButNotItsParentPoll() = runTest {
+        val api = Protocol(view(owner = "pc", snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        endpoint.activateGate = CompletableDeferred()
+        api.current = view(epoch = 2, snapshot = prepared, transfer = PlaybackTransfer("switch", "pc", "phone", "activating"),
+            directives = listOf(PlaybackDirective("activation", 2, "activate", "switch", state = prepared)))
+        advanceTimeBy(1000); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
+        assertEquals(1, endpoint.cancelledActions)
+        assertFalse(api.sentAcks.any { it.deliveryId == "activation" && it.status == "ok" })
+        val polls = api.polls
+        advanceTimeBy(1000); runCurrent(); assertTrue(api.polls > polls)
+        assertTrue(endpoint.starts.isEmpty())
+        c.close()
+    }
+
+    @Test fun stableRemoteHeartbeatsDoNotCancelAnInFlightMusicalPreparation() = runTest {
+        val api = Protocol(view(owner = "pc", snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        val stops = endpoint.stops
+        repeat(3) { advanceTimeBy(1000); runCurrent() }
+        assertEquals(stops, endpoint.stops)
+        assertNull(c.currentAuthority())
+        assertTrue(endpoint.executed.isEmpty())
+        api.current = view(owner = "pc", epoch = 2, snapshot = prepared)
+        c.retry(); runCurrent()
+        assertTrue(endpoint.stops > stops) // A real epoch/output change STILL fences the old intent.
+        c.close()
+    }
+
+    @Test fun queuedResumeDoesNotSurviveRevokeAndPauseRoutesToFreshRemoteOwnerAfterPoll() = runTest {
+        val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        var gate = CompletableDeferred<Unit>(); api.pollGate = gate
+        c.retry(); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+        api.current = view(epoch = 2, snapshot = prepared)
+        gate.complete(Unit); runCurrent()
+        assertTrue(endpoint.executed.isEmpty()); assertTrue(endpoint.starts.isEmpty())
+        gate = CompletableDeferred(); api.pollGate = gate
+        c.retry(); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause"))
+        api.current = view(owner = "pc", epoch = 3, snapshot = prepared)
+        gate.complete(Unit); runCurrent()
+        assertEquals(listOf(3L to "pause"), api.commands)
+        assertTrue(endpoint.executed.isEmpty())
+        c.close()
+    }
+
+    @Test fun pauseSilencesImmediatelyDuringTransferOrQuarantine() = runTest {
+        for (pendingView in listOf(
+            view(transfer = PlaybackTransfer("switch", "phone", "pc", "preparing")),
+            view(owner = "", quarantine = 2000),
+        )) {
+            val api = Protocol(pendingView); val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            endpoint.snapshot = prepared
+            val stops = endpoint.stops
+            c.remoteCommand(PlaybackDeviceCommand.transport("pause"))
+            assertTrue(endpoint.stops > stops); assertFalse(endpoint.snapshot.playing)
+            runCurrent(); assertTrue(api.commands.isEmpty())
+            c.close()
+        }
+    }
+
+    @Test fun conflictReconciliationIsDisplayOnlyUntilFreshSuccessfulPoll() = runTest {
+        val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+        val held = c.currentAuthority()!!
+        api.pollFailure = ApiException(409, "conflict")
+        c.retry(); runCurrent()
+        assertFalse(held.isValid()); assertNull(c.currentAuthority()); assertFalse(c.state.value.connected)
+        c.rename("phone", "Renamed after conflict"); runCurrent()
+        assertFalse("A rename response is not a fresh owner poll", c.state.value.connected)
+        c.localAction { fail("Conflict display must not grant authority"); PlaybackEndpointResult("ok", prepared) }
+        runCurrent(); assertFalse(endpoint.snapshot.playing)
+        api.pollFailure = null
+        c.retry(); runCurrent()
+        assertFalse(endpoint.snapshot.playing)
+        c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+        assertTrue(endpoint.snapshot.playing)
+        c.close()
+    }
+
+    @Test fun retainedAuthorityRenewsFromAtomicPermitAndRevokesSynchronously() = runTest {
+        val api = Protocol(view(snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
+        val held = c.currentAuthority()!!
+        advanceTimeBy(7000); runCurrent()
+        assertTrue("Successful polling renews existing tokens beyond their first deadline", held.isValid())
+        assertTrue(withContext(Dispatchers.Default) { held.isValid() })
+        c.remoteCommand(PlaybackDeviceCommand.transport("pause"))
+        assertFalse(held.isValid())
+        assertFalse(withContext(Dispatchers.Default) { held.isValid() })
         c.close()
     }
 

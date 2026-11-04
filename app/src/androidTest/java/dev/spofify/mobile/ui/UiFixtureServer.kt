@@ -5,6 +5,9 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.Log
+import android.os.SystemClock
+import dev.spofify.mobile.core.*
+import kotlinx.serialization.json.*
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -38,6 +41,16 @@ class UiFixtureServer : AutoCloseable {
     val historyWrites = AtomicInteger()
     val playlistWrites = AtomicInteger()
     val authenticationFailures = AtomicInteger()
+    /** Action names only: never request bodies, credentials, or musical metadata. */
+    val playerCalls = CopyOnWriteArrayList<String>()
+    private val playerRoom = SyntheticPlayerRoom()
+
+    /** Freeze only the fixture coordinator, not Android audio or the client's lease watchdog. */
+    @Synchronized fun freezePlayerClock() { playerRoom.freezeClock() }
+    @Synchronized fun advancePlayerClockBy(milliseconds: Long) {
+        require(milliseconds >= 0)
+        playerRoom.advanceClock(milliseconds)
+    }
     @Volatile private var searchGate: CountDownLatch? = null
 
     fun holdSearchResponses() {
@@ -218,7 +231,8 @@ class UiFixtureServer : AutoCloseable {
                 .put("nextCursor", if (offset + limit < 4) "synthetic-cursor-${offset + limit}" else JSONObject.NULL)
                 .put("revision", 1).put("fence", "synthetic-fence").put("complete", true))
         }
-        if (method == "GET" && path == "/api/me/player") return json(devices())
+        if (path == "/api/me/player" && method in listOf("GET", "POST"))
+            return playerRoom.route(request).setHeader("Cache-Control", "no-store")
         return unexpected(request)
     }
 
@@ -262,11 +276,275 @@ class UiFixtureServer : AutoCloseable {
         .put("kind", "derived").put("countState", "unevaluated").put("trackCount", JSONObject.NULL).put("availableCount", JSONObject.NULL).put("revision", 1)
         .put("capabilities", JSONObject().put("editMetadata", true).put("editEntries", false).put("editDefinition", true)
             .put("play", true).put("copyToManual", true).put("delete", true).put("addTracks", false))
-    private fun devices() = JSONObject().put("deviceId", "").put("devices", JSONArray().put(JSONObject()
-        .put("deviceId", "synthetic-speaker").put("name", "Studio speaker").put("available", true)))
-        .put("activeDeviceId", "synthetic-speaker").put("epoch", 1).put("leaseMs", 0).put("quarantineMs", 0)
-        .put("state", JSONObject.NULL).put("stateSeq", 0).put("stateAgeMs", 0).put("transfer", JSONObject.NULL)
-        .put("directives", JSONArray()).put("commands", JSONArray()).put("error", "")
+    /**
+     * Small account-local implementation of internal/web/playback.go, not a new device API.
+     * A pristine room starts after the Go coordinator's startup drain: first registration owns
+     * an idle lease. Additional devices must register/poll and ACK exactly like the phone.
+     * No fake speaker, hidden audio engine, automatic ACK, or off-device connection is installed.
+     */
+    private inner class SyntheticPlayerRoom {
+        private inner class Device(val id: String, var name: String, var seen: Long, var selectionSeq: Long = 0)
+        private inner class Delivery(val deviceId: String, val value: PlaybackDirective, val deadline: Long, var delivered: Boolean = false)
+        private inner class Outcome(val deviceId: String, val request: JsonObject, var status: String, val expires: Long)
+        private val devices = linkedMapOf<String, Device>()
+        private val deliveries = mutableListOf<Delivery>()
+        private val outcomes = linkedMapOf<String, Outcome>()
+        private var nextDevice = 0
+        private var nextDelivery = 0
+        private var registered = false
+        private var active = ""
+        private var epoch = 1L
+        private var leaseUntil = 0L
+        private var quarantineUntil = 0L
+        private var state: PlaybackSnapshot? = null
+        private var stateSeq = 0L
+        private var stateAccepted = 0L
+        private var transfer: PlaybackTransfer? = null
+        private var frozenNow: Long? = null
+        private fun now() = frozenNow ?: SystemClock.elapsedRealtime()
+        fun freezeClock() { frozenNow = now() }
+        fun advanceClock(ms: Long) { frozenNow = Math.addExact(now(), ms) }
+
+        fun route(request: RecordedRequest): MockResponse {
+            if (request.requestUrl?.query != null) return invalid()
+            if (request.method == "GET") {
+                prune()
+                playerCalls.add("view")
+                return response()
+            }
+            if (request.getHeader("Content-Type")?.substringBefore(';')?.trim() != "application/json")
+                return json(JSONObject().put("error", "Content-Type must be application/json"), 415)
+            if (request.body.size > 2 * 1024 * 1024) return json(JSONObject().put("error", "JSON body is too large"), 413)
+            val q = try {
+                Json.parseToJsonElement(request.body.readUtf8()).jsonObject.also(::validate)
+            } catch (_: RuntimeException) { return invalid() }
+            prune()
+            playerCalls.add(q.string("action"))
+            val action = q.string("action")
+            if (action == "register") {
+                if (devices.size >= 16) return response(status = 429, error = "device limit reached")
+                val id = "synthetic-player-${++nextDevice}"
+                devices[id] = Device(id, q.string("name"), now())
+                if (!registered && epoch == 1L && now() >= quarantineUntil) { active = id; leaseUntil = now() + 8000 }
+                registered = true
+                return response(id, deliver = true)
+            }
+            val id = q.string("deviceId")
+            val device = devices[id] ?: return response(id, 404, "device not found")
+            if (action == "rename") { device.name = q.string("name"); return response(id) }
+            if (action == "leave") { remove(id, explicit = true); return response(id) }
+            var staleSelection = false
+            if (action == "transfer") {
+                val selection = q["selectionSeq"]?.jsonPrimitive?.long
+                if (selection != null && selection > device.selectionSeq) device.selectionSeq = selection
+                else if (selection != null || device.selectionSeq != 0L) staleSelection = true
+            }
+            if (action in listOf("command", "transfer")) {
+                outcomes[q.string("commandId")]?.let {
+                    return if (it.deviceId == id && it.request == q) response(id)
+                    else response(id, 409, "commandId already used")
+                }
+            }
+            if (staleSelection) return response(id, 409, "stale selection sequence")
+            val requestedEpoch = q.number("epoch")
+            if (requestedEpoch != epoch && !(action == "transfer" && q.containsKey("selectionSeq") && requestedEpoch < epoch))
+                return response(id, 409, "stale epoch")
+            val error = when (action) {
+                "poll" -> poll(device, q)
+                "command" -> command(device, q)
+                "transfer" -> select(device, q)
+                else -> error("Validated action missing implementation")
+            }
+            val status = when (error) { "" -> 200; "command limit reached" -> 429; else -> 409 }
+            return response(id, status, error, deliver = action == "poll" && error.isEmpty())
+        }
+
+        private fun invalid(): MockResponse {
+            unexpectedRoutes.add("invalid synthetic player request")
+            return json(JSONObject().put("error", "invalid playback request"), 400)
+        }
+        private fun JsonObject.string(key: String): String = getValue(key).jsonPrimitive.let {
+            require(it.isString); it.content
+        }
+        private fun JsonObject.number(key: String): Long = getValue(key).jsonPrimitive.let {
+            require(!it.isString); it.long.also { n -> require(n in 1..9007199254740991L) }
+        }
+        private fun validate(q: JsonObject) {
+            val required = when (q.string("action")) {
+                "register" -> setOf("action", "name")
+                "rename" -> setOf("action", "deviceId", "name")
+                "leave" -> setOf("action", "deviceId")
+                "poll" -> setOf("action", "deviceId", "epoch")
+                "command" -> setOf("action", "deviceId", "epoch", "commandId", "command")
+                "transfer" -> setOf("action", "deviceId", "epoch", "commandId", "targetDeviceId")
+                else -> throw IllegalArgumentException("Unknown action")
+            }
+            val optional = when (q.string("action")) {
+                "poll" -> setOf("state", "stateSeq", "acks")
+                "transfer" -> setOf("selectionSeq")
+                else -> emptySet()
+            }
+            require(q.keys.containsAll(required) && q.keys.all { it in required || it in optional })
+            listOf("deviceId", "commandId", "targetDeviceId").forEach { if (q.containsKey(it)) require(validPlaybackProtocolId(q.string(it))) }
+            if (q.containsKey("name")) require(validPlaybackDeviceName(q.string("name")))
+            listOf("epoch", "stateSeq", "selectionSeq").forEach { if (q.containsKey(it)) q.number(it) }
+            val snapshot = q["state"]?.takeUnless { it == JsonNull }
+            require((snapshot != null) == q.containsKey("stateSeq"))
+            snapshot?.let { PlaybackSnapshot.fromJson(it.jsonObject) }
+            // Use the shipped mobile positive command DTO; do not silently accept arbitrary APIs.
+            q["command"]?.let { PlaybackDeviceCommand.fromJson(it.jsonObject) }
+            val acks = q["acks"]?.jsonArray.orEmpty()
+            require(acks.size <= 16 && acks.map { it.jsonObject.string("deliveryId") }.distinct().size == acks.size)
+            acks.forEach {
+                val a = it.jsonObject
+                require(a.keys == setOf("deliveryId", "epoch", "status") && validPlaybackProtocolId(a.string("deliveryId")))
+                a.number("epoch"); require(a.string("status") in setOf("ok", "blocked", "media", "rejected"))
+            }
+        }
+        private fun response(id: String = "", status: Int = 200, error: String = "", deliver: Boolean = false): MockResponse {
+            val directives = if (deliver) deliveries.filter { it.deviceId == id && !it.delivered }.map { it.delivered = true; it.value } else emptyList()
+            val view = PlaybackDevicesView(id, devices.values.map { PlaybackDevice(it.id, it.name, now() - it.seen <= 5000) },
+                active, epoch, if (active.isEmpty()) 0 else (leaseUntil - now()).coerceAtLeast(0),
+                (quarantineUntil - now()).coerceIn(0, 8000), state, stateSeq,
+                if (state == null) 0 else (now() - stateAccepted).coerceAtLeast(0), transfer, directives,
+                outcomes.map { PlaybackOutcome(it.key, it.value.status) }, error)
+            return json(JSONObject(view.toJson().toString()), status).setHeader("Cache-Control", "no-store")
+        }
+        private fun finish(commandId: String, status: String) { outcomes[commandId]?.let { if (it.status == "pending") it.status = status } }
+        private fun cancelTransfer(status: String) {
+            val id = transfer?.commandId ?: return
+            finish(id, status); deliveries.removeAll { it.value.commandId == id }; transfer = null
+        }
+        private fun fence(status: String) {
+            quarantineUntil = maxOf(quarantineUntil, leaseUntil)
+            val waiting = transfer?.takeIf { it.phase == "waiting" }
+            outcomes.forEach { (id, outcome) -> if (outcome.status == "pending" && id != waiting?.commandId) outcome.status = status }
+            deliveries.clear(); transfer = waiting; active = ""; leaseUntil = 0; epoch++; stateSeq = 0; state = state?.paused()
+        }
+        private fun recoverTransfer(status: String) {
+            transfer = transfer?.copy(sourceDeviceId = "", phase = "waiting")
+            fence(status)
+        }
+        private fun remove(id: String, explicit: Boolean = false) {
+            val wasActive = active == id
+            devices.remove(id)
+            transfer?.let { t ->
+                if (t.targetDeviceId == id || outcomes[t.commandId]?.deviceId == id) {
+                    if (t.phase in setOf("preparing", "waiting")) cancelTransfer("cancelled") else fence("cancelled")
+                }
+            }
+            if (active == id || transfer?.sourceDeviceId == id) recoverTransfer("cancelled")
+            if (outcomes.values.any { it.deviceId == id && it.status == "pending" }) fence("cancelled")
+            if (explicit && wasActive) quarantineUntil = 0
+        }
+        private fun prune() {
+            devices.values.filter { now() - it.seen >= 30000 }.map { it.id }.forEach { remove(it) }
+            transfer?.let { t ->
+                val target = devices[t.targetDeviceId]
+                val requester = devices[outcomes[t.commandId]?.deviceId]
+                if (target == null || requester == null || now() - target.seen > 5000 || now() - requester.seen > 5000) {
+                    if (t.phase in setOf("preparing", "waiting")) cancelTransfer("cancelled") else fence("cancelled")
+                }
+            }
+            if (active.isNotEmpty()) {
+                if (transfer?.sourceDeviceId == active && (now() - devices.getValue(active).seen > 5000 || now() >= leaseUntil)) recoverTransfer("timeout")
+                else if (now() >= leaseUntil) fence("timeout")
+            }
+            if (deliveries.any { now() >= it.deadline && it.value.type != "prepare" }) fence("timeout")
+            if (deliveries.any { now() >= it.deadline && it.value.type == "prepare" }) cancelTransfer("timeout")
+            outcomes.entries.removeAll { it.value.status != "pending" && now() >= it.value.expires }
+        }
+        private fun addDelivery(device: String, type: String, commandId: String, command: JsonObject? = null, snapshot: PlaybackSnapshot? = null) {
+            deliveries += Delivery(device, PlaybackDirective("synthetic-delivery-${++nextDelivery}", epoch, type, commandId, command, snapshot), now() + 8000)
+        }
+        private fun makeOutcome(device: Device, q: JsonObject): Boolean {
+            if (outcomes.size >= 128) {
+                val completed = outcomes.entries.firstOrNull { it.value.status != "pending" } ?: return false
+                outcomes.remove(completed.key)
+            }
+            outcomes[q.string("commandId")] = Outcome(device.id, q, "pending", now() + 300000)
+            return true
+        }
+        private fun command(device: Device, q: JsonObject): String {
+            if (transfer != null) return "transfer in progress"
+            if (active.isEmpty()) return "no active device"
+            if (deliveries.isNotEmpty()) {
+                if (q.getValue("command").jsonObject.string("type") !in setOf("pause", "close")) return "command in progress"
+                deliveries.forEach { finish(it.value.commandId, "cancelled") }; deliveries.clear()
+            }
+            if (!makeOutcome(device, q)) return "command limit reached"
+            addDelivery(active, "command", q.string("commandId"), q.getValue("command").jsonObject)
+            return ""
+        }
+        private fun select(device: Device, q: JsonObject): String {
+            val target = devices[q.string("targetDeviceId")] ?: return "target unavailable"
+            if (target != device && now() - target.seen > 5000) return "target unavailable"
+            if (target.id == active && transfer == null && deliveries.isEmpty()) return "target is already active"
+            if (outcomes.size >= 128 && outcomes.values.none { it.status != "pending" }) return "command limit reached"
+            device.seen = now()
+            val uncertain = deliveries.isNotEmpty() && (transfer == null || transfer?.phase != "preparing")
+            cancelTransfer("cancelled")
+            if (uncertain || active.isNotEmpty() && now() - devices.getValue(active).seen > 5000) fence("cancelled")
+            check(makeOutcome(device, q))
+            transfer = PlaybackTransfer(q.string("commandId"), active, target.id, "waiting")
+            startTransfer()
+            return ""
+        }
+        private fun startTransfer() {
+            val t = transfer ?: return
+            if (t.phase != "waiting" || now() < quarantineUntil) return
+            val target = devices[t.targetDeviceId]
+            if (target == null || now() - target.seen > 5000) { cancelTransfer("cancelled"); return }
+            if (target.id == active) { cancelTransfer("ok"); return }
+            transfer = t.copy(phase = "preparing")
+            addDelivery(target.id, "prepare", t.commandId, snapshot = state)
+        }
+        private fun activate() {
+            val t = checkNotNull(transfer)
+            if (t.sourceDeviceId.isEmpty()) state = state?.paused()
+            epoch++; stateSeq = 0; active = t.targetDeviceId; leaseUntil = now() + 8000
+            transfer = t.copy(phase = "activating")
+            addDelivery(active, "activate", t.commandId, snapshot = state)
+        }
+        private fun poll(device: Device, q: JsonObject): String {
+            val snapshot = q["state"]?.takeUnless { it == JsonNull }?.let { PlaybackSnapshot.fromJson(it.jsonObject) }
+            if (snapshot != null) {
+                if (active != device.id) return "only the active device may publish state"
+                if (q.number("stateSeq") <= stateSeq) return "stale state sequence"
+            }
+            val acknowledged = mutableListOf<Pair<Delivery, String>>()
+            for (element in q["acks"]?.jsonArray.orEmpty()) {
+                val ack = element.jsonObject
+                val found = deliveries.firstOrNull { it.value.deliveryId == ack.string("deliveryId") } ?: continue
+                if (found.deviceId != device.id || found.value.epoch != ack.number("epoch") || !found.delivered) return "invalid acknowledgement"
+                if (found.value.type in setOf("release", "activate", "command") && snapshot == null) return "acknowledgement requires state"
+                val status = ack.string("status")
+                if (found.value.type == "activate" && status == "ok" && snapshot?.error != "") return "activation outcome does not match state"
+                if (status in setOf("blocked", "media") && snapshot != null && (snapshot.playing || snapshot.error != status)) return "outcome does not match state"
+                acknowledged += found to status
+            }
+            device.seen = now()
+            if (active == device.id) leaseUntil = now() + 8000
+            if (snapshot != null) { state = snapshot; stateSeq = q.number("stateSeq"); stateAccepted = now() }
+            for ((delivery, status) in acknowledged) {
+                deliveries.remove(delivery)
+                when (delivery.value.type) {
+                    "command" -> finish(delivery.value.commandId, status)
+                    "prepare" -> if (status != "ok") cancelTransfer(status) else {
+                        val t = checkNotNull(transfer)
+                        if (t.sourceDeviceId.isEmpty()) activate() else {
+                            transfer = t.copy(phase = "releasing")
+                            addDelivery(t.sourceDeviceId, "release", t.commandId)
+                        }
+                    }
+                    "release" -> if (status != "ok") cancelTransfer(status) else activate()
+                    "activate" -> { finish(delivery.value.commandId, status); transfer = null; if (status == "rejected") fence("cancelled") }
+                }
+            }
+            startTransfer()
+            return ""
+        }
+    }
     private fun playback(items: List<JSONObject>, kind: String, id: String, name: String) = JSONObject()
         .put("items", JSONArray(items)).put("total", items.size).put("limit", 1000).put("truncated", false)
         .put("revision", 7).put("context", JSONObject().put("kind", kind).put("id", id).put("name", name))

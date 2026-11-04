@@ -2,7 +2,7 @@
 
 ## Tracking
 - ID: FEAT-004
-- Status: in-progress
+- Status: review
 - Phase: implementation
 - Spec readiness: ready
 - Owner: device-recovery
@@ -11,15 +11,15 @@
 - Depends on: none
 - Discovery depends on: none
 - Touchpoints: PlaybackDevicesApi.kt and protocol tests; PlaybackCoordinator.kt; NativePlaybackEndpoint.kt; PlaybackDevicesSheet.kt; Media3PlaybackEndpoint.kt; PlaybackService.kt; PlaybackConnection.kt; PlaybackSnapshotCodec.kt; PlaybackQueue.kt; MediaSession/system transport integration
-- Next action: device-recovery actively fixes close-ACK and long-derived-occurrence critical review findings plus the lint error; independently review the new exact candidate before any enablement or integration
+- Next action: independently review and fully gate the enabled production participant against the merged foundation base, self-integrate and post-check under the main/build leases; native completion remains blocked by BUG-001
 
 ## Current state and evidence boundary
 
-Implementation/recovery is active, **not complete**. At the supplied historical device-lane checkpoint `77d45be`, the device topic had merged main `4183ed3` **into itself**. The device implementation was **not integrated into main `4183ed3`**, nor shipped by the foundation landing. Git ancestry confirms `4183ed3` is an ancestor of `77d45be`, not the reverse. The test/review observations below describe that historical checkpoint, not a live gate or a new implementation in this documentation task.
+The source candidate is under final review for integration, **not native-complete**. Device-lane phase-A candidate `755860290fdfcaa04aaba28e26da71a550639de1` preserves the earlier `77d45be` history and fixes close publication/disposal, long derived occurrences and the notification lint error. Both independent protocol/native-critical reviewers passed that exact phase-A SHA. Its full leased gate passed **114 core + 358 app**, both APK assembly tasks and lint with **0 errors** (13 warnings + 1 hint). Those counts describe phase A, not automatic approval of the later enabled candidate.
 
-At that checkpoint, **114 core + 344 app tests and debug/instrumentation APK builds passed**; **lint has 1 error**. Critical independent-review findings remain on **close-ACK handling** and **long-derived occurrence preservation**. The new recovery effort is actively fixing these findings; do not describe it as idle, awaiting a lane, or reviewed clean. Report fresh exact-SHA evidence after corrections rather than carrying forward historical counts as a current pass.
+Enablement commit `311b9db` sets production `Media3PlaybackEndpoint.supportsExactHandoff = true`; the actual `AppGraph` service callback now registers the phone through `PlaybackDevicesApi`, not a test-only capability override. `AppGraphPlaybackParticipationTest` exercises authenticated synthetic loopback registration, silent startup with playing server metadata, non-autoplay enqueue, current positive Play with honest foreground denial, incoming Pause/Close and exact ACK publication, and fresh silent registration after service recreation. The enabled real-service bridge and production-graph targeted gate passed **37 tests**. Existing real-service tests now use the production endpoint directly without capability overrides.
 
-The production `Media3PlaybackEndpoint.supportsExactHandoff` remains **false**. Registration/exact native handoff must not be advertised or enabled merely because a coordinator, picker, export method, synthetic endpoint test or APK exists. Source contract readiness does not mean implementation acceptance.
+Foundation main `5c6cf00` and factual follow-up `3ae4417` have been normal-merged into the device branch. Device checkpoint `77d45be` had merged main `4183ed3` **into itself**, not the reverse: the device implementation was **not integrated into main `4183ed3`** or shipped by foundation. Git ancestry confirms `4183ed3` is an ancestor of `77d45be`, not the reverse. Integration of this reviewed device delta is still a separate leased transaction. Exact final candidate/base, full results, reviewer identities, APK hashes and main post-check evidence are retained outside the frozen candidate under ignored `.tooling/` evidence; no self-referential approval SHA is invented here.
 
 ## Outcome and service/authority contract
 
@@ -40,11 +40,11 @@ A close/release interruption must cancel stale starts and suspend output while p
 
 ### Long derived occurrences
 
-Round-trip a genuinely long prepared derived queue, including duplicate tracks with different occurrence/context identities and history flags. Prove exact identity/order/context survives the supported wire/codec bounds or that unsupported input is rejected **before mutation with capability kept disabled**. Never silently truncate, regenerate IDs or refetch a saved collection to fake an exact import. Include current/next selection and history after round-trip, not just DTO equality on a short queue.
+Round-trip a genuinely long prepared derived queue, including duplicate tracks with different occurrence/context identities and history flags. Capability is true for **publication-safe bounded state**: individual occurrence IDs may use their full 4096-byte bound, but a canonical complete snapshot must fit the protocol's 2MiB outbound body with a 16KiB proven envelope/state-growth reserve. Structurally valid oversized incoming state remains decodable so preparation/activation can return a rejected ACK **before mutation**, preserving prior exact queue/history. Validate final rekeyed replacements, combined enqueue and undo restoration before installing/removing media or allocating live keys. Unsupported state is rejected, never silently shortened or substituted; this aggregate admission bound does not turn the working participant into a fake disabled endpoint. Include a full 1,000-row long-derived round-trip, next/current identity and history, not just short DTO equality.
 
 ### Capability barrier
 
-Keep `supportsExactHandoff = false` until complete exact import/export, all start-path authority fences and critical review corrections are established. Enabling capability requires an explicit reviewed candidate and validation accounting; no UI-only toggle or recovery checkpoint bypass. Incomplete native/audio/background evidence must remain explicit even if source corrections land.
+The capability is now **true in the source candidate**, after phase-A critical corrections, independent exact-SHA audits and regression gates. Exact import/export and start-path fences remain prerequisites, not optional behavior. Final cumulative protocol/native-critical review and full automated gates must approve the enabled candidate before integration. Registration follows the real service lifetime; login, browsing and device-sheet presence alone do not advertise an output. No UI-only toggle, fake endpoint or test capability override substitutes for production registration. Incomplete native/audio/background evidence remains explicit even after source integration.
 
 ## Remaining acceptance and risks
 
@@ -54,7 +54,19 @@ Main risks are split authority between app/system controls, ACK loss during tear
 
 ## Evidence and completion gate
 
-After correction, record exact candidate/base SHAs, the two critical regression results, current core/app counts, APK hashes and a clean lint result or explicit remaining blocker. Obtain independent read-only review of the **new exact SHA**; a changed candidate requires re-review. Integration follows standing assignment-bound conditional self-integration authority, separate exclusive advisory build and main-squash leases, and independent exact-SHA review per [worktree-review.md](../worktree-review.md). Meet its preconditions before acting; merging main into the device topic is not main integration or a completion certificate.
+Named automated evidence maps to the contract:
+
+- `PlaybackSnapshotCodecTest`, `PlaybackSnapshotMediaTest`, `PlaybackServiceBridgeTest`: exact traversal/baseline/duplicates/context/history import, fractions, long occurrences, current positive Play and no token leakage/refetch.
+- `PlaybackCommandResolverTest`, core `DerivedPlaylistsApiTest` and `PreparedPlaybackAuthorityTest`: original derived revision/fence/occurrence/selection envelope, original auth generation and bounded identity. Long occurrence stays in its 4096-byte field, never manual `entryId` (512 bytes).
+- `PlaybackCoordinatorTest`, `PlaybackDeviceIdentityTest`: ownership, conservative leases, stable foreign-owner polling, latest selection, atomic execution result/ACK and origin/account-bound encrypted installation/name metadata.
+- `PlaybackServiceBridgeTest`: actual service Close is silent/empty immediately; final ACK/state get one 4000ms publication attempt before disposal, with a 4500ms service fail-safe. Queued replacement holds retain cleanup, including stale/rejected/pre-entry-cancel paths, and have a 9000ms bounded watchdog. Old completions/timers cannot destroy installed successor state.
+- `PlaybackForegroundNotificationTest`, `PlaybackAudioFocusTest`, `CoordinatedSessionPlayerTest`: genuine session-bound MediaStyle, honest FGS denial, scoped transport and no focus-gain autoplay. Notification-permission exemption is narrow, not an Android background-start exemption.
+- `AppGraphPlaybackParticipationTest`: actual enabled production graph/API/coordinator/service registration and commands, silent startup/recreation, no audio/history/catalog calls; no injected protocol or endpoint. Full 1,000-row long-derived state publishes exactly; >4MiB incoming prepare/activate is decoded but ACK-rejected without changing it.
+- Core `PlaybackPublicationTest` proves the 16KiB reserve covers worst escaped context/history/scalars and maximum poll identity/16ACK envelope. `PlaybackServiceBridgeTest` rejects combined enqueue overflow from two individually safe 500-row derived batches before any queue/key mutation; a subsequent small enqueue still receives the next live key.
+- `PlaybackDeviceFixtureTest`: shipped protocol synthetic fixture authentication, transfer phases, exact release/activation state and commands. Compiled instrumentation is not an executed native test.
+
+Record exact final candidate/base SHAs, fresh core/app counts, APK hashes, lint results and independent reviewer identities externally. A changed candidate or main base requires re-gating/re-review. Integration follows standing assignment-bound conditional authority and the separate advisory build/main leases in [worktree-review.md](../worktree-review.md). Only verified main integration/post-checks may be described as integrated source; source completion does not mark this task native-done.
+Merging main into this device topic is not main integration or a completion certificate.
 
 [BUG-001](BUG-001-native-validation-environment.md) is the **completion/validation gate only, never a hard source dependency**. Native AFTER-render, audio and background validation are **BLOCKED / NOT COMPLETE**. No successful native handoff/background/audio behavior is claimed. A future authorized isolated synthetic AVD journey must exercise device status, transfer/lease loss, app/system controls, lifecycle and inspected renders; genuine hardware-only limits remain explicitly unverified, not a reason to access a phone.
 

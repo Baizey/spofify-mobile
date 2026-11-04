@@ -27,21 +27,27 @@ internal class PlaybackProgress(private val thresholdMs: Long = 1_000) {
         wasPlaying = false
     }
 
-    /** Returns true once, only when enough actual forward playback has accumulated. */
+    /**
+     * Returns true once, on NEW positive audible progress after reaching the threshold.
+     * Imported progress is credit toward the threshold, never itself permission to report:
+     * paused samples, the initial anchor and seeks must not emit a transferred history event.
+     */
     fun sample(positionMs: Long, realtimeMs: Long, isPlaying: Boolean, speed: Float = 1f): Boolean {
         val previous = position
+        var addedMs = 0L
         if (!recorded && previous != null && wasPlaying && isPlaying) {
             val elapsed = (realtimeMs - realtime).coerceAtLeast(0)
             val delta = positionMs - previous
             val expected = (elapsed * speed.coerceAtLeast(0f)).toLong()
             if (delta > 0 && delta <= expected + 250) {
-                accumulatedMs += min(delta, expected)
+                addedMs = min(delta, expected)
+                accumulatedMs = (accumulatedMs + addedMs).coerceAtMost(604_800_000)
             }
         }
         position = positionMs
         realtime = realtimeMs
         wasPlaying = isPlaying
-        if (!recorded && accumulatedMs >= thresholdMs) {
+        if (!recorded && addedMs > 0 && accumulatedMs >= thresholdMs) {
             recorded = true
             return true
         }

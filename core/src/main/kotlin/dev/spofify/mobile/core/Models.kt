@@ -2,6 +2,7 @@ package dev.spofify.mobile.core
 
 import java.io.IOException
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.JsonObject
 
 @Serializable
@@ -64,7 +65,80 @@ data class PlaybackQueue(
     val truncated: Boolean = false,
     val context: LibraryPlaybackContext? = null,
     val revision: Long = 0,
+    val preparedState: PlaybackSnapshot? = null,
+    @Transient val selectionAuthority: PreparedPlaybackAuthority? = null,
 )
+
+/**
+ * Ephemeral selection permission, never part of a serialized queue or prepared wire snapshot.
+ * Identity is bound to the original request's client/session and its selected musical occurrence.
+ */
+class PreparedPlaybackAuthority internal constructor(
+    private val source: PreparedPlaybackSource,
+    private val selectionToken: String?,
+    private val context: PlaybackContext,
+    private val trackId: String,
+    private val targetId: String,
+    private val occurrenceId: String,
+) {
+    fun isValidFor(client: SpofifyClient, state: PlaybackSnapshot): Boolean {
+        if (!source.isCurrent(client)) return false
+        val selected = state.queue.getOrNull(state.position) ?: return false
+        return matchesContext(state.context) && matchesContext(selected.playbackContext) &&
+            selected.id == trackId && selected.targetId == targetId && selected.occurrenceId == occurrenceId
+    }
+
+    /** Null is also the original whole-collection request: check isValidFor separately. */
+    fun selectionTokenFor(client: SpofifyClient, state: PlaybackSnapshot): String? =
+        if (isValidFor(client, state)) selectionToken else null
+
+    private fun matchesContext(value: PlaybackContext?): Boolean = value != null &&
+        value.kind == context.kind && value.id == context.id &&
+        value.revision == context.revision && value.fence == context.fence
+
+    override fun toString(): String = "PreparedPlaybackAuthority([redacted])"
+}
+
+/** Capture BEFORE the request; binding after its response must never capture a newer session. */
+internal class PreparedPlaybackSource private constructor(
+    private val client: SpofifyClient,
+    private val origin: String,
+    private val session: Session?,
+    private val generation: Long,
+) {
+    internal fun isCurrent(candidate: SpofifyClient): Boolean = candidate === client &&
+        candidate.server.origin == origin && session != null && candidate.currentSession() === session &&
+        candidate.personalMutationGeneration() == generation
+
+    internal fun bind(selectionToken: String?, state: PlaybackSnapshot): PreparedPlaybackAuthority? {
+        if (!isCurrent(client)) return null
+        val context = state.context ?: return null
+        val selected = state.queue.getOrNull(state.position) ?: return null
+        if (context.kind != "derived" || selected.targetId != context.id || selected.occurrenceId.isEmpty() ||
+            selected.playbackContext != context) return null
+        return bind(selectionToken, context, selected.id, selected.occurrenceId)
+    }
+
+    /** The API has already validated this returned context/start; do not add response validation here. */
+    internal fun bind(
+        selectionToken: String?,
+        context: PlaybackContext,
+        selectedTrackId: String?,
+        selectedOccurrenceId: String?,
+    ): PreparedPlaybackAuthority? {
+        if (!isCurrent(client) || selectedTrackId == null || selectedOccurrenceId == null) return null
+        return PreparedPlaybackAuthority(this, selectionToken, context, selectedTrackId, context.id, selectedOccurrenceId)
+    }
+
+    override fun toString(): String = "PreparedPlaybackSource([redacted])"
+
+    internal companion object {
+        fun capture(client: SpofifyClient): PreparedPlaybackSource {
+            val generation = client.personalMutationGeneration()
+            return PreparedPlaybackSource(client, client.server.origin, client.currentSession(), generation)
+        }
+    }
+}
 
 @Serializable
 data class LibraryPlaybackContext(val kind: String, val id: String = "", val name: String = "")

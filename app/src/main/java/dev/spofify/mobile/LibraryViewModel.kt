@@ -13,6 +13,7 @@ import dev.spofify.mobile.core.Session
 import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.playback.PlaybackConnection
 import dev.spofify.mobile.playback.PlaybackControls
+import dev.spofify.mobile.playback.PlaybackRequests
 import dev.spofify.mobile.feature.library.CatalogStateHolder
 import dev.spofify.mobile.feature.library.ClientCatalogReader
 import dev.spofify.mobile.feature.library.ClientHomeReader
@@ -387,9 +388,17 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             mutable.update { it.copy(notice = "The selected song is not in this prepared queue. Reload the collection and try again.") }
             return
         }
-        playback.play(queue.items, expectedClient, startTrackId, startEntryId = startEntryId)
-        playback.setContext(queue.context?.let { LibraryItem(it.kind, it.id, it.name) })
+        if (!preparedSelectionValid(queue, expectedClient)) {
+            mutable.update { it.copy(notice = "This prepared selection expired. Reload the collection and choose again.") }; return
+        }
+        playback.playPrepared(queue, expectedClient, startTrackId, startEntryId = startEntryId)
         if (queue.truncated) mutable.update { it.copy(notice = "This queue is limited to 1,000 available songs.") }
+    }
+
+    private fun preparedSelectionValid(queue: PlaybackQueue, client: SpofifyClient): Boolean {
+        if (queue.context?.kind != "derived" && queue.preparedState?.context?.kind != "derived") return true
+        val prepared = queue.preparedState ?: return false
+        return queue.selectionAuthority?.isValidFor(client, prepared) == true
     }
 
     private fun prepare(start: LibraryItem?, shuffle: Boolean, enqueue: Boolean = false, playNext: Boolean = false,
@@ -398,27 +407,32 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         if (state.value.session == null || state.value.busy) return
         queueJob?.cancel()
         val request = ++queueGeneration
+        // Capture BEFORE fetching: PlaybackConnection cannot tell a late queue response from
+        // a new tap if pause, output handoff or logout invalidates playback while we await it.
+        val playbackEpoch = PlaybackRequests.epoch
         val account = state.value.session?.accountId
+        fun isCurrent() = request == queueGeneration && playbackEpoch == PlaybackRequests.epoch &&
+            graph.client === client && account != null && client.currentSession()?.accountId == account &&
+            state.value.session?.accountId == account
         mutable.update { it.copy(preparing = true, playbackIntentGeneration = request) }
         queueJob = viewModelScope.launch {
             try {
                 val queue = fetch(client)
-                if (request != queueGeneration || client !== graph.client || client.currentSession()?.accountId != account ||
-                    state.value.session?.accountId != account || account == null) return@launch
+                if (!isCurrent()) return@launch
                 if (queue.items.isEmpty()) mutable.update { it.copy(notice = "No audio is available in this collection.") }
                 else {
-                    if (enqueue) playback.enqueue(queue.items, client, playNext)
-                    else {
-                        playback.play(queue.items, client, start?.id, shuffle, startEntryId = start?.entryId)
-                        playback.setContext(queue.context?.let { LibraryItem(it.kind, it.id, it.name) } ?: context)
+                    if (!preparedSelectionValid(queue, client)) {
+                        mutable.update { it.copy(notice = "This prepared selection expired. Reload the collection and choose again.") }
+                        return@launch
                     }
+                    if (enqueue) playback.enqueue(queue.items, client, playNext)
+                    else playback.playPrepared(queue, client, start?.id, shuffle, startEntryId = start?.entryId, context = context)
                     if (queue.truncated) mutable.update { it.copy(notice = "This queue is limited to 1,000 available songs.") }
                     else if (enqueue) mutable.update { it.copy(notice = if (playNext) "Added to play next." else "Added to queue.") }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                if (request == queueGeneration && graph.client === client && state.value.session?.accountId == account)
-                    mutable.update { it.copy(notice = message(error)) }
+                if (isCurrent()) mutable.update { it.copy(notice = message(error)) }
             } finally {
                 if (request == queueGeneration) mutable.update { it.copy(preparing = false) }
             }

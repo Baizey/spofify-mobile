@@ -150,6 +150,31 @@ class DerivedPlaylistsApiTest {
         assertEquals(LibraryPlaybackContext("derived", "rules", "Rules"), result.queue.context)
         assertEquals(5L, result.queue.revision)
         assertEquals(result.queue, result.toPlaybackQueue())
+        val prepared = requireNotNull(result.queue.preparedState)
+        val authority = requireNotNull(result.queue.selectionAuthority)
+        assertTrue(authority.isValidFor(client, prepared))
+        assertEquals("signed-click", authority.selectionTokenFor(client, prepared))
+        assertFalse(result.toString().contains("token-"))
+        assertFalse(result.toString().contains("signed-click"))
+        assertFalse(result.toString().contains("selectionTokens"))
+        val expectedContext = PlaybackContext("derived", "rules", "Rules", 5, "f1_fence")
+        assertEquals(expectedContext, prepared.context)
+        assertEquals(1, prepared.position)
+        assertEquals(listOf("same", "same"), prepared.queue.map { it.id })
+        assertEquals(listOf("occ-1", "occ-2"), prepared.queue.map { it.occurrenceId })
+        assertEquals(listOf("rules", "rules"), prepared.queue.map { it.targetId })
+        assertEquals(listOf(expectedContext, expectedContext), prepared.queue.map { it.playbackContext })
+        assertEquals(listOf(1L, 2L), prepared.queue.map { it.key })
+        assertEquals(listOf(0L, 1L), prepared.queue.map { it.order })
+        assertTrue(prepared.queue.all { it.entryId.isEmpty() })
+        assertFalse(prepared.playing)
+        assertFalse(prepared.waiting)
+        assertFalse(prepared.loading)
+        assertNull(prepared.occurrence)
+        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
+        assertFalse(prepared.toJson().toString().contains("selectionToken"))
+        assertFalse(prepared.toJson().toString().contains("token-"))
+        assertFalse(prepared.toJson().toString().contains("signed-click"))
         assertEquals(initial, client.personalRevision.value)
     }
 
@@ -163,6 +188,53 @@ class DerivedPlaylistsApiTest {
         assertEquals(Int.MAX_VALUE, result.queue.total)
         assertTrue(result.truncated)
         assertEquals("CLICKED_OCCURRENCE_ONLY", result.notice)
+        val prepared = requireNotNull(result.queue.preparedState)
+        assertEquals(occurrence, prepared.queue.single().occurrenceId)
+        assertEquals(0, prepared.position)
+        assertTrue(prepared.truncated)
+        assertEquals("CLICKED_OCCURRENCE_ONLY", prepared.notice)
+        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
+        assertEquals(1, web.requestCount)
+    }
+
+    @Test fun preparedQueueProjectsOnlyPositiveMusicalFieldsAndPreservesPlaybackLimit() = runBlocking {
+        val item = flatTrack("occ-1", "returned-selection").dropLast(1) +
+            ""","artists":[{"id":"artist-id","name":"Artist"}],"albumId":"album-id","albumName":"Album","durationMs":123456,"libraryPath":"/private/catalog/song.flac","unknownPrivateField":"hidden"}"""
+        web.enqueue(jsonResponse(playbackBody("[$item]", 1001, "occ-1", "PLAYBACK_LIMIT")))
+        val queue = api.playback("rules", 5, "f1_fence").toPlaybackQueue()
+        val prepared = requireNotNull(queue.preparedState)
+        val selected = prepared.queue.single()
+        assertEquals(listOf(PlaybackArtist("artist-id", "Artist")), selected.artists)
+        assertEquals("album-id", selected.albumId)
+        assertEquals("Album", selected.albumName)
+        assertEquals(123.456, selected.duration, 0.0)
+        assertEquals(123.456, prepared.duration, 0.0)
+        assertEquals(0.0, prepared.elapsed, 0.0)
+        assertEquals("PLAYBACK_LIMIT", prepared.notice)
+        assertTrue(prepared.truncated)
+        assertEquals(1001, queue.total)
+        assertEquals(1000, queue.limit)
+        assertFalse(queue.items.single().libraryPath.isNullOrEmpty()) // Existing callback data stays unchanged.
+        val wire = prepared.toJson().toString()
+        listOf("libraryPath", "/private", "unknownPrivateField", "hidden", "selectionToken", "returned-selection", "hasAudio").forEach {
+            assertFalse("Unexpected private field in prepared wire data", wire.contains(it))
+        }
+        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
+        assertEquals(1, web.requestCount)
+    }
+
+    @Test fun emptyPreparedQueueRetainsContextWithoutInventingASelection() = runBlocking {
+        web.enqueue(jsonResponse(playbackBody("[]", 0, "unused").replace("\"startOccurrenceId\":\"unused\"", "\"startOccurrenceId\":null")))
+        val result = api.playback("rules", 5, "f1_fence")
+        val queue = result.toPlaybackQueue()
+        val prepared = requireNotNull(queue.preparedState)
+        assertTrue(queue.items.isEmpty())
+        assertTrue(prepared.queue.isEmpty())
+        assertEquals(-1, prepared.position)
+        assertNull(result.startIndex)
+        assertEquals(PlaybackContext("derived", "rules", "Rules", 5, "f1_fence"), prepared.context)
+        assertNull(prepared.occurrence)
+        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
         assertEquals(1, web.requestCount)
     }
 

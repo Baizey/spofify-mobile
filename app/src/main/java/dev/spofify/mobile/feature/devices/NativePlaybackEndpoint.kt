@@ -29,7 +29,23 @@ class PlaybackAuthority internal constructor(val epoch: Long, val generation: Lo
     fun isValid(): Boolean = check()
 }
 
-data class PlaybackEndpointResult(val status: String, val snapshot: PlaybackSnapshot) {
+/** Service-instance-scoped close disposal; queued replacement intent only HOLDS its obligation. */
+class PlaybackFinalClose internal constructor(
+    private val finish: (dispose: Boolean) -> Unit,
+    private val releaseReplacement: () -> Unit,
+) {
+    fun dispose() = finish(true)
+    fun holdForReplacement() = finish(false)
+    /** Safe from a job-completion callback: the service marshals release to its main looper. */
+    fun finishReplacement() = releaseReplacement()
+}
+
+data class PlaybackEndpointResult(
+    val status: String,
+    val snapshot: PlaybackSnapshot,
+    /** Transient lifecycle capability, never serialized into snapshots or protocol state. */
+    val finalClose: PlaybackFinalClose? = null,
+) {
     init {
         require(status in setOf("ok", "blocked", "media", "rejected"))
         snapshot.validated()

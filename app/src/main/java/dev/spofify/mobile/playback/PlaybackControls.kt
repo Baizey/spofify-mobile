@@ -11,6 +11,14 @@ interface PlaybackControls {
     fun release()
     fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String? = null,
         shuffle: Boolean = false, startEntryId: String? = null)
+    /** Already server-prepared musical intent. Production preserves the optional exact wire
+     * envelope; the default keeps existing test/host implementations source-compatible. */
+    fun playPrepared(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
+        startTrackId: String? = null, shuffle: Boolean = false, startEntryId: String? = null,
+        context: LibraryItem? = null) {
+        play(queue.items, client, startTrackId, shuffle, startEntryId)
+        setContext(queue.context?.let { LibraryItem(it.kind, it.id, it.name) } ?: context)
+    }
     /** Prepared items only: fetching a collection remains an explicit host action. Never autoplays. */
     fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean = false) {}
     fun removeUpcoming(occurrenceId: String) {}

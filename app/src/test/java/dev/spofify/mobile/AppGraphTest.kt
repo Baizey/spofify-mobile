@@ -66,6 +66,26 @@ class AppGraphTest {
         } finally { graph.clear(); first.shutdown(); second.shutdown() }
     }
 
+    @Test fun queuedExpiryCannotRetireANewerSessionInstalledOnTheSameClient() = runBlocking {
+        val web = MockWebServer().apply { start() }
+        val graph = AppGraph(context, MemoryStore())
+        try {
+            val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
+            web.enqueue(login()); client.login("listener", "password")
+            client.clearSession()
+            val oldEpoch = dev.spofify.mobile.playback.PlaybackRequests.epoch
+            client.onUnauthorized!!.invoke() // Expiry posts main cleanup, but invalidates starts now.
+            assertTrue(dev.spofify.mobile.playback.PlaybackRequests.epoch > oldEpoch)
+            web.enqueue(login()); val fresh = client.login("listener", "password")
+            val freshEpoch = dev.spofify.mobile.playback.PlaybackRequests.epoch
+            shadowOf(Looper.getMainLooper()).idle()
+            assertSame(client, graph.client)
+            assertSame(fresh, client.currentSession())
+            assertFalse(graph.sessionExpired.value)
+            assertEquals(freshEpoch, dev.spofify.mobile.playback.PlaybackRequests.epoch)
+        } finally { graph.clear(); web.shutdown() }
+    }
+
     @Test fun offlineRestorationCanRetryTheSavedSessionWithoutAPassword() = runBlocking {
         val web = MockWebServer().apply { start() }
         val server = "http://127.0.0.1:${web.port}"

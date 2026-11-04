@@ -16,8 +16,25 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.*
+import dev.spofify.mobile.playback.PlaybackRequests
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+
+/** Capture at the Play tap, before launching/fetching; a late queue is never a fresh intent. */
+internal class PlaylistPlaybackRequest(private val generation: PlaylistRequestGeneration) {
+    private val ticket = generation.invalidate()
+    private val playbackEpoch = PlaybackRequests.epoch
+
+    /** Success/error publication and queue delivery are synchronous on the Compose main coroutine. */
+    fun deliver(action: () -> Unit) {
+        if (generation.accepts(ticket) && playbackEpoch == PlaybackRequests.epoch) action()
+    }
+
+    /** Cancellation must still clear busy, but never clear a newer request's busy state. */
+    fun finish(action: () -> Unit) {
+        if (generation.accepts(ticket)) action()
+    }
+}
 
 /** Account-local navigation. Browsing never prepares or starts a queue. */
 @Composable
@@ -239,26 +256,26 @@ private fun PlaylistDetail(
     fun play(selectionToken: String? = null, trackId: String? = null, entryId: String? = null) {
         if (busy || stale || saved == null) return
         val result = evaluation
-        val ticket = generation.invalidate(); busy = true
+        val request = PlaylistPlaybackRequest(generation); busy = true
         scope.launch {
             try {
                 if (saved.kind == PlaylistKind.DERIVED && result != null) {
                     val queue = derived.playback(id, saved.revision, result.fence, selectionToken)
-                    if (generation.accepts(ticket)) {
+                    request.deliver {
                         message = when (queue.notice) { "CLICKED_OCCURRENCE_ONLY" -> "Only the selected occurrence was prepared because it is beyond the first 1,000 available occurrences."
                             "PLAYBACK_LIMIT" -> "Playback is limited to the first 1,000 available occurrences."; else -> null }
                         onPlayQueue(queue.queue, null, queue.startOccurrenceId)
                     }
                 } else if (saved.kind == PlaylistKind.MANUAL) {
                     val queue = api.playback(id)
-                    if (generation.accepts(ticket)) {
+                    request.deliver {
                         if (entryId != null && queue.items.none { it.entryId == entryId }) message = "This occurrence is outside the prepared playback limit. No queue was replaced."
                         else onPlayQueue(queue.queue, trackId, entryId)
                     }
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (generation.accepts(ticket)) { message = playlistFailure(e); stale = true } }
-            finally { if (generation.accepts(ticket)) busy = false }
+            catch (e: Exception) { request.deliver { message = playlistFailure(e); stale = true } }
+            finally { request.finish { busy = false } }
         }
     }
     LazyColumn(modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
