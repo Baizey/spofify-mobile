@@ -16,7 +16,6 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import dev.spofify.mobile.LikeButton
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.feature.library.MusicCredits
 
@@ -49,7 +48,15 @@ internal fun MusicActionsContent(
         MusicAction("Play next", enabled = item.playable, onClick = onPlayNext)
         MusicAction("Add to queue", enabled = item.playable, onClick = onEnqueue)
         if (item.kind == "track") {
-            LikeButton(liked, likePending, likeFailed, toggle = onToggleLike, retry = onRetryLike)
+            val likeLabel = when {
+                likePending -> "Saving like"
+                liked == null && likeFailed -> "Retry like status"
+                liked == null -> "Checking like status"
+                liked -> "Unlike song"
+                else -> "Like song"
+            }
+            MusicAction(likeLabel, enabled = !likePending && (liked != null || likeFailed),
+                onClick = { if (liked == null) onRetryLike() else onToggleLike() })
             MusicAction("Add to playlist", onClick = onAddToPlaylist)
         }
         MusicAction("Open details", onClick = { onOpenItem(item) })

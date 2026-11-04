@@ -20,6 +20,7 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -45,6 +46,14 @@ import java.util.Locale
 private val Mint = Color(0xFF78E0AC)
 private val Background = Color(0xFF101412)
 private val Surface = Color(0xFF1A211D)
+private val TonalContainer = Mint.copy(alpha = .16f).compositeOver(Surface)
+
+internal fun listeningColorScheme() = darkColorScheme(
+    primary = Mint, onPrimary = Color(0xFF08351F),
+    primaryContainer = TonalContainer, onPrimaryContainer = Mint,
+    secondaryContainer = TonalContainer, onSecondaryContainer = Mint,
+    background = Background, surface = Surface, secondary = Mint, surfaceContainer = Surface,
+)
 
 class MainActivity : ComponentActivity() {
     private val model: LibraryViewModel by viewModels()
@@ -52,9 +61,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme(primary = Mint, onPrimary = Color(0xFF08351F),
-                background = Background, surface = Surface, secondary = Mint, surfaceContainer = Surface),
-                typography = AppTypography) {
+            MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                 SpofifyApp(model)
             }
         }

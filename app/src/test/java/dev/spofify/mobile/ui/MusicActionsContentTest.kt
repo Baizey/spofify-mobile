@@ -5,13 +5,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
-import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -39,6 +41,31 @@ class MusicActionsContentTest {
     @Test fun allCreditsAndActionsAreReachableOnNarrowPhoneAt135PercentText() = checkReachability(1.35f)
 
     @Test fun allCreditsAndActionsAreReachableOnNarrowPhoneAt200PercentText() = checkReachability(2f)
+
+    @Test fun moreLikeActionPreservesLoadingRetryAndToggleStates() {
+        val liked = mutableStateOf<Boolean?>(null)
+        val pending = mutableStateOf(false)
+        val failed = mutableStateOf(false)
+        var retries = 0
+        var toggles = 0
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                MusicActionsContent(LibraryItem("track", "song", "Song", hasAudio = true),
+                    liked.value, pending.value, failed.value, onPlay = {}, onPlayNext = {}, onEnqueue = {},
+                    onToggleLike = { toggles++ }, onRetryLike = { retries++ }, onAddToPlaylist = {}, onOpenItem = {})
+            }
+        }
+        compose.onNodeWithText("Checking like status").assertHeightIsAtLeast(48.dp).assertIsNotEnabled()
+        compose.runOnIdle { failed.value = true }
+        compose.onNodeWithText("Retry like status").assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(1, retries); assertEquals(0, toggles); liked.value = false }
+        compose.onNodeWithText("Like song").assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(1, toggles); pending.value = true }
+        compose.onNodeWithText("Saving like").assertIsNotEnabled()
+        compose.runOnIdle { pending.value = false; liked.value = true }
+        compose.onNodeWithText("Unlike song").assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(2, toggles); assertEquals(1, retries) }
+    }
 
     @OptIn(ExperimentalMaterial3Api::class)
     private fun checkReachability(fontScale: Float) {
@@ -73,7 +100,7 @@ class MusicActionsContentTest {
             compose.runOnIdle { assertEquals(expected, events.last()) }
         }
         // Traverse back through the actual actions, not a duplicate test-only menu.
-        for (label in listOf("Open details", "Add to playlist", "Add to queue", "Play next", "Play")) {
+        for (label in listOf("Open details", "Add to playlist", "Add to queue", "Play next", "Play", "Like song")) {
             val action = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
             val viewport = compose.onNodeWithTag("music-actions").getUnclippedBoundsInRoot()
             val target = action.getUnclippedBoundsInRoot()
@@ -83,8 +110,6 @@ class MusicActionsContentTest {
                 target.top >= viewport.top - 0.5.dp && target.bottom <= viewport.bottom + 0.5.dp)
             action.performClick()
         }
-        compose.onNodeWithContentDescription("Like song").performScrollTo().assertIsDisplayed()
-            .assertHeightIsAtLeast(48.dp).performClick()
         compose.runOnIdle {
             assertEquals(listOf("album:album", "artist:artist-24", "track:song", "playlist", "queue", "next", "play", "like"), events)
         }

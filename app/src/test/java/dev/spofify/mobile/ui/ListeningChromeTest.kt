@@ -11,6 +11,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
@@ -25,6 +27,7 @@ import dev.spofify.mobile.core.ServerAddress
 import dev.spofify.mobile.core.SessionStore
 import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.core.StoredSession
+import dev.spofify.mobile.listeningColorScheme
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -39,6 +42,25 @@ import org.robolectric.annotation.Config
 @Config(sdk = [35], qualifiers = "w411dp-h891dp-xhdpi")
 class ListeningChromeTest {
     @get:Rule val compose = createComposeRule()
+
+    @Test fun productionContainersUseExistingMintTonesWithReadableForegrounds() {
+        val colors = listeningColorScheme()
+        val mint = Color(0xFF78E0AC)
+        val tonalContainer = Color(0xFF294034)
+        assertEquals(mint, colors.primary)
+        assertEquals(mint, colors.secondary)
+        for ((container, foreground) in listOf(
+            colors.primaryContainer to colors.onPrimaryContainer,
+            colors.secondaryContainer to colors.onSecondaryContainer,
+        )) {
+            assertEquals(tonalContainer, container)
+            assertEquals(mint, foreground)
+            assertEquals(1f, container.alpha, 0f)
+            assertEquals(1f, foreground.alpha, 0f)
+            val contrast = (foreground.luminance() + .05f) / (container.luminance() + .05f)
+            assertTrue("Production container text must meet 4.5:1 contrast (was $contrast)", contrast >= 4.5f)
+        }
+    }
 
     @Test fun onlySearchFocusOrItsImeCollapsesChrome() {
         assertFalse(hideListeningChrome(true, false, false))
