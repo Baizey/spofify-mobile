@@ -48,11 +48,9 @@ class PlaylistOccurrenceActionsTest {
     private val effectDispatcher = StandardTestDispatcher(effectScheduler, name = "PlaylistOccurrenceActions-effects")
     @get:Rule val compose = createComposeRule(effectContext = effectDispatcher)
 
-    @Test fun idleMoreKeepsExplicitNonStartingAddDistinctFromPlayNowSwipeIntent() = checkActions("Play now")
+    @Test fun moreKeepsQueueLowAndHighDistinctReachableAndWithoutMusicalWork() = checkActions()
 
-    @Test fun activeMoreKeepsExplicitAddDistinctFromContextualAddSwipeIntent() = checkActions("Add to queue")
-
-    private fun checkActions(contextualLabel: String) {
+    private fun checkActions() {
         MockWebServer().use { web ->
             web.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
@@ -85,7 +83,7 @@ class PlaylistOccurrenceActionsTest {
                     MaterialTheme(typography = AppTypography) {
                         if (shown.value) PlaylistOccurrenceActions(client, track,
                             onDismiss = {}, onOpen = {}, onAdd = {}, onPersonalChange = {},
-                            playbackEnabled = true, contextualLabel = contextualLabel,
+                            playbackEnabled = true, contextualLabel = "Queue High",
                             onPlayNow = { events += "play-now" }, onContextual = { events += "contextual" },
                             onEnqueue = { events += "enqueue" }, onPlayNext = { events += "play-next" },
                             onOpenItem = {})
