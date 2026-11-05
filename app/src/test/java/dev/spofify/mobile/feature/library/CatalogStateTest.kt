@@ -494,6 +494,47 @@ class CatalogStateTest {
         }
     }
 
+    @Test fun firstSameRevisionDetailPollCannotRetryFailedChildBatchOrEraseItsFrontier() = runTest {
+        for (append in listOf(false, true)) {
+            val reader = Reader()
+            val seed = LibraryItem("album", "album", "Resolved album")
+            val holder = CatalogStateHolder(reader, backgroundScope, initialItem = seed)
+            holder.setVisible(true); runCurrent()
+            if (append) {
+                reader.reads.single().completeRows(total = 120); runCurrent()
+                holder.more("tracks"); runCurrent()
+            }
+            reader.reads.last().result.completeExceptionally(IOException()); runCurrent()
+            holder.rememberScroll(holder.state.value.current.key, if (append) 35 else 0, 12)
+            val failed = holder.state.value.current.sections.getValue("tracks")
+            val requestsBeforePoll = reader.reads.size
+            val sourceVersion = holder.navigationVersion
+
+            // This first poll must still validate the parent detail, but revision 1 is not
+            // a source reset and cannot turn either an initial or append error into a read.
+            holder.checkRevision(); runCurrent()
+            assertEquals(2, reader.details.size)
+            assertEquals(sourceVersion, holder.navigationVersion)
+            holder.setVisible(false); holder.setVisible(true)
+            repeat(5) { holder.demandMore("tracks"); holder.checkRevision() }
+            runCurrent()
+            assertEquals(requestsBeforePoll, reader.reads.size)
+            assertEquals(failed, holder.state.value.current.sections.getValue("tracks"))
+            assertEquals(12, holder.state.value.current.scrollOffset)
+
+            // Only explicit Retry reserves that exact failed offset, once, retaining rows.
+            holder.retry("tracks"); holder.retry("tracks"); runCurrent()
+            assertEquals(requestsBeforePoll + 1, reader.reads.size)
+            assertEquals(if (append) 40 else 0, reader.reads.last().request.offset)
+            assertEquals(failed.items, holder.state.value.current.sections.getValue("tracks").items)
+            reader.reads.last().completeRows(total = 120); runCurrent()
+            val recovered = holder.state.value.current.sections.getValue("tracks")
+            assertNull(recovered.error)
+            assertEquals(if (append) 80 else 40, recovered.items.size)
+            holder.close()
+        }
+    }
+
     @Test fun changedResolvedDetailAndWithdrawalRetireActionsEvenAtSamePolledRevision() = runTest {
         for (change in listOf("metadata", "availability", "identity", "missing")) {
             val seed = LibraryItem("track", "detail", "Detail", hasAudio = true)

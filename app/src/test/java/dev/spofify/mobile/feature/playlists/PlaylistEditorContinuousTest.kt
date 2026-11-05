@@ -22,10 +22,10 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 
 private fun previewPage(offset: Int, total: Int = 81, fence: String = "fence", next: String? =
-    if (offset + 40 < total) "cursor-${offset + 40}" else null): String {
+    if (offset + 40 < total) "cursor-${offset + 40}" else null, positionShift: Int = 0): String {
     val items = (offset until minOf(offset + 40, total)).joinToString(",") {
         // Every track is deliberately the same; occurrence identity, not track ID, must survive.
-        """{"occurrenceId":"occ-$it","selectionToken":null,"position":$it,"track":{"kind":"track","id":"same","name":"Song $it"}}"""
+        """{"occurrenceId":"occ-$it","selectionToken":null,"position":${it + positionShift},"track":{"kind":"track","id":"same","name":"Song $it"}}"""
     }
     return """{"items":[$items],"total":$total,"availableTotal":$total,"limit":40,"nextCursor":${next?.let { "\"$it\"" } ?: "null"},"revision":null,"fence":"$fence","complete":true}"""
 }
@@ -83,6 +83,8 @@ class PlaylistEditorPreviewStateTest {
             previewPage(40).replace("\"revision\":null", "\"revision\":2"),
             previewPage(40, total = 82),
             previewPage(40, next = "cursor-40"),
+            previewPage(40, positionShift = 1), // increasing positions still skip the prefix frontier
+            previewPage(40).replace("\"position\":79", "\"position\":80"), // gap within an increasing batch
             previewPage(0), // repeated occurrences/positions are not progress
         )
         for (invalid in invalidPages) MockWebServer().use { web ->
@@ -93,6 +95,55 @@ class PlaylistEditorPreviewStateTest {
             state.more(); until { !state.pending }
             assertTrue(state.stale); assertEquals(40, state.entries.size)
             state.more(); state.retry(); assertEquals(2, web.requestCount)
+        }
+    }
+
+    @Test fun previewMustBeginAtZeroAndInvalidPrefixNeedsExplicitRefresh() = runTest {
+        MockWebServer().use { web ->
+            web.start(); val client = previewClient(web)
+            val state = EditorPreviewState(DerivedPlaylistsApi(client), client, this)
+            web.enqueue(previewResponse(previewPage(0, positionShift = 1)))
+            state.refresh(blankRecipe(), true, null); until { !state.pending }
+            assertTrue(state.stale)
+            assertTrue(state.entries.isEmpty())
+            assertNull(state.page)
+            state.more(); state.retry(); runCurrent()
+            assertEquals(1, web.requestCount)
+
+            web.enqueue(previewResponse(previewPage(0)))
+            state.refresh(blankRecipe(), true, null); until { !state.pending }
+            assertFalse(state.stale)
+            assertEquals(0L, state.entries.first().position)
+            assertEquals(40, state.entries.size)
+            assertEquals(2, web.requestCount)
+        }
+    }
+
+    @Test fun expiredPreviewCursorRetainsReadOnlyPrefixAndCannotBeRetried() = runTest {
+        for (status in listOf(409, 410)) MockWebServer().use { web ->
+            web.start(); val client = previewClient(web)
+            val state = EditorPreviewState(DerivedPlaylistsApi(client), client, this)
+            web.enqueue(previewResponse(previewPage(0)))
+            web.enqueue(previewResponse("{}", status))
+            state.refresh(blankRecipe(), true, null); until { !state.pending }
+            val prefix = state.entries
+            state.more(); until { !state.pending }
+            assertTrue("Expired cursor $status requires a new deliberate evaluation", state.stale)
+            assertEquals(prefix, state.entries)
+            assertNull(state.error)
+            repeat(5) { state.more(); state.retry() }
+            runCurrent(); assertEquals(2, web.requestCount)
+
+            web.enqueue(previewResponse(previewPage(0, fence = "fresh")))
+            state.refresh(blankRecipe(), true, null); until { !state.pending }
+            assertFalse(state.stale)
+            assertEquals("fresh", state.page?.fence)
+            val bodies = (0 until 3).map {
+                ApiJson.parseToJsonElement(web.takeRequest(1, TimeUnit.SECONDS)!!.body.readUtf8()).jsonObject
+            }
+            assertFalse(bodies[0].containsKey("cursor"))
+            assertEquals("cursor-40", bodies[1].getValue("cursor").jsonPrimitive.content)
+            assertFalse("Refresh starts a new prefix, never restarts into retained rows", bodies[2].containsKey("cursor"))
         }
     }
 

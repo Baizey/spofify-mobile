@@ -89,7 +89,10 @@ internal class EditorPreviewState(
                 val fresh = result.items.filter { old[it.occurrenceId] == null }
                 check(result.items.all { old[it.occurrenceId]?.let { previous -> previous == it } ?: true })
                 check(result.items.zipWithNext().all { (a, b) -> a.position < b.position })
-                check(fresh.isEmpty() || fresh.first().position > (prefix.lastOrNull()?.position ?: -1))
+                // Cursor progress must extend the exact positional prefix, not merely move
+                // forward: an increasing page can still silently skip an occurrence.
+                check(fresh.isEmpty() || fresh.first().position == (prefix.lastOrNull()?.position ?: -1) + 1)
+                check(fresh.zipWithNext().all { (a, b) -> b.position == a.position + 1 })
                 check(fresh.isNotEmpty() || (before == null && result.total == 0L && result.nextCursor == null))
                 val all = prefix + fresh
                 check(all.size.toLong() <= result.total)
@@ -103,7 +106,7 @@ internal class EditorPreviewState(
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 if (identity !== ticket) return@launch
-                val invalid = e is IllegalStateException || (e is ApiException && (e.status in 200..299 || e.status == 409))
+                val invalid = e is IllegalStateException || (e is ApiException && (e.status in 200..299 || e.status == 409 || e.status == 410))
                 stale = invalid
                 if (invalid) message = "Preview changed or expired. Retained rows are not current; refresh preview explicitly."
                 else {

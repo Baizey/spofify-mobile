@@ -338,7 +338,7 @@ class CatalogStateHolder(
             (!preservePending || !screen.detailLoading)) loadDetail(quiet = stale || screen.detailResolved)
         if (!screen.detailUnavailable) screen.sectionKinds.forEach { kind ->
             val section = screen.sections[kind]
-            if ((section?.error == null || stale) && (section?.loaded != true || section.needsReload || stale) &&
+            if (section?.error == null && (section?.loaded != true || section.needsReload || stale) &&
                 (!preservePending || section?.loading != true))
                 loadSection(kind, quiet = stale || section?.loaded == true)
         }
@@ -542,9 +542,11 @@ class CatalogStateHolder(
         if (sourceChanged) navigationVersion++
         mutable.value = mutable.value.copy(stack = mutable.value.stack.map { screen ->
             screen.copy(stale = true, sections = screen.sections.mapValues { (_, section) ->
-                // A new revision invalidates the prefix too, not just a failed/pending expansion.
-                // Preserve the listener's requested extent, but rebuild it from a fresh snapshot.
-                section.copy(appendPending = false, requestedOffset = null, error = null, refreshRequired = false, demandPaused = false,
+                // A same-revision first detail fence is not permission to retry a failed child
+                // batch. Keep its exact frontier and latch, including across Back/visibility.
+                // Only a changed source may discard that frontier and rebuild a fresh prefix.
+                if (!sourceChanged && section.error != null) section else section.copy(
+                    appendPending = false, requestedOffset = null, error = null, refreshRequired = false, demandPaused = false,
                     revalidateCount = maxOf(section.revalidateCount,
                         if (section.appendPending) section.nextOffset + section.limit - section.offset else 0))
             })
