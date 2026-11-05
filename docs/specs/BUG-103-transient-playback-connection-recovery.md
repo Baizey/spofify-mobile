@@ -13,9 +13,9 @@
 - Touchpoints: fresh prepared transport and queue admission after transient connection failure; actual-host persistent-broker regressions
 - Next action: Complete the full provisioned gate, exact-candidate independent review and individual normal-Git integration/postchecks. Actual-host accepted ordinary heartbeat-loss RED is fixed with fresh-action exact-live prepared reacceptance; 14 focused tests pass. Native checks remain NOT COMPLETE: current Pixel 10 Pro control route is unavailable from the tool environment, awaiting an approved accessible ADB route; no current boot failure is claimed.
 
-## READY — one investigation-led, test-first fix
+## Original READY analysis — one investigation-led, test-first fix
 
-- **Spec readiness: READY. Product RED: not yet established.** Source-only analysis; no build, test, broker, download, device or live-account execution was performed. A plausible current production-path recovery gap is identified below, not a proven explanation of the user's incident.
+- **At analyzer handoff: spec READY; product RED not yet established.** Source-only analysis; no build, test, broker, download, device or live-account execution was performed. A plausible current production-path recovery gap is identified below, not a proven explanation of the user's incident.
 - Base: clean landed mobile main **`5b2422f645bc461af3e8419cd6af3399b33fc940`** (includes prepared Resume/handoff fixes and conditional unselected Queue High).
 - Owned analyzer branch: `spec/transient-playback-recovery`; worktree: `/var/home/lsm/repos/spofify-mobile-transient-playback-specs`; canonical deliverable: this file. Lead implements from current landed main in its own scoped topic/worktree. No unfinished imports or main/source edits in this analysis.
 - Scope: one small end-to-end fix for fresh explicit playback/queue actions after a transient failure, including truthful admission/refusal and focused production-path regressions. **Independent of FEAT-115 song caching.** Neither cached bytes nor warmed HTTP connections repair coordinator/service permission. No cache prerequisite is evidenced; identify any genuine minimal prerequisite with a failing trace before proposing separate work.
