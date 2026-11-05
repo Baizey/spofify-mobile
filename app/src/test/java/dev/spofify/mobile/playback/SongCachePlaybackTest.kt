@@ -67,7 +67,8 @@ class SongCachePlaybackTest {
     /** Small, authenticated control room. It reports only states actually published by the
      * production receiver. No directives/activation/start ACK or cache result are invented.
      */
-    private class Room(private val remote: Boolean = false, private val sampleRate: Int = 8000) : Dispatcher() {
+    private class Room(private val remote: Boolean = false, private val sampleRate: Int = 8000,
+        private val longCurrent: Boolean = false) : Dispatcher() {
         /** Bytes scheduled at dispatch, not bytes written to a socket or read by a client.
          * A delayed/cancelled response can schedule its full body but transmit less or nothing.
          */
@@ -113,7 +114,7 @@ class SongCachePlaybackTest {
             if (path.size == 5 && path.take(3) == listOf("api", "library", "tracks") && path[4] == "audio") {
                 val id = path[3]
                 check(id.length == 1 && id[0] in 'A'..'Z')
-                val wav = wav(id, sampleRate)
+                val wav = wav(id, sampleRate, (durationMillis(id) / 1000).toInt())
                 val range = request.getHeader("Range")
                 val start = range?.removePrefix("bytes=")?.substringBefore('-')?.toIntOrNull() ?: 0
                 if (start !in wav.indices) return MockResponse().setResponseCode(416)
@@ -161,17 +162,20 @@ class SongCachePlaybackTest {
                 return json(view().toJson().toString())
             }
         }
+        fun durationMillis(id: String) = if (longCurrent && id == "A") 120_000L else 12_000L
         fun fetched() = audio.filter { it.method == "GET" }.map { it.id }.toSet()
         fun scheduledBodies(id: String) = audio.filter { it.id == id && it.method == "GET" }
             .sumOf { it.scheduledBodyBytes.toLong() }
         companion object {
             private const val SESSION = """{"accountId":"cache-account","username":"listener","role":"user","csrfToken":"cache-csrf"}"""
-            // 192,044 bytes/track, generated on demand; no binary assets/whole-song cache helper.
+            // Normally 192,044 bytes/track; the two worker/window tests use a 120s current A
+            // to cross the progressive loading checkpoint before EOF and keep buffering inside A. Generated on demand;
+            // no binary assets or whole-song cache helper.
             // All A..Z markers are distinct. Each bounded captured slice checks identical
             // 16-bit samples; this is sampled PCM identity, not a whole-stream hash.
             fun marker(id: String) = 0x1000 + id.single().code * 17
-            fun wav(id: String, sampleRate: Int = 8000): ByteArray {
-                val size = 12 * sampleRate * 2
+            fun wav(id: String, sampleRate: Int = 8000, seconds: Int = 12): ByteArray {
+                val size = seconds * sampleRate * 2
                 return ByteBuffer.allocate(44 + size).order(ByteOrder.LITTLE_ENDIAN).apply {
                     put("RIFF".toByteArray()); putInt(size + 36); put("WAVEfmt ".toByteArray())
                     putInt(16); putShort(1.toShort()); putShort(1.toShort()); putInt(sampleRate); putInt(sampleRate * 2)
@@ -183,9 +187,9 @@ class SongCachePlaybackTest {
     }
 
     private inner class Journey(remote: Boolean = false, private val limits: SongCache.Limits = SongCache.Limits(),
-        sampleRate: Int = 8000) : AutoCloseable {
+        sampleRate: Int = 8000, longCurrent: Boolean = false) : AutoCloseable {
         val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        val room = Room(remote, sampleRate)
+        val room = Room(remote, sampleRate, longCurrent)
         val web = MockWebServer().apply { dispatcher = room; start(InetAddress.getByName("127.0.0.1"), 0) }
         val server = ServerAddress.parse("http://127.0.0.1:${web.port}")
         val sessions = Sessions()
@@ -248,7 +252,7 @@ class SongCachePlaybackTest {
         }
         fun play(vararg ids: String) = playAt(0, *ids)
         fun playAt(start: Int, vararg ids: String) {
-            val items = ids.mapIndexed { index, id -> track(id, "$id-$index") }
+            val items = ids.mapIndexed { index, id -> track(id, "$id-$index").copy(durationMs = room.durationMillis(id)) }
             assertNull(PlaybackService.replacePrepared(items.map { PlaybackMedia.create(it, client) }, client,
                 start, false, true))
             await("actual started ${ids[start]} PCM through production source") {
@@ -370,35 +374,47 @@ class SongCachePlaybackTest {
     }
 
     @Test fun prefetchedBIsActuallyConsumedAsBWithoutAnotherBodyOrFreshnessHead() {
-        Journey().use { j ->
+        Journey(limits = SongCache.Limits(maxTracks = 8, maxBytes = 4 * 1024 * 1024L), longCurrent = true).use { j ->
             j.startService()
             j.play("A", "B", "C", "D", "E", "F", "G")
             j.awaitFetched("A", "B", "C", "D", "E", "F")
-            await("current plus permitted five are completely retained") { j.assertBounded().complete == 6 }
-            assertEquals(setOf("A", "B", "C", "D", "E", "F"), j.room.fetched())
-            assertEquals("Speculation never consumes B in the output renderer", 0L, consumed("B"))
-            val before = j.room.audio.toList()
-            val scheduledBeforeB = j.room.scheduledBodies("B")
-            val bytesB = consumed("B")
-            j.controller!!.seekToNextMediaItem()
-            await("warm exact B really plays and advances") {
-                j.controller!!.currentMediaItem?.mediaId == "B" && j.controller!!.isPlaying &&
-                    j.controller!!.currentPosition > 50 && consumed("B") > bytesB
+            // A is legitimately partial/pinned while its normal forward buffer is full.
+            // All five future whole objects must therefore come from speculative work.
+            await("five complete future objects plus the legitimate partial current entry") {
+                j.assertBounded().let { it.complete == 5 && it.entries == 6 }
             }
-            assertTrue("Cold B must have requested an authenticated nonempty body", scheduledBeforeB > 0)
-            assertEquals("Warm B must not schedule another audio body", scheduledBeforeB, j.room.scheduledBodies("B"))
-            assertEquals("No HEAD/GET freshness check on cached B", before.filter { it.id == "B" }, j.room.audio.filter { it.id == "B" })
+            assertEquals(setOf("A", "B", "C", "D", "E", "F"), j.room.fetched())
+            val future = listOf("B", "C", "D", "E", "F")
+            future.forEach { assertEquals("Speculation never renders $it", 0L, consumed(it)) }
+            val before = j.room.audio.toList()
+            future.forEach { id ->
+                val scheduled = j.room.scheduledBodies(id)
+                assertTrue("Cold $id requested an authenticated nonempty body", scheduled > 0)
+                val pcm = consumed(id)
+                // A one-item replacement builds a fresh production MediaSource; seeking Next
+                // could otherwise pass by playing an already-buffered old period in memory.
+                j.play(id)
+                await("fresh source really plays retained exact $id PCM and advances") {
+                    j.controller!!.currentMediaItem?.mediaId == id && j.controller!!.isPlaying &&
+                        j.controller!!.currentPosition > 50 && consumed(id) > pcm
+                }
+                assertEquals("Warm $id must not schedule another body", scheduled, j.room.scheduledBodies(id))
+                assertEquals("No fresh GET/HEAD on whole cached $id", before.filter { it.id == id }, j.room.audio.filter { it.id == id })
+            }
+            assertEquals(setOf("A", "B", "C", "D", "E", "F"), j.room.fetched())
             assertNotEquals(Room.marker("A"), Room.marker("B"))
             j.assertHealthy()
         }
     }
 
     @Test fun fiveOccurrenceStepsDeduplicateWithoutScanningFartherAndProgressDoesNotRestartWork() {
-        Journey().use { j ->
+        Journey(limits = SongCache.Limits(maxTracks = 8, maxBytes = 4 * 1024 * 1024L), longCurrent = true).use { j ->
             j.startService()
             j.play("A", "B", "B", "C", "D", "E", "F")
             j.awaitFetched("A", "B", "C", "D", "E")
-            await("five unique IDs in six occurrence steps are retained") { j.assertBounded().complete == 5 }
+            await("four complete future IDs plus partial current within six occurrence steps") {
+                j.assertBounded().let { it.complete == 4 && it.entries == 5 }
+            }
             assertEquals(setOf("A", "B", "C", "D", "E"), j.room.fetched())
             assertEquals(1, j.room.audio.count { it.id == "B" && it.method == "GET" })
             val queue = PlaybackService.exportLocalSnapshot().queue
@@ -416,6 +432,19 @@ class SongCachePlaybackTest {
             assertEquals(starts, SongCachePlaybackMedia.starts.get())
             assertEquals(event, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
             assertTrue("Only the actual A occurrence may earn history", j.room.history.get() <= 1)
+            // Only after the unchanged-queue/history/heartbeat oracles, replace each period
+            // with a fresh production source to prove all four future objects are whole hits.
+            listOf("B", "C", "D", "E").forEach { id ->
+                val pcm = consumed(id)
+                j.play(id)
+                await("fresh source consumes retained distinct $id after duplicate-window warming") {
+                    j.controller!!.currentMediaItem?.mediaId == id && j.controller!!.isPlaying &&
+                        j.controller!!.currentPosition > 50 && consumed(id) > pcm
+                }
+                assertEquals("Whole cached $id needs no further GET/HEAD", requests.filter { it.id == id }, j.room.audio.filter { it.id == id })
+            }
+            assertEquals(setOf("A", "B", "C", "D", "E"), j.room.fetched())
+            assertEquals(1, j.room.audio.count { it.id == "B" && it.method == "GET" })
             j.assertHealthy()
         }
     }

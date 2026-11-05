@@ -592,6 +592,35 @@ class SongCacheIntegrationTest {
         }
     }
 
+    @Test fun idleOpenDemandDoesNotBlockFuturePrefetchAndReadActivityStaysBalanced() {
+        val notifications = mutableListOf<Boolean>()
+        var activeOperations = 0
+        val demand = handle.factory(upstream, { "current" }, ::authorize) { active ->
+            notifications += active
+            activeOperations += if (active) 1 else -1
+            assertTrue("No duplicate decrement or overlapping operation", activeOperations in 0..1)
+        }.createDataSource()
+        try {
+            demand.open(spec("current"))
+            assertEquals(listOf(true, false), notifications)
+            assertEquals(0, activeOperations)
+            assertEquals(0L, readBytes.get()) // Body unread; the current DataSource remains open.
+            assertTrue(handle.prefetch("B", spec("B"), upstream, ::authorize, SongCache.Cancellation()))
+            assertEquals(bytes("B").size.toLong(), readBytes.get())
+            assertEquals(listOf(true, false), notifications) // Speculation is not demand activity.
+            assertBytes(bytes("current"), drain(demand))
+            assertEquals(0, activeOperations)
+            assertEquals((bytes("B").size + bytes("current").size).toLong(), readBytes.get())
+        } finally { demand.close() }
+        assertEquals(0, activeOperations)
+        assertTrue(notifications.size > 2)
+        assertTrue(notifications.chunked(2).all { it == listOf(true, false) })
+        val observed = readBytes.get()
+        assertBytes(bytes("B"), fetch("B"))
+        assertEquals(observed, readBytes.get())
+        assertEquals(1, requests["B"])
+    }
+
     @Test fun demandCancelsHeldSpeculationAndTransfersExactCurrentBytes() {
         val entered = CountDownLatch(1)
         responses["slow"] = {
@@ -606,11 +635,14 @@ class SongCacheIntegrationTest {
             val notifications = mutableListOf<Boolean>()
             val demand = handle.factory(upstream, { "current" }, ::authorize) { active ->
                 notifications += active
-                if (active) assertFalse("Block scheduler before cancelling speculation", cancellation.isCancelled)
+                if (active && notifications.size == 1) {
+                    assertFalse("Block scheduler before cancelling speculation", cancellation.isCancelled)
+                }
             }.createDataSource()
             try { demand.open(spec("current")); assertBytes(bytes("current"), drain(demand)) }
             finally { demand.close() }
-            assertEquals(listOf(true, false), notifications)
+            assertTrue(notifications.size > 2)
+            assertTrue(notifications.chunked(2).all { it == listOf(true, false) })
             assertTrue(cancellation.isCancelled)
             assertFalse(pending.get(3, TimeUnit.SECONDS))
             assertEquals(1, requests["current"])

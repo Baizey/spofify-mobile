@@ -56,6 +56,7 @@ import dev.spofify.mobile.core.SpofifyClient
 import java.io.IOException
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -209,9 +210,14 @@ class PlaybackService : MediaSessionService() {
     private data class PrefetchRequest(val trackId: String, val spec: DataSpec)
     private var songPrefetch: SongPrefetchScheduler<PrefetchRequest>? = null
     private var prefetchAllowed = false // Explicit local action only; never passive recovery/import.
-    private val demandAudioSources = AtomicInteger()
+    private val demandAudioOperations = AtomicInteger()
+    private val cachePriorityPosted = AtomicBoolean()
+    private val updateCachePriority = Runnable {
+        cachePriorityPosted.set(false)
+        if (active.get() === this) updatePrefetchPriority()
+    }
     private fun updatePrefetchPriority() {
-        songPrefetch?.setDemandActive(demandAudioSources.get() > 0 || player?.isLoading == true ||
+        songPrefetch?.setDemandActive(demandAudioOperations.get() > 0 || player?.isLoading == true ||
             player?.playbackState == Player.STATE_BUFFERING)
     }
     private var promotionPending: Any? = null
@@ -527,11 +533,12 @@ class PlaybackService : MediaSessionService() {
             audioCache?.prefetch(request.trackId, request.spec, upstream, ::authorizeAudio, storeCancellation)
         }
         val dataSources = SongCache.authorizedFactory(audioCache, upstream, { it.key }, ::authorizeAudio) { active ->
-            demandAudioSources.addAndGet(if (active) 1 else -1)
-            // Cancel speculation immediately on a demand miss. Read player state only on main,
-            // and aggregate all sources so one close cannot release another's priority.
+            demandAudioOperations.addAndGet(if (active) 1 else -1)
+            // Prioritize actual opens/reads, not an idle stream held by Media3's load control.
+            // Aggregate concurrent operations and coalesce read completions to one main task;
+            // player state stays main-thread-only without enqueueing work per audio chunk.
             if (active) songPrefetch?.setDemandActive(true)
-            handler.post { if (PlaybackService.active.get() === this) updatePrefetchPriority() }
+            else if (cachePriorityPosted.compareAndSet(false, true)) handler.post(updateCachePriority)
         }
         val exo = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSources))

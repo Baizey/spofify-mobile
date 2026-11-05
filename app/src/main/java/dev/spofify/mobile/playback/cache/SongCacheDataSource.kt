@@ -32,7 +32,8 @@ internal class SongCacheDataSource(
     private var writer: SongCache.Writer? = null
     private var consumed = 0L
     private var expected = C.LENGTH_UNSET.toLong()
-    private var networkNotified = false
+    private val demandLock = Any()
+    private var networkNotified = false // Access only under demandLock, including concurrent close.
     private var completed = false
 
     private fun guard() {
@@ -111,22 +112,40 @@ internal class SongCacheDataSource(
 
     private fun openNetwork(request: DataSpec, mayRetain: Boolean): Long {
         guard()
-        if (!speculative) {
-            networkNotified = true
-            onDemandNetworkChange(true)
-            session?.demandNetwork()
-        }
         val source = upstream.createDataSource()
         network = source
         listeners.forEach(source::addTransferListener)
         // Do not catch upstream errors: redirects/auth/media failures retain ordinary semantics.
-        val length = source.open(request)
+        val length = demandOperation { source.open(request) }
         guard()
         val coverage = validateResponse(source, request, length)
         expected = coverage.readLength
         if (mayRetain && coverage.retain && id != null && session != null) writer = session.writer(id!!)
         if (speculative && writer == null) throw IOException("Audio cache admission unavailable")
         return expected
+    }
+
+    /** An open-but-idle Media3 source must not starve speculation during buffered playback. */
+    private inline fun <T> demandOperation(operation: () -> T): T {
+        if (speculative) return operation()
+        try {
+            synchronized(demandLock) {
+                if (!networkNotified) {
+                    networkNotified = true
+                    onDemandNetworkChange(true)
+                }
+            }
+            // Block scheduler admission before cancelling the store's current speculative call.
+            session?.demandNetwork()
+            return operation()
+        } finally { endDemandOperation() }
+    }
+
+    private fun endDemandOperation() = synchronized(demandLock) {
+        if (networkNotified) {
+            networkNotified = false
+            onDemandNetworkChange(false)
+        }
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
@@ -146,7 +165,7 @@ internal class SongCacheDataSource(
         } else {
             // Bounded tee chunks reserve actual bytes before each unbuffered disk write.
             val chunk = minOf(length, session?.chunkBytes() ?: 16 * 1024)
-            count = try { network!!.read(buffer, offset, chunk) } catch (error: IOException) {
+            count = try { demandOperation { network!!.read(buffer, offset, chunk) } } catch (error: IOException) {
                 writer?.abort(); writer = null
                 throw error
             }
@@ -214,7 +233,7 @@ internal class SongCacheDataSource(
             consumed = 0
             completed = false
             expected = C.LENGTH_UNSET.toLong()
-            if (networkNotified) { networkNotified = false; onDemandNetworkChange(false) }
+            endDemandOperation()
         }
     }
 
