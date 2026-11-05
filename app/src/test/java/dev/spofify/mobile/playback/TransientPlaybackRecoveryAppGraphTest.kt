@@ -161,12 +161,21 @@ class TransientPlaybackRecoveryAppGraphTest {
             diagnostic = {
                 val state = owner.state.value
                 val projected = connected.state.value
+                val local = PlaybackService.exportLocalSnapshot()
+                val view = state.view
                 // Fixed booleans/enums/numbers only: never serialize a view, identity or payload.
                 "connected=${state.connected},recovery=${state.recovery},canQueueIntent=${state.canQueueIntent}," +
                     "isPlaying=${raw.isPlaying},samplesDelta=${PreparedTransportMedia.samples.get() - samplesAtFault}," +
                     "playerFeedback=${!((projected.error ?: projected.notice).isNullOrBlank())}," +
                     "hostFeedback=${!model.state.value.notice.isNullOrBlank()}," +
-                    "coordinatorFeedback=${state.message.isNotBlank()},pending=${field(owner, "pendingCommand") != null}"
+                    "coordinatorFeedback=${state.message.isNotBlank()},pending=${field(owner, "pendingCommand") != null}," +
+                    "localQueueCount=${local.queue.size},serverQueueCount=${view?.state?.queue?.size}," +
+                    "exactQueueEqual=${view?.state?.queue == local.queue}," +
+                    "metadataEqual=${view?.queueIntents?.state == PlaybackService.exportLocalQueueIntentState()}," +
+                    "serverPlaying=${view?.state?.playing},projectedCanQueueIntent=${projected.canQueueIntent}," +
+                    "publishedBindingCurrent=${projected.queueIntentBinding == state.queueIntentBinding}," +
+                    "publishedKeyCurrent=${projected.interactionKey === PlaybackService.interactionKey()}," +
+                    "preparing=${model.state.value.preparing},settled=${settled(owner)}"
             }
             fun search(name: String) {
                 compose.runOnIdle { model.switchTab(Tab.SEARCH); model.search(name) }
@@ -180,12 +189,38 @@ class TransientPlaybackRecoveryAppGraphTest {
             }
             fun initialAction(name: String, label: String) {
                 search(name)
+                // Setup only: terminal coordinator settlement can precede the real
+                // Connection publisher. Let its current key/binding reach the host BEFORE
+                // opening this fresh menu. Never refresh a captured menu or retry a refusal.
+                // In particular, do NOT put this admission-readiness wait on post-fault High.
+                await("SETUP: current Connection key/binding published before More $label", details = diagnostic) {
+                    val state = owner.state.value
+                    val projected = connected.state.value
+                    val local = PlaybackService.exportLocalSnapshot()
+                    state.connected && state.recovery == PlaybackConnectionRecovery.NONE && settled(owner) &&
+                        !model.state.value.preparing && state.canQueueIntent && projected.canQueueIntent &&
+                        projected.queueIntentBinding != null && projected.queueIntentBinding == state.queueIntentBinding &&
+                        projected.interactionKey === PlaybackService.interactionKey() &&
+                        (local.queue.isEmpty() || projected.interactionKey != null)
+                }
                 val count = receipts.size
+                val queueCount = PlaybackService.exportLocalSnapshot().queue.size
                 more(name, label)
-                await("SETUP: actual More $label has a terminal receipt") { receipts.size == count + 1 }
-                assertNotNull("SETUP: actual More action must be admitted before fault injection",
-                    receipts.last().queueIntentResult)
-                await("SETUP: accepted queue publication and ACK settle") { settled(owner) }
+                await("SETUP: actual More $label has a terminal receipt", details = diagnostic) { receipts.size == count + 1 }
+                val receipt = receipts.last()
+                val result = receipt.queueIntentResult
+                val installed = PlaybackService.exportLocalSnapshot()
+                record("setup-$name-status=${receipt.status}-outcome=${result?.outcome ?: "absent"}" +
+                    "-acceptedCount=${result?.acceptedCount ?: 0}-queueCount=${installed.queue.size}")
+                assertNotNull("SETUP: actual More action must have a terminal queue receipt; ${diagnostic()}", result)
+                val accepted = requireNotNull(result)
+                assertEquals("SETUP: actual More $label must genuinely accept its requested operation; ${diagnostic()}",
+                    if (count == 0) "playing" else "queued", accepted.outcome)
+                assertEquals("SETUP: actual More $label accepts exactly one row", 1, accepted.acceptedCount)
+                assertEquals("SETUP: actual More $label has truthful playback outcome",
+                    if (count == 0) "started" else "unchanged", accepted.playback)
+                assertEquals("SETUP: actual More $label installs exactly one occurrence", queueCount + 1, installed.queue.size)
+                await("SETUP: accepted queue publication and ACK settle", details = diagnostic) { settled(owner) }
             }
             val initialSamples = PreparedTransportMedia.samples.get()
             initialAction("A", "Play now")
@@ -200,7 +235,7 @@ class TransientPlaybackRecoveryAppGraphTest {
             // Resolve the row before injecting the fault, but open NO menu/capture NO held key.
             // The recovery More action below is a genuinely fresh host capture.
             if (queueHighFirst) search("B1")
-            await("SETUP: full playing queue and terminal metadata publication settle") {
+            await("SETUP: full playing queue and terminal metadata publication settle", details = diagnostic) {
                 val snapshot = PlaybackService.exportLocalSnapshot()
                 val view = owner.state.value.view
                 raw.isPlaying && settled(owner) && snapshot.queue.size == 4 && view != null &&
