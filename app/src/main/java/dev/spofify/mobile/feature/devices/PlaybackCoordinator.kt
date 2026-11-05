@@ -14,6 +14,12 @@ import kotlinx.coroutines.sync.withLock
 /** Presentation only: never grants playback authority or schedules a retry. */
 enum class PlaybackConnectionRecovery { NONE, VERIFICATION_NEEDED, AUTH_REQUIRED, OWNER_ENDED, UNSUPPORTED }
 
+/** Only explicitly classified routine narration may be hidden by the picker. */
+enum class PlaybackDevicesMessagePurpose { GUIDANCE, PROGRESS }
+
+/** Opaque in-process presentation identity; never authority or a saved/wire token. */
+data class PlaybackDeviceSelection(val deviceId: String, val token: Long)
+
 /** Remote display is NOT a local audible traversal and must never feed local history. */
 data class PlaybackDevicesState(
     val deviceId: String = "", val view: PlaybackDevicesView? = null,
@@ -23,6 +29,8 @@ data class PlaybackDevicesState(
     val message: String = "Connect the playback service to use this phone as an output.",
     val recovery: PlaybackConnectionRecovery = PlaybackConnectionRecovery.NONE,
     val verifyingConnection: Boolean = false,
+    val messagePurpose: PlaybackDevicesMessagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE,
+    val pendingSelection: PlaybackDeviceSelection? = null,
 ) {
     val retryAvailable: Boolean get() = recovery == PlaybackConnectionRecovery.VERIFICATION_NEEDED && !verifyingConnection
     val activeDeviceId: String get() = view?.activeDeviceId.orEmpty()
@@ -149,6 +157,40 @@ class PlaybackCoordinator(
     private var finalCloseVersion = 0L
     private data class Selection(val target: String, val version: Long)
 
+    // Presentation only. Request identity, not target equality, fences same-target ABA.
+    private data class SelectionFeedback(val presentation: PlaybackDeviceSelection,
+        val version: Long? = null, val commandId: String? = null)
+    private data class CommandFeedback(val commandId: String, val observedPending: Boolean)
+    private var selectionFeedback: SelectionFeedback? = null
+    private var feedbackToken = 0L
+    private val retiredFeedbackTransfers = LinkedHashSet<String>()
+    private fun retireFeedbackTransfer(id: String?) {
+        if (id == null) return
+        retiredFeedbackTransfers.add(id)
+        while (retiredFeedbackTransfers.size > 256) retiredFeedbackTransfers.remove(retiredFeedbackTransfers.first())
+    }
+    private fun clearSelectionFeedback(expectedToken: Long? = selectionFeedback?.presentation?.token) {
+        if (selectionFeedback?.presentation?.token != expectedToken) return
+        retireFeedbackTransfer(selectionFeedback?.commandId)
+        selectionFeedback = null
+        mutableState.value = state.value.copy(pendingSelection = null)
+    }
+    private fun observeSelectionFeedback(view: PlaybackDevicesView, sentFeedback: SelectionFeedback?, grantAuthority: Boolean) {
+        if (!grantAuthority) return
+        val current = selectionFeedback
+        if (current != null) {
+            // An unsent choice cannot be completed by an unrelated poll/rename response.
+            if (current.commandId == null || sentFeedback?.presentation?.token != current.presentation.token) return
+            val outcome = view.commands.find { it.commandId == current.commandId }
+            val matching = view.transfer?.takeIf { it.commandId == current.commandId && it.targetDeviceId == current.presentation.deviceId }
+            if (outcome != null && outcome.status != "pending" || matching == null) clearSelectionFeedback(current.presentation.token)
+        } else if (intent == null) {
+            val transfer = view.transfer ?: return
+            if (transfer.commandId in retiredFeedbackTransfers || view.commands.any { it.commandId == transfer.commandId && it.status != "pending" }) return
+            selectionFeedback = SelectionFeedback(PlaybackDeviceSelection(transfer.targetDeviceId, ++feedbackToken), commandId = transfer.commandId)
+        }
+    }
+
     // A sibling of work, NOT its completion handler: cancellation cleanup starts even if
     // another work child is stuck in NonCancellable. Uses the endpoint's serial dispatcher.
     private val cancellationGuard = scope.launch(start = CoroutineStart.UNDISPATCHED) {
@@ -161,9 +203,11 @@ class PlaybackCoordinator(
                     revokeAuthority()
                     endpoint.suspendOutput(); managedOutput = false; serviceActive = false
                     mutableState.value = state.value.copy(connected = false, exclusiveOwner = false,
-                        message = "Playback service stopped. Reconnect and press Play explicitly.")
+                        message = "Playback service stopped. Reconnect and press Play explicitly.",
+                        messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
                 }
                 clearConnectionChecks()
+                clearSelectionFeedback()
                 mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.OWNER_ENDED)
             }
         }
@@ -199,12 +243,14 @@ class PlaybackCoordinator(
         if (closed || active == serviceActive) return
         if (active && !work.isActive) {
             mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.OWNER_ENDED,
-                message = "The playback owner scope has ended. Recreate the service connection.")
+                message = "The playback owner scope has ended. Recreate the service connection.",
+                messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
             return
         }
         if (active && !endpoint.supportsExactHandoff) {
             mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.UNSUPPORTED,
-                message = "This playback engine cannot yet transfer the complete prepared queue safely.")
+                message = "This playback engine cannot yet transfer the complete prepared queue safely.",
+                messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
             return
         }
         serviceActive = active
@@ -227,6 +273,7 @@ class PlaybackCoordinator(
             lifecycle++; fenceLocal(); managedOutput = false; work.coroutineContext.cancelChildren(); heartbeat = null
             selectionJob?.cancel(); intent = null; acks.clear(); ackState = null; deliveries.clear(); pendingCommand = null
             clearConnectionChecks()
+            clearSelectionFeedback()
             mutableState.value = PlaybackDevicesState(message = "Playback service is not connected. Reconnecting never starts audio automatically.",
                 recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED)
             if (oldId.isNotEmpty()) scope.launch { transport.withLock { try { withTimeout(4000) { api.leave(oldId) } } catch (_: Exception) { /* Single attempt only. */ } } }
@@ -268,12 +315,14 @@ class PlaybackCoordinator(
         setServiceActive(false)
         lifecycle++; fenceLocal(); work.coroutineContext.cancelChildren()
         clearConnectionChecks()
+        clearSelectionFeedback()
         mutableState.value = PlaybackDevicesState(message = "Sign in again to connect your players.", recovery = PlaybackConnectionRecovery.AUTH_REQUIRED)
     }
     fun close() {
         if (!closed) {
             setServiceActive(false); closed = true; lifecycle++; work.cancel(); cancellationGuard.cancel(); fenceLocal()
             clearConnectionChecks()
+            clearSelectionFeedback()
             mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.OWNER_ENDED)
         }
     }
@@ -325,8 +374,14 @@ class PlaybackCoordinator(
             // to execute and ACK the server's release at its exact final position.
             generation++; actionVersion++; revokeAuthority(); endpointJob?.cancel(); endpoint.suspendOutput()
         }
+        retireFeedbackTransfer(selectionFeedback?.commandId)
+        retireFeedbackTransfer(state.value.view?.transfer?.commandId)
+        selectionFeedback = SelectionFeedback(PlaybackDeviceSelection(targetDeviceId, ++feedbackToken), selection.version)
+        val retainedGuidance = state.value.message.isNotEmpty() && state.value.messagePurpose == PlaybackDevicesMessagePurpose.GUIDANCE
         mutableState.value = state.value.copy(selectedDeviceId = targetDeviceId, selectionUnconfirmed = true,
-            message = "Selecting output. You can choose another device while waiting.")
+            pendingSelection = selectionFeedback?.presentation,
+            message = if (retainedGuidance) state.value.message else "Selecting output. You can choose another device while waiting.",
+            messagePurpose = if (retainedGuidance) PlaybackDevicesMessagePurpose.GUIDANCE else PlaybackDevicesMessagePurpose.PROGRESS)
         if (selectionJob?.isActive == true) return
         selectionJob = work.launch {
             while (intent != null && serviceActive && !closed) {
@@ -334,7 +389,11 @@ class PlaybackCoordinator(
                     val latest = intent ?: return@withLock
                     val life = lifecycle
                     exchange {
-                        request { api.transfer(state.value.deviceId, epoch, nonce(), latest.target, latest.version) }
+                        val commandId = nonce()
+                        selectionFeedback?.takeIf { it.version == latest.version }?.let {
+                            selectionFeedback = it.copy(commandId = commandId)
+                        }
+                        request { api.transfer(state.value.deviceId, epoch, commandId, latest.target, latest.version) }
                     }
                     if (life == lifecycle && intent == latest) {
                         intent = null
@@ -356,7 +415,7 @@ class PlaybackCoordinator(
             work.launch { transport.withLock {
                 try {
                     val view = withTimeout(4000) { api.rename(deviceId, name.trim()) }.validated().copy(directives = emptyList())
-                    if (life == lifecycle && !closed && work.isActive && !serviceActive) mutableState.value = state.value.copy(view = view, message = "Device name saved. Native handoff remains unavailable on this phone.")
+                    if (life == lifecycle && !closed && work.isActive && !serviceActive) mutableState.value = state.value.copy(view = view, message = "Device name saved. Native handoff remains unavailable on this phone.", messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
                 } catch (error: Exception) {
                     if (error is CancellationException && error !is TimeoutCancellationException) throw error
                     if (life == lifecycle && !closed && work.isActive && !serviceActive) readOnlyFailure(error,
@@ -585,10 +644,13 @@ class PlaybackCoordinator(
     private suspend fun request(registration: Boolean = false, ownerPoll: Boolean = false, call: suspend () -> PlaybackDevicesView) {
         if (closed || !serviceActive) return
         val life = lifecycle; val sent = clockMs(); val revision = actionVersion
+        val sentFeedback = selectionFeedback
+        val sentCommand = pendingCommand?.let { CommandFeedback(it, observedPendingCommand == it) }
         val view = withTimeout(4000) { call() }.validated()
         if (life != lifecycle || closed || !serviceActive || !work.isActive) return
         consume(view, sent, registration, startsAllowed = revision == actionVersion,
-            grantAuthority = registration || ownerPoll || state.value.connected)
+            grantAuthority = registration || ownerPoll || state.value.connected, sentFeedback = sentFeedback,
+            sentCommand = sentCommand)
     }
     private suspend fun consume(
         view: PlaybackDevicesView,
@@ -596,6 +658,8 @@ class PlaybackCoordinator(
         registration: Boolean = false,
         startsAllowed: Boolean = true,
         grantAuthority: Boolean = true,
+        sentFeedback: SelectionFeedback? = null,
+        sentCommand: CommandFeedback? = null,
     ) {
         if (!registration && view.epoch < epoch) return
         if (!registration && view.epoch == epoch && view.stateSeq < (state.value.view?.stateSeq ?: 0)) return
@@ -630,14 +694,33 @@ class PlaybackCoordinator(
         val terminal = outcome != null && outcome.status != "pending" || outcomeForgotten
         val completedCommand = pendingCommand.takeIf { terminal }
         if (terminal) { pendingCommand = null; observedPendingCommand = null }
-        val connectedMessage = when {
+        val selectionOutcome = view.commands.find { it.commandId == sentFeedback?.commandId }
+        // A newer selection may retire the command while this request is suspended.
+        // Retain its failure/forgotten guidance without reviving control or its callback.
+        val sentCommandOutcome = view.commands.find { it.commandId == sentCommand?.commandId }
+        val sentCommandForgotten = sentCommand?.observedPending == true && sentCommandOutcome == null
+        val failureStatuses = setOf("timeout", "cancelled", "rejected", "media", "blocked")
+        val guidance = when {
             !grantAuthority && state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED -> "Sign in again to connect your players."
             !grantAuthority -> "Playback connection needs verification. The action was not replayed. Reconnect before pressing Play."
-            view.quarantineMs > 0 -> "Waiting for previous playback permission to expire. The selected output will be prepared paused."
-            view.transfer != null -> "Switching playback; waiting for the players to confirm."
-            outcomeForgotten || outcome?.status in setOf("timeout", "cancelled", "rejected", "media") -> "The action could not be confirmed. It was not replayed."
+            outcomeForgotten || sentCommandForgotten || outcome?.status in failureStatuses ||
+                sentCommandOutcome?.status in failureStatuses || selectionOutcome?.status in failureStatuses -> "The action could not be confirmed. It was not replayed."
+            view.state?.error == "blocked" -> "Playback needs a tap on the selected device."
+            view.state?.error == "media" -> "The selected device could not play this audio. Choose music or retry explicitly."
             else -> ""
         }
+        val progress = when {
+            view.quarantineMs > 0 -> "Waiting for previous playback permission to expire. The selected output will be prepared paused."
+            view.transfer != null -> "Switching playback; waiting for the players to confirm."
+            else -> ""
+        }
+        val retainedGuidance = !registration && (progress.isNotEmpty() || selectionFeedback != null || intent != null) &&
+            state.value.message.isNotEmpty() &&
+            state.value.messagePurpose == PlaybackDevicesMessagePurpose.GUIDANCE
+        val connectedMessage = guidance.ifEmpty { if (retainedGuidance) state.value.message else progress }
+        val messagePurpose = if (guidance.isEmpty() && !retainedGuidance && progress.isNotEmpty())
+            PlaybackDevicesMessagePurpose.PROGRESS else PlaybackDevicesMessagePurpose.GUIDANCE
+        observeSelectionFeedback(view, sentFeedback, grantAuthority)
         observeInteractionBinding(id, view)
         mutableState.value = PlaybackDevicesState(id, view,
             intent?.target ?: view.transfer?.targetDeviceId.orEmpty(), intent != null, grantAuthority, false,
@@ -647,17 +730,21 @@ class PlaybackCoordinator(
                 state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED -> PlaybackConnectionRecovery.AUTH_REQUIRED
                 else -> PlaybackConnectionRecovery.VERIFICATION_NEEDED
             },
-            verifyingConnection = connectionChecks > 0)
+            verifyingConnection = connectionChecks > 0, messagePurpose = messagePurpose,
+            pendingSelection = selectionFeedback?.presentation)
         publishAuthority()
         if (terminal) finishCommandResult(completedCommand, outcome?.status ?: "cancelled")
         leaseTimer?.cancel()
+        val feedbackAtLease = selectionFeedback?.presentation?.token
         if (grantAuthority && view.activeDeviceId == id) leaseTimer = work.launch {
             while (clockMs() < leaseDeadline) delay((leaseDeadline - clockMs()).coerceAtLeast(1))
             if (epoch == view.epoch && state.value.activeDeviceId == id) {
                 uncertainConnection = true
                 fenceLocal()
+                clearSelectionFeedback(feedbackAtLease)
                 mutableState.value = state.value.copy(connected = false, recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED,
-                    message = "Playback permission expired. Reconnect and press Play explicitly.")
+                    message = "Playback permission expired. Reconnect and press Play explicitly.",
+                    messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
             }
         }
         // A non-directive recovery NEVER imports playing state. It stays silent until explicit Play.
@@ -751,25 +838,28 @@ class PlaybackCoordinator(
     private suspend fun exchange(block: suspend () -> Unit) {
         if (closed || !serviceActive) return
         val life = lifecycle
+        val feedbackAtDispatch = selectionFeedback?.presentation?.token
         try { block() }
         catch (error: CancellationException) {
             if (error !is TimeoutCancellationException) throw error
-            if (life == lifecycle && !closed && serviceActive) failed(error)
+            if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch)
         }
-        catch (error: Exception) { if (life == lifecycle && !closed && serviceActive) failed(error) }
+        catch (error: Exception) { if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch) }
     }
-    private suspend fun failed(error: Exception) {
+    private suspend fun failed(error: Exception, feedbackAtDispatch: Long?) {
         // Unknown writes are NOT replayed. Stop buffered output immediately, not merely remote UI state.
         uncertainConnection = true
         fenceLocal(); acks.clear(); ackState = null; pendingCommand = null
+        clearSelectionFeedback(feedbackAtDispatch)
         mutableState.value = state.value.copy(connected = false, connecting = false, exclusiveOwner = false,
+            messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE,
             recovery = if (state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED) PlaybackConnectionRecovery.AUTH_REQUIRED else PlaybackConnectionRecovery.VERIFICATION_NEEDED,
             message = if (state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED) "Sign in again to connect your players."
                 else "Connection or playback changed. The action was not replayed. Retry connection, choose an output, then press Play.")
         // Reconcile a device-scoped conflict through its validated safe view; never replay its action.
         if (error is ApiException && error.status == 401) { authLost(); return }
         if (error is ApiException && error.status == 404) {
-            lifecycle++; mutableState.value = state.value.copy(deviceId = ""); return
+            lifecycle++; clearSelectionFeedback(); mutableState.value = state.value.copy(deviceId = ""); return
         }
         if (error is ApiException && error.status == 409) {
             val life = lifecycle
@@ -785,7 +875,7 @@ class PlaybackCoordinator(
                     // must not advertise a connection retry as a sign-in replacement.
                     if (life == lifecycle && !closed && work.isActive && reconciliationError is ApiException && reconciliationError.status == 401) {
                         mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.AUTH_REQUIRED,
-                            message = "Sign in again to connect your players.")
+                            message = "Sign in again to connect your players.", messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
                     }
                 }
             }
@@ -799,8 +889,9 @@ class PlaybackCoordinator(
                 !endpoint.supportsExactHandoff -> PlaybackConnectionRecovery.UNSUPPORTED
                 else -> PlaybackConnectionRecovery.VERIFICATION_NEEDED
             },
-            message = if (authRequired) "Sign in again to connect your players." else guidance)
+            message = if (authRequired) "Sign in again to connect your players." else guidance,
+            messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
     }
-    private fun message(value: String) { mutableState.value = state.value.copy(message = value) }
+    private fun message(value: String) { mutableState.value = state.value.copy(message = value, messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE) }
     private fun nonce() = UUID.randomUUID().toString()
 }

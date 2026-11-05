@@ -1,13 +1,19 @@
 package dev.spofify.mobile.feature.devices
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -16,6 +22,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.spofify.mobile.core.PlaybackDevice
+import dev.spofify.mobile.ui.LoadingRing
 
 /** Presentation only: dismissing the picker never tears down output ownership or heartbeats. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -45,19 +52,16 @@ internal fun ColumnScope.PlaybackDevicesContent(
     var editing by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
-        Row(Modifier.fillMaxWidth()) {
-            Text("Playback devices", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
-            TextButton(onClick = onDismiss) { Text("Close", maxLines = 1, softWrap = false) }
-        }
+        Text("Playback devices", style = MaterialTheme.typography.titleLarge)
         if (viewOnly) Text("View only · Playback transfer is unavailable on this phone.",
             Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.bodyMedium)
-        if (state.message.isNotEmpty()) Text(state.message,
+        if (state.message.isNotEmpty() && state.messagePurpose != PlaybackDevicesMessagePurpose.PROGRESS) Text(state.message,
             Modifier.padding(vertical = 12.dp).semantics { liveRegion = LiveRegionMode.Polite })
         if (state.connecting || state.verifyingConnection) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (state.retryAvailable) TextButton(onClick = onRetry) { Text("Retry connection") }
         if (!viewOnly && state.needsTap) Button(onClick = onContinue) { Text("Continue playback here") }
         if (state.devices.isEmpty() && !state.connecting && !state.verifyingConnection) Text("No devices available.")
-        LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false)) {
+        LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).testTag("Playback device list")) {
             items(state.devices, key = { it.deviceId }) { device ->
                 PlaybackDeviceCard(state, device, editing == device.deviceId && !viewOnly, draft,
                     onDraft = { draft = it }, onSelect = { onSelect(device.deviceId) },
@@ -82,44 +86,43 @@ internal fun PlaybackDeviceCard(
     val musical = state.view?.state
     val status = listOfNotNull(
         "This device".takeIf { device.deviceId == state.deviceId },
-        (if (state.selectionUnconfirmed) "Selecting" else "Selected").takeIf { selected },
         when { !device.available -> "Unavailable"; !active -> "Available"; musical?.error == "blocked" -> "Needs a tap"; musical?.playing == true -> "Playing"; else -> "Active output · Paused" },
     ).joinToString(" · ")
     val measurer = rememberTextMeasurer()
     val density = LocalDensity.current
     val actionStyle = MaterialTheme.typography.labelLarge
-    // Measure production scaled typography, not names, to select one layout for all cards.
-    val playWidth = with(density) { measurer.measure("Play from here", actionStyle, softWrap = false).size.width.toDp() }
+    // A stable trailing slot, measured with production scaled typography, never competes with identity.
     val renameWidth = with(density) { measurer.measure("Rename", actionStyle, softWrap = false).size.width.toDp() } + 24.dp
+    val canSelect = device.available && !viewOnly && !selected && (!active || state.selectedDeviceId.isNotEmpty())
+    val pending = state.pendingSelection?.deviceId == device.deviceId
+    val ringSize = with(density) { MaterialTheme.typography.bodyMedium.fontSize.toDp() }
+    val selectionModifier = if (editing) Modifier else Modifier.clickable(
+        enabled = canSelect, role = Role.Button, onClickLabel = "Select output on ${device.name}", onClick = onSelect,
+    ).semantics {
+        contentDescription = "Select output on ${device.name}"
+        this.selected = active // Confirmed authority only, never the optimistic request.
+        stateDescription = listOfNotNull(status, "Switching output".takeIf { pending }).joinToString(" · ")
+    }
     Surface(color = if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        BoxWithConstraints(Modifier.padding(12.dp)) {
-            val stacked = maxWidth < playWidth + renameWidth + 8.dp
-            Column {
-                Row(Modifier.fillMaxWidth()) {
-                    Column(Modifier.weight(1f)) {
+        Column(selectionModifier.padding(12.dp).heightIn(min = 48.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f)) {
+                    // Reserve the small overlay footprint even when idle: no text reflow when intent changes.
+                    Column(Modifier.fillMaxWidth().padding(end = ringSize + 8.dp)) {
                         Text(device.name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         Text(status, style = MaterialTheme.typography.bodySmall)
                     }
-                    if (!viewOnly && !editing && stacked) RenameDeviceButton(device.name, renameWidth, onEdit)
+                    if (pending) LoadingRing(Modifier.align(Alignment.TopEnd).size(ringSize).testTag("Pending output"))
                 }
-                if (editing) {
-                    OutlinedTextField(value = draft, onValueChange = onDraft, label = { Text("Device name") }, singleLine = true,
-                        modifier = Modifier.fillMaxWidth())
-                    Row {
-                        TextButton(onClick = onSave) { Text("Save") }
-                        TextButton(onClick = onCancel) { Text("Cancel") }
-                    }
-                } else if (!viewOnly) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    // Pending/quarantine intentionally DO NOT disable other available choices.
-                    TextButton(onClick = onSelect,
-                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).semantics { contentDescription = "Play from here on ${device.name}" },
-                        contentPadding = PaddingValues(vertical = 8.dp),
-                        enabled = device.available && state.deviceId.isNotEmpty() && !selected && (!active || state.selectedDeviceId.isNotEmpty())) {
-                        // The text, not just the target, starts at the name/status edge.
-                        Text("Play from here", Modifier.fillMaxWidth(), maxLines = 1, softWrap = false)
-                    }
-                    if (!stacked) RenameDeviceButton(device.name, renameWidth, onEdit)
+                if (!viewOnly && !editing) RenameDeviceButton(device.name, renameWidth, onEdit)
+            }
+            if (editing) {
+                OutlinedTextField(value = draft, onValueChange = onDraft, label = { Text("Device name") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth())
+                Row {
+                    TextButton(onClick = onSave, modifier = Modifier.heightIn(min = 48.dp)) { Text("Save") }
+                    TextButton(onClick = onCancel, modifier = Modifier.heightIn(min = 48.dp)) { Text("Cancel") }
                 }
             }
         }
@@ -128,7 +131,7 @@ internal fun PlaybackDeviceCard(
 
 @Composable
 private fun RenameDeviceButton(name: String, width: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
-    TextButton(onClick = onClick, modifier = Modifier.requiredWidth(width).heightIn(min = 48.dp)
+    TextButton(onClick = onClick, modifier = Modifier.requiredWidth(width.coerceAtLeast(48.dp)).heightIn(min = 48.dp)
         .semantics { contentDescription = "Rename $name" }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
         Text("Rename", maxLines = 1, softWrap = false)
     }

@@ -57,6 +57,8 @@ class PlaybackCoordinatorTest {
         val sentAcks = mutableListOf<PlaybackAck>()
         val ackStates = mutableListOf<Pair<List<PlaybackAck>, PlaybackSnapshot?>>()
         val selections = mutableListOf<String>()
+        val selectionIds = mutableListOf<String>()
+        var onTransfer: (suspend (String, String, Long) -> PlaybackDevicesView)? = null
         var transferGate: CompletableDeferred<Unit>? = null
         var pollGate: CompletableDeferred<Unit>? = null
         var lateRenameFailure: CompletableDeferred<Unit>? = null
@@ -65,6 +67,7 @@ class PlaybackCoordinatorTest {
         var registerGate: CompletableDeferred<Unit>? = null
         var pollFailure: Exception? = null
         val commands = mutableListOf<Pair<Long, String>>()
+        val commandIds = mutableListOf<String>()
         var echoPendingCommand = false
         override suspend fun view(): PlaybackDevicesView {
             views++; viewGate?.await(); viewFailure?.let { throw it }
@@ -91,11 +94,13 @@ class PlaybackCoordinatorTest {
             return current
         }
         override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView {
-            commands += epoch to command.type
+            commands += epoch to command.type; commandIds += commandId
             return if (echoPendingCommand) current.copy(commands = listOf(PlaybackOutcome(commandId, "pending"))) else current
         }
         override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView {
-            selections += targetDeviceId; transferGate?.await(); return current
+            selections += targetDeviceId; selectionIds += commandId
+            onTransfer?.let { return it(commandId, targetDeviceId, selectionSeq) }
+            transferGate?.await(); return current
         }
         override suspend fun leave(deviceId: String) { leaves++ }
     }
@@ -209,8 +214,13 @@ class PlaybackCoordinatorTest {
             runCurrent()
             assertTrue(c.state.value.connected); assertFalse(c.state.value.retryAvailable)
             assertFalse(c.state.value.verifyingConnection)
-            if (healthy.quarantineMs > 0 || healthy.transfer != null) assertTrue(c.state.value.message.isNotEmpty())
-            else assertEquals("", c.state.value.message)
+            if (healthy.quarantineMs > 0 || healthy.transfer != null) {
+                assertTrue(c.state.value.message.isNotEmpty())
+                assertEquals(PlaybackDevicesMessagePurpose.PROGRESS, c.state.value.messagePurpose)
+            } else if (healthy.state?.error in setOf("blocked", "media")) {
+                assertTrue(c.state.value.message.isNotEmpty())
+                assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+            } else assertEquals("", c.state.value.message)
             c.rename("phone", " "); runCurrent()
             assertTrue(c.state.value.message.contains("1–64")); assertFalse(c.state.value.retryAvailable)
             assertEquals(0, api.renames)
@@ -422,6 +432,268 @@ class PlaybackCoordinatorTest {
         gate.complete(Unit); runCurrent()
         assertEquals(listOf("pc", "tablet"), api.selections)
         c.close()
+    }
+
+    @Test fun quietSelectionFeedbackFencesSameTargetAbaAndTracksAcceptedTransferAfterRpc() = runTest {
+        val api = Protocol(view()); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        val first = CompletableDeferred<Unit>(); val latest = CompletableDeferred<Unit>()
+        api.onTransfer = { id, target, _ ->
+            if (api.selections.size == 1) first.await() else latest.await()
+            view(transfer = PlaybackTransfer(id, "phone", target, "preparing"))
+        }
+        c.select("pc"); runCurrent()
+        val old = c.state.value.pendingSelection!!
+        c.select("tablet")
+        val middle = c.state.value.pendingSelection!!
+        c.select("pc")
+        val newest = c.state.value.pendingSelection!!
+        assertEquals("pc", newest.deviceId)
+        assertTrue(old.token != middle.token && middle.token != newest.token && old.token != newest.token)
+        assertEquals(PlaybackDevicesMessagePurpose.PROGRESS, c.state.value.messagePurpose)
+        assertEquals("phone", c.state.value.activeDeviceId) // Never optimistic authority.
+        first.complete(Unit); runCurrent()
+        assertEquals(listOf("pc", "pc"), api.selections) // Only latest unsent choice is sent.
+        assertEquals(newest, c.state.value.pendingSelection)
+        latest.complete(Unit); runCurrent()
+        assertFalse(c.state.value.selectionUnconfirmed)
+        assertEquals(newest, c.state.value.pendingSelection) // RPC return is not transfer completion.
+        val id = api.selectionIds.last()
+        api.current = view(transfer = PlaybackTransfer(id, "phone", "pc", "releasing"))
+        repeat(12) { advanceTimeBy(1000); runCurrent(); assertEquals(newest, c.state.value.pendingSelection) }
+        api.current = view(owner = "pc", epoch = 2)
+        c.retry(); runCurrent()
+        assertNull(c.state.value.pendingSelection)
+        assertEquals("pc", c.state.value.activeDeviceId)
+        assertEquals(1, api.registers); assertEquals(2, api.selections.size)
+        assertTrue(endpoint.starts.isEmpty()); assertTrue(endpoint.executed.isEmpty())
+        c.close()
+    }
+
+    @Test fun oldSelectionFailureCannotClearNewerRingAndGuidanceSurvivesProgressHeartbeats() = runTest {
+        for (sameTarget in listOf(false, true)) {
+            val api = Protocol(view()); val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            val first = CompletableDeferred<Unit>(); val latest = CompletableDeferred<Unit>()
+            api.onTransfer = { id, target, _ ->
+                if (api.selections.size == 1) { first.await(); error("synthetic unknown old write") }
+                latest.await()
+                view(transfer = PlaybackTransfer(id, "phone", target, "preparing"))
+            }
+            c.select("pc"); runCurrent()
+            c.select("tablet")
+            if (sameTarget) c.select("pc")
+            val newest = c.state.value.pendingSelection!!
+            first.complete(Unit); runCurrent()
+            assertEquals(newest, c.state.value.pendingSelection)
+            assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+            assertTrue(c.state.value.message.contains("not replayed"))
+            latest.complete(Unit); runCurrent()
+            val id = api.selectionIds.last()
+            api.current = view(transfer = PlaybackTransfer(id, "phone", newest.deviceId, "preparing"))
+            repeat(12) {
+                advanceTimeBy(1000); runCurrent()
+                assertEquals(newest, c.state.value.pendingSelection)
+                assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+                assertTrue(c.state.value.message.contains("not replayed"))
+            }
+            assertEquals(2, api.selections.size); assertTrue(endpoint.starts.isEmpty())
+            c.close()
+        }
+    }
+
+    @Test fun olderTerminalSelectionResponseCannotCompleteTheLatestSameTargetRequest() = runTest {
+        for (status in listOf("ok", "rejected", "timeout")) {
+            val api = Protocol(view())
+            val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            val first = CompletableDeferred<Unit>(); val latest = CompletableDeferred<Unit>()
+            api.onTransfer = { id, target, _ ->
+                if (api.selections.size == 1) {
+                    first.await()
+                    view(quarantine = 2000, transfer = PlaybackTransfer(id, "phone", target, "waiting"))
+                        .copy(commands = listOf(PlaybackOutcome(id, status)))
+                } else {
+                    latest.await()
+                    view(transfer = PlaybackTransfer(id, "phone", target, "preparing"))
+                }
+            }
+            c.select("pc"); runCurrent()
+            c.select("tablet"); c.select("pc")
+            val newest = c.state.value.pendingSelection!!
+            first.complete(Unit); runCurrent()
+            assertEquals(newest, c.state.value.pendingSelection)
+            if (status != "ok") {
+                assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+                assertTrue(c.state.value.message.contains("not replayed"))
+            }
+            latest.complete(Unit); runCurrent()
+            assertEquals(newest, c.state.value.pendingSelection)
+            if (status != "ok") assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+            assertEquals(listOf("pc", "pc"), api.selections)
+            c.close()
+        }
+    }
+
+    @Test fun terminalSelectionFailuresWinOverTransferAndQuarantineProgressAndDoNotReviveRing() = runTest {
+        for (status in listOf("timeout", "cancelled", "rejected", "media", "blocked")) {
+            val api = Protocol(view())
+            val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            api.onTransfer = { id, target, _ -> view(transfer = PlaybackTransfer(id, "phone", target, "preparing")) }
+            c.select("pc"); runCurrent()
+            assertNotNull(c.state.value.pendingSelection)
+            val id = api.selectionIds.single()
+            api.current = view(quarantine = 2000, transfer = PlaybackTransfer(id, "phone", "pc", "waiting"))
+                .copy(commands = listOf(PlaybackOutcome(id, status)))
+            c.retry(); runCurrent()
+            assertNull(c.state.value.pendingSelection)
+            assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+            assertTrue(c.state.value.message.contains("not replayed"))
+            api.current = api.current.copy(commands = emptyList()) // Stale transfer metadata cannot revive it.
+            repeat(3) {
+                advanceTimeBy(1000); runCurrent()
+                assertNull(c.state.value.pendingSelection)
+                assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+            }
+            assertEquals(1, api.selections.size)
+            c.close()
+        }
+    }
+
+    @Test fun commandFailureAndForgottenOutcomeWinEvenDuringAnotherPendingSelection() = runTest {
+        for (status in listOf("timeout", "cancelled", "rejected", "media", "blocked", "forgotten", "pending", "ok", "missing-unobserved")) {
+            val api = Protocol(view(owner = "pc", snapshot = prepared)).apply { echoPendingCommand = status != "missing-unobserved" }
+            val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            val results = mutableListOf<String>()
+            c.remoteCommandWithResult(PlaybackDeviceCommand.transport("next"), isCurrent = { true }, onResult = { results += it })
+            runCurrent()
+            assertTrue(results.isEmpty())
+            val gate = CompletableDeferred<Unit>(); api.pollGate = gate
+            c.retry(); runCurrent() // Poll snapshots the old command before a newer choice retires it.
+            c.select("tablet")
+            val newest = c.state.value.pendingSelection!!
+            assertEquals(listOf("cancelled"), results)
+            val transferGate = CompletableDeferred<Unit>(); api.transferGate = transferGate
+            api.current = view(owner = "pc", quarantine = 2000,
+                transfer = PlaybackTransfer("older-transfer", "pc", "phone", "waiting"))
+                .copy(commands = if (status in setOf("forgotten", "missing-unobserved")) emptyList()
+                    else listOf(PlaybackOutcome(api.commandIds.single(), status)))
+            gate.complete(Unit); runCurrent()
+            val failure = status !in setOf("pending", "ok", "missing-unobserved")
+            assertEquals(status, newest, c.state.value.pendingSelection)
+            assertEquals(status, if (failure) PlaybackDevicesMessagePurpose.GUIDANCE else PlaybackDevicesMessagePurpose.PROGRESS,
+                c.state.value.messagePurpose)
+            assertEquals(status, failure, c.state.value.message.contains("not replayed"))
+            assertEquals("Presentation must not complete a retired command again", listOf("cancelled"), results)
+            assertEquals(1, api.commands.size)
+            c.close(); transferGate.complete(Unit); runCurrent()
+            assertEquals(listOf("cancelled"), results)
+        }
+    }
+
+    @Test fun outputFailuresRemainGuidanceWhenTransferAndQuarantineAreAlsoPresent() = runTest {
+        for (error in listOf("blocked", "media")) {
+            val api = Protocol(view(owner = "pc", snapshot = prepared.paused().copy(error = error), quarantine = 2000,
+                transfer = PlaybackTransfer("external", "pc", "tablet", "waiting")))
+            val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            assertNotNull(c.state.value.pendingSelection)
+            assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+            assertTrue(c.state.value.message.isNotEmpty())
+            assertFalse(c.state.value.needsTap) // A remote blocked output does not enable local Continue.
+            c.close()
+        }
+    }
+
+    @Test fun ordinaryHeartbeatsAndQuarantineAloneNeverCreateSelectionFeedback() = runTest {
+        val api = Protocol(view(owner = "pc", snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        repeat(12) { tick ->
+            api.current = view(owner = "pc", snapshot = prepared.copy(elapsed = 20.0 + tick), quarantine = if (tick % 2 == 0) 2000 else 0)
+            advanceTimeBy(1000); runCurrent()
+            assertNull(c.state.value.pendingSelection)
+        }
+        api.current = view(owner = "pc", transfer = PlaybackTransfer("external", "pc", "tablet", "preparing"))
+        c.retry(); runCurrent()
+        val observed = c.state.value.pendingSelection!!
+        assertEquals("tablet", observed.deviceId)
+        repeat(12) { advanceTimeBy(1000); runCurrent(); assertEquals(observed, c.state.value.pendingSelection) }
+        api.current = view(owner = "tablet", epoch = 2)
+        c.retry(); runCurrent(); assertNull(c.state.value.pendingSelection)
+        assertTrue(api.selections.isEmpty()); assertTrue(api.commands.isEmpty()); assertTrue(endpoint.starts.isEmpty())
+        c.close()
+    }
+
+    @Test fun selectionTimeoutAndAllLifecycleEndsClearFeedbackWithoutReplay() = runTest {
+        for (end in listOf("timeout", "stop", "auth", "close", "scope")) {
+            val parent = SupervisorJob()
+            val ownedScope = CoroutineScope(StandardTestDispatcher(testScheduler) + parent)
+            val api = Protocol(view()).apply { transferGate = CompletableDeferred() }
+            val c = PlaybackCoordinator(api, Endpoint(), ownedScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            c.select("pc"); runCurrent(); assertNotNull(c.state.value.pendingSelection)
+            when (end) {
+                "timeout" -> { advanceTimeBy(4000); runCurrent() }
+                "stop" -> c.setServiceActive(false)
+                "auth" -> c.authLost()
+                "close" -> c.close()
+                "scope" -> parent.cancel()
+            }
+            runCurrent(); assertNull(c.state.value.pendingSelection)
+            assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+            val sent = api.selections.size
+            api.transferGate!!.complete(Unit); runCurrent()
+            assertNull(c.state.value.pendingSelection); assertEquals(sent, api.selections.size)
+            c.close(); parent.cancel(); runCurrent()
+        }
+    }
+
+    @Test fun disposedSelectionResponseCannotReviveFeedbackOrClearReplacementRequest() = runTest {
+        val endpoint = Endpoint(); val oldApi = Protocol(view())
+        val old = PlaybackCoordinator(oldApi, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        old.setServiceActive(true); runCurrent()
+        val gate = CompletableDeferred<Unit>()
+        oldApi.onTransfer = { id, target, _ ->
+            withContext(NonCancellable) { gate.await() }
+            view(transfer = PlaybackTransfer(id, "phone", target, "preparing"))
+        }
+        old.select("pc"); runCurrent(); assertNotNull(old.state.value.pendingSelection)
+        old.close(); assertNull(old.state.value.pendingSelection)
+        val api = Protocol(view()).apply { transferGate = CompletableDeferred() }
+        val replacement = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        replacement.setServiceActive(true); runCurrent()
+        replacement.select("tablet"); runCurrent()
+        val newest = replacement.state.value.pendingSelection!!
+        val stops = endpoint.stops
+        gate.complete(Unit); runCurrent()
+        assertNull(old.state.value.pendingSelection)
+        assertEquals(newest, replacement.state.value.pendingSelection)
+        assertEquals(stops, endpoint.stops)
+        replacement.close(); api.transferGate!!.complete(Unit); runCurrent()
+    }
+
+    @Test fun validationAndUnavailableGuidanceRemainReadableAlongsidePendingSelection() = runTest {
+        val api = Protocol(view()).apply { transferGate = CompletableDeferred() }
+        val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+        c.setServiceActive(true); runCurrent()
+        c.select("pc"); runCurrent()
+        val pending = c.state.value.pendingSelection
+        c.rename("phone", " ")
+        assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+        assertTrue(c.state.value.message.contains("1–64")); assertEquals(pending, c.state.value.pendingSelection)
+        c.select("missing")
+        assertTrue(c.state.value.message.contains("unavailable")); assertEquals(pending, c.state.value.pendingSelection)
+        c.select("tablet")
+        assertEquals("tablet", c.state.value.pendingSelection?.deviceId)
+        assertTrue(c.state.value.message.contains("unavailable"))
+        assertEquals(PlaybackDevicesMessagePurpose.GUIDANCE, c.state.value.messagePurpose)
+        assertEquals(0, api.renames)
+        c.close(); api.transferGate!!.complete(Unit); runCurrent()
     }
 
     @Test fun readOnlyBrowsingAndDisposalNeverAdvertiseOrStopUnrelatedNativeAudio() = runTest {

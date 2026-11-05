@@ -9,6 +9,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -22,6 +23,12 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextReplacement
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.click
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.swipeUp
+import androidx.compose.ui.test.assertIsFocused
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -134,15 +141,15 @@ class PlaybackDevicesSheetTest {
     // Native font metrics are necessary: legacy ShadowPaint cannot prove production-font fit.
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
     @Test fun normalPhoneTextEdgesAndRenameSlotAreStableForShortLongAndUnicodeNames() {
-        assertCardGeometry(width = 400, fontScale = 1f, stacked = false)
+        assertCardGeometry(width = 400, fontScale = 1f)
     }
 
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
     @Test fun narrowFontTwoKeepsCompleteActionsAndSeparateFortyEightDpTargets() {
-        assertCardGeometry(width = 320, fontScale = 2f, stacked = true)
+        assertCardGeometry(width = 320, fontScale = 2f)
     }
 
-    private fun assertCardGeometry(width: Int, fontScale: Float, stacked: Boolean) {
+    private fun assertCardGeometry(width: Int, fontScale: Float) {
         val holder = mutableStateOf(state())
         val calls = Calls()
         compose.setContent {
@@ -166,33 +173,28 @@ class PlaybackDevicesSheetTest {
             val selected = if (index == 1 || index == 3) "phone" else ""
             compose.runOnIdle { holder.value = state(device, selected = selected).copy(selectionUnconfirmed = index == 3) }
             val status = when (index) {
-                1 -> "This device · Selected · Available"
+                1 -> "This device · Available"
                 2 -> "This device · Unavailable"
-                3 -> "This device · Selecting · Available"
+                3 -> "This device · Available"
                 else -> "This device · Available"
             }
             val title = text(name)
             val statusText = text(status)
-            val play = text("Play from here")
             val rename = text("Rename")
             assertEquals("Name/status content start ($name)", title.start, statusText.start, tolerance)
-            assertEquals("Name/play content start ($name)", title.start, play.start, tolerance)
-            assertCompleteOneLine(play, "Play from here")
             assertCompleteOneLine(rename, "Rename")
+            compose.onNodeWithText("Play from here").assertDoesNotExist()
+            compose.onNodeWithText("Loading", substring = true).assertDoesNotExist()
             renameEnd?.let { assertEquals("Rename end is independent of identity/state", it, rename.end, tolerance) }
             renameEnd = rename.end
-            val playTarget = target("Play from here on $name")
+            val rowTarget = target("Select output on $name")
             val renameTarget = target("Rename $name")
-            assertDisjoint(playTarget, renameTarget)
-            assertTrue("Targets remain in the phone viewport", playTarget.left >= 0f && renameTarget.right <= width + tolerance)
-            assertTrue("Text is within its target", play.bounds.left >= playTarget.left - tolerance &&
-                play.bounds.right <= playTarget.right + tolerance && rename.bounds.right <= renameTarget.right + tolerance)
-            if (stacked) {
-                assertTrue("At font2 playback yields a separate line", playTarget.top >= renameTarget.bottom)
-                assertTrue("Long identity is bounded before Rename", title.bounds.right <= renameTarget.left + tolerance)
-            } else {
-                assertEquals("Normal-phone action row", playTarget.center.y, renameTarget.center.y, tolerance)
-            }
+            // Rename consumes its own nested pointer/semantics action; title/status never overlap it.
+            assertTrue("Targets remain in the phone viewport", rowTarget.left >= 0f && renameTarget.right <= width + tolerance)
+            assertTrue("Long identity is bounded before Rename", title.bounds.right <= renameTarget.left + tolerance)
+            assertTrue("Status is bounded before Rename", statusText.bounds.right <= renameTarget.left + tolerance)
+            assertTrue("Rename text fits its independently usable target", rename.bounds.right <= renameTarget.right + tolerance)
+            assertTrue("Whole padded row contains identity", rowTarget.left < title.bounds.left && rowTarget.right > title.bounds.right)
         }
         compose.runOnIdle { calls.assertQuiet() }
     }
@@ -218,7 +220,7 @@ class PlaybackDevicesSheetTest {
                 holder.value = candidate.copy(selectionUnconfirmed = case.pending,
                     view = candidate.view!!.copy(quarantineMs = 1500))
             }
-            val action = compose.onNodeWithContentDescription("Play from here on Phone")
+            val action = compose.onNodeWithContentDescription("Select output on Phone")
             if (case.enabled) action.assertIsEnabled() else action.assertIsNotEnabled()
             action.performClick()
             if (case.enabled) expectedCalls++
@@ -233,8 +235,9 @@ class PlaybackDevicesSheetTest {
         compose.onNodeWithText("Play from here").assertDoesNotExist()
         compose.onNodeWithText("Rename").assertDoesNotExist()
         compose.onNodeWithText("View only · Playback transfer is unavailable on this phone.").assertExists()
-        compose.onNodeWithText("Close").performClick()
-        compose.runOnIdle { assertEquals(1, calls.dismiss); assertEquals(expectedCalls, calls.selections.size) }
+        compose.onNodeWithContentDescription("Select output on Phone").assertIsNotEnabled()
+        compose.onNodeWithText("Close").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(0, calls.dismiss); assertEquals(expectedCalls, calls.selections.size) }
     }
 
     @Test fun retryIsOnlyExplicitRecoveryAndNeverAHealthyReadOnlyOrBusyCommand() {
@@ -307,8 +310,8 @@ class PlaybackDevicesSheetTest {
         val cases = listOf(
             state(active = "phone", snapshot = PlaybackSnapshot(playing = true)) to "This device · Playing",
             state(active = "phone", snapshot = PlaybackSnapshot()) to "This device · Active output · Paused",
-            state(selected = "phone") to "This device · Selected · Available",
-            state(selected = "phone").copy(selectionUnconfirmed = true) to "This device · Selecting · Available",
+            state(selected = "phone") to "This device · Available",
+            state(selected = "phone").copy(selectionUnconfirmed = true) to "This device · Available",
             state(phone.copy(available = false)) to "This device · Unavailable",
         )
         for ((value, status) in cases) {
@@ -316,6 +319,116 @@ class PlaybackDevicesSheetTest {
             compose.onNodeWithText(status).assertExists()
             compose.onNodeWithText("Retry connection").assertDoesNotExist()
         }
+        compose.runOnIdle { calls.assertQuiet() }
+    }
+
+    @Test fun wholePaddedSurfaceDispatchesExactlyOnceAndRenameTouchNeverBubbles() {
+        val calls = Calls()
+        content(state(), calls)
+        val row = compose.onNodeWithContentDescription("Select output on Phone")
+        // Physical touches at outer padding, identity and status (not just accessibility invocation).
+        row.performTouchInput { click(Offset(2f, 2f)) }
+        compose.onNodeWithText("Phone", useUnmergedTree = true).performTouchInput { click() }
+        compose.onNodeWithText("This device · Available", useUnmergedTree = true).performTouchInput { click() }
+        compose.runOnIdle { assertEquals(listOf("phone", "phone", "phone"), calls.selections) }
+        compose.onNodeWithContentDescription("Rename Phone").performTouchInput { click() }
+        compose.onNode(hasSetTextAction()).performTouchInput { click() }
+        compose.onNode(hasSetTextAction()).performTextReplacement("Draft 🎧")
+        // The editor and all its padding have no enclosing row activation while editing.
+        compose.onNodeWithContentDescription("Select output on Phone").assertDoesNotExist()
+        compose.onNodeWithText("Cancel").performTouchInput { click() }
+        compose.runOnIdle {
+            assertEquals(listOf("phone", "phone", "phone"), calls.selections)
+            assertTrue(calls.renames.isEmpty())
+        }
+        compose.onNodeWithContentDescription("Rename Phone").performTouchInput { click() }
+        compose.onNode(hasSetTextAction()).performTextReplacement("Saved 🎧")
+        compose.onNodeWithText("Save").performTouchInput { click() }
+        compose.runOnIdle {
+            assertEquals(listOf("phone", "phone", "phone"), calls.selections)
+            assertEquals(listOf("phone" to "Saved 🎧"), calls.renames)
+        }
+    }
+
+    @Test fun latestRingIsAnOverlayWithoutProgressProseOrFalsePlayingAndRetainsRealErrors() {
+        val calls = Calls()
+        val other = PlaybackDevice("room", "Living room 🎧", true)
+        val initial = state(active = "phone").let { it.copy(view = it.view!!.copy(devices = listOf(phone, other))) }
+        val holder = content(initial, calls)
+        val phoneBefore = target("Select output on Phone")
+        val roomBefore = target("Select output on Living room 🎧")
+        val listBefore = compose.onNodeWithTag("Playback device list").fetchSemanticsNode().boundsInRoot
+        for (index in 1..12) {
+            val id = if (index % 2 == 0) "phone" else "room"
+            compose.runOnIdle {
+                holder.value = initial.copy(selectedDeviceId = id, selectionUnconfirmed = true,
+                    pendingSelection = PlaybackDeviceSelection(id, index.toLong()),
+                    message = "Selecting output…", messagePurpose = PlaybackDevicesMessagePurpose.PROGRESS)
+            }
+            compose.onNodeWithTag("Pending output", useUnmergedTree = true).assertExists()
+            compose.onNodeWithText("Selecting output…").assertDoesNotExist()
+            compose.onNodeWithText("Close").assertDoesNotExist()
+            compose.onNodeWithText("Play from here").assertDoesNotExist()
+            compose.onNodeWithText("Loading", substring = true).assertDoesNotExist()
+            compose.onNodeWithText("Playing", substring = true).assertDoesNotExist()
+            assertEquals(phoneBefore, target("Select output on Phone"))
+            assertEquals(roomBefore, target("Select output on Living room 🎧"))
+            assertEquals(listBefore, compose.onNodeWithTag("Playback device list").fetchSemanticsNode().boundsInRoot)
+            val ring = compose.onNodeWithTag("Pending output", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+            val requested = target(if (id == "phone") "Select output on Phone" else "Select output on Living room 🎧")
+            assertTrue("Only latest row contains the overlay", requested.contains(ring.center))
+            val rename = target(if (id == "phone") "Rename Phone" else "Rename Living room 🎧")
+            assertDisjoint(ring, rename)
+        }
+        val guidance = "Playback needs a tap. The previous action was not replayed."
+        compose.runOnIdle { holder.value = holder.value.copy(message = guidance,
+            messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE, needsTap = true) }
+        compose.onNodeWithText(guidance).assertExists()
+        compose.onNodeWithTag("Pending output", useUnmergedTree = true).assertExists()
+        compose.onNodeWithText("Continue playback here").assertExists()
+        compose.runOnIdle { holder.value = initial.copy(verifyingConnection = true) }
+        compose.onNodeWithTag("Pending output", useUnmergedTree = true).assertDoesNotExist()
+        compose.runOnIdle { calls.assertQuiet() }
+    }
+
+    @Test fun overflowTouchScrollAndReleaseKeepViewportAndOffsetThroughPendingFrames() {
+        val calls = Calls()
+        val initial = state().let { base -> base.copy(view = base.view!!.copy(
+            devices = (0..39).map { PlaybackDevice("room-$it", "Room $it — 音楽 🎧", true) })) }
+        val holder = content(initial, calls)
+        val list = compose.onNodeWithTag("Playback device list")
+        list.performTouchInput { swipeUp(durationMillis = 700) }
+        compose.waitForIdle()
+        val before = list.fetchSemanticsNode()
+        val offset = before.config[SemanticsProperties.VerticalScrollAxisRange].value()
+        assertTrue("The fixture must genuinely overflow and physically scroll", offset > 0f)
+        for (index in 1..24) {
+            compose.runOnIdle { holder.value = initial.copy(pendingSelection = PlaybackDeviceSelection(
+                if (index % 2 == 0) "room-35" else "room-36", index.toLong())) }
+            assertEquals(before.boundsInRoot, list.fetchSemanticsNode().boundsInRoot)
+            assertEquals(offset, list.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value(), .01f)
+        }
+        compose.runOnIdle { calls.assertQuiet() }
+    }
+
+    @Test fun editingDraftFocusAndSelectionSurviveOtherPendingTargetPublications() {
+        val calls = Calls()
+        val initial = state().let { it.copy(view = it.view!!.copy(devices = listOf(phone,
+            PlaybackDevice("room", "Room 🎧", true)))) }
+        val holder = content(initial, calls)
+        compose.onNodeWithContentDescription("Rename Phone").performTouchInput { click() }
+        val editor = compose.onNode(hasSetTextAction())
+        editor.performTouchInput { click() }
+        editor.performTextReplacement("Keep this draft 🎧")
+        editor.performSemanticsAction(SemanticsActions.SetSelection) { it(2, 7, false) }
+        val selection = editor.fetchSemanticsNode().config[SemanticsProperties.TextSelectionRange]
+        for (index in 1..24) {
+            compose.runOnIdle { holder.value = initial.copy(selectedDeviceId = "room", selectionUnconfirmed = true,
+                pendingSelection = PlaybackDeviceSelection("room", 1L)) }
+            editor.assertIsFocused().assertTextContains("Keep this draft 🎧")
+            assertEquals(selection, editor.fetchSemanticsNode().config[SemanticsProperties.TextSelectionRange])
+        }
+        compose.onNodeWithText("Cancel").performTouchInput { click() }
         compose.runOnIdle { calls.assertQuiet() }
     }
 
