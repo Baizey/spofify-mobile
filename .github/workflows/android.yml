@@ -18,7 +18,45 @@ jobs:
       - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
       - run: sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0'
-      - run: ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug --no-daemon
+      - name: Provision immutable playback broker integration prerequisite
+        env:
+          SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL: ${{ vars.SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL }}
+        run: |
+          # CI must not silently fall back to the default fast-unit category. The repository
+          # administrator supplies a reviewed immutable artifact, never a live backend URL.
+          python3 - <<'PY'
+          import os, urllib.parse
+          value = os.environ.get('SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL', '')
+          url = urllib.parse.urlsplit(value)
+          if url.scheme != 'https' or not url.hostname or url.username or url.password or url.fragment or url.query:
+              raise SystemExit('Configure SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL as an HTTPS immutable-artifact URL without credentials/query/fragment')
+          PY
+          python3 - <<'PY'
+          import os
+          for path in (os.environ['RUNNER_TEMP'], '/dev/shm'):
+              fs = os.statvfs(path)
+              if fs.f_bavail * fs.f_frsize < 1024**3 or fs.f_files and fs.f_favail < 10000:
+                  raise SystemExit('Insufficient private artifact/runtime bytes or inodes')
+          print('Private broker/runtime preflight complete; user/project quota remains unknown')
+          PY
+          owned="$RUNNER_TEMP/spofify-broker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$owned"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --max-time 60 --max-filesize 33554432 \
+            "$SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL" -o "$owned/broker"
+          printf '%s  %s\n' '425e4bb46efcf1c25e195d92d4d1845ed2389cd35e6ebf9ad8981cd80c2c70f4' "$owned/broker" | sha256sum --check --status
+          chmod 500 "$owned/broker"
+          runtime="/dev/shm/spofify-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$runtime"
+          printf 'SPOFIFY_TEST_GO_BROKER_BINARY=%s\nSPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT=%s\n' "$owned/broker" "$runtime" >> "$GITHUB_ENV"
+      - name: All unit and mandatory real-broker integration checks
+        run: ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug -Pspofify.realBrokerIntegration=true --no-daemon
+      - name: Verify integration fixtures cleaned their owned runtimes
+        if: always() && env.SPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT != ''
+        run: |
+          # Never sweep a nonempty root or kill unknown children after failed/cancelled tests.
+          # Each fixture must await its own child and remove only its unique runtime.
+          rmdir -- "$SPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT"
       - uses: actions/upload-artifact@v4
         with:
           name: spofify-debug

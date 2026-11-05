@@ -836,7 +836,7 @@ class PlaybackCoordinatorTest {
         c.close()
     }
 
-    @Test fun heartbeatRetriesUnknownRegistrationWithBoundedBackoffAndManualRetryCannotStorm() = runTest {
+    @Test fun heartbeatSpacesUnknownRegistrationAtLeastThirtySecondsAndManualRetryCannotStorm() = runTest {
         val api = Protocol(view()).apply { failRegister = true }; val endpoint = Endpoint()
         val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
         c.setServiceActive(true); runCurrent(); assertEquals(1, api.registers)
@@ -844,9 +844,11 @@ class PlaybackCoordinatorTest {
         assertFalse(c.state.value.connecting)
         repeat(10) { c.retry(); runCurrent() }
         assertTrue(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
-        advanceTimeBy(7999); runCurrent(); assertEquals(1, api.registers)
+        // Real persistent broker retains an unknown accepted row for >=30s. This floor
+        // reduces avoidable churn; it does not prove expiry after delayed acceptance.
+        advanceTimeBy(29999); runCurrent(); assertEquals(1, api.registers)
         advanceTimeBy(1); runCurrent(); assertEquals(2, api.registers)
-        advanceTimeBy(15999); runCurrent(); assertEquals(2, api.registers)
+        advanceTimeBy(29999); runCurrent(); assertEquals(2, api.registers)
         advanceTimeBy(1); runCurrent(); assertEquals(3, api.registers)
         api.failRegister = false
         advanceTimeBy(29999); runCurrent(); assertEquals(3, api.registers)
@@ -904,6 +906,8 @@ class PlaybackCoordinatorTest {
         failingApi.registerGate!!.complete(Unit); runCurrent()
         failingApi.failRegister = false
         advanceTimeBy(8000); runCurrent()
+        assertEquals("Unknown accepted registration cannot be retried at the old eight-second interval", "", next.state.value.deviceId)
+        advanceTimeBy(22000); runCurrent()
         assertEquals("phone", next.state.value.deviceId); assertTrue(endpoint.starts.isEmpty())
         next.close()
     }

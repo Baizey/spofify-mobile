@@ -55,3 +55,13 @@ dependencies {
     androidTestImplementation("com.squareup.okhttp3:mockwebserver:5.5.1")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
+
+val realBrokerIntegration = providers.gradleProperty("spofify.realBrokerIntegration")
+    .map { it.toBooleanStrict() }.orElse(false)
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    useJUnit {
+        if (!realBrokerIntegration.get()) {
+            excludeCategories("dev.spofify.mobile.testing.RealBrokerIntegration")
+        }
+    }
+}

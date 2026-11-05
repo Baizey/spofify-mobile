@@ -1,7 +1,19 @@
 package dev.spofify.mobile.core
 
 import java.io.IOException
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -16,6 +28,11 @@ import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Cookie
 import okhttp3.CookieJar
+import okhttp3.Connection
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
+import okhttp3.Dns
+import okhttp3.EventListener
 import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -33,6 +50,8 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
     private var cookie: Cookie? = null
     private var session: Session? = null
     private var generation: Long = 0
+    // One no-auth, already connected direct address; never resolve or persist route metadata.
+    private var playbackLeaveAddress: InetAddress? = null
     private val mutablePersonalRevision = MutableStateFlow(PersonalRevision())
     val personalRevision: StateFlow<PersonalRevision> = mutablePersonalRevision.asStateFlow()
 
@@ -43,6 +62,15 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
     @Volatile var onUnauthorized: (() -> Unit)? = null
 
     val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .eventListenerFactory {
+            val requestGeneration = synchronized(lock) { generation }
+            object : EventListener() {
+                override fun connectionAcquired(call: Call, connection: Connection) {
+                    val route = connection.route()
+                    recordPlaybackLeaveRoute(requestGeneration, call.request().url, route.address.url, route.proxy.type(), route.socketAddress)
+                }
+            }
+        }
         .followRedirects(false)
         .followSslRedirects(false)
         .retryOnConnectionFailure(false)
@@ -83,6 +111,20 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
 
     fun currentSession(): Session? = synchronized(lock) { session }
 
+    /** Metadata-only seam shared by the production connection listener and core route tests.
+     * Neither stale generations nor another origin may supply a cleanup destination. A proxied
+     * or unresolved same-origin connection retires any previous direct candidate. */
+    internal fun recordPlaybackLeaveRoute(
+        expectedGeneration: Long, requestUrl: HttpUrl, routeUrl: HttpUrl,
+        proxyType: Proxy.Type, socketAddress: InetSocketAddress,
+    ) = synchronized(lock) {
+        if (generation == expectedGeneration && server.contains(requestUrl) && server.contains(routeUrl)) {
+            playbackLeaveAddress = socketAddress.address?.takeIf {
+                proxyType == Proxy.Type.DIRECT && socketAddress.port == requestUrl.port && !socketAddress.isUnresolved
+            }
+        }
+    }
+
     /** Call only after a confirmed personal mutation, never after optimistic UI changes or reads. */
     fun notifyPersonalChange(collection: PersonalCollection) = synchronized(lock) {
         notifyPersonalChange(collection, generation)
@@ -104,9 +146,37 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
 
     fun clearSession() { resetSession() }
 
+    /** Only the fixed player leave may outlive clearSession/cancelAll. No client, store, session
+     * object or mutable auth provider escapes. The clock seam is per capability, for core tests. */
+    internal fun preparePlaybackLeave(deviceId: String, nanoTime: () -> Long = System::nanoTime): suspend () -> Unit {
+        require(validPlaybackProtocolId(deviceId)) { "Invalid playback device identifier" }
+        val capturedAt = nanoTime()
+        val request = synchronized(lock) {
+            val oldCookie = cookie
+            val oldSession = session
+            val oldAddress = playbackLeaveAddress
+            if (oldCookie == null || oldSession == null || oldAddress == null || oldCookie.expiresAt <= System.currentTimeMillis()) null
+            else {
+                val body = buildJsonObject { put("action", "leave"); put("deviceId", deviceId) }.toString()
+                PlaybackLeaveAuthority(
+                    Request.Builder().url(server.url("api", "me", "player"))
+                        .header("Origin", server.origin)
+                        .header("Cookie", "${oldCookie.name}=${oldCookie.value}")
+                        .header("X-CSRF-Token", oldSession.csrfToken)
+                        .header("Accept", "application/json")
+                        .post(OneShotBody(body.toRequestBody("application/json; charset=utf-8".toMediaType())))
+                        .build(),
+                    oldCookie.expiresAt, oldAddress,
+                )
+            }
+        }
+        return PreparedPlaybackLeave(request, capturedAt, nanoTime)::invoke
+    }
+
     private fun resetSession(): Long = synchronized(lock) {
         cookie = null
         session = null
+        playbackLeaveAddress = null
         generation++
         try { store.write(null) }
         catch (_: Exception) { throw IOException("Unable to clear the saved session. Sign in again.") }
@@ -152,6 +222,7 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
             generation++
             cookie = null
             session = null
+            playbackLeaveAddress = null
             generation to store.read()
         }
         if (saved == null) return null
@@ -186,6 +257,7 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         if (generation == expectedGeneration) {
             cookie = null
             session = null
+            playbackLeaveAddress = null
             generation++
         }
     }
@@ -284,32 +356,10 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         request: Request,
         errorFactory: ((Response) -> ApiException)? = null,
         block: (Response) -> T,
-    ): T = suspendCancellableCoroutine { continuation ->
-        val call = httpClient.newCall(request)
-        // Keep cancellation attached until the body has been consumed, not merely until headers
-        // arrive. All body reading/decoding stays on OkHttp's worker, never the UI dispatcher.
-        continuation.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (!continuation.isCancelled) continuation.resumeWithException(networkError())
-            }
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    val result = response.use {
-                        if (!it.isSuccessful) throw errorFactory?.invoke(it)
-                            ?: ApiException(it.code, safeError(it.code, request.url.encodedPath == "/api/auth/login"))
-                        block(it)
-                    }
-                    continuation.resume(result) { _, _, _ -> }
-                } catch (error: Exception) {
-                    if (!continuation.isCancelled) {
-                        continuation.resumeWithException(if (error is IOException && error !is ApiException) networkError() else error)
-                    }
-                }
-            }
-        })
-    }
-    private fun networkError() = IOException("Unable to reach the server. Check your connection and server address.")
+    ): T = httpClient.newCall(request).awaitResponse(
+        errorFactory ?: { ApiException(it.code, safeError(it.code, request.url.encodedPath == "/api/auth/login")) },
+        block,
+    )
     private inline fun <reified T> decode(response: Response): T {
         val mediaType = response.body?.contentType()
         if (mediaType?.subtype != "json" && mediaType?.subtype?.endsWith("+json") != true)
@@ -329,6 +379,107 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         else -> "The server could not complete the request (HTTP $status)"
     }
 }
+
+private const val PLAYBACK_LEAVE_LIFETIME_MS = 4000L
+private val PLAYBACK_LEAVE_LIFETIME_NS = TimeUnit.MILLISECONDS.toNanos(PLAYBACK_LEAVE_LIFETIME_MS)
+private class PlaybackLeaveAuthority(val request: Request, val cookieExpiresAt: Long, val address: InetAddress)
+
+/** No system/custom resolver, reverse lookup, fallback address or resolver worker. The origin
+ * hostname remains in the request URL, Host header and default TLS/hostname verification. */
+internal class PlaybackLeaveDns(private val host: String, private val address: InetAddress) : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        if (hostname != host) throw leaveUnavailable()
+        return listOf(address)
+    }
+}
+
+/** Not an authenticated client clone: the only reachable operation is this captured POST.
+ * Unused auth is dropped by the timer, and claiming the capability removes it from the closure.
+ * Transport resources are created only on invocation and never share ordinary cancellation. */
+private class PreparedPlaybackLeave(
+    authority: PlaybackLeaveAuthority?,
+    private val capturedAt: Long,
+    private val nanoTime: () -> Long,
+) {
+    private val pending = AtomicReference(authority)
+    private val expiry = if (authority == null) null else CoroutineScope(Dispatchers.Default).launch(start = CoroutineStart.UNDISPATCHED) {
+        // Schedule against capture, not against eventual dispatcher execution. Rounding down
+        // may retire unused authority <1ms early, never extend its lifetime.
+        val remaining = try { remainingNanos() } catch (_: IOException) { 0L }
+        delay(TimeUnit.NANOSECONDS.toMillis(remaining))
+        pending.set(null)
+    }
+
+    private fun remainingNanos(): Long {
+        val elapsed = nanoTime() - capturedAt
+        if (elapsed < 0 || elapsed >= PLAYBACK_LEAVE_LIFETIME_NS) throw leaveUnavailable()
+        return PLAYBACK_LEAVE_LIFETIME_NS - elapsed
+    }
+
+    suspend fun invoke() {
+        val authority = pending.getAndSet(null) ?: throw leaveUnavailable()
+        expiry?.cancel()
+        currentCoroutineContext().ensureActive()
+        remainingNanos()
+        if (authority.cookieExpiresAt <= System.currentTimeMillis()) throw leaveUnavailable()
+        val dispatcher = Dispatcher()
+        val pool = ConnectionPool()
+        var call: Call? = null
+        try {
+            // Fresh transport deliberately retains OkHttp's platform TLS/hostname defaults.
+            // No inherited interceptor, cookie jar, authenticator, cache or successor auth.
+            // Never enter blocking InetAddress DNS or proxy selection: cancellation cannot
+            // interrupt those calls. Use only the captured, previously connected direct route.
+            val transport = OkHttpClient.Builder()
+                .dispatcher(dispatcher).connectionPool(pool)
+                .proxy(Proxy.NO_PROXY)
+                .dns(PlaybackLeaveDns(authority.request.url.host, authority.address))
+                .followRedirects(false).followSslRedirects(false)
+                .retryOnConnectionFailure(false)
+                .addNetworkInterceptor { chain ->
+                    remainingNanos()
+                    if (authority.cookieExpiresAt <= System.currentTimeMillis()) throw leaveUnavailable()
+                    chain.proceed(chain.request())
+                }
+                .build()
+            currentCoroutineContext().ensureActive()
+            call = transport.newCall(authority.request)
+            call.timeout().deadlineNanoTime(System.nanoTime() + remainingNanos())
+            call.awaitResponse({ ApiException(it.code, "The server refused playback cleanup (HTTP ${it.code})") }) { Unit }
+        } finally {
+            call?.cancel()
+            pool.evictAll()
+            dispatcher.executorService.shutdown()
+        }
+    }
+}
+
+private fun leaveUnavailable() = IOException("Playback cleanup is unavailable or expired")
+private fun networkError() = IOException("Unable to reach the server. Check your connection and server address.")
+
+/** Keep cancellation attached through response consumption, not merely header delivery. */
+private suspend fun <T> Call.awaitResponse(errorFactory: (Response) -> ApiException, block: (Response) -> T): T =
+    suspendCancellableCoroutine { continuation ->
+        continuation.invokeOnCancellation { cancel() }
+        enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (!continuation.isCancelled) continuation.resumeWithException(networkError())
+            }
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    val result = response.use {
+                        if (!it.isSuccessful) throw errorFactory(it)
+                        block(it)
+                    }
+                    continuation.resume(result) { _, _, _ -> }
+                } catch (error: Exception) {
+                    if (!continuation.isCancelled) {
+                        continuation.resumeWithException(if (error is IOException && error !is ApiException) networkError() else error)
+                    }
+                }
+            }
+        })
+    }
 
 /** Cookie policy is shared by login and restore; parsing does not install or trust the cookie. */
 internal fun parseSessionCookie(server: ServerAddress, serialized: String): Cookie? {

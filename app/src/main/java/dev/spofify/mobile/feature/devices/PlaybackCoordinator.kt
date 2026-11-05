@@ -56,11 +56,15 @@ class PlaybackCoordinator(
     private val identity: (() -> PlaybackDeviceIdentityStore?)? = null,
     // Production supplies Android uptime for KeyEvent timestamps; injected test clocks stay JVM-only.
     private val mediaEventUptimeMs: () -> Long = clockMs,
+    // A retiring graph's bounded disposal, never a registration or authority to restore.
+    private val predecessorDisposal: Job? = null,
+    private val registrationPacing: PlaybackRegistrationPacing = PlaybackRegistrationPacing(),
 ) {
     private val work = CoroutineScope(scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]))
     private val mutableState = MutableStateFlow(PlaybackDevicesState())
     val state: StateFlow<PlaybackDevicesState> = mutableState.asStateFlow()
     private val transport = Mutex()
+    private var disposal: Job? = null
     private var serviceActive = false
     private var managedOutput = false
     private var closed = false
@@ -182,8 +186,6 @@ class PlaybackCoordinator(
     private fun admissionCurrent(value: PlayAdmission) = playAdmission === value && !closed && serviceActive &&
         lifecycle == value.lifecycle && actionVersion == value.revision && selectionVersion == value.choice &&
         clockMs() < value.deadline && value.lifetime() && value.origin() && work.isActive
-    private var nextRegistrationAt = 0L
-    private var registrationBackoffMs = 8000L
     private var selectionVersion = 0L
     private var intent: Selection? = null
     private var pendingCommand: String? = null
@@ -311,6 +313,10 @@ class PlaybackCoordinator(
             fenceLocal(invalidateActions = false)
             managedOutput = true
             heartbeat = work.launch {
+                // UI reattachment never enters this branch. Actual disposal/recreation must
+                // not race a still-running exact-ID leave with the next registration.
+                predecessorDisposal?.join()
+                disposal?.join()
                 while (isActive && serviceActive && !closed) {
                     transport.withLock {
                         if (intent == null) exchange {
@@ -331,7 +337,22 @@ class PlaybackCoordinator(
             clearSelectionFeedback()
             mutableState.value = PlaybackDevicesState(message = "Playback service is not connected. Reconnecting never starts audio automatically.",
                 recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED)
-            if (oldId.isNotEmpty()) scope.launch { transport.withLock { try { withTimeout(4000) { api.leave(oldId) } } catch (_: Exception) { /* Single attempt only. */ } } }
+            if (oldId.isNotEmpty()) disposal = disposeRegistration(oldId)
+        }
+    }
+
+    private fun disposeRegistration(id: String): Job {
+        // Capture only a one-shot exact-ID disposal before the graph retires ordinary HTTP
+        // and auth. It cannot publish, poll, select or borrow a successor's credentials.
+        val leave = api.prepareLeave(id)
+        val owner = SupervisorJob()
+        return scope.launch(owner) {
+            try {
+                // Include mutex waiting, not merely the HTTP exchange, in the lifetime bound.
+                withTimeout(4000) { transport.withLock { leave() } }
+            } catch (_: Exception) {
+                // Unknown leave outcome is not retried. Broker expiry/drain remains necessary.
+            } finally { owner.complete() }
         }
     }
 
@@ -392,13 +413,14 @@ class PlaybackCoordinator(
         clearSelectionFeedback()
         mutableState.value = PlaybackDevicesState(message = "Sign in again to connect your players.", recovery = PlaybackConnectionRecovery.AUTH_REQUIRED)
     }
-    fun close() {
+    fun close(): Job? {
         if (!closed) {
             setServiceActive(false); closed = true; lifecycle++; work.cancel(); cancellationGuard.cancel(); fenceLocal()
             clearConnectionChecks()
             clearSelectionFeedback()
             mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.OWNER_ENDED)
         }
+        return disposal ?: predecessorDisposal
     }
 
     fun retry() {
@@ -499,7 +521,7 @@ class PlaybackCoordinator(
             } }
             return
         }
-        work.launch { transport.withLock { exchange { request { api.rename(deviceId, name.trim()) } } } }
+        work.launch { transport.withLock { exchange(missingTarget = deviceId) { request { api.rename(deviceId, name.trim()) } } } }
     }
 
     /** Route ALL app/notification actions here, not straight to a controller that bypasses ownership. */
@@ -883,7 +905,10 @@ class PlaybackCoordinator(
     private suspend fun register(): Unit = verifyConnection {
         // register(name) creates an ephemeral server ID and has no idempotency key.
         // A lost response may have succeeded: do not create an orphan every heartbeat/tap.
-        if (clockMs() < nextRegistrationAt) return@verifyConnection
+        // Manual Retry/action paths also call register under transport: never join a leave
+        // while holding its mutex. The heartbeat awaits completion outside the lock.
+        if (predecessorDisposal?.isCompleted == false || disposal?.isCompleted == false ||
+            !registrationPacing.mayAttempt(clockMs())) return@verifyConnection
         mutableState.value = state.value.copy(connecting = true)
         val life = lifecycle
         try {
@@ -894,16 +919,15 @@ class PlaybackCoordinator(
             if (life != lifecycle || closed || !serviceActive) return@verifyConnection
             val capable = queueIntentsNegotiated && endpoint.supportsQueueIntents
             receiverRegistered = capable
+            // Record uncertainty BEFORE dispatch, so cancellation/lifecycle replacement
+            // cannot reopen the write floodgate. Probe failures never mark a sent write.
+            val attempt = registrationPacing.dispatched(clockMs())
             request(registration = true) { api.register(deviceName, if (capable) 1 else null) }
-            if (life == lifecycle && state.value.deviceId.isNotEmpty()) {
-                nextRegistrationAt = 0; registrationBackoffMs = 8000L
+            if (life == lifecycle && !closed && serviceActive && state.value.deviceId.isNotEmpty()) {
+                registrationPacing.confirmed(attempt)
             }
         } finally {
             if (life == lifecycle) mutableState.value = state.value.copy(connecting = false)
-            if (state.value.deviceId.isEmpty()) {
-                nextRegistrationAt = clockMs() + registrationBackoffMs
-                registrationBackoffMs = (registrationBackoffMs * 2).coerceAtMost(30000L)
-            }
         }
     }
     private suspend fun poll(): Unit = verifyConnection {
@@ -1351,18 +1375,19 @@ class PlaybackCoordinator(
         return true
     }
 
-    private suspend fun exchange(block: suspend () -> Unit) {
+    private suspend fun exchange(missingTarget: String? = null, block: suspend () -> Unit) {
         if (closed || !serviceActive) return
         val life = lifecycle
+        val missingSelf = missingTarget == null || missingTarget == state.value.deviceId
         val feedbackAtDispatch = selectionFeedback?.presentation?.token
         try { block() }
         catch (error: CancellationException) {
             if (error !is TimeoutCancellationException) throw error
-            if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch)
+            if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch, missingSelf)
         }
-        catch (error: Exception) { if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch) }
+        catch (error: Exception) { if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch, missingSelf) }
     }
-    private suspend fun failed(error: Exception, feedbackAtDispatch: Long?) {
+    private suspend fun failed(error: Exception, feedbackAtDispatch: Long?, missingSelf: Boolean = true) {
         // Unknown writes are NOT replayed. Stop buffered output immediately, not merely remote UI state.
         uncertainConnection = true
         fenceLocal(); acks.clear(); ackState = null; ackQueueIntentState = null; pendingCommand = null
@@ -1375,7 +1400,13 @@ class PlaybackCoordinator(
         // Reconcile a device-scoped conflict through its validated safe view; never replay its action.
         if (error is ApiException && error.status == 401) { authLost(); return }
         if (error is ApiException && error.status == 404) {
-            lifecycle++; clearSelectionFeedback(); mutableState.value = state.value.copy(deviceId = ""); return
+            // Rename addresses its TARGET, unlike device-scoped control/poll requests.
+            // Its 404 cannot invalidate this live service's issuer registration. A later
+            // self poll will independently establish whether our own exact ID expired.
+            if (missingSelf) {
+                lifecycle++; clearSelectionFeedback(); mutableState.value = state.value.copy(deviceId = "")
+            }
+            return
         }
         if (error is ApiException && error.status == 409) {
             val life = lifecycle

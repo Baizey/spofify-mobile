@@ -250,8 +250,12 @@ interface PlaybackDevicesProtocol {
     suspend fun claimUnselected(deviceId: String, epoch: Long, commandId: String, selectionSeq: Long): PlaybackDevicesView =
         throw UnsupportedOperationException("Conditional playback selection is unavailable")
     suspend fun leave(deviceId: String)
+    /** Capture before retiring ordinary auth/work. Production supplies a bounded, exact-ID,
+     * single-use disposal capability, never a replacement authenticated client. Without an
+     * already connected direct exact-origin route, cleanup fails closed rather than resolving. */
+    fun prepareLeave(deviceId: String): suspend () -> Unit = { leave(deviceId) }
 }
-class PlaybackDevicesApi(client: SpofifyClient) : PlaybackDevicesProtocol {
+class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesProtocol {
     private val transport = ApiTransport(client)
     private val path = listOf("api", "me", "player")
     @Volatile private var extensions = false
@@ -307,5 +311,6 @@ class PlaybackDevicesApi(client: SpofifyClient) : PlaybackDevicesProtocol {
         }
     }
     override suspend fun leave(deviceId: String) { require(validPlaybackProtocolId(deviceId)); post("leave") { put("deviceId", deviceId) } }
+    override fun prepareLeave(deviceId: String): suspend () -> Unit = client.preparePlaybackLeave(deviceId)
     private fun JsonObjectBuilder.identity(id: String, epoch: Long) { require(validPlaybackProtocolId(id) && epoch in 1..MAX_SAFE); put("deviceId", id); put("epoch", epoch) }
 }

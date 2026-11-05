@@ -18,10 +18,12 @@ import dev.spofify.mobile.playback.PlaybackService
 import dev.spofify.mobile.playback.Media3PlaybackEndpoint
 import dev.spofify.mobile.core.PlaybackDevicesApi
 import dev.spofify.mobile.feature.devices.PlaybackCoordinator
+import dev.spofify.mobile.feature.devices.PlaybackRegistrationPacing
 import dev.spofify.mobile.feature.devices.PlaybackDeviceIdentityStore
 import dev.spofify.mobile.playback.PlaybackRequests
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -50,13 +52,17 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     var playbackCoordinator: PlaybackCoordinator? = null
         private set
     private var coordinationScope: CoroutineScope? = null
+    private var retiringDisposal: Job? = null
+    // Process-local rate limit only; never persistent device/session authority.
+    private val registrationPacing = PlaybackRegistrationPacing()
 
-    private fun endCoordination() {
+    private fun endCoordination(): Job? {
         PlaybackService.onServiceActiveChanged = null
-        playbackCoordinator?.close()
+        retiringDisposal = playbackCoordinator?.close() ?: retiringDisposal
         playbackCoordinator = null
         coordinationScope?.cancel()
         coordinationScope = null
+        return retiringDisposal
     }
     val lastServer: String get() = preferences.getString("server", "") ?: ""
     // Compatibility for the legacy signed-in account UI. Forgetting is not a future save opt-out.
@@ -99,7 +105,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
 
     @Synchronized
     fun configure(server: ServerAddress): SpofifyClient {
-        endCoordination()
+        val predecessorDisposal = endCoordination()
         PlaybackService.stopActivePlayback()
         context.stopService(Intent(context, PlaybackService::class.java))
         imageLoader?.shutdown()
@@ -128,7 +134,8 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         val coordinator = PlaybackCoordinator(PlaybackDevicesApi(next), Media3PlaybackEndpoint(), scope,
             identity = { next.currentSession()?.let { PlaybackDeviceIdentityStore(context, next.server, it.accountId) } },
-            mediaEventUptimeMs = { android.os.SystemClock.uptimeMillis() })
+            mediaEventUptimeMs = { android.os.SystemClock.uptimeMillis() },
+            predecessorDisposal = predecessorDisposal, registrationPacing = registrationPacing)
         coordinationScope = scope
         playbackCoordinator = coordinator
         PlaybackService.onServiceActiveChanged = { active ->
