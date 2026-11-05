@@ -74,6 +74,12 @@ class UiFixtureServer : AutoCloseable {
     private val server = MockWebServer()
     private val liked = linkedSetOf("track-02")
     private val history = mutableListOf("track-01", "track-09", "track-13")
+    private var sharedSongRows = false
+
+    /** Presentation-only opt-in; never changes catalog totals, history or playlist occurrences. */
+    @Synchronized fun setSharedSongRows(enabled: Boolean) { sharedSongRows = enabled }
+    @Synchronized fun recentTrackIds(): List<String> =
+        if (sharedSongRows) SHARED_SONG_IDS else history.distinct().take(3)
     private var manualName = MANUAL_NAME
     private var manualDescription = "A little music for the way home."
     private var manualRevision = 1L
@@ -146,7 +152,9 @@ class UiFixtureServer : AutoCloseable {
                 searchCalls.add(SearchCall(kind, query, limit, offset))
                 if (query.equals(ERROR_QUERY, true)) return json(JSONObject().put("error", "Synthetic temporary failure"), 503)
             }
+            val sharedQuery = query == SHARED_SONG_QUERY && artistId == null && albumId == null
             val all = when {
+                sharedQuery -> if (sharedSongRows && kind == "tracks") SHARED_SONG_IDS.map(::track) else emptyList()
                 albumId != null -> tracks().filter { it.getString("albumId") == albumId }
                 artistId != null -> if (url.queryParameter("releaseGroup") !in listOf("singles", "appearances"))
                     albums().filter { hasArtist(it, artistId) } else emptyList()
@@ -154,7 +162,7 @@ class UiFixtureServer : AutoCloseable {
                 kind == "albums" -> albums()
                 kind == "tracks" -> tracks()
                 else -> listOf(artist()) + albums() + tracks()
-            }.filter { artistId != null || albumId != null || it.getString("name").contains(query, ignoreCase = true) }
+            }.filter { sharedQuery || artistId != null || albumId != null || it.getString("name").contains(query, ignoreCase = true) }
             return json(page(all, limit, offset))
         }
         val catalog = Regex("/api/library/(artists|albums|tracks)/([^/]+)(?:/(artwork|audio|playback))?").matchEntire(path)
@@ -168,7 +176,9 @@ class UiFixtureServer : AutoCloseable {
                 else -> tracks().firstOrNull { it.getString("id") == id }
             } ?: return unexpected(request)
             return when (action) {
-                "artwork" -> binary(pngs[albumIndex(id)], "image/png", request)
+                "artwork" -> if (sharedSongRows && id == SHARED_UNAVAILABLE_ID)
+                    json(JSONObject().put("error", "Synthetic artwork absent"), 404)
+                else binary(pngs[albumIndex(id)], "image/png", request)
                 "audio" -> if (kind == "tracks") { audioRequests.incrementAndGet(); binary(wav, "audio/wav", request) } else unexpected(request)
                 "playback" -> {
                     if (kind !in listOf("artists", "albums")) return unexpected(request)
@@ -196,7 +206,7 @@ class UiFixtureServer : AutoCloseable {
             return MockResponse().setResponseCode(204)
         }
         if (method == "GET" && path in listOf("/api/me/likes", "/api/me/recent")) {
-            val ids = if (path.endsWith("likes")) liked.toList() else history.distinct().take(3)
+            val ids = if (path.endsWith("likes")) liked.toList() else recentTrackIds()
             val limit = url.queryParameter("limit")?.toIntOrNull() ?: 40
             val offset = url.queryParameter("offset")?.toIntOrNull() ?: 0
             return json(page(ids.map { JSONObject().put("track", track(it)) }, limit, offset))
@@ -285,7 +295,13 @@ class UiFixtureServer : AutoCloseable {
             .put("name", TRACK_NAMES[index - 1]).put("artists", credits(multiple = index == 2)).put("albumId", "album-$album")
             .put("albumName", listOf(ALBUM_NAME, "Orbit Afterglow", "Orbit Tides")[album - 1])
             .put("durationMs", AUDIO_SECONDS * 1000).put("hasAudio", true).put("discNumber", 1).put("trackNumber", index)
-            .put("genres", JSONArray(listOf("Ambient")))
+            .put("genres", JSONArray(listOf("Ambient"))).apply {
+                if (sharedSongRows) when (index) {
+                    7 -> put("artists", JSONArray())
+                    8 -> put("artists", JSONArray().put(JSONObject().put("id", "").put("name", SHARED_UNKNOWN_ARTIST)))
+                    15 -> put("hasAudio", false)
+                }
+            }
     }
     private fun track(id: String) = tracks().first { it.getString("id") == id }
     private fun manual() = JSONObject().put("id", MANUAL_ID).put("name", manualName).put("description", manualDescription)
@@ -658,6 +674,14 @@ class UiFixtureServer : AutoCloseable {
         const val DERIVED_ID = "ambient-rules"
         const val DERIVED_NAME = "Ambient discoveries"
         const val ERROR_QUERY = "fixture-error"
+        const val SHARED_SONG_QUERY = "fixture-shared-song-rows"
+        const val SHARED_UNAVAILABLE_ID = "track-15"
+        const val SHARED_UNKNOWN_ARTIST = "Unlinked credit · 海辺の音楽 🌙"
+        // Exactly Home's eight-row bound, with the SAME ordered objects returned by Search.
+        // The first six manual-playlist tracks, entry IDs/order and normal recents stay untouched.
+        val SHARED_SONG_IDS = listOf("track-01", "track-02", "track-07", "track-08",
+            SHARED_UNAVAILABLE_ID, "track-16", "track-09", "track-13")
+        val SHARED_SONG_NAMES: List<String> get() = SHARED_SONG_IDS.map { TRACK_NAMES[it.takeLast(2).toInt() - 1] }
         // Leave room for a slow software-rendered AVD without a natural track transition mid-assertion.
         private const val AUDIO_SECONDS = 600
         const val AUDIO_DURATION_MS = AUDIO_SECONDS * 1000L

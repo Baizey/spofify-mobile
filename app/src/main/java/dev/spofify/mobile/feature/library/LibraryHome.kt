@@ -153,7 +153,9 @@ fun LibraryHome(
     DisposableEffect(holder) { onDispose { holder.setVisible(false) } }
     val callback by rememberUpdatedState(onVisibleItems)
     LaunchedEffect(state.recent.value) { callback(state.recent.value.orEmpty()) }
-    LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    LazyColumn(modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = MusicListLayout.horizontalPadding, vertical = 16.dp),
+        verticalArrangement = MusicListLayout.arrangement) {
         item {
             ElevatedCard(onClick = onOpenLikes, modifier = Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically,
@@ -170,22 +172,22 @@ fun LibraryHome(
             state.likedCount.error?.let { LoadError(it, "Retry liked count") { holder.refresh("likes") } }
         }
         if (state.recent.loading || state.recent.error != null || !state.recent.value.isNullOrEmpty()) item {
-            Text("Recently played", style = MaterialTheme.typography.titleLarge)
-            if (state.recent.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            state.recent.error?.let { LoadError(it, "Retry recently played") { holder.refresh("recent") } }
+            Column(Modifier.padding(top = 12.dp, bottom = 12.dp)) {
+                Text("Recently played", style = MaterialTheme.typography.titleLarge)
+                if (state.recent.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+                state.recent.error?.let { LoadError(it, "Retry recently played") { holder.refresh("recent") } }
+            }
         }
-        items(state.recent.value.orEmpty(), key = { "recent:${it.id}" }) { item ->
-            MusicRow(item, onOpenItem, onPlayItem, onShowActions, onEnqueueItem, artwork,
-                playback = playback, like = likes[item.id], onToggleLike = onToggleLike)
-        }
+        musicRows(state.recent.value.orEmpty(), key = { _, item -> "recent:${item.id}" },
+            onOpenItem, onPlayItem, onShowActions, onEnqueueItem, artwork, playback, likes, onToggleLike)
         item {
-            Text("Your playlists", style = MaterialTheme.typography.titleLarge)
+            Text("Your playlists", Modifier.padding(top = 12.dp), style = MaterialTheme.typography.titleLarge)
             TextButton(onClick = { onOpenPlaylists(null) }) { Text("All playlists") }
             if (state.playlists.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
             state.playlists.error?.let { LoadError(it, "Retry playlists") { holder.refresh("playlists") } }
         }
         items(state.playlists.value.orEmpty(), key = { "playlist:${it.id}" }) { playlist ->
-            ElevatedCard(onClick = { onOpenPlaylists(playlist.id) }, modifier = Modifier.fillMaxWidth()) {
+            ElevatedCard(onClick = { onOpenPlaylists(playlist.id) }, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
                 Column(Modifier.padding(16.dp)) {
                     Text(playlist.name, style = MaterialTheme.typography.titleMedium)
                     Text(if (playlist.kind == PlaylistKind.DERIVED) "Rules playlist" else "${playlist.trackCount} songs", style = MaterialTheme.typography.bodySmall)

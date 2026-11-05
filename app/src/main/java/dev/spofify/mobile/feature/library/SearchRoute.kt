@@ -5,7 +5,6 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -202,7 +201,8 @@ internal fun CatalogScreenContent(
     }
     Column(modifier.fillMaxSize()) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll,
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)) {
+        contentPadding = PaddingValues(horizontal = MusicListLayout.horizontalPadding, vertical = 8.dp),
+        verticalArrangement = MusicListLayout.arrangement) {
         val detail = screen.item
         if (detail == null && !screen.emptySearch && screen.sections.values.any { it.loading }) item(key = "search-loading") {
             LinearProgressIndicator(Modifier.fillMaxWidth().semantics { contentDescription = "Searching saved music" })
@@ -269,10 +269,8 @@ internal fun CatalogScreenContent(
                 Text("No saved ${catalogLabel(kind).lowercase()} in this group.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
             }
-            itemsIndexed(section.items, key = { index, item -> "$kind:${section.offset}:$index:${item.id}" }) { _, item ->
-                MusicRow(item, onOpen, onPlay, onMore, onQueue, artwork, playback = playback,
-                    like = likes[item.id], onToggleLike = onToggleLike)
-            }
+            musicRows(section.items, key = { index, item -> "$kind:${section.offset}:$index:${item.id}" },
+                onOpen, onPlay, onMore, onQueue, artwork, playback, likes, onToggleLike)
             if (section.hasNext) item(key = "$kind:more") {
                 TextButton(onClick = { holder.more(kind) }, enabled = !section.loading,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {

@@ -13,6 +13,8 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModelProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -148,6 +150,12 @@ class NativeUiSmokeTest {
                 dismissSearchImeAndAssertEmptyRoot()
                 assertEquals(0, fixture.searchCalls.size)
                 screenshot("04c-search-back-restored")
+                // Keep the original empty-Search/no-reads assertions above genuinely pristine.
+                compose.onNodeWithText("Home").performClick()
+                waitFor(hasText("Recently played"))
+                assertSharedSongHostRegression(fixture, "04f-normal-shared-songs", playing = false)
+                activateSearchAndAssertEmpty(fixture, "04g-shared-songs-return-keyboard")
+                dismissSearchImeAndAssertEmptyRoot()
                 val heldSearch = fixture.holdSearchResponses()
                 try {
                     search("Orbit")
@@ -442,6 +450,7 @@ class NativeUiSmokeTest {
                 compose.onNodeWithText("Home").performClick()
                 waitFor(hasText("Recently played"))
                 screenshot("10f-narrow-home")
+                assertSharedSongHostRegression(fixture, "10fa-narrow-shared-songs", playing = true)
                 compose.onNodeWithText("Playlists").performClick()
                 waitFor(hasText(UiFixtureServer.DERIVED_NAME))
                 screenshot("10g-narrow-playlists")
@@ -475,6 +484,7 @@ class NativeUiSmokeTest {
                 waitFor(hasText("Recently played"))
                 assertPlayingTransition(beforeHomeTab, fixture, "large-font Home navigation")
                 screenshot("11-large-font-home")
+                assertSharedSongHostRegression(fixture, "11a-font2-narrow-shared-songs", playing = true)
                 val beforeLargePlaylistsTab = capturePlaying(fixture)
                 compose.onNodeWithText("Playlists").performClick()
                 waitFor(hasText(UiFixtureServer.DERIVED_NAME))
@@ -971,6 +981,293 @@ class NativeUiSmokeTest {
             heights.maxOrNull()!! - heights.minOrNull()!! <= 1f)
         compose.onNode(catalogItem(UiFixtureServer.TRACK_NAMES[1])).assert(
             hasText(UiFixtureServer.CREDIT_ARTISTS.joinToString(", ") { it.second }, substring = true))
+    }
+
+    private data class SongTextSlot(val text: String, val bounds: Rect, val baseline: Float, val ellipsized: Boolean)
+    private data class SongRowSlots(
+        val width: Float, val height: Float, val art: Rect, val more: Rect,
+        val text: List<SongTextSlot>, val buttons: List<Pair<String, Rect>>,
+        val customActions: List<String>, val longClick: String?, val state: String?,
+    )
+    private data class SongHostRows(val rows: List<SongRowSlots>, val pitches: List<Float>)
+
+    /**
+     * The real Home shelf and real query-driven Search, not two test-only MusicRow containers.
+     * The opt-in read fixture is restored before the original journey continues: the six-track
+     * manual queue, occurrence IDs, catalog totals and audible-history fixture are never edited.
+     * These captures require human inspection; equal semantics/bounds are not visual approval.
+     */
+    private fun assertSharedSongHostRegression(fixture: UiFixtureServer, prefix: String, playing: Boolean) {
+        val before = if (playing) capturePlaying(fixture) else null
+        val queue = upcomingOccurrences()
+        var regressionFailure: Throwable? = null
+        fixture.setSharedSongRows(true)
+        try {
+            // A previously successful default-fixture image must not conceal the opt-in 404.
+            compose.runOnIdle {
+                ViewModelProvider(compose.activity)[LibraryViewModel::class.java].graph.imageLoader?.memoryCache?.clear()
+            }
+            refreshRecentFixture(fixture)
+            val home = captureSharedSongHost("$prefix-home")
+            assertSharedSongActions(fixture, home = true, prefix = "$prefix-home")
+            compose.onNodeWithText("Search").performClick()
+            waitFor(hasTestTag("search-query"))
+            waitForIme(true)
+            search(UiFixtureServer.SHARED_SONG_QUERY)
+            waitForIme(false)
+            waitUntilAbsent(hasContentDescription("Searching saved music"))
+            assertEquals(UiFixtureServer.SHARED_SONG_QUERY, queryText())
+            assertGroupedSearchBounded(fixture, UiFixtureServer.SHARED_SONG_QUERY)
+            val searchRows = captureSharedSongHost("$prefix-search")
+            assertSharedSongActions(fixture, home = false, prefix = "$prefix-search")
+            assertEquals("Both hosts must expose the same bounded song order", home.rows.size, searchRows.rows.size)
+            home.rows.zip(searchRows.rows).forEachIndexed { index, (left, right) ->
+                val name = UiFixtureServer.SHARED_SONG_NAMES[index]
+                assertEquals("$name row width", left.width, right.width, 1f)
+                assertEquals("$name row height", left.height, right.height, 1f)
+                assertSlotEquals("$name artwork", left.art, right.art)
+                assertSlotEquals("$name More", left.more, right.more)
+                assertEquals("$name text roles", left.text.size, right.text.size)
+                left.text.zip(right.text).forEach { (a, b) ->
+                    assertEquals("$name copy", a.text, b.text)
+                    assertSlotEquals("$name text", a.bounds, b.bounds)
+                    assertEquals("$name baseline", a.baseline, b.baseline, 1f)
+                    assertEquals("$name ellipsis", a.ellipsized, b.ellipsized)
+                }
+                assertEquals("$name custom actions", left.customActions, right.customActions)
+                assertEquals("$name long press", left.longClick, right.longClick)
+                assertEquals("$name playback state", left.state, right.state)
+                assertEquals("$name independent controls", left.buttons.map { it.first }, right.buttons.map { it.first })
+                left.buttons.zip(right.buttons).forEach { (a, b) -> assertSlotEquals("$name ${a.first}", a.second, b.second) }
+            }
+            home.pitches.zip(searchRows.pitches).forEachIndexed { index, (a, b) ->
+                assertEquals("Consecutive Home/Search pitch at song $index", a, b, 1f)
+            }
+            File(evidence, "$prefix-measurements.txt").writeText(
+                "units=dp; row-local coordinates; baseline relative to row top\n" +
+                    "fixtureIds=${UiFixtureServer.SHARED_SONG_IDS}\n" +
+                    "home=$home\nsearch=$searchRows\n" +
+                    "noInlinePlayAndReclaimedSlot=asserted in both hosts; More-only with full copy constraints\n" +
+                    "activePausedBufferingAndLikePendingMatrix=not injected by this native regression\n" +
+                    "visualReview=required; screenshots not automatically approved\n")
+            assertEquals("Presentation/navigation must preserve exact upcoming occurrences", queue, upcomingOccurrences())
+            if (playing) assertPlayingTransition(checkNotNull(before), fixture, "paired Home/Search song rows")
+            else assertNoAutoplayOnBrowse(fixture)
+        } catch (error: Throwable) {
+            regressionFailure = error
+            runCatching { screenshot("$prefix-failure") }
+            throw error
+        } finally {
+            fixture.setSharedSongRows(false)
+            // Return to a real root and invalidate only the recent shelf, even after an assertion.
+            // Do not stop/replace playback or reset any playlist/queue to achieve cleanup.
+            runCatching {
+                if (exists(hasTestTag("music-actions"))) {
+                    pressBack()
+                    waitUntilAbsent(hasTestTag("music-actions"))
+                }
+                compose.runOnIdle {
+                    ViewModelProvider(compose.activity)[LibraryViewModel::class.java].switchTab(Tab.HOME)
+                }
+                waitFor(hasText("Recently played"))
+                refreshRecentFixture(fixture)
+                compose.onAllNodes(hasScrollToIndexAction()).onFirst().performScrollToIndex(0)
+            }.exceptionOrNull()?.let { cleanupError ->
+                val primary = regressionFailure
+                if (primary != null) primary.addSuppressed(cleanupError) else throw cleanupError
+            }
+        }
+    }
+
+    private fun refreshRecentFixture(fixture: UiFixtureServer) {
+        val holder = compose.runOnIdle {
+            checkNotNull(ViewModelProvider(compose.activity)[LibraryViewModel::class.java].homeHolder()).also { it.invalidate("recent") }
+        }
+        compose.waitUntil(20_000) {
+            val recent = holder.state.value.recent
+            !recent.loading && recent.error == null && recent.value?.map { it.id } == fixture.recentTrackIds()
+        }
+    }
+
+    private fun SemanticsNodeInteraction.dpBounds(): Rect = getUnclippedBoundsInRoot().let {
+        Rect(it.left.value, it.top.value, it.right.value, it.bottom.value)
+    }
+    private fun Rect.relativeTo(row: Rect) = translate(-row.left, -row.top)
+    private fun assertSlotEquals(label: String, a: Rect, b: Rect) {
+        assertEquals("$label left", a.left, b.left, 1f)
+        assertEquals("$label top", a.top, b.top, 1f)
+        assertEquals("$label right", a.right, b.right, 1f)
+        assertEquals("$label bottom", a.bottom, b.bottom, 1f)
+    }
+    private fun assertFullyInSongViewport(name: String): Rect {
+        val row = compose.onNode(catalogItem(name)).assertIsDisplayed().dpBounds()
+        val viewport = compose.onAllNodes(hasScrollToIndexAction()).onFirst().dpBounds()
+        assertTrue("Complete destination/More must fit above host dock/player/navigation: $name $row in $viewport",
+            row.left >= viewport.left - 1f && row.right <= viewport.right + 1f &&
+                row.top >= viewport.top - 1f && row.bottom <= viewport.bottom + 1f)
+        return row
+    }
+
+    private fun captureSharedSongHost(prefix: String): SongHostRows {
+        val rows = mutableListOf<SongRowSlots>()
+        val pitches = mutableListOf<Float>()
+        val names = UiFixtureServer.SHARED_SONG_NAMES
+        val model = compose.runOnIdle { ViewModelProvider(compose.activity)[LibraryViewModel::class.java] }
+        // Compare the same resolved like state, not a race between a new shelf and its status read.
+        compose.waitUntil(15_000) { model.state.value.likes.keys.containsAll(UiFixtureServer.SHARED_SONG_IDS) }
+        names.forEachIndexed { index, name ->
+            // Start from the actual parent list to avoid measuring a disposed/clipped predecessor.
+            compose.onAllNodes(hasScrollToIndexAction()).onFirst().performScrollToIndex(0)
+            scrollToCatalogItem(name)
+            if (index < names.lastIndex) scrollToCatalogItem(names[index + 1])
+            val bounds = assertFullyInSongViewport(name)
+            rows += captureSongRowSlots(name, bounds, UiFixtureServer.SHARED_SONG_IDS[index] != UiFixtureServer.SHARED_UNAVAILABLE_ID)
+            if (index < names.lastIndex) {
+                val next = assertFullyInSongViewport(names[index + 1])
+                val pitch = next.top - bounds.top
+                assertEquals("Search-canonical zero song gap for $name", bounds.height, pitch, 1f)
+                pitches += pitch
+            }
+            if (index in listOf(0, 4, 6)) {
+                screenshot("$prefix-pair-$index") // one/many, unavailable/long Unicode, terminal pair.
+                val viewport = compose.onAllNodes(hasScrollToIndexAction()).onFirst().dpBounds()
+                val complete = names.count { candidate ->
+                    compose.onAllNodes(catalogItem(candidate)).fetchSemanticsNodes().singleOrNull()?.let {
+                        val b = compose.onNode(catalogItem(candidate)).dpBounds()
+                        b.top >= viewport.top && b.bottom <= viewport.bottom
+                    } == true
+                }
+                File(evidence, "$prefix-pair-$index-rows.txt").writeText("completeVisibleSongRows=$complete\n" +
+                    "viewportDp=$viewport\nfirst=$name\nrowDp=$bounds\n")
+            }
+        }
+        assertTrue("Credit cardinality, absent audio/art and Unicode must not change row height: $rows",
+            rows.maxOf { it.height } - rows.minOf { it.height } <= 1f)
+        return SongHostRows(rows, pitches)
+    }
+
+    private fun captureSongRowSlots(name: String, bounds: Rect, playable: Boolean): SongRowSlots {
+        val row = compose.onNode(catalogItem(name)).fetchSemanticsNode()
+        val inside = hasAnyAncestor(SemanticsMatcher("song row ${row.id}") { it.id == row.id })
+        val more = compose.onNodeWithContentDescription("More actions for $name")
+            .assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).dpBounds().relativeTo(bounds)
+        assertEquals("More stays flush with the row end; no playback spacer", bounds.width, more.right, 1f)
+        val art = compose.onNode(hasContentDescription("Song") and inside, useUnmergedTree = true).dpBounds().relativeTo(bounds)
+        assertEquals("Song artwork stays square", 52f, art.width, 1f)
+        assertEquals("Song artwork stays square", 52f, art.height, 1f)
+        val textNodes = compose.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.GetTextLayoutResult) and inside,
+            useUnmergedTree = true).fetchSemanticsNodes().filter { node ->
+                // The real artwork can contain a fallback initial. Only the copy column has
+                // title/credit roles; do not mistake an image placeholder for a third text line.
+                val local = compose.onNode(SemanticsMatcher("copy ${node.id}") { it.id == node.id },
+                    useUnmergedTree = true).dpBounds().relativeTo(bounds)
+                local.left >= art.right - 1f && local.right <= more.left + 1f
+            }
+        assertEquals("Title and ONE inline metadata line, not per-artist buttons", 2, textNodes.size)
+        val text = textNodes.map { node ->
+            val target = compose.onNode(SemanticsMatcher("text ${node.id}") { it.id == node.id }, useUnmergedTree = true)
+            val layouts = mutableListOf<TextLayoutResult>()
+            target.performSemanticsAction(SemanticsActions.GetTextLayoutResult) { assertTrue(it(layouts)) }
+            val layout = layouts.single()
+            // Check the available copy width, not short text's intrinsic bounds: removing an
+            // icon but retaining its invisible 48dp slot must fail in either production host.
+            assertEquals("Song copy reclaims the removed playback slot up to More minus shared padding",
+                more.left - art.right - 20f,
+                layout.layoutInput.constraints.maxWidth / compose.activity.resources.displayMetrics.density, 1f)
+            assertEquals("Single-line song copy", 1, layout.lineCount)
+            assertEquals("Bounded song copy", 1, layout.layoutInput.maxLines)
+            assertEquals("Overflow ellipsizes rather than clips", TextOverflow.Ellipsis, layout.layoutInput.overflow)
+            if (layout.multiParagraph.maxIntrinsicWidth > layout.multiParagraph.width + 1f) {
+                assertTrue("Overflowing song identity/credits must ellipsize", layout.isLineEllipsized(0))
+            }
+            // didOverflowHeight also reports legitimate max-line ellipsis; check physical height.
+            assertTrue("Song paragraph must fit its measured text height", layout.multiParagraph.height <= layout.size.height + 1f)
+            val slot = target.dpBounds().relativeTo(bounds)
+            assertEquals("Measured text height must fit its node", layout.size.height.toFloat(),
+                slot.height * compose.activity.resources.displayMetrics.density, 1f)
+            assertTrue("Text must fit within its song row", slot.top >= -1f && slot.bottom <= bounds.height + 1f)
+            SongTextSlot(layout.layoutInput.text.text, slot,
+                slot.top + layout.firstBaseline / compose.activity.resources.displayMetrics.density, layout.isLineEllipsized(0))
+        }.sortedBy { it.bounds.top }
+        val buttons = compose.onAllNodes(hasClickAction() and inside).fetchSemanticsNodes().map { node ->
+            val description = node.config.getOrNull(SemanticsProperties.ContentDescription).orEmpty().joinToString()
+            assertEquals("Only More is an inline action; no playback or credit buttons",
+                "More actions for $name", description)
+            assertFalse("More stays available even without audio", node.config.contains(SemanticsProperties.Disabled))
+            description to compose.onNode(SemanticsMatcher("button ${node.id}") { it.id == node.id }).dpBounds().relativeTo(bounds)
+        }.sortedBy { it.second.left }
+        assertEquals("Exactly one independent More target per song", listOf("More actions for $name"), buttons.map { it.first })
+        val custom = row.config.getOrNull(SemanticsActions.CustomActions).orEmpty().map { it.label }.sorted()
+        assertTrue("Every song has an accessible More action", "More actions" in custom)
+        assertEquals("Deliberate Play now matches audio availability", playable, "Play now" in custom)
+        val playback = readPlaybackState()
+        val activeIntent = playback.isPlaying || (playback.isBuffering && playback.playWhenReady)
+        assertEquals("Contextual Add is available only with active playback and a current binding",
+            playable && activeIntent && playback.interactionKey != null, "Add to queue" in custom)
+        return SongRowSlots(bounds.width, bounds.height, art, more, text, buttons, custom,
+            row.config.getOrNull(SemanticsActions.OnLongClick)?.label, row.config.getOrNull(SemanticsProperties.StateDescription))
+    }
+
+    private fun assertSharedSongActions(fixture: UiFixtureServer, home: Boolean, prefix: String) {
+        val model = compose.runOnIdle { ViewModelProvider(compose.activity)[LibraryViewModel::class.java] }
+        listOf(1, 4).forEach { index -> // Four ID-backed credits, then unavailable audio/missing art.
+            val id = UiFixtureServer.SHARED_SONG_IDS[index]
+            val name = UiFixtureServer.SHARED_SONG_NAMES[index]
+            scrollToCatalogItem(name)
+            val top = compose.onNode(catalogItem(name)).fetchSemanticsNode().boundsInRoot.top
+            val page = model.state.value.page
+            val menu = hasTestTag("music-actions")
+            val inMenu = hasAnyAncestor(menu)
+            fun checkMenu() {
+                waitFor(menu)
+                compose.onNode(hasText(name) and inMenu).assertExists()
+                listOf("Play now", "Play next", "Add to queue").forEach { action ->
+                    val control = compose.onNode(hasText(action) and hasClickAction() and inMenu)
+                    if (index == 4) control.assertIsNotEnabled() else control.assertIsEnabled()
+                }
+                assertEquals("Child More/long press/custom More must not navigate", page, model.state.value.page)
+            }
+            compose.onNodeWithContentDescription("More actions for $name").performTouchInput { click() }
+            checkMenu()
+            if (index == 1) UiFixtureServer.CREDIT_ARTISTS.forEach { (_, artist) ->
+                compose.onNode(hasText(artist) and hasClickAction() and inMenu).assertExists()
+            }
+            screenshot("$prefix-more-$index")
+            pressBack()
+            waitUntilAbsent(menu)
+            val identityX = 70f * compose.activity.resources.displayMetrics.density
+            compose.onNode(catalogItem(name)).performTouchInput { longClick(Offset(identityX, center.y)) }
+            checkMenu()
+            pressBack()
+            waitUntilAbsent(menu)
+            val accessibleMore = compose.onNode(catalogItem(name)).fetchSemanticsNode()
+                .config[SemanticsActions.CustomActions].single { it.label == "More actions" }
+            compose.runOnIdle { assertTrue(accessibleMore.action()) }
+            checkMenu()
+            pressBack()
+            waitUntilAbsent(menu)
+            compose.onNode(catalogItem(name)).performTouchInput { click(Offset(identityX, center.y)) }
+            waitFor(hasText("Disc 1 · Track ${id.takeLast(2).toInt()}"))
+            compose.waitUntil(15_000) { fixture.catalogDetails.any { it.kind == "track" && it.id == id } }
+            val after = model.state.value.page
+            if (home) {
+                assertTrue("Home identity opens the host detail stack", after is Page.Detail)
+                assertEquals("Exact Home detail identity", id, (after as Page.Detail).item.id)
+            } else assertEquals("Search owns an inner detail stack, not a host Page.Detail", page, after)
+            pressBack()
+            waitFor(catalogItem(name))
+            assertRetainedSearchPosition(top, name) // Row-local restore also applies to Home.
+            if (!home) assertEquals("Back retains the exact Search query", UiFixtureServer.SHARED_SONG_QUERY, queryText())
+        }
+        // The unlinked credit is honest metadata, not an invented detail destination.
+        val missingCreditName = UiFixtureServer.SHARED_SONG_NAMES[3]
+        scrollToCatalogItem(missingCreditName)
+        compose.onNodeWithContentDescription("More actions for $missingCreditName").performClick()
+        waitFor(hasTestTag("music-actions"))
+        compose.onNode(hasText(UiFixtureServer.SHARED_UNKNOWN_ARTIST) and hasAnyAncestor(hasTestTag("music-actions")))
+            .assertExists().assert(!hasClickAction())
+        pressBack()
+        waitUntilAbsent(hasTestTag("music-actions"))
     }
 
     private fun assertFourArtistCreditNavigation(fixture: UiFixtureServer) {
