@@ -1,8 +1,21 @@
-# Playback registration lifetime and reliable output selection
+# BUG-101 — Playback registration lifetime and reliable output selection
+
+## Tracking
+
+- ID: BUG-101
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: graph/service registration lifetime, bounded exact-ID cleanup and output-selection authority
+- Next action: Source repair delivered in b6fbc103b6202d334ea0f09143d0f77cfd75e908; native rendered/audio/FGS/process-death acceptance remains BLOCKED / NOT COMPLETE. Unknown accepted registration ID and abrupt hard-death duplicate recovery remain OPEN: require an authenticated backend idempotency/recovery/replacement contract that fences or drains prior authority, not name filtering, hidden endpoints or invented mobile authority. Validate current landed lifecycle behavior; source closure does not close those protocol/native residuals.
 
 ## Independent bugfix unit / source-only analysis
 
-Deliver reliable same-installation participation and output selection across UI, service and application lifetimes, without hiding real endpoints or acquiring playback on passive reopening. This is independent of [prepared transport reliability](playback-prepared-transport-reliability.md): registration can be repaired and validated with silent prepared outputs; Pause/Resume can be repaired under one stable registration. Shared coordinator/service/test files require hunk coordination, not a batch. Neither implementation waits for a project rewrite or an invented protocol.
+Deliver reliable same-installation participation and output selection across UI, service and application lifetimes, without hiding real endpoints or acquiring playback on passive reopening. This is independent of prepared transport reliability (BUG-102, reserved peer brief; not yet landed): registration can be repaired and validated with silent prepared outputs; Pause/Resume can be repaired under one stable registration. Shared coordinator/service/test files require hunk coordination, not a batch. Neither implementation waits for a project rewrite or an invented protocol.
 
 Analysis base: clean mobile main **`ed198abecc8cc597bf3ea6ce1b2762d105c11175`**. Read-only actual Go **`b6eb54ffdc91e07e2ce7824b8be5f90afa8b05eb`**. Dedicated docs lane: `/var/home/lsm/repos/spofify-mobile-playback-reliability-analysis`, `spec/playback-reliability`. Preserve this and all previous analyzer/recovery refs/worktrees. Extract this spec into an assigned lead's own feature worktree from actual landed main. This analysis ran no tests/builds/native/network; findings below are source evidence, **not reproductions or a proven sole cause** of the user report.
 

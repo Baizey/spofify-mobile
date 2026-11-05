@@ -1,4 +1,17 @@
-# Device rows select output; switching stays quiet
+# FEAT-109 — Device rows select output; switching stays quiet
+
+## Tracking
+
+- ID: FEAT-109
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: whole-row output selection, independent Rename and quiet target-row switching feedback
+- Next action: Source delivered in efb5b755f9c342631378a02fb47da3464525b651; native UI/render/audio acceptance remains BLOCKED / NOT COMPLETE. Validate current whole-row selection, independent Rename, native dismissal, target-row progress and genuine recovery on an isolated synthetic AVD, preserving FEAT-112 quiet routine refresh; not a source implementation TODO.
 
 ## One independently deliverable feature / authorized implementation
 
@@ -48,7 +61,7 @@ Inspected `/var/home/lsm/repos/spofify-go/docs/frontend.md` “Shared loading UI
 
 ## Parallel lanes / exclusions
 
-- Jitter lead `8cccd9fe` owns `/var/home/lsm/repos/spofify-mobile-device-refresh-jitter`, `fix/device-refresh-jitter`. Read its **committed** `docs/specs/device-refresh-jitter.md` (analyzed at `7725724`); no editing/importing unfinished source. It independently fixes toggled inline `LinearProgressIndicator` above `LazyColumn` and known-empty label churn from routine `connecting/verifyingConnection` pulses. Do not expand, cancel, reassign, delay or squash it with this feature.
+- Jitter lead `8cccd9fe` owns `/var/home/lsm/repos/spofify-mobile-device-refresh-jitter`, `fix/device-refresh-jitter`. Read its **committed** `docs/specs/device-refresh-jitter.md` (analyzed at `7725724`; current integrated spec: `FEAT-112-device-refresh-jitter.md`); no editing/importing unfinished source. It independently fixes toggled inline `LinearProgressIndicator` above `LazyColumn` and known-empty label churn from routine `connecting/verifyingConnection` pulses. Do not expand, cancel, reassign, delay or squash it with this feature.
 - Shared hunks: Sheet content progress/message block and focused tests; this lead owns **new header/item interaction and intentional-switch feedback metadata**, jitter lead owns ordinary refresh visibility. This new request supersedes only the old visible Close/Play and routine switching-prose requirements, not jitter's loaded populated/known-empty stability, initial/recovery progress, scroll, rename focus or passive-render invariants. Full row feedback must not reintroduce a heartbeat pulse. Reuse its stabilized base/candidate regression when landed; no dependency on its unfinished branch and no serial waterfall merely for file overlap.
 - Consume landed main normally before delivery. Real conflicts or a changed shared test seam go to a **separate scoped resolver reading both specs**, followed by refreshed checks/exact-SHA review, not ours/theirs. No MainActivity/Profile (`f8f0313c`)/Login (`da9555bf`) source/spec edits or dependency on either; retain outer sheet API for Profile reuse.
 - No core/server/Go changes; heartbeat, registration/backoff, leases/authority/ownership, transfer phases/commands, queue/admission, nonce/idempotency, late-ACK fences, autoplay and persistence remain unchanged. Mini/full-player, queued-intent policy and unrelated cleanup are out of scope. Presentation cannot issue protocol work or implicitly Continue/Play.

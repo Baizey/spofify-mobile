@@ -1,8 +1,21 @@
-# Profile as a normal full-screen destination
+# FEAT-108 — Profile as a normal full-screen destination
+
+## Tracking
+
+- ID: FEAT-108
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: Profile destination, nested offline Credits and session/navigation lifetime
+- Next action: Source delivered in c059c781e8acd8f90669f4fa92235fa0df83ee86; its initial main postcheck FAILED, then scoped correction 4364bb9f87b75b77ef2bebbe8d5afdc3799cbc7c passed. Native rendered/audio/background acceptance remains BLOCKED / NOT COMPLETE. Validate current Profile/Credits and four-tab Back/session continuity; historical Profile device entry is superseded by FEAT-110 picker placement beside transport and must not be restored. No source reimplementation or original-postcheck pass is claimed.
 
 ## Deliverable and authority
 
-Replace the signed-in account popup with a basic **Profile** tab and nested **Credits**. This is one independently deliverable feature; `streamlined-login.md` is a peer, not a prerequisite. Grounded source base: `9d6be64bb8058de22fc46915c8fae274dfb3dda8` (clean main). This spec is source analysis, not inspected screenshots or native approval.
+Replace the signed-in account popup with a basic **Profile** tab and nested **Credits**. This is one independently deliverable feature; `FEAT-107-streamlined-login.md` is a peer, not a prerequisite. Grounded source base: `9d6be64bb8058de22fc46915c8fae274dfb3dda8` (clean main). This spec is source analysis, not inspected screenshots or native approval.
 
 The latest user request supersedes the three-destination-only rule specifically to permit **Home / Search / Playlists / Profile**. The PROFILE lead must narrowly update both current navigation statements in root `AGENTS.md`, navigation guidance in `docs/mobile-ux.md`, and affected README/`docs/feature-parity.md` claims. Preserve unrelated product/safety policies; do not rewrite global guidance.
 

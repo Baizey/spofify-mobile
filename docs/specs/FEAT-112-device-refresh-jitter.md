@@ -1,4 +1,17 @@
-# Playback devices: quiet routine refresh
+# FEAT-112 — Playback devices: quiet routine refresh
+
+## Tracking
+
+- ID: FEAT-112
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: retained playback-device sheet geometry, known-empty state and routine verification feedback
+- Next action: Source delivered in 65123ab5f14d933cb17810135f38020d0028abce; native UI/render/audio acceptance remains BLOCKED / NOT COMPLETE. Validate current retained populated/known-empty refresh without geometry/scroll/rename churn and with truthful null-view/error recovery on an isolated synthetic AVD; preserve FEAT-109 whole-row behavior, not a source implementation TODO.
 
 ## Assignment / authority
 - **User/parent authorized implementation; parent lead owns Sheet/tests.** This source-analysis child remains docs-only and freezes after handoff. Retain `fix/device-refresh-jitter`, `/var/home/lsm/repos/spofify-mobile-device-refresh-jitter`.

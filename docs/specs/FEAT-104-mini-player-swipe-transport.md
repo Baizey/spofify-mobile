@@ -1,4 +1,17 @@
-# Mini-player swipe transport
+# FEAT-104 — Mini-player swipe transport
+
+## Tracking
+
+- ID: FEAT-104
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: bottom mini-player gesture recognition, transport capture fences and accessibility
+- Next action: Source delivered in 2165a8e5a4e38c800cab2c411d244d25945652bf; native render/audio/background acceptance remains BLOCKED / NOT COMPLETE. Validate current landed physical-left Next/right Previous, expansion, accessible alternatives and stale-gesture guards on an isolated synthetic AVD; this is not a source implementation TODO.
 
 ## One independent deliverable
 

@@ -1,8 +1,21 @@
-# Streamlined Login with automatic secure remembering
+# FEAT-107 — Streamlined Login with automatic secure remembering
+
+## Tracking
+
+- ID: FEAT-107
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: minimal sign-in form, explicit-origin admission and encrypted latest-success login
+- Next action: Source delivered in 5dcab8a60fda7ec3e4865d0467f4d5350d586aa3; native rendered/audio acceptance remains BLOCKED / NOT COMPLETE. Validate current landed form, IME/Back/error/retry, successful-login autofill and offline Profile/Credits notice on an isolated synthetic AVD; retain exact-origin/privacy/no-autoplay guards, not a new implementation TODO.
 
 ## Deliverable and authority
 
-Ship a minimal login form, accept valid explicit HTTP/HTTPS origins, and automatically remember/autofill the latest **successful** login. This is one independently deliverable feature; `profile-settings-tab.md` is a peer, not a prerequisite. Grounded clean-main source base: `9d6be64bb8058de22fc46915c8fae274dfb3dda8`. Source was inspected; no screenshots/native pass are claimed.
+Ship a minimal login form, accept valid explicit HTTP/HTTPS origins, and automatically remember/autofill the latest **successful** login. This is one independently deliverable feature; `FEAT-108-profile-settings-tab.md` is a peer, not a prerequisite. Grounded clean-main source base: `9d6be64bb8058de22fc46915c8fae274dfb3dda8`. Source was inspected; no screenshots/native pass are claimed.
 
 Current `SignIn.kt` has **one actual checkbox: Remember sign-in on this device**. There is no HTTP-acknowledgement checkbox to remove. Its busy presentation includes marketing/tutorial copy, URL advice, HTTP warning, remember prose, saved-for/Use/Forget controls, account/Spotify advice and Font license. `ServerAddress.kt` separately rejects hostname/public HTTP via `privateLiteral`; merely deleting UI cannot satisfy the new request.
 

@@ -1,8 +1,21 @@
-# Explicit first Play conditionally selects this phone
+# FEAT-111 — Explicit first Play conditionally selects this phone
+
+## Tracking
+
+- ID: FEAT-111
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: explicit-app-Play preparation, conditional exact-self output admission and service intent fences
+- Next action: Source delivered in 626e7da89af84ceb9f41dc87153ae94f2597fcdf; native render/audio acceptance remains BLOCKED / NOT COMPLETE. Validate current explicit first-Play conditional claim, held route/session/authority failures and no passive or queue-only acquisition on an isolated synthetic AVD; preserve FEAT-113 landed selection/start semantics, not a source implementation TODO.
 
 ## Independent feature / inspected base
 
-User: “if nothing is selected and we click play on something we should just play on the current device ... auto select itself”. Deliver one complete **explicit-Play admission feature**, not UI/authority ownership slices: requested music starts once on this phone after legitimate conditional ownership, without a picker step. Independent of `player-device-control.md`; do not wait for its control placement or unfinished priority-queue work.
+User: “if nothing is selected and we click play on something we should just play on the current device ... auto select itself”. Deliver one complete **explicit-Play admission feature**, not UI/authority ownership slices: requested music starts once on this phone after legitimate conditional ownership, without a picker step. Independent of `FEAT-110-player-device-control.md`; do not wait for its control placement or unfinished priority-queue work.
 
 Spec-only lane `/var/home/lsm/repos/spofify-mobile-player-device-specs`, `spec/player-device-corrections`; source base is clean landed main **`efb5b755f9c342631378a02fb47da3464525b651`** (normal row-UI landing advanced assignment's `c059c78` before lane creation). Extract this file alone into the implementation lead's own feature worktree/topic from actual landed main. This analyzer changes no app/core/Go source, runs no builds/native and integrates nothing.
 
@@ -47,7 +60,7 @@ Existing request is `transfer {deviceId, epoch, commandId, targetDeviceId: devic
 
 ## Coordination, gates and honest handoff
 
-Own the feature end-to-end; do not split core wire support, coordinator admission and service intent into unfinished prerequisite branches. `player-device-control.md` is independent presentation work. Shared hunks: coordinator submit/select/consume/directive/lifecycle and focused tests; landed row fields `messagePurpose/pendingSelection` must survive; jitter `8cccd9fe` owns sheet-only ordinary-progress/known-empty fix (`device-refresh-jitter.md`). No edits/imports from unfinished peer lanes; Profile `f8f0313c` retains its `RootCopyHostTest` postcheck follow-up. Go FEAT023/future mobile priority adapter are unrelated. Consume landed main normally; actual conflict or changed test seam gets a separate scoped resolver reading both specs, then rechecks/exact-SHA review, not ours/theirs or a combined batch. No unrelated Profile/Login/NativePlayer layout changes.
+Own the feature end-to-end; do not split core wire support, coordinator admission and service intent into unfinished prerequisite branches. `FEAT-110-player-device-control.md` is independent presentation work. Shared hunks: coordinator submit/select/consume/directive/lifecycle and focused tests; landed row fields `messagePurpose/pendingSelection` must survive; jitter `8cccd9fe` owns sheet-only ordinary-progress/known-empty fix (`FEAT-112-device-refresh-jitter.md`). No edits/imports from unfinished peer lanes; Profile `f8f0313c` retains its `RootCopyHostTest` postcheck follow-up. Go FEAT023/future mobile priority adapter are unrelated. Consume landed main normally; actual conflict or changed test seam gets a separate scoped resolver reading both specs, then rechecks/exact-SHA review, not ours/theirs or a combined batch. No unrelated Profile/Login/NativePlayer layout changes.
 
 - Lead owns full API37 offline gate: `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug --offline --no-daemon --console=plain` (core/app, both APKs, lint).
 - Storage: repo/output and `/tmp` bytes/inodes/visible-quota preflight, bounded owned scratch/log/capture/descendant budget, verify forked JVM `java.io.tmpdir`, monitor and stop EDQUOT/ENOSPC; account temporary duplicates, retain compact nonsecret evidence, clean only verified stopped owned artifacts, no shared SDK/cache purges/foreign cleanup.

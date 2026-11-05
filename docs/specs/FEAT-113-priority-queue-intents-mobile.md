@@ -1,4 +1,17 @@
-# Mobile successor — negotiated priority queue intents
+# FEAT-113 — Mobile successor — negotiated priority queue intents
+
+## Tracking
+
+- ID: FEAT-113
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: negotiated Low/High/Next/Now intents, native receiver/controller, strict codecs and truthful receipts
+- Next action: Source delivered in ed198abecc8cc597bf3ea6ce1b2762d105c11175; installed-Android render/audio/background and native-to-isolated-synthetic-website protocol acceptance remain BLOCKED / NOT COMPLETE. Validate current landed negotiated contract against pinned external Go b6eb54ffdc91e07e2ce7824b8be5f90afa8b05eb, unchanged-current silence and exact selected-output outcomes; external Go FEAT-023 is already delivered, not a missing mobile ID or new implementation TODO.
 
 ## Assignment boundary and prerequisite
 

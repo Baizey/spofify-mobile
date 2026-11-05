@@ -1,4 +1,17 @@
-# Shared song-list rows — Search and Recently played
+# FEAT-105 — Shared song-list rows — Search and Recently played
+
+## Tracking
+
+- ID: FEAT-105
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: shared song-list row emission, Home Recently played and Search hosts
+- Next action: Source delivered in e7c9551f0bdfb9413b8f8219be1a07f2318e8ec7; native rendered/audio acceptance remains BLOCKED / NOT COMPLETE. Validate current landed Home/Search row pitch, narrow/font2 geometry, More/gesture/Back and playback continuity on an isolated synthetic AVD; no source reimplementation or missing-image approval is implied.
 
 ## One independently deliverable feature
 

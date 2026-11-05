@@ -1,4 +1,17 @@
-# Playback-device popup: aligned actions and contextual recovery
+# FEAT-106 — Playback-device popup: aligned actions and contextual recovery
+
+## Tracking
+
+- ID: FEAT-106
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: playback-device popup action alignment and contextual connection recovery
+- Next action: Source delivered in 9d6be64bb8058de22fc46915c8fae274dfb3dda8; native UI/render/audio acceptance remains BLOCKED / NOT COMPLETE. Validate current successor FEAT-109 whole-row selection/native dismissal and FEAT-112 quiet refresh, including genuine recovery and narrow/font2 states; historical visible Close/Play-from-here controls below are superseded, not controls to restore or a source implementation TODO.
 
 ## One independently deliverable feature
 

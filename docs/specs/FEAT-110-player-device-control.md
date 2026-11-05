@@ -1,8 +1,21 @@
-# Playback devices beside Play/Pause, not Profile
+# FEAT-110 — Playback devices beside Play/Pause, not Profile
+
+## Tracking
+
+- ID: FEAT-110
+- Status: blocked
+- Phase: implementation
+- Spec readiness: ready
+- Owner: unassigned
+- Branch: unassigned
+- Worktree: unassigned
+- Depends on: none
+- Touchpoints: mini/expanded player device-picker placement, empty dock and picker dismissal
+- Next action: Source delivered in a55b7a47873b302c636671745ac42d2b746a7fdb; native render/audio acceptance remains BLOCKED / NOT COMPLETE. Validate current device control immediately left of Play/Pause in mini/expanded/empty player states, picker-over-player Back ownership and no presentation-induced playback on an isolated synthetic AVD; not a source implementation TODO.
 
 ## Independent delivery / authority
 
-User: “playback device setting should not be hidden in the profile ... not tied to profile ... should be to the left of the start/pause button”. Deliver **placement only**, independently of `explicit-play-default-device.md`; do not change output admission to make the new control work.
+User: “playback device setting should not be hidden in the profile ... not tied to profile ... should be to the left of the start/pause button”. Deliver **placement only**, independently of `FEAT-111-explicit-play-default-device.md`; do not change output admission to make the new control work.
 
 Spec-only base: clean landed main `efb5b755f9c342631378a02fb47da3464525b651`. Main advanced normally from the assignment's `c059c781e8acd8f90669f4fa92235fa0df83ee86` by landing whole-row/quiet-switch UI before this lane was created. Analysis lane: `/var/home/lsm/repos/spofify-mobile-player-device-specs`, `spec/player-device-corrections`. Commit/extract this file alone into the placement lead's **own feature worktree/topic**; the two implementations are not a batch. No source/build/native/integration work was performed for this brief.
 
@@ -34,7 +47,7 @@ Lead and descendants must read current `AGENTS.md`, `AGENT_BEHAVIOUR.md`, full `
 
 ## Coordination / delivery gates
 
-No real prerequisite on first-Play, jitter or unfinished Go FEAT023/priority adapter. Whole-row UI is now in this base; preserve its public Sheet API. Jitter `8cccd9fe` still owns sheet-only routine-progress/known-empty fix (`device-refresh-jitter.md`); no unfinished imports/edits. Shared hunks with the first-Play lead should be minimal (native smoke/MainActivity only if that lead proves route plumbing necessary), not file-ownership barriers. Profile `f8f0313c` owns its postcheck fixture follow-up; no reassignment/batching. Consume **landed main normally**; actual conflict/test-seam changes require a separate scoped resolver reading both specs and refreshed gates/review, never ours/theirs.
+No real prerequisite on first-Play, jitter or unfinished Go FEAT023/priority adapter. Whole-row UI is now in this base; preserve its public Sheet API. Jitter `8cccd9fe` still owns sheet-only routine-progress/known-empty fix (`FEAT-112-device-refresh-jitter.md`); no unfinished imports/edits. Shared hunks with the first-Play lead should be minimal (native smoke/MainActivity only if that lead proves route plumbing necessary), not file-ownership barriers. Profile `f8f0313c` owns its postcheck fixture follow-up; no reassignment/batching. Consume **landed main normally**; actual conflict/test-seam changes require a separate scoped resolver reading both specs and refreshed gates/review, never ours/theirs.
 
 - Own full API37 offline gate: `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug --offline --no-daemon --console=plain`.
 - Preflight repo/output and `/tmp` bytes/inodes/visible quota; bounded owned scratch/log/capture budget, verify forked test JVM `java.io.tmpdir`, monitor/stop EDQUOT/ENOSPC, account descendants/duplicate artifacts, retain compact useful evidence, clean only stopped verified owned disposable paths. No shared SDK edits/cache purges/foreign cleanup.
