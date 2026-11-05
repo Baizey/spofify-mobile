@@ -480,6 +480,137 @@ class TransientPlaybackRecoveryCoordinatorTest {
         }
     }
 
+    @Test fun heldFreshOriginSurvivesTwelveBenignOwnerRenewalsWithoutPassiveActivation() = runTest {
+        withRecovery { f ->
+            val output = f.output as Endpoint
+            val captured = Origin().capture()
+            val expected = f.coordinator.state.value.queueIntentBinding
+            val frozen = output.snapshot
+            repeat(12) {
+                advanceTimeBy(1000); runCurrent()
+                assertEquals(expected, f.coordinator.state.value.queueIntentBinding)
+                assertTrue(f.coordinator.state.value.canQueueIntent)
+                assertNull(f.coordinator.currentAuthority())
+                assertTrue(output.preparedAcceptances.isEmpty())
+                assertEquals(frozen, output.snapshot)
+            }
+            var rejected = 0
+            f.resume(captured, { rejected++ }); runCurrent()
+            assertEquals(0, rejected)
+            assertEquals(listOf(frozen), output.preparedAcceptances)
+            assertEquals(2, output.starts)
+            f.assertNoImportOrTakeover()
+        }
+    }
+
+    @Test fun newerResumeSupersedesWaitingRecoveryWithoutStartingTheOldIntent() = runTest {
+        withRecovery { f ->
+            val output = f.output as Endpoint
+            val frozen = output.snapshot
+            val gate = CompletableDeferred<Unit>().also { output.acceptanceGate = it }
+            var firstRejected = 0
+            var firstCompleted = 0
+            var secondRejected = 0
+            var secondCompleted = 0
+            f.resume(Origin().capture(), { firstRejected++ }, { firstCompleted++ }); runCurrent()
+            assertEquals(listOf(frozen), output.preparedAcceptances)
+            f.resume(Origin().capture(), { secondRejected++ }, { secondCompleted++ }); runCurrent()
+            assertEquals("Successor waits for the cancellation-insensitive predecessor", 1, output.preparedAcceptances.size)
+            assertEquals(1, output.starts)
+            assertNull(f.coordinator.currentAuthority())
+            gate.complete(Unit); runCurrent()
+            assertEquals(1, firstRejected)
+            assertEquals(0, firstCompleted)
+            assertEquals(0, secondRejected)
+            assertEquals(1, secondCompleted)
+            assertEquals(listOf(frozen, frozen), output.preparedAcceptances)
+            assertEquals("Only the new deliberate Resume starts", 2, output.starts)
+            repeat(2) { advanceTimeBy(1000); runCurrent() }
+            assertEquals(2, output.starts)
+            assertTrue(requireNotNull(f.coordinator.currentAuthority()).isValid())
+            f.assertNoImportOrTakeover()
+        }
+    }
+
+    @Test fun authLossDuringPreparedAcceptanceCannotReturnAuthorityOrExecuteMusic() = runTest {
+        withRecovery { f ->
+            val output = f.output as Endpoint
+            val gate = CompletableDeferred<Unit>().also { output.acceptanceGate = it }
+            val frozen = output.snapshot
+            var rejected = 0
+            var completed = 0
+            f.resume(Origin().capture(), { rejected++ }, { completed++ }); runCurrent()
+            assertEquals(listOf(frozen), output.preparedAcceptances)
+            f.coordinator.authLost(); runCurrent()
+            gate.complete(Unit); runCurrent()
+            assertEquals(1, rejected)
+            assertEquals(0, completed)
+            assertEquals(PlaybackConnectionRecovery.AUTH_REQUIRED, f.coordinator.state.value.recovery)
+            assertNull(f.coordinator.currentAuthority())
+            assertFalse(f.coordinator.state.value.canQueueIntent)
+            assertEquals(frozen, output.snapshot)
+            assertEquals(1, output.starts)
+            f.assertNoImportOrTakeover()
+        }
+    }
+
+    @Test fun changedAcceptedBindingWhileHighWaitsCannotBorrowNewRecoveryReadiness() = runTest {
+        withRecovery { f ->
+            val output = f.output as Endpoint
+            val frozen = output.snapshot
+            val expected = requireNotNull(f.coordinator.state.value.queueIntentBinding)
+            val gate = CompletableDeferred<Unit>().also { f.api.pollGate = it }
+            f.coordinator.retry(); runCurrent()
+            val results = mutableListOf<QueueIntentResult?>()
+            f.coordinator.queueIntent(QueueIntentIntent.HIGH, expected,
+                QueueIntentSelection.Occurrence(4), Origin().capture(), results::add)
+            runCurrent()
+            assertTrue(results.isEmpty())
+            // A newer accepted semantic revision is not the captured action's binding,
+            // even if the displayed queue happens to have returned to the same shape.
+            val changed = requireNotNull(output.metadata).copy(revision = expected.revision + 2)
+            f.api.current = room(frozen, changed).copy(stateSeq = f.api.current.stateSeq + 1)
+            gate.complete(Unit); f.api.pollGate = null; runCurrent()
+            assertEquals(listOf<QueueIntentResult?>(null), results)
+            assertNotEquals(expected, f.coordinator.state.value.queueIntentBinding)
+            assertTrue(output.preparedAcceptances.isEmpty())
+            assertTrue(output.executions.isEmpty())
+            assertEquals(frozen, output.snapshot)
+            assertEquals(1, output.starts)
+            assertNull(f.coordinator.currentAuthority())
+            f.assertNoImportOrTakeover()
+        }
+    }
+
+    @Test fun lostRecoveryPublicationStopsOnceAndNeverReplaysUntilAnotherFreshResume() = runTest {
+        withRecovery { f ->
+            val output = f.output as Endpoint
+            val frozen = output.snapshot
+            f.api.dropNextPoll = true
+            f.resume(Origin().capture()); runCurrent()
+            assertEquals(2, output.starts)
+            assertEquals(listOf(frozen), output.preparedAcceptances)
+            assertEquals(PlaybackConnectionRecovery.VERIFICATION_NEEDED, f.coordinator.state.value.recovery)
+            assertEquals(frozen, output.snapshot)
+            assertNull(f.coordinator.currentAuthority())
+            assertTrue(output.startAuthorities.none { it.isValid() })
+            val acceptedSequence = f.api.current.stateSeq
+            f.coordinator.retry(); runCurrent()
+            repeat(2) { advanceTimeBy(1000); runCurrent() }
+            assertEquals("Healthy polls do not republish the lost result", acceptedSequence, f.api.current.stateSeq)
+            assertEquals(2, output.starts)
+            assertEquals(listOf(frozen), output.preparedAcceptances)
+            assertEquals(frozen, output.snapshot)
+            assertNull(f.coordinator.currentAuthority())
+            f.resume(Origin().capture()); runCurrent()
+            assertEquals("A distinct fresh action may start the retained occurrence", 3, output.starts)
+            assertEquals(listOf(frozen, frozen), output.preparedAcceptances)
+            assertEquals(frozen.occurrence, output.snapshot.occurrence)
+            assertTrue(requireNotNull(f.coordinator.currentAuthority()).isValid())
+            f.assertNoImportOrTakeover()
+        }
+    }
+
     @Test fun unsupportedPreparedEndpointFailsClosedWithoutGenericFallback() = runTest {
         withRecovery(defaultPreparedEndpoint = true) { f ->
             var rejected = 0
