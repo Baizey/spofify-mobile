@@ -62,6 +62,13 @@ fun MusicRow(
     playback: CatalogPlaybackFeedback = CatalogPlaybackFeedback(),
     like: CatalogLikeState? = null,
     onToggleLike: ((LibraryItem) -> Unit)? = null,
+    // Occurrence hosts keep their exact identity and admission without owning a second row/gesture.
+    rowIdentity: Any = item,
+    currentOccurrence: Boolean? = null,
+    playbackEnabled: Boolean = true,
+    actionsEnabled: Boolean = true,
+    onShowScopedActions: ((LibraryItem, () -> Boolean) -> Unit)? = null,
+    onPlayScoped: ((LibraryItem, () -> Boolean) -> Unit)? = null,
 ) {
     val typography = MaterialTheme.typography
     val titleStyle = typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
@@ -85,9 +92,13 @@ fun MusicRow(
     }
     val rowHeight = maxOf(72.dp, copyHeight + 20.dp)
     val subtitle = compactMusicSubtitle(item)
-    val current = item.kind == "track" && playback.trackId == item.id
+    val current = currentOccurrence ?: (item.kind == "track" && playback.trackId == item.id)
+    val canPlay = playbackEnabled && item.playable
+    val latestCanPlay by rememberUpdatedState(canPlay)
+    val latestActionsEnabled by rememberUpdatedState(actionsEnabled)
     val capture = playback.interactionKey ?: playback.unselectedQueueOrigin
-    val contextualEnabled = item.playable && (playback.interactionKey != null && playback.onContextual != null ||
+    val latestCapture by rememberUpdatedState(capture)
+    val contextualEnabled = canPlay && (playback.interactionKey != null && playback.onContextual != null ||
         playback.unselectedQueueOrigin != null && playback.onUnselectedHigh != null)
     fun contextual(captured: Any, current: () -> Boolean) {
         when (captured) {
@@ -95,20 +106,31 @@ fun MusicRow(
             is dev.spofify.mobile.playback.PlaybackQueueOrigin -> playback.onUnselectedHigh?.invoke(item, captured, current)
         }
     }
-    dev.spofify.mobile.ui.ContextualSwipeRow(item, capture, contextualEnabled,
+    dev.spofify.mobile.ui.ContextualSwipeRow(rowIdentity, capture, contextualEnabled,
         playback.contextualLabel, onCommit = { captured, current -> contextual(captured, current) }, modifier = modifier) { swipeModifier, isCurrent ->
+        fun more() {
+            if (isCurrent() && latestActionsEnabled && latestCapture === capture) {
+                if (onShowScopedActions != null) onShowScopedActions(item, isCurrent) else onShowActions(item)
+            }
+        }
         Row(swipeModifier.fillMaxWidth().background(
             if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background)
-            .combinedClickable(onClick = { onOpenItem(item) }, onLongClickLabel = "More actions for ${item.name}",
-                onLongClick = { onShowActions(item) })
+            .combinedClickable(onClick = { if (isCurrent()) onOpenItem(item) },
+                onLongClickLabel = if (actionsEnabled) "More actions for ${item.name}" else null,
+                onLongClick = if (actionsEnabled) ({ more() }) else null)
             .semantics {
                 if (current) stateDescription = if (playback.buffering) "Buffering" else if (playback.isPlaying) "Playing" else "Paused"
                 customActions = buildList {
-                    add(CustomAccessibilityAction("More actions") { onShowActions(item); true })
-                    if (item.playable) {
-                        add(CustomAccessibilityAction("Play now") { onPlayItem(item, false); true })
+                    if (actionsEnabled) add(CustomAccessibilityAction("More actions") { more(); true })
+                    if (canPlay) {
+                        add(CustomAccessibilityAction("Play now") {
+                            if (isCurrent() && latestCanPlay && latestCapture === capture) {
+                                if (onPlayScoped != null) onPlayScoped(item, isCurrent) else onPlayItem(item, false)
+                            }
+                            true
+                        })
                         if (contextualEnabled) add(CustomAccessibilityAction(playback.contextualLabel) {
-                            if (isCurrent()) capture?.let { contextual(it, isCurrent) }; true
+                            if (isCurrent() && latestCanPlay && latestCapture === capture) capture?.let { contextual(it, isCurrent) }; true
                         })
                     }
                     if (item.kind == "track" && onToggleLike != null && like?.pending != true) {
@@ -138,7 +160,7 @@ fun MusicRow(
                     overflow = TextOverflow.Ellipsis, style = subtitleStyle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            IconButton(onClick = { onShowActions(item) }, modifier = Modifier.size(48.dp)) {
+            IconButton(onClick = { more() }, enabled = actionsEnabled, modifier = Modifier.size(48.dp)) {
                 Icon(Icons.Default.MoreVert, "More actions for ${item.name}")
             }
         }

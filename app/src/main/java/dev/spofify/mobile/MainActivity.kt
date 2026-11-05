@@ -240,7 +240,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                         Page.Playlists, is Page.Playlist -> PlaylistsRoute(client,
                             onOpenTrack = openExternal,
                             onPlayQueue = { prepared, trackId, entryId -> model.playPrepared(client, accountId, prepared, trackId, entryId, preparedGeneration) },
-                            onShowTrackActions = showMore, modifier = contentModifier, playback = feedback,
+                            onShowTrackActions = showMore, modifier = contentModifier, playback = feedback, artwork = art,
                             onQueueIntent = { selection, action, binding, expectedBinding, isCurrent ->
                                 model.queueIntentSelectionFrom(client, selection, action, binding, isCurrent, expectedBinding)
                             },

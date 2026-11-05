@@ -256,7 +256,7 @@ class RootCopyHostTest {
         compose.onNodeWithText("Retry playlists").performScrollTo().performClick()
         waitText("Evening mix")
         compose.onNodeWithText("Evening mix").performScrollTo().performClick()
-        waitText("0 tracks · 0 with audio")
+        waitText("0 songs")
         compose.onNodeWithText("Evening mix").assertIsDisplayed()
     }
 
