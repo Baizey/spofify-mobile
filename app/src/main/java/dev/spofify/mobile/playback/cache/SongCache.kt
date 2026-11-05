@@ -12,6 +12,7 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -31,6 +32,7 @@ class SongCache(
     cacheDir: File,
     val limits: Limits = Limits(),
     private val deleteFile: (File) -> Boolean = { it.delete() },
+    private val openWrite: (File) -> OutputStream = { FileOutputStream(it) },
 ) : Closeable {
     data class Limits(
         val maxTracks: Int = MAX_TRACKS,
@@ -62,6 +64,7 @@ class SongCache(
         private var thread: Thread? = null
         private var closeNetwork: (() -> Unit)? = null
         @Synchronized fun cancel() {
+            if (isCancelled) return
             isCancelled = true
             thread?.interrupt()
             closeNetwork?.let { close -> cancellations.execute(close) }
@@ -239,10 +242,14 @@ class SongCache(
             check()
             storageState()
             state.initialize()
-            state.entries[key(trackId)]?.takeIf { !state.disabled && !state.retired && !state.released && it.length >= 0 }?.also { it.pins++ }
+            state.entries[key(trackId)]?.takeIf { !state.disabled && !state.retired && !state.released && it.length >= 0 }?.also {
+                if (it.pins == 0) it.pinnedBytes = it.length
+                it.pins++
+            }
         }
         internal fun unpin(entry: Entry) = synchronized(lock) {
             entry.pins--
+            if (entry.pins == 0) entry.pinnedBytes = 0
             if (entry.pins == 0 && entry.length < 0) state.remove(entry)
             state.finishIfIdle()
         }
@@ -271,7 +278,7 @@ class SongCache(
             state.entries[key] = entry
             if (!state.persistSafely()) { entry.pins = 0; state.remove(entry); return null }
             try {
-                Writer(state, entry, FileOutputStream(state.stage(entry))) { active && !closed }
+                Writer(state, entry, openWrite(state.stage(entry))) { active && !closed }
             } catch (_: Exception) {
                 entry.pins = 0
                 state.disabled = true
@@ -285,12 +292,14 @@ class SongCache(
         var pins = 0
         // An OS-unlinked open staging inode remains owned until its stream actually closes.
         var openBytes = 0L
+        // Preserve inode ownership even if another open invalidates length to a tombstone.
+        var pinnedBytes = 0L
     }
 
     internal inner class Writer(
         private val state: State,
         private val entry: Entry,
-        private val output: FileOutputStream,
+        private val output: OutputStream,
         private val authorized: () -> Boolean,
     ) {
         private val hash = MessageDigest.getInstance("SHA-256")
@@ -525,8 +534,8 @@ class SongCache(
             size(root, 0) + states.values.sumOf { state ->
                 state.entries.values.sumOf { entry ->
                     val staging = (entry.openBytes - state.stage(entry).length()).coerceAtLeast(0)
-                    val missingPin = if (entry.pins > 0 && entry.length > 0 && entry.artifact.isNotEmpty() &&
-                        !File(state.directory, entry.artifact).exists()) entry.length else 0L
+                    val missingPin = if (entry.pins > 0 && entry.pinnedBytes > 0 && entry.artifact.isNotEmpty() &&
+                        !File(state.directory, entry.artifact).exists()) entry.pinnedBytes else 0L
                     staging + missingPin
                 }
             }

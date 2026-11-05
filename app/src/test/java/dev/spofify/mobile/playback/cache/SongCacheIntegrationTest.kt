@@ -15,7 +15,9 @@ import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.core.StoredSession
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -27,6 +29,7 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import okio.Buffer
 import org.junit.After
 import org.junit.Assert.*
@@ -56,6 +59,7 @@ class SongCacheIntegrationTest {
     private val readBytes = AtomicLong()
     private val responses = ConcurrentHashMap<String, () -> MockResponse>()
     @Volatile private var authorized = true
+    @Volatile private var loginAccount = "synthetic-account"
     private val audioRequests = mutableListOf<RecordedRequest>()
 
     @Before fun setup() = runBlocking {
@@ -66,7 +70,7 @@ class SongCacheIntegrationTest {
                 if (request.path == "/api/auth/login") return MockResponse()
                     .setHeader("Content-Type", "application/json")
                     .setHeader("Set-Cookie", "spofify_session=synthetic-cookie; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax")
-                    .setBody("""{"accountId":"synthetic-account","username":"synthetic","role":"user","csrfToken":"synthetic-csrf"}""")
+                    .setBody("""{"accountId":"$loginAccount","username":"synthetic","role":"user","csrfToken":"synthetic-csrf"}""")
                 synchronized(audioRequests) { audioRequests += request }
                 if (request.getHeader("Cookie") != "spofify_session=synthetic-cookie") return MockResponse().setResponseCode(401)
                 val id = request.requestUrl!!.pathSegments.let { it[it.size - 2] }
@@ -94,15 +98,19 @@ class SongCacheIntegrationTest {
             override fun write(value: StoredSession?) { this.value = value }
         })
         client.login("synthetic", "synthetic-password")
-        val authenticated = OkHttpDataSource.Factory(client.httpClient)
-        upstream = DataSource.Factory {
+        upstream = observedFactory(client)
+        startCache()
+    }
+
+    private fun observedFactory(sharedClient: SpofifyClient): DataSource.Factory {
+        val authenticated = OkHttpDataSource.Factory(sharedClient.httpClient)
+        return DataSource.Factory {
             val delegate = authenticated.createDataSource()
             object : HttpDataSource by delegate {
                 override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
                     delegate.read(buffer, offset, length).also { if (it > 0) readBytes.addAndGet(it.toLong()) }
             }
         }
-        startCache()
     }
 
     @After fun teardown() {
@@ -360,6 +368,168 @@ class SongCacheIntegrationTest {
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(2, requests["A"])
         assertTrue(cache.inventory().bypassed)
+    }
+
+    @Test fun malformedAndTruncatedLengthsNeverCompleteButClampedRangesAreExact() {
+        responses["malformed"] = {
+            MockResponse().setBody("not-complete").setHeader("Content-Length", "not-a-length")
+                .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        }
+        responses["truncated"] = {
+            MockResponse().setBody("short-body").setHeader("Content-Length", "4096")
+                .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        }
+        responses["contradictory"] = {
+            MockResponse().setResponseCode(206).setBody("short-body")
+                .setHeader("Content-Range", "bytes 0-31/32")
+        }
+        for (id in listOf("malformed", "truncated", "contradictory")) {
+            ioFailure { fetch(id) }
+            assertEquals(0, cache.inventory().complete)
+            assertEquals(0, cache.inventory().entries)
+        }
+        responses.clear()
+        assertBytes(bytes("truncated"), fetch("truncated"))
+        assertEquals(2, requests["truncated"])
+        bytes("range", 64)
+        assertBytes(bytes("range").copyOfRange(60, 64), fetch("range", 60, 100))
+        assertEquals(1, cache.inventory().complete) // Range-only is not a whole-song hit.
+        fetch("range")
+        val actualUpstream = readBytes.get()
+        assertBytes(bytes("range").copyOfRange(60, 64), fetch("range", 60, 100))
+        assertEquals(actualUpstream, readBytes.get())
+    }
+
+    @Test fun injectedMidWriteFailurePreservesExactDemandAndSkipsFurtherSpeculation() {
+        cache.close()
+        var writes = 0
+        cache = SongCache(directory, SongCache.Limits(maxBytes = 40_000, maxTracks = 4, chunkBytes = 512), openWrite = { file ->
+            val output = FileOutputStream(file)
+            object : OutputStream() {
+                override fun write(value: Int) = write(byteArrayOf(value.toByte()), 0, 1)
+                override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                    if (++writes == 4) throw IOException("Synthetic storage write failure")
+                    output.write(buffer, offset, length)
+                }
+                override fun close() = output.close()
+            }
+        })
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        bytes("A", 12_000)
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(4, writes)
+        assertEquals(12_000L, readBytes.get())
+        assertEquals(1, requests["A"])
+        assertEquals(0, cache.inventory().complete)
+        assertEquals(0, cache.inventory().entries)
+        assertTrue(cache.inventory().bypassed)
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(24_000L, readBytes.get())
+        assertEquals(4, writes)
+        assertFalse(handle.prefetch("future", spec("future"), upstream, ::authorize, SongCache.Cancellation()))
+        assertNull(requests["future"])
+    }
+
+    @Test fun osUnlinkedCompletedInodeRemainsOwnedThroughInvalidationUntilReaderCloses() {
+        cache.close(); startCache(SongCache.Limits(maxTracks = 3, maxBytes = 24_000, chunkBytes = 512))
+        bytes("A", 9_000); fetch("A")
+        val reader = source(); reader.open(spec("A"))
+        fun visibleBytes() = directory.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        try {
+            val media = directory.walkTopDown().single { it.isFile && it.name.endsWith(".exo") }
+            assertTrue(media.delete())
+            assertEquals(visibleBytes() + 9_000, cache.inventory().ownedBytes)
+            // A second open discovers the missing file and tombstones it, but the first reader
+            // still owns the unlinked inode. Do not erase its accounting with completion length.
+            assertBytes(bytes("A"), fetch("A"))
+            assertEquals(visibleBytes() + 9_000, cache.inventory().ownedBytes)
+            assertBytes(bytes("A"), drain(reader))
+            assertEquals(2, requests["A"])
+        } finally { reader.close() }
+        assertEquals(visibleBytes(), cache.inventory().ownedBytes)
+        assertEquals(0, cache.inventory().pinned)
+    }
+
+    @Test fun shared401FencesBothWarmReaderAndInFlightFillAndCannotServeStaleBytes() {
+        fetch("A")
+        val hit = source(); hit.open(spec("A"))
+        val fill = source(); fill.open(spec("B")); fill.read(ByteArray(512), 0, 512)
+        client.onUnauthorized = { cache.retire() }
+        responses["denied"] = { MockResponse().setResponseCode(401).setBody("synthetic-denial") }
+        try {
+            ioFailure { fetch("denied") }
+            assertNull(client.currentSession())
+            assertEquals(0, cache.inventory().complete)
+            ioFailure { hit.read(ByteArray(1), 0, 1) }
+            ioFailure { fill.read(ByteArray(1), 0, 1) }
+            ioFailure { fetch("A") }
+            assertEquals(1, requests["A"])
+            assertEquals(1, requests["B"])
+        } finally { hit.close(); fill.close() }
+        assertEquals(0L, cache.inventory().ownedBytes)
+    }
+
+    @Test fun warmOffOriginIsGuardedAndAuthenticatedRedirectNeverFollows() {
+        fetch("A")
+        val other = MockWebServer()
+        other.start()
+        try {
+            val destination = other.url("/api/library/tracks/A/audio").toString()
+            val warm = handle.factory(upstream, { "A" }, ::authorize).createDataSource()
+            try { ioFailure { warm.open(DataSpec.Builder().setUri(destination).build()) } } finally { warm.close() }
+            // Defense in depth: even a cold miss with a permissive caller guard cannot make the
+            // unchanged exact-origin authenticated client send an off-origin request.
+            val cold = handle.factory(upstream, { "not-cached" }, {}).createDataSource()
+            try { ioFailure { cold.open(DataSpec.Builder().setUri(destination).build()) } } finally { cold.close() }
+            responses["redirect"] = { MockResponse().setResponseCode(302).setHeader("Location", destination) }
+            ioFailure { fetch("redirect") }
+            assertEquals(0, other.requestCount)
+            assertEquals(1, requests["redirect"])
+            val before = readBytes.get()
+            assertBytes(bytes("A"), fetch("A"))
+            assertEquals(before, readBytes.get())
+            assertEquals(1, requests["A"])
+        } finally { other.shutdown() }
+    }
+
+    @Test fun validatedAccountAndOriginSwitchesCannotReuseSameTrackIdentity() = runBlocking {
+        fetch("A")
+        val old = source(); old.open(spec("A"))
+        loginAccount = "second-account"
+        client.login("second-listener", "synthetic-password")
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        payloads["A"] = bytes("A").reversedArray()
+        try {
+            ioFailure { old.read(ByteArray(1), 0, 1) }
+            assertBytes(bytes("A"), fetch("A"))
+            assertEquals(2, requests["A"])
+        } finally { old.close() }
+        cache.close() // Leave the second account's completed namespace dormant across restart.
+        val other = MockWebServer().apply { dispatcher = web.dispatcher; start() }
+        val nextClient = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${other.port}"), object : SessionStore {
+            private var value: StoredSession? = null
+            override fun read() = value
+            override fun write(value: StoredSession?) { this.value = value }
+        })
+        try {
+            nextClient.login("second-listener", "synthetic-password")
+            cache = SongCache(directory)
+            val next = cache.bind(nextClient.server.origin, nextClient.currentSession()!!.accountId)
+            payloads["A"] = ByteArray(4096) { (it xor 0x5a).toByte() }
+            val approved = nextClient.audioUrl(LibraryItem("track", "A", "synthetic"))
+            val source = next.factory(observedFactory(nextClient), { "A" }, {
+                if (nextClient.currentSession() == null || it.uri.toString() != approved) throw IOException("Unauthorized audio")
+            }).createDataSource()
+            try { source.open(DataSpec.Builder().setUri(approved).build()); assertBytes(bytes("A"), drain(source)) }
+            finally { source.close() }
+            assertEquals(3, requests["A"])
+            assertEquals(3L * 4096, readBytes.get())
+            assertEquals(1, File(directory, "song-cache-v1").listFiles()!!.count { it.isDirectory })
+        } finally {
+            nextClient.httpClient.dispatcher.cancelAll()
+            nextClient.httpClient.connectionPool.evictAll()
+            other.shutdown()
+        }
     }
 
     @Test fun demandCancelsHeldSpeculationAndTransfersExactCurrentBytes() {

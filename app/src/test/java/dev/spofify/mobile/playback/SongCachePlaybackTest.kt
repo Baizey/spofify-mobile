@@ -52,6 +52,8 @@ import java.util.concurrent.atomic.AtomicInteger
 @LooperMode(LooperMode.Mode.PAUSED)
 @androidx.annotation.OptIn(UnstableApi::class)
 class SongCachePlaybackTest {
+    private var timeoutDiagnostics: (() -> String)? = null
+
     private class Sessions(initial: StoredSession? = null) : SessionStore {
         @Volatile private var saved = initial
         override fun read() = saved
@@ -203,6 +205,7 @@ class SongCachePlaybackTest {
             graph = install(AppGraph(app, sessions, Logins(), audioCacheLimits = limits))
             client = graph.configure(server)
             runBlocking { client.login("listener", "synthetic-password") }
+            timeoutDiagnostics = ::diagnostics
         }
         private fun install(value: AppGraph): AppGraph {
             // Application installation only. No service/cache/plan fields are inspected.
@@ -252,27 +255,75 @@ class SongCachePlaybackTest {
                 controller!!.isPlaying && controller!!.currentPosition >= 50 && consumed(ids[start]) > 0
             }
             assertNull(controller!!.playerError)
+            awaitLocalPublication("initial Play")
+        }
+        /** Dispatch mutates Room.snapshot before its HTTP response is accepted. Wait for the
+         * production coordinator's accepted view and genuine controller projection instead;
+         * never infer admission readiness from the fixture server's in-flight state alone.
+         */
+        fun awaitLocalPublication(label: String) {
+            await("accepted local publication/controller projection after $label") {
+                val owner = graph.playbackCoordinator!!.state.value
+                val live = PlaybackService.exportLocalSnapshot()
+                val accepted = owner.view?.state
+                val metadata = PlaybackService.exportLocalQueueIntentState()
+                val media = controller
+                val repeat = when (live.repeat) {
+                    "all" -> Player.REPEAT_MODE_ALL
+                    "one" -> Player.REPEAT_MODE_ONE
+                    else -> Player.REPEAT_MODE_OFF
+                }
+                owner.connected && owner.exclusiveOwner && !owner.selectionUnconfirmed &&
+                    owner.activeDeviceId == owner.deviceId && owner.view?.transfer == null &&
+                    owner.canQueueIntent && PlaybackService.interactionKey() != null &&
+                    metadata != null && owner.view?.queueIntents?.state == metadata &&
+                    accepted != null && accepted.queue == live.queue && accepted.position == live.position &&
+                    accepted.context == live.context && accepted.shuffle == live.shuffle && accepted.repeat == live.repeat &&
+                    accepted.playing == live.playing && accepted.occurrence?.eventId == live.occurrence?.eventId &&
+                    media != null && media.isPlaying == live.playing && media.repeatMode == repeat
+            }
         }
         fun pause() {
+            awaitLocalPublication("before Pause")
             controller!!.pause()
-            await("settled actual pause") { !controller!!.isPlaying && !room.snapshot.playing }
+            await("actual paused output") { !controller!!.isPlaying && !PlaybackService.exportLocalSnapshot().playing }
+            awaitLocalPublication("Pause")
         }
         fun repeat(mode: Int, wire: String) {
+            awaitLocalPublication("before repeat $wire")
             controller!!.repeatMode = mode
-            await("accepted repeat $wire") { PlaybackService.exportLocalSnapshot().repeat == wire && room.snapshot.repeat == wire }
+            await("actual repeat $wire") { PlaybackService.exportLocalSnapshot().repeat == wire }
+            awaitLocalPublication("repeat $wire")
         }
         fun repeatOne() {
             repeat(Player.REPEAT_MODE_ALL, "all")
             repeat(Player.REPEAT_MODE_ONE, "one")
         }
         fun action(action: PlaybackListAction, vararg ids: String) {
+            awaitLocalPublication("before $action")
+            val key = requireNotNull(PlaybackService.interactionKey())
             var result: PlaybackActionResult? = null
             PlaybackService.performPreparedAction(dev.spofify.mobile.core.PlaybackQueue(ids.mapIndexed { index, id -> track(id, "$id-added-$index") },
-                total = ids.size), client, action, PlaybackService.interactionKey(), null, null, null) { result = it }
+                total = ids.size), client, action, key, null, null, null) { result = it }
             await("real $action receipt") { result != null }
-            val detail = requireNotNull(result!!.queueIntentResult)
+            val detail = requireNotNull(result!!.queueIntentResult) { "Missing terminal detail: $result; ${diagnostics()}" }
             assertEquals("queued", detail.outcome)
             assertEquals("unchanged", detail.playback)
+            awaitLocalPublication(action.toString())
+        }
+        private fun diagnostics(): String {
+            val live = PlaybackService.exportLocalSnapshot()
+            val owner = graph.playbackCoordinator?.state?.value
+            val accepted = owner?.view?.state
+            fun summary(value: PlaybackSnapshot?) = value?.let {
+                "ids=${it.queue.map { track -> track.id }},at=${it.position},playing=${it.playing},repeat=${it.repeat},shuffle=${it.shuffle},error=${it.error}"
+            }
+            return "live={${summary(live)}}; accepted={${summary(accepted)}}; " +
+                "owner connected=${owner?.connected},exclusive=${owner?.exclusiveOwner},canQueue=${owner?.canQueueIntent}," +
+                "unconfirmed=${owner?.selectionUnconfirmed},message=${owner?.message}; " +
+                "controller playing=${controller?.isPlaying},repeat=${controller?.repeatMode},shuffle=${controller?.shuffleModeEnabled}; " +
+                "inventory=${runCatching { graph.songCache.inventory() }.getOrNull()}; " +
+                "audio=${room.audio.takeLast(32).map { "${it.method}:${it.id}:${it.range}" }}"
         }
         fun awaitFetched(vararg ids: String) = await("permitted window ${ids.toList()}") { room.fetched().containsAll(ids.toList()) }
         fun assertBounded(): SongCache.Inventory = graph.songCache.inventory().also {
@@ -313,6 +364,7 @@ class SongCachePlaybackTest {
             cleanup { pump(100) }
             cleanup { web.shutdown() }
             SongCachePlaybackMedia.reset()
+            timeoutDiagnostics = null
             failure?.let { throw it }
         }
     }
@@ -421,8 +473,7 @@ class SongCachePlaybackTest {
             j.startService()
             j.play("A", "B")
             j.awaitFetched("B")
-            j.controller!!.pause()
-            await("pause publication") { !j.controller!!.isPlaying && j.room.snapshot.playing == false }
+            j.pause()
             val before = PlaybackService.exportLocalSnapshot()
             val renderer = listOf(SongCachePlaybackMedia.starts.get(), SongCachePlaybackMedia.enables.get(), SongCachePlaybackMedia.resets.get())
             val focus = j.focusRequest()
@@ -483,6 +534,7 @@ class SongCachePlaybackTest {
             j.action(PlaybackListAction.QUEUE_LOW, "B", "C", "D", "E", "F", "G", "H", "I")
             j.controller!!.shuffleModeEnabled = true
             await("actual shuffled future") { PlaybackService.exportLocalSnapshot().shuffle }
+            j.awaitLocalPublication("shuffle")
             val shuffled = PlaybackService.upcomingEntries().toList()
             assertEquals(8, shuffled.size)
             assertEquals(setOf("A"), j.room.fetched())
@@ -490,14 +542,17 @@ class SongCachePlaybackTest {
             val removed = shuffled[1]
             PlaybackService.removeQueued(removed.occurrenceId)
             await("accepted removal") { PlaybackService.upcomingEntries().none { it.occurrenceId == removed.occurrenceId } }
+            j.awaitLocalPublication("remove")
             PlaybackService.undoQueuedRemoval()
             await("accepted Undo") { PlaybackService.upcomingEntries().map { it.occurrenceId } == shuffled.map { it.occurrenceId } }
+            j.awaitLocalPublication("Undo")
             // Absolute move deliberately exits shuffle, while keeping current A/history intact.
             val moved = shuffled.last()
             PlaybackService.moveQueued(requireNotNull(PlaybackService.interactionKey()), moved.occurrenceId, 0)
             await("accepted absolute reorder exits shuffle") {
                 !PlaybackService.exportLocalSnapshot().shuffle && PlaybackService.upcomingEntries().firstOrNull()?.occurrenceId == moved.occurrenceId
             }
+            j.awaitLocalPublication("absolute reorder")
             val traversal = PlaybackService.upcomingEntries()
             assertEquals(listOf(moved.occurrenceId) + shuffled.dropLast(1).map { it.occurrenceId }, traversal.map { it.occurrenceId })
             val expected = setOf("A") + traversal.take(5).map { it.item.id }
@@ -644,7 +699,8 @@ class SongCachePlaybackTest {
             if (condition()) return
             Thread.sleep(5)
         }
-        fail("Timed out: $label; audio samples=${SongCachePlaybackMedia.samples.get()}")
+        fail("Timed out: $label; audio samples=${SongCachePlaybackMedia.samples.get()}; " +
+            runCatching { timeoutDiagnostics?.invoke().orEmpty() }.getOrDefault("diagnostics unavailable"))
     }
     private fun pump(ms: Long) {
         repeat((ms / 5).toInt()) {

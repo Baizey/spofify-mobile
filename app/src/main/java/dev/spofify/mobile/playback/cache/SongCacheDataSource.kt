@@ -221,14 +221,16 @@ internal class SongCacheDataSource(
         fun header(name: String) = source.responseHeaders.entries.firstOrNull { it.key.equals(name, true) }?.value?.singleOrNull()
         if (source.uri != request.uri) throw IOException("Redirected audio response")
         val code = http.responseCode
+        val declaredLength = header("Content-Length")?.let {
+            it.toLongOrNull()?.takeIf { value -> value >= 0 } ?: throw IOException("Invalid audio content length")
+        }
         var readLength = openedLength
         var wholeResponse = true
         when (code) {
             200 -> {
                 if (header("Content-Range") != null) throw IOException("Unexpected audio range")
-                val contentLength = header("Content-Length")?.toLongOrNull()
-                if (request.length >= 0 && contentLength != null) {
-                    readLength = minOf(request.length, (contentLength - request.position).coerceAtLeast(0))
+                if (request.length >= 0 && declaredLength != null) {
+                    readLength = minOf(request.length, (declaredLength - request.position).coerceAtLeast(0))
                 }
             }
             206 -> {
@@ -243,8 +245,7 @@ internal class SongCacheDataSource(
                 if (request.length >= 0) {
                     if (readLength != minOf(request.length, total - first)) throw IOException("Invalid audio range coverage")
                 } else if (openedLength >= 0 && openedLength != readLength) throw IOException("Invalid audio range length")
-                val declared = header("Content-Length")?.let { it.toLongOrNull() ?: throw IOException("Invalid audio range length") }
-                if (declared != null && declared != readLength) throw IOException("Invalid audio range length")
+                if (declaredLength != null && declaredLength != readLength) throw IOException("Invalid audio range length")
                 wholeResponse = first == 0L && last == total - 1
             }
             416 -> return Coverage(0, false) // Media3 accepts only a valid empty seek at EOF; never retain it.
