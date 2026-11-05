@@ -224,6 +224,68 @@ class TransientPlaybackRecoveryCoordinatorTest {
         }
     }
 
+    @Test fun repeatedFailedVerificationPreservesPriorActivationButCannotInventPristineProvenance() = runTest {
+        withRecovery { f ->
+            repeat(2) {
+                f.api.dropNextPoll = true; f.coordinator.retry(); runCurrent()
+                assertNull(f.coordinator.currentAuthority())
+            }
+            f.coordinator.retry(); runCurrent()
+            assertTrue(f.coordinator.state.value.canQueueIntent)
+            f.resume(Origin().capture()); runCurrent()
+            assertEquals(2, f.output.starts)
+            assertEquals(1, (f.output as Endpoint).preparedAcceptances.size)
+            f.assertNoImportOrTakeover()
+        }
+        val state = retained()
+        val output = Endpoint(state, metadata(state))
+        val api = Protocol(room(state, output.metadata))
+        val c = PlaybackCoordinator(api, output, backgroundScope, clockMs = { testScheduler.currentTime })
+        try {
+            c.setServiceActive(true); runCurrent()
+            assertFalse(c.state.value.canQueueIntent)
+            repeat(2) { api.dropNextPoll = true; c.retry(); runCurrent() }
+            c.retry(); runCurrent()
+            assertTrue(c.state.value.connected)
+            assertFalse(c.state.value.canQueueIntent)
+            var rejected = 0
+            Fixture(api, output, c).resume(Origin().capture(), { rejected++ }); runCurrent()
+            assertEquals(1, rejected)
+            assertTrue(c.state.value.message.isNotBlank())
+            assertTrue(output.preparedAcceptances.isEmpty())
+            assertEquals(0, output.imports); assertEquals(0, output.starts)
+            assertEquals(state, output.snapshot)
+            assertNull(c.currentAuthority())
+            assertEquals(1, api.registrations)
+            assertEquals(0, api.claims); assertEquals(0, api.transfers)
+        } finally { c.close(); runCurrent() }
+    }
+
+    @Test fun ownerAndEpochAbaRetiresProvenanceEvenWhenExactPreparationReturns() = runTest {
+        withRecovery { f ->
+            val original = f.api.current
+            val frozen = f.output.snapshot
+            f.api.current = room(requireNotNull(original.state), f.output.metadata, owner = "remote")
+                .copy(epoch = original.epoch + 1, stateSeq = original.stateSeq)
+            f.coordinator.retry(); runCurrent()
+            f.api.current = original.copy(epoch = original.epoch + 2)
+            f.coordinator.retry(); runCurrent()
+            f.api.dropNextPoll = true; f.coordinator.retry(); runCurrent()
+            f.coordinator.retry(); runCurrent()
+            assertTrue(f.coordinator.state.value.connected)
+            assertFalse(f.coordinator.state.value.canQueueIntent)
+            var rejected = 0
+            f.resume(Origin().capture(), { rejected++ }); runCurrent()
+            assertEquals(1, rejected)
+            assertTrue(f.coordinator.state.value.message.isNotBlank())
+            assertTrue((f.output as Endpoint).preparedAcceptances.isEmpty())
+            assertEquals(1, f.output.starts)
+            assertEquals(frozen, f.output.snapshot)
+            assertNull(f.coordinator.currentAuthority())
+            f.assertNoImportOrTakeover()
+        }
+    }
+
     @Test fun passiveSuccessfulOwnerPollsExposeReadinessButNeverActivateOrReplayOldPlay() = runTest {
         withRecovery { f ->
             val output = f.output as Endpoint
