@@ -27,7 +27,7 @@ The server can contain far too much music for an all-artists/albums/songs landin
 
 ## Listener parity requirements
 
-These are capability and safety requirements, not an implementation-status table. Check current source and candidate-specific validation evidence for what is implemented and approved. Presentation follows the newer product decisions in [mobile-ux.md](mobile-ux.md), not an older desktop control inventory.
+These are capability and safety requirements, not an implementation-status table. Check current source and candidate-specific validation evidence for what is implemented and approved. Current presentation decisions live in hmem's Music-first Android UX topic (see the [bootstrap](../AGENTS.md#hmem-bootstrap)), not an older desktop control inventory.
 
 | Area | Required behavior |
 | --- | --- |
@@ -100,7 +100,7 @@ Sign out/expiry retain that encrypted record for explicit re-authentication; sig
 
 ## Parallel implementation and integration gates
 
-Each assigned lead uses a dedicated worktree/topic branch with its own index and build outputs, not file assignments inside a shared checkout. Follow [worktree-review.md](worktree-review.md): coordinate shared interfaces, independently review the exact committed candidate and corrections, and integrate under standing conditional assigned-scope authority using normal Git locking and brief root-write communication, not a custom Git/MAIN guard or flock. BUILD/cache and standalone NATIVE safeguards remain as documented there; root builds use BUILD only with intended-SHA/clean-source checks and source-mutation coordination. Main integration requires the reviewed exact base and a clean destination; stop on another lane's dirt rather than staging, stashing or deleting it. The parent owns combined automated/native validation and evidence-preserving, content-accounted cleanup; a source checkpoint does not waive the native gate. Backend-blocked feature contracts remain coordination work, not fabricated UI capabilities.
+Current role, exact-candidate review, integration, BUILD/NATIVE ownership and validation practices live in hmem; use the [bootstrap](../AGENTS.md#hmem-bootstrap) to read the applicable topics. The capability outline below is technical context, not task state or integration authorization. Backend-blocked contracts remain coordination work, not fabricated UI capabilities.
 
 Capability dependencies to consider when assigning work (not a current task queue):
 

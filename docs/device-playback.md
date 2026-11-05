@@ -4,7 +4,7 @@
 
 The production endpoint capability is **enabled in source**: the application-owned coordinator uses the Media3 service endpoint and authenticated player API, with service-lifecycle registration rather than a test-only capability override. The device sheet is view-only without a registration and exposes selected-output controls when registered. This is not a claim of native handoff/audio/background acceptance.
 
-**Native handoff runtime / rendered-app validation is not complete.** Earlier isolated AVD attempts failed before app launch; their results do not establish current environment health. Normal isolated synthetic AVD validation is allowed under [ui-validation.md](ui-validation.md). Robolectric and compiled instrumentation are development evidence, not actual Android audio, screen-lock, power-management or vendor-background approval. Record the API/runtime actually exercised; do not infer older-version or hardware coverage from source review or cached test runtimes.
+**Native handoff runtime / rendered-app validation is not complete.** Earlier isolated AVD attempts failed before app launch; their results do not establish current environment health. Current isolated synthetic AVD practices live in hmem's native-validation topic; use the [bootstrap](../AGENTS.md#hmem-bootstrap) to read it. Robolectric and compiled instrumentation are development evidence, not actual Android audio, screen-lock, power-management or vendor-background approval. Record the API/runtime actually exercised; do not infer older-version or hardware coverage from source review or cached test runtimes.
 
 ## One output, same-account coordination
 

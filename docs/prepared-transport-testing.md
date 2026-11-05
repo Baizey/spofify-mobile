@@ -126,11 +126,8 @@ Initial single-track setup uses the public VM Now path: actual catalog More Now
 correctly expands its complete album context, not a one-row replacement oracle.
 
 Installed-Android rendering, native audio/background/FGS delivery and AVD-to-website
-acceptance remain separate mandatory gates. Current Pixel 10 Pro validation is
-not complete: the assigned native assessment found its AVD/recent boot marker but
-the existing control route was unavailable from the tool environment. No current
-boot failure or app inspection was observed; an approved accessible ADB route is
-pending. The recorded preboot-emulator failure is historical, not a verdict about
-that AVD; no JVM/broker result turns into a native pass. Follow [testing.md](testing.md), [ui-validation.md](ui-validation.md)
-and [worktree-review.md](worktree-review.md) for resource fencing and exact-candidate
-review/integration.
+acceptance remain separate mandatory gates; no JVM/broker result establishes a
+native pass. Current resource fencing, native validation and exact-candidate
+review/integration practices live in hmem; use the [bootstrap](../AGENTS.md#hmem-bootstrap)
+to read the applicable project details. [Historical native evidence](testing.md#native-evidence-status)
+is retained separately from this technical fixture contract.
