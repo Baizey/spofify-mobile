@@ -102,6 +102,7 @@ class SongCache(
         // Fence preserves this inactive handle, so identity switches still retire its released
         // state. Older tracked scopes were already retired by their own identity transition.
         current?.let { if (it.state.scope != scope) it.retire() else it.suspend() }
+        forgetReclaimedStates()
         root.listFiles()?.filter { it.isDirectory && it.name != scope && it.name !in states }?.forEach(::retireDirectory)
         val state = states[scope]?.takeUnless { it.released } ?: State(scope).also { states[scope] = it }
         SessionCache(state).also { current = it; if (closed) it.suspend() }
@@ -119,6 +120,13 @@ class SongCache(
             state.finishIfIdle()
         }
         root.listFiles().orEmpty().filter { it.isDirectory && it.name !in states }.forEach(::retireDirectory)
+        forgetReclaimedStates()
+    }
+
+    private fun forgetReclaimedStates() {
+        // Keep pins and failed/unknown cleanup, but not one in-memory FIFO per former account.
+        states.entries.removeAll { (_, state) -> state.retired && state.released &&
+            java.nio.file.Files.notExists(state.directory.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) }
     }
 
     /** Mark before deletion so a failed wipe cannot leave an apparently reusable manifest. */

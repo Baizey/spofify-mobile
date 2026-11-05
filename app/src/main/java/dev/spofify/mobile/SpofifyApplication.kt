@@ -93,19 +93,22 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
             AuthenticationChangeKind.INVALIDATED, AuthenticationChangeKind.EXPIRED -> {
                 audioCache = null
                 songCache.retire()
-                if (change.kind == AuthenticationChangeKind.EXPIRED) revokePlayback(source)
+                if (change.kind == AuthenticationChangeKind.EXPIRED) {
+                    source.httpClient.dispatcher.cancelAll()
+                    revokePlayback(source)
+                }
             }
         }
     }
 
     private fun revokePlayback(source: SpofifyClient) {
         // Expiry is observed on audio/cache reads as well as API responses. Fence pending
-        // work and cancel authenticated calls synchronously; only player mutation is posted.
+        // starts synchronously; only player mutation is posted. The 401 callback must not
+        // cancel its own call before the existing API error classifier sees the response.
         // onUnauthorized runs under the client's auth-generation lock: do not borrow
         // the cache lock here (cache authentication fencing also reads client authority).
         if (client !== source || source.currentSession() != null) return
         PlaybackRequests.invalidate()
-        source.httpClient.dispatcher.cancelAll()
         Handler(Looper.getMainLooper()).post {
             if (client === source && source.currentSession() == null) {
                 playbackCoordinator?.authLost()
