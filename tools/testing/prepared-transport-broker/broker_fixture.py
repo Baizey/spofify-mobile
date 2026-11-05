@@ -222,7 +222,13 @@ class Handler(BaseHTTPRequestHandler):
                                request.get('state', {}).get('playing') is True)
                     if matches and f.fault and not f.fault['accepted']:
                         fault = f.fault
-                        fault.update(accepted=True, status=response.status, stateSeq=json.loads(data)['stateSeq'])
+                        accepted = json.loads(data)
+                        fault.update(accepted=True, status=response.status, stateSeq=accepted['stateSeq'],
+                                     requestEpoch=request.get('epoch'), responseEpoch=accepted.get('epoch'),
+                                     requestPlaying=request.get('state', {}).get('playing'),
+                                     requestAction=request['action'], requestHasCommand='command' in request,
+                                     requestAckCount=len(request.get('acks', [])),
+                                     responseDirectiveCount=len(accepted.get('directives', [])))
             if fault:
                 if fault['mode'] == 'drop':
                     return  # Close actual accepted response, do not invent HTTP success.

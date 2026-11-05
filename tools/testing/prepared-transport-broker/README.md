@@ -113,7 +113,10 @@ Control endpoints are on `baseUrl` and require header
 2. Drive the **production** Pause action/publication.
 3. `GET /__fixture/status` until `accepted:true` (finite test deadline).
 4. Its `status:200` and `stateSeq` witness are recorded **after fully reading a
-   real Go response**, not merely after request arrival. A separate authenticated
+   real Go response**, not merely after request arrival. The bounded scalar witness
+   also records request action/epoch/playing, ACK count, command presence, response
+   epoch and directive count. This distinguishes an ordinary playing heartbeat
+   from command/ACK traffic without retaining identities or payloads. A separate authenticated
    `GET /api/me/player` can verify Go has the paused state before client delivery.
 5. With a hold active, test admission/feedback and then
    `POST /__fixture/release` with `{}`. No automatic retry/replay is installed.
