@@ -43,13 +43,44 @@ import okio.BufferedSink
 import okhttp3.Response
 import kotlin.coroutines.resumeWithException
 
+/** Credential-free, process-local identity. Compare the client instance as well as this value;
+ * incarnation is not persistent authority and must never be restored from disk. */
+data class ValidatedSessionIdentity(val origin: String, val accountId: String, val incarnation: Long)
+
+enum class AuthenticationChangeKind { DORMANT, VALIDATED, RESET, INVALIDATED, EXPIRED }
+
+/** DORMANT fences access without proving saved auth invalid (for example an offline restore).
+ * RESET, INVALIDATED and EXPIRED retire authorization; consumers may wipe retired storage.
+ * revision orders notifications within ONE client, including notifications racing across threads. */
+data class AuthenticationChange(
+    val revision: Long,
+    val kind: AuthenticationChangeKind,
+    val identity: ValidatedSessionIdentity?,
+)
+
 /** One origin and one account. The same client can safely be shared with images and Media3. */
-class SpofifyClient(val server: ServerAddress, private val store: SessionStore) {
+class SpofifyClient internal constructor(
+    val server: ServerAddress,
+    private val store: SessionStore,
+    private val authenticationTimeMillis: () -> Long,
+) {
+    constructor(server: ServerAddress, store: SessionStore) : this(server, store, System::currentTimeMillis)
     private val json = Json { ignoreUnknownKeys = true }
     private val lock = Any()
     private var cookie: Cookie? = null
     private var session: Session? = null
     private var generation: Long = 0
+    private var authentication = AuthenticationChange(0, AuthenticationChangeKind.DORMANT, null)
+
+    /** Synchronous fencing notification, always OUTSIDE the client lock, including disk failures.
+     * Install before starting auth operations. Listeners must be nonthrowing, fence access/cancel
+     * work rather than wait for I/O, and ignore stale revisions and retired client instances.
+     * Concurrent callbacks can arrive out of order; an event is not itself read authority. Call
+     * validatedSessionIdentity() on every protected read and match the captured incarnation.
+     * DORMANT must not be treated as logout: failed/offline restoration can retain dormant bytes.
+     * No cookie, token, password or Session is exposed by this callback. */
+    @Volatile var onAuthenticationChanged: ((AuthenticationChange) -> Unit)? = null
+
     // One no-auth, already connected direct address; never resolve or persist route metadata.
     private var playbackLeaveAddress: InetAddress? = null
     private val mutablePersonalRevision = MutableStateFlow(PersonalRevision())
@@ -77,9 +108,10 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         .cookieJar(object : CookieJar {
             // Only login may install a session, after the entire response has been validated.
             override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) = Unit
-            override fun loadForRequest(url: HttpUrl): List<Cookie> = synchronized(lock) {
+            override fun loadForRequest(url: HttpUrl): List<Cookie> = changingAuthentication {
+                expireSessionLocked()
                 if (!server.contains(url)) emptyList()
-                else cookie?.takeIf { it.expiresAt > System.currentTimeMillis() }?.let { listOf(it) } ?: emptyList()
+                else cookie?.let { listOf(it) } ?: emptyList()
             }
         })
         .addInterceptor { chain ->
@@ -109,7 +141,60 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         }
         .build()
 
-    fun currentSession(): Session? = synchronized(lock) { session }
+    fun currentSession(): Session? = changingAuthentication {
+        expireSessionLocked()
+        session
+    }
+
+    /** Live, server-validated authority only; a persisted summary or restore-in-flight cookie
+     * never qualifies. Expiry synchronously fences listeners before this call returns. Auth reads
+     * fail closed without throwing if clearing the expired persisted session fails. */
+    fun validatedSessionIdentity(): ValidatedSessionIdentity? = changingAuthentication {
+        expireSessionLocked()
+        authentication.identity
+    }
+
+    /** Match the actual captured Session, not structural account equality (including account ABA).
+     * Suitable for each cached read alongside the caller's client/origin/output-authority checks. */
+    fun hasValidSession(expected: Session): Boolean = changingAuthentication {
+        expireSessionLocked()
+        session === expected && authentication.identity != null
+    }
+
+    // Snapshot transitions under the auth lock, notify only after releasing it. Do not serialize
+    // callbacks with another lock: graph -> client reads must not invert client -> graph fencing.
+    // Revision fencing lets consumers reject delayed events without blocking a successor login.
+    private inline fun <T> changingAuthentication(block: () -> T): T {
+        var change: AuthenticationChange? = null
+        try {
+            return synchronized(lock) {
+                val previous = authentication.revision
+                try { block() }
+                finally { if (authentication.revision != previous) change = authentication }
+            }
+        } finally {
+            change?.let { onAuthenticationChanged?.invoke(it) }
+        }
+    }
+
+    private fun authenticationChangedLocked(kind: AuthenticationChangeKind) {
+        authentication = AuthenticationChange(authentication.revision + 1, kind,
+            if (kind == AuthenticationChangeKind.VALIDATED)
+                ValidatedSessionIdentity(server.origin, checkNotNull(session).accountId, generation)
+            else null)
+    }
+
+    private fun expireSessionLocked() {
+        if (cookie?.let { it.expiresAt <= authenticationTimeMillis() } == true) {
+            try { resetSessionLocked(AuthenticationChangeKind.EXPIRED) }
+            catch (_: IOException) {
+                // Read-only authority queries are used synchronously by playback and UI. Runtime
+                // auth and the expiry event were already cleared/recorded before the disk write;
+                // failed persistence must not crash these readers or restore expired authority.
+                // Explicit clear/invalidation operations retain their persistence error behavior.
+            }
+        }
+    }
 
     /** Metadata-only seam shared by the production connection listener and core route tests.
      * Neither stale generations nor another origin may supply a cleanup destination. A proxied
@@ -173,22 +258,25 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
         return PreparedPlaybackLeave(request, capturedAt, nanoTime)::invoke
     }
 
-    private fun resetSession(): Long = synchronized(lock) {
+    private fun resetSession(): Long = changingAuthentication { resetSessionLocked(AuthenticationChangeKind.RESET) }
+
+    private fun resetSessionLocked(kind: AuthenticationChangeKind): Long {
         cookie = null
         session = null
         playbackLeaveAddress = null
         generation++
+        authenticationChangedLocked(kind)
         try { store.write(null) }
         catch (_: Exception) { throw IOException("Unable to clear the saved session. Sign in again.") }
-        generation
+        return generation
     }
 
     /** Old requests must not clear or resurrect a newer account session. */
-    private fun invalidate(expectedGeneration: Long, notifyUnauthorized: Boolean = false): Boolean = synchronized(lock) {
+    private fun invalidate(expectedGeneration: Long, notifyUnauthorized: Boolean = false): Boolean = changingAuthentication {
         if (generation != expectedGeneration) false
         else {
             val invalidatedGeneration = generation + 1
-            try { resetSession() }
+            try { resetSessionLocked(AuthenticationChangeKind.INVALIDATED) }
             finally {
                 // Runtime auth is cleared before persistence. Even a failed disk clear must stop
                 // buffered playback. Invoke under the generation lock so an old 401 cannot signal
@@ -218,11 +306,12 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
 
     /** Revalidates persisted origin and cookie before contacting the server; no optimistic authentication. */
     suspend fun restore(): Session? {
-        val (restoreGeneration, saved) = synchronized(lock) {
+        val (restoreGeneration, saved) = changingAuthentication {
             generation++
             cookie = null
             session = null
             playbackLeaveAddress = null
+            authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
             generation to store.read()
         }
         if (saved == null) return null
@@ -253,12 +342,13 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
 
     // A transport failure or cancellation must not leave an unvalidated cookie usable by media.
     // Keep the persisted copy for a later explicit restoration attempt.
-    private fun forgetRestore(expectedGeneration: Long) = synchronized(lock) {
+    private fun forgetRestore(expectedGeneration: Long) = changingAuthentication {
         if (generation == expectedGeneration) {
             cookie = null
             session = null
             playbackLeaveAddress = null
             generation++
+            authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
         }
     }
 
@@ -337,16 +427,15 @@ class SpofifyClient(val server: ServerAddress, private val store: SessionStore) 
     private fun requireCurrentGeneration(expectedGeneration: Long) {
         if (generation != expectedGeneration) throw IOException("The account session changed while the request was in progress")
     }
-    private fun install(summary: Session, value: Cookie, expectedGeneration: Long) {
-        if (value.expiresAt <= System.currentTimeMillis()) throw ApiException(200, "The server returned an expired session cookie")
+    private fun install(summary: Session, value: Cookie, expectedGeneration: Long) = changingAuthentication {
+        if (value.expiresAt <= authenticationTimeMillis()) throw ApiException(200, "The server returned an expired session cookie")
         if (summary.accountId.isBlank() || summary.username.isBlank() || summary.role !in setOf("admin", "user") || summary.csrfToken.isBlank())
             throw ApiException(200, "The server returned an invalid session")
-        synchronized(lock) {
-            requireCurrentGeneration(expectedGeneration)
-            store.write(StoredSession(server.origin, value.toString(), summary))
-            cookie = value
-            session = summary
-        }
+        requireCurrentGeneration(expectedGeneration)
+        store.write(StoredSession(server.origin, value.toString(), summary))
+        cookie = value
+        session = summary
+        authenticationChangedLocked(AuthenticationChangeKind.VALIDATED)
     }
     private fun request(url: HttpUrl, method: String = "GET", body: String? = null): Request = Request.Builder().url(url)
         .method(method, body?.toRequestBody("application/json; charset=utf-8".toMediaType())).build()
