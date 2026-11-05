@@ -145,7 +145,7 @@ class PlaybackService : MediaSessionService() {
                 ?: service.contextIdentity
         }
         fun setQueueNotice(value: String?) { active.get()?.localEdit { queueMessage = value } }
-        fun queueNotice(): String? = active.get()?.queueMessage
+        fun queueNotice(): String? = active.get()?.let { it.currentTransportNotice() ?: it.queueMessage }
         fun restartCurrentTraversal() { active.get()?.localEdit { restartTraversal() } }
         fun exportLocalSnapshot(): PlaybackSnapshot = active.get()?.exportPrepared() ?: PlaybackSnapshot()
         fun exportLocalQueueIntentState(): QueueIntentState? = active.get()?.exportIntentState()
@@ -288,6 +288,15 @@ class PlaybackService : MediaSessionService() {
     private var historyWasPlaying = false
     private var contextIdentity: LibraryItem? = null
     private var queueMessage: String? = null
+    // Local presentation only: never part of the musical snapshot, history or semantic binding.
+    private data class TransportNotice(val message: String, val isCurrent: () -> Boolean)
+    private var transportNotice: TransportNotice? = null
+    private fun currentTransportNotice(): String? {
+        val notice = transportNotice ?: return null
+        if (notice.isCurrent()) return notice.message
+        if (transportNotice === notice) transportNotice = null
+        return null
+    }
     private var removed: Pair<PlaybackQueue.Removal, MediaItem>? = null
     private var removedTrack: PlaybackTrack? = null
     private var removedWasManual = false
@@ -613,7 +622,7 @@ class PlaybackService : MediaSessionService() {
         val playing = if (remote != null) track != null && remote.error.isEmpty() && remote.playing
             else hasAuthority() && current?.playWhenReady == true
         // Remote display/control state may update metadata, never promote local output/FGS.
-        foreground?.update(mediaSession, track, playing)
+        foreground?.update(mediaSession, track, playing, currentTransportNotice())
         return Futures.immediateFuture(null)
     }
 
@@ -868,6 +877,21 @@ class PlaybackService : MediaSessionService() {
 
     private fun sessionTransportSnapshot(): PlaybackSnapshot = remoteSessionSnapshot() ?: exportPrepared()
 
+    private fun transportRejected(owner: PlaybackCoordinator, isCurrent: () -> Boolean) {
+        if (!isCurrent()) return // An obsolete completion cannot annotate a successor's output.
+        // Preserve the coordinator's actual recovery guidance (pending, selection, reconnect),
+        // rather than implying that every refusal will recover merely by waiting.
+        transportNotice = TransportNotice(owner.state.value.message, isCurrent)
+        session?.let { mediaSession ->
+            val remote = remoteSessionSnapshot()
+            val track = if (remote != null) remotePlaybackState(remote).item
+                else player?.currentMediaItem?.let(PlaybackMedia::libraryItem)
+            val playing = if (remote != null) remote.playing && remote.error.isEmpty()
+                else hasAuthority() && player?.playWhenReady == true
+            foreground?.update(mediaSession, track, playing, currentTransportNotice())
+        }
+    }
+
     private fun routeCommand(command: PlaybackDeviceCommand, userInteraction: Boolean = false) {
         val graph = (application as SpofifyApplication).graph
         val source = client ?: return
@@ -894,6 +918,7 @@ class PlaybackService : MediaSessionService() {
                     else request == PlaybackRequests.epoch && now == version)
         }
         val intended = exportPrepared()
+        if (userInteraction) transportNotice = null
         if (userInteraction && !pause) {
             val prepared = if (local) intended else devices.view?.state
             if (prepared == null || prepared.queue.getOrNull(prepared.position) == null) return
@@ -903,7 +928,7 @@ class PlaybackService : MediaSessionService() {
             // The existing prepared-output gate checks before initialization and never imports
             // a restored/server queue to make a system Play valid. A fresh catalog action is
             // a separate path; media Play only resumes this in-memory prepared occurrence.
-            owner.editPreparedQueue(isCurrent = isCurrent) { permit ->
+            owner.editPreparedQueue(isCurrent = isCurrent, onRejected = { transportRejected(owner, isCurrent) }) { permit ->
                 val currentState = exportPrepared()
                 val sameQueue = currentState.queue == intended.queue &&
                     currentState.queue.getOrNull(currentState.position)?.key == intended.queue.getOrNull(intended.position)?.key &&
@@ -1065,6 +1090,7 @@ class PlaybackService : MediaSessionService() {
         isCurrent: () -> Boolean = { true }): PlaybackEndpointResult {
         val current = player ?: return frozenResult("rejected", snapshot = PlaybackSnapshot())
         if (!isCurrent() || !acceptAuthority(value)) return frozenResult("rejected")
+        transportNotice = null // A newly admitted start retires earlier refusal presentation.
         // Observe the accepted installation before allocating the attempt cleanup token, but
         // do NOT manufacture a traversal for generic foreground/focus/media-denied starts.
         // Raw queue selection commits establish their own history separately. For a generic
@@ -1731,7 +1757,9 @@ class PlaybackService : MediaSessionService() {
         }
         fun current() = isCurrent() && lifetimeCurrent()
         if (!current()) return "Playback changed. Choose music again."
-        owner.explicitLocalPlay(isCurrent = ::current, admissionIsCurrent = ::lifetimeCurrent, preparedResume = intended.paused()) { permit ->
+        transportNotice = null
+        owner.explicitLocalPlay(isCurrent = ::current, admissionIsCurrent = ::lifetimeCurrent,
+            onRejected = { transportRejected(owner, ::current) }, preparedResume = intended.paused()) { permit ->
             if (!current()) frozenResult("rejected")
             else executeOwned(PlaybackDeviceCommand.transport(if (intended.error.isEmpty()) "resume" else "retry"), permit, ::current) { receipt ->
                 val restarted = receipt?.after

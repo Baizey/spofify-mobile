@@ -3,6 +3,9 @@ package dev.spofify.mobile.feature.devices
 import dev.spofify.mobile.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.test.*
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import java.io.IOException
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -24,6 +27,8 @@ class PlaybackCoordinatorTest {
         var starts = mutableListOf<PlaybackSnapshot>()
         var authority: PlaybackAuthority? = null
         var preparing = 0
+        var prepareGate: CompletableDeferred<Unit>? = null
+        var activating = 0
         var activateGate: CompletableDeferred<Unit>? = null
         var executeGate: CompletableDeferred<Unit>? = null
         var cancelledActions = 0
@@ -31,8 +36,9 @@ class PlaybackCoordinatorTest {
         val executed = mutableListOf<String>()
         override fun suspendOutput() { stops++; onSuspend?.invoke(); snapshot = snapshot.paused() }
         override fun exportSnapshot() = snapshot
-        override suspend fun prepare(snapshot: PlaybackSnapshot): Boolean { snapshot.validated(); preparing++; return true }
+        override suspend fun prepare(snapshot: PlaybackSnapshot): Boolean { snapshot.validated(); preparing++; prepareGate?.await(); return true }
         override suspend fun activate(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult {
+            activating++
             try { activateGate?.await() } catch (error: CancellationException) { cancelledActions++; throw error }
             check(authority.isValid()); this.snapshot = snapshot; starts += snapshot; this.authority = authority
             return PlaybackEndpointResult("ok", snapshot)
@@ -66,6 +72,7 @@ class PlaybackCoordinatorTest {
         var failRegister = false
         var registerGate: CompletableDeferred<Unit>? = null
         var pollFailure: Exception? = null
+        var onPoll: (suspend (Long, Long?, PlaybackSnapshot?, List<PlaybackAck>) -> PlaybackDevicesView)? = null
         val commands = mutableListOf<Pair<Long, String>>()
         val commandIds = mutableListOf<String>()
         var echoPendingCommand = false
@@ -85,6 +92,7 @@ class PlaybackCoordinatorTest {
             }
             if (acks.isNotEmpty()) ackStates += acks to state
             lastState = state; sentAcks += acks
+            onPoll?.let { return it(epoch, stateSeq, state, acks) }
             val result = current; current = current.copy(directives = emptyList()); return result
         }
         override suspend fun rename(deviceId: String, name: String): PlaybackDevicesView {
@@ -1087,6 +1095,338 @@ class PlaybackCoordinatorTest {
         assertFalse(held.isValid())
         assertFalse(withContext(Dispatchers.Default) { held.isValid() })
         c.close()
+    }
+
+    /** Policy regression only: Endpoint records the admitted snapshot, not audio execution.
+     * Real broker + Media3 composition supplies the independent execution proof. */
+    @Test fun acceptedOwnSourcePresentSelectionSurvivesOnlyItsEmptyInboxStaleEpochConflict() = runTest {
+        ownSelectionEpochConflict("exact-empty-inbox", expectPlaying = true)
+    }
+
+    @Test fun staleEpochSelectionExceptionCannotRelaxUncertaintyPublicationBindingOrOutcomeFences() = runTest {
+        for (variant in listOf("prior-io", "prepare-ack", "source-less", "command-mismatch", "target-mismatch",
+            "source-mismatch", "epoch-jump", "outcome-ok", "outcome-cancelled", "outcome-timeout", "outcome-missing",
+            "missing-body", "malformed-body", "missing-reason", "selection-aba")) {
+            ownSelectionEpochConflict(variant, expectPlaying = false)
+        }
+    }
+
+    // Production decodes this narrow fact separately; the retained body stays sanitized.
+    private fun inboxEpochConflict(body: JsonObject?, reason: PlaybackConflictReason? = PlaybackConflictReason.STALE_EPOCH) =
+        ApiException(409, "synthetic playback conflict", responseBody = body, playbackConflictReason = reason)
+
+    private suspend fun TestScope.ownSelectionEpochConflict(variant: String, expectPlaying: Boolean) {
+        val source = if (variant == "source-less") "" else "pc"
+        val api = Protocol(view(owner = source, snapshot = prepared))
+        val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        var acceptedId = ""
+        var transferCount = 0
+        fun pending(id: String, owner: String = source, epoch: Long = 1, phase: String = "preparing") =
+            view(owner = owner, epoch = epoch, snapshot = prepared,
+                transfer = PlaybackTransfer(id, source, "phone", phase))
+                .copy(commands = listOf(PlaybackOutcome(id, "pending")))
+        try {
+            api.onTransfer = { id, target, _ ->
+                transferCount++
+                if (transferCount == 1) {
+                    acceptedId = id
+                    assertEquals("phone", target)
+                    pending(id) // A transfer response never delivers the receiver inbox.
+                } else {
+                    // Genuine later public selections, never refreshed authority for the old one.
+                    view(owner = source, snapshot = prepared, transfer = PlaybackTransfer(id, source, target, "preparing"))
+                        .copy(commands = listOf(PlaybackOutcome(id, "pending")))
+                }
+            }
+            c.setServiceActive(true); runCurrent()
+            assertEquals(1, api.registers)
+            c.select("phone"); runCurrent()
+            assertTrue(acceptedId.isNotEmpty()); assertEquals(0, endpoint.preparing)
+            api.onPoll = { epoch, sequence, snapshot, acks ->
+                assertEquals(1L, epoch); assertNull(sequence); assertNull(snapshot); assertTrue(acks.isEmpty())
+                pending(acceptedId).copy(directives = listOf(PlaybackDirective("own-prepare", 1, "prepare", acceptedId, state = prepared)))
+            }
+            c.retry(); runCurrent() // Only a fresh own-device poll delivers the real prepare shape.
+            assertEquals(1, endpoint.preparing)
+            assertTrue(endpoint.starts.isEmpty()); assertNull(c.currentAuthority())
+            assertEquals(acceptedId, c.state.value.view?.transfer?.commandId)
+            assertTrue(c.state.value.view?.commands?.any { it.commandId == acceptedId && it.status == "pending" } == true)
+            if (variant != "prepare-ack") {
+                api.onPoll = { epoch, sequence, snapshot, acks ->
+                    assertEquals(1L, epoch); assertNull(sequence); assertNull(snapshot)
+                    assertEquals(listOf(PlaybackAck("own-prepare", 1, "ok")), acks)
+                    pending(acceptedId, phase = "releasing")
+                }
+                c.retry(); runCurrent() // Successful prepare ACK precedes the empty-inbox race.
+            }
+            if (variant == "prior-io") {
+                api.onPoll = { _, _, _, acks -> assertTrue(acks.isEmpty()); throw IOException("synthetic accepted-selection uncertainty") }
+                c.retry(); runCurrent()
+                assertTrue(c.state.value.retryAvailable); assertNull(c.currentAuthority())
+            }
+            if (variant == "selection-aba") {
+                c.select("tablet"); runCurrent(); c.select("phone"); runCurrent()
+                assertEquals(listOf("phone", "tablet", "phone"), api.selections)
+                assertNotEquals(acceptedId, api.selectionIds.last())
+            }
+            val nextEpoch = if (variant == "epoch-jump") 3L else 2L
+            val activation = pending(acceptedId, owner = "phone", epoch = nextEpoch, phase = "activating")
+                .copy(directives = listOf(PlaybackDirective("own-activate", nextEpoch, "activate", acceptedId, state = prepared)))
+            val safe = activation.copy(directives = emptyList(), error = "",
+                transfer = requireNotNull(activation.transfer).copy(
+                    commandId = if (variant == "command-mismatch") "unrelated-command" else acceptedId,
+                    sourceDeviceId = if (variant == "source-mismatch") "tablet" else source,
+                    targetDeviceId = if (variant == "target-mismatch") "tablet" else "phone"),
+                commands = when (variant) {
+                    "outcome-ok" -> listOf(PlaybackOutcome(acceptedId, "ok"))
+                    "outcome-cancelled" -> listOf(PlaybackOutcome(acceptedId, "cancelled"))
+                    "outcome-timeout" -> listOf(PlaybackOutcome(acceptedId, "timeout"))
+                    "outcome-missing" -> emptyList()
+                    else -> listOf(PlaybackOutcome(acceptedId, "pending"))
+                }).validated()
+            val body = when (variant) {
+                "missing-body" -> null
+                "malformed-body" -> JsonObject(mapOf("epoch" to JsonPrimitive("invalid")))
+                else -> safe.toJson()
+            }
+            // Missing/malformed bodies may fall back to a real read-only API view, but that
+            // fallback must never manufacture the narrow accepted-write classification.
+            api.current = activation.copy(directives = emptyList())
+            api.onPoll = { epoch, sequence, snapshot, acks ->
+                assertEquals("$variant old target inbox epoch", 1L, epoch)
+                assertNull(sequence); assertNull(snapshot)
+                if (variant == "prepare-ack") assertEquals(listOf(PlaybackAck("own-prepare", 1, "ok")), acks)
+                else assertTrue("$variant must witness an actually empty inbox request", acks.isEmpty())
+                throw inboxEpochConflict(body, if (variant == "missing-reason") null else PlaybackConflictReason.STALE_EPOCH)
+            }
+            val viewsBefore = api.views
+            val pollsBefore = api.polls
+            c.retry(); runCurrent()
+            assertEquals("$variant conflict is not replayed or internally retried", pollsBefore + 1, api.polls)
+            assertEquals("$variant reconciliation never activates", emptyList<PlaybackSnapshot>(), endpoint.starts)
+            assertNull("$variant GET/safe conflict view grants no authority", c.currentAuthority())
+            assertTrue("$variant reconciliation cannot execute transport", endpoint.executed.isEmpty())
+            assertEquals("$variant must not register again", 1, api.registers)
+            assertEquals(if (variant == "selection-aba") 3 else 1, api.selections.size)
+            assertTrue(api.commands.isEmpty())
+            assertEquals(if (variant in setOf("missing-body", "malformed-body")) viewsBefore + 1 else viewsBefore, api.views)
+            // Real Go error/GET views contain no delivered inbox directives. Only this
+            // subsequent fresh own-device poll delivers activate; musical payload is unchanged.
+            api.onPoll = { epoch, sequence, snapshot, acks ->
+                assertEquals(nextEpoch, epoch); assertNull(sequence); assertNull(snapshot); assertTrue(acks.isEmpty())
+                activation
+            }
+            val pollsBeforeActivation = api.polls
+            c.retry(); runCurrent()
+            assertEquals("$variant fresh activation poll is not replayed", pollsBeforeActivation + 1, api.polls)
+            if (expectPlaying) {
+                assertEquals("Exact accepted empty-inbox conflict must preserve intentional playing admission",
+                    listOf(prepared), endpoint.starts)
+            } else {
+                // A conservative implementation may refuse the activation entirely. If it
+                // imports, the only permitted state is the exact unchanged payload paused.
+                assertTrue("$variant must not admit playing after uncertainty", endpoint.starts.all { it == prepared.paused() })
+                assertFalse("$variant must leave actual endpoint policy state paused", endpoint.snapshot.playing)
+            }
+            endpoint.starts.forEach { admitted ->
+                assertEquals(prepared.queue, admitted.queue); assertEquals(prepared.occurrence, admitted.occurrence)
+            }
+            assertEquals(1, api.registers); assertTrue(api.commands.isEmpty())
+            assertEquals(if (variant == "selection-aba") 3 else 1, api.selections.size)
+        } finally { c.close(); runCurrent() }
+    }
+
+    @Test fun reconciledOwnHandoffCannotPlayAfterPublicInvalidationAtAnyActivationSuspension() = runTest {
+        for (stage in listOf("before-poll", "held-poll", "validation", "activation", "no-directive")) {
+            for (action in listOf("pause", "close", "same-target", "aba")) {
+                withReconciledOwnHandoff { api, endpoint, c, id, safe ->
+                    val responseGate = CompletableDeferred<Unit>()
+                    val validationGate = CompletableDeferred<Unit>()
+                    val activationGate = CompletableDeferred<Unit>()
+                    val activation = handoffActivation(safe, id, "activation-$stage-$action")
+                    var freshPollEntered = false
+                    fun invalidate() {
+                        when (action) {
+                            "pause", "close" -> c.remoteCommand(PlaybackDeviceCommand.transport(action))
+                            "same-target" -> c.select("phone")
+                            else -> { c.select("tablet"); runCurrent(); c.select("phone") }
+                        }
+                        runCurrent()
+                    }
+                    api.onPoll = { _, _, _, _ -> safe }
+                    try {
+                        if (stage == "before-poll") invalidate()
+                        if (stage == "validation") endpoint.prepareGate = validationGate
+                        if (stage == "activation") endpoint.activateGate = activationGate
+                        val prepares = endpoint.preparing
+                        val activations = endpoint.activating
+                        api.onPoll = { _, _, _, _ ->
+                            freshPollEntered = true
+                            if (stage == "held-poll") responseGate.await()
+                            if (stage == "no-directive") safe else activation
+                        }
+                        c.retry(); runCurrent()
+                        assertTrue("$stage/$action reaches the real fresh-poll script", freshPollEntered)
+                        if (stage == "validation") assertEquals(prepares + 1, endpoint.preparing)
+                        if (stage == "activation") assertEquals(activations + 1, endpoint.activating)
+                        if (stage in setOf("held-poll", "validation", "activation")) {
+                            assertTrue("$stage/$action setup must suspend before any playing endpoint effect", endpoint.starts.none { it.playing })
+                        }
+                        // Subsequent genuine Pause publication may legitimately initialize a
+                        // PAUSED endpoint; do not reject that or force null state/ACK payloads.
+                        api.onPoll = { _, _, _, _ -> safe }
+                        if (stage != "before-poll") invalidate()
+                        endpoint.prepareGate = null; endpoint.activateGate = null
+                        responseGate.complete(Unit); validationGate.complete(Unit); activationGate.complete(Unit); runCurrent()
+                        assertTrue("$stage/$action cannot finish obsolete playing activation", endpoint.starts.none { it.playing })
+                        // New delivery ID prevents ordinary delivery deduplication from being
+                        // the only reason an obsolete command cannot acquire playing admission.
+                        api.onPoll = { _, _, _, _ -> handoffActivation(safe, id, "late-$stage-$action") }
+                        c.retry(); runCurrent()
+                        assertTrue("$stage/$action cannot resurrect the retired command", endpoint.starts.none { it.playing })
+                        assertFalse(endpoint.snapshot.playing)
+                        assertEquals(1, api.registers); assertTrue(api.commands.isEmpty())
+                        val explicitChoices = when (action) { "same-target" -> 2; "aba" -> 3; else -> 1 }
+                        assertTrue("No transfer replay beyond explicit selections", api.selections.size in 1..explicitChoices)
+                        if (action in setOf("pause", "close")) assertEquals(listOf("phone"), api.selections)
+                        endpoint.starts.forEach { admitted ->
+                            assertEquals(prepared.queue, admitted.queue); assertEquals(prepared.occurrence, admitted.occurrence)
+                        }
+                    } finally {
+                        endpoint.prepareGate = null; endpoint.activateGate = null
+                        responseGate.complete(Unit); validationGate.complete(Unit); activationGate.complete(Unit); runCurrent()
+                    }
+                }
+            }
+        }
+    }
+
+    @Test fun awaitingHandoffCannotReuseClassificationAfterAnotherFailureOrMismatchedActivation() = runTest {
+        for (fault in listOf("second-409", "fresh-io", "source", "command", "epoch")) {
+            withReconciledOwnHandoff { api, endpoint, c, id, safe ->
+                var next = safe
+                if (fault in setOf("second-409", "fresh-io")) {
+                    if (fault == "second-409") next = safe.copy(epoch = 3)
+                    api.onPoll = { _, _, _, _ ->
+                        if (fault == "fresh-io") throw IOException("synthetic fresh-poll uncertainty")
+                        else throw inboxEpochConflict(next.toJson())
+                    }
+                    c.retry(); runCurrent()
+                    assertTrue(endpoint.starts.isEmpty()); assertNull(c.currentAuthority())
+                }
+                val activation = when (fault) {
+                    "source" -> handoffActivation(safe.copy(transfer = requireNotNull(safe.transfer).copy(sourceDeviceId = "tablet")), id, "wrong-source")
+                    "command" -> handoffActivation(safe, "unrelated-command", "wrong-command")
+                    "epoch" -> handoffActivation(safe.copy(epoch = 3), id, "wrong-epoch")
+                    else -> handoffActivation(next, id, "after-$fault")
+                }
+                api.onPoll = { _, _, _, _ -> activation }
+                c.retry(); runCurrent()
+                assertTrue("$fault cannot borrow an already consumed classification", endpoint.starts.none { it.playing })
+                assertFalse(endpoint.snapshot.playing)
+                assertEquals(1, api.registers); assertEquals(listOf("phone"), api.selections); assertTrue(api.commands.isEmpty())
+            }
+        }
+    }
+
+    @Test fun moreThan256PublicInvalidationsCannotReviveTheRetiredHandoffCommand() = runTest {
+        withReconciledOwnHandoff { api, endpoint, c, id, safe ->
+            api.onPoll = { _, _, _, _ -> safe }
+            repeat(257) { c.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent() }
+            assertTrue(endpoint.starts.none { it.playing })
+            api.onPoll = { _, _, _, _ -> handoffActivation(safe, id, "after-257-invalidations") }
+            c.retry(); runCurrent()
+            assertTrue("A retired command cannot become new permission after bounded repeated invalidation", endpoint.starts.none { it.playing })
+            assertFalse(endpoint.snapshot.playing)
+            assertEquals(1, api.registers); assertEquals(listOf("phone"), api.selections); assertTrue(api.commands.isEmpty())
+        }
+    }
+
+    private fun handoffActivation(safe: PlaybackDevicesView, command: String, delivery: String) = safe.copy(
+        directives = listOf(PlaybackDirective(delivery, safe.epoch, "activate", command, state = prepared)))
+
+    /** The accepted write is proved by the actual transfer callback and validated response;
+     * pendingSelection/SelectionFeedback presentation is never sampled as authorization. */
+    private suspend fun TestScope.withReconciledOwnHandoff(
+        block: suspend (Protocol, Endpoint, PlaybackCoordinator, String, PlaybackDevicesView) -> Unit,
+    ) {
+        val api = Protocol(view(owner = "pc", snapshot = prepared)); val endpoint = Endpoint()
+        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+        var id = ""
+        try {
+            api.onTransfer = { command, target, _ ->
+                if (id.isEmpty()) {
+                    id = command
+                    view(owner = "pc", snapshot = prepared, transfer = PlaybackTransfer(command, "pc", target, "preparing"))
+                        .copy(commands = listOf(PlaybackOutcome(command, "pending")))
+                } else {
+                    // A newer explicit serialized transfer may supersede the old proof, but
+                    // never returns old directives or an invented execution ACK.
+                    view(owner = "phone", epoch = 2, snapshot = prepared.paused(),
+                        transfer = PlaybackTransfer(command, "", target, "preparing"))
+                        .copy(commands = listOf(PlaybackOutcome(command, "pending")))
+                }
+            }
+            c.setServiceActive(true); runCurrent(); c.select("phone"); runCurrent()
+            assertEquals(1, api.registers); assertTrue(id.isNotEmpty())
+            assertEquals(id, c.state.value.view?.transfer?.commandId)
+            api.onPoll = { _, _, snapshot, acks ->
+                assertNull(snapshot); assertTrue(acks.isEmpty())
+                view(owner = "pc", snapshot = prepared, transfer = PlaybackTransfer(id, "pc", "phone", "preparing"),
+                    directives = listOf(PlaybackDirective("prepare-owned", 1, "prepare", id, state = prepared)))
+                    .copy(commands = listOf(PlaybackOutcome(id, "pending")))
+            }
+            c.retry(); runCurrent(); assertEquals(1, endpoint.preparing)
+            api.onPoll = { _, _, snapshot, acks ->
+                assertNull(snapshot); assertEquals(listOf(PlaybackAck("prepare-owned", 1, "ok")), acks)
+                view(owner = "pc", snapshot = prepared, transfer = PlaybackTransfer(id, "pc", "phone", "releasing"))
+                    .copy(commands = listOf(PlaybackOutcome(id, "pending")))
+            }
+            c.retry(); runCurrent()
+            val safe = view(epoch = 2, snapshot = prepared, transfer = PlaybackTransfer(id, "pc", "phone", "activating"))
+                .copy(commands = listOf(PlaybackOutcome(id, "pending"))).validated()
+            api.onPoll = { epoch, sequence, snapshot, acks ->
+                assertEquals(1L, epoch); assertNull(sequence); assertNull(snapshot); assertTrue(acks.isEmpty())
+                throw inboxEpochConflict(safe.toJson())
+            }
+            c.retry(); runCurrent()
+            assertTrue("Reconciliation cannot activate", endpoint.starts.isEmpty()); assertNull(c.currentAuthority())
+            assertEquals(1, api.registers); assertEquals(listOf("phone"), api.selections); assertTrue(api.commands.isEmpty())
+            block(api, endpoint, c, id, safe)
+        } finally { c.close(); runCurrent() }
+    }
+
+    @Test fun lateStaleEpochPollAfterAuthLossOrCloseCannotReconcileOrActivate() = runTest {
+        for (end in listOf("auth", "close")) {
+            val api = Protocol(view(owner = "pc", snapshot = prepared)); val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            val gate = CompletableDeferred<Unit>()
+            var acceptedId = ""
+            try {
+                api.onTransfer = { id, _, _ ->
+                    acceptedId = id
+                    view(owner = "pc", snapshot = prepared, transfer = PlaybackTransfer(id, "pc", "phone", "releasing"))
+                        .copy(commands = listOf(PlaybackOutcome(id, "pending")))
+                }
+                c.setServiceActive(true); runCurrent(); c.select("phone"); runCurrent()
+                val activating = view(epoch = 2, snapshot = prepared, transfer = PlaybackTransfer(acceptedId, "pc", "phone", "activating"))
+                    .copy(commands = listOf(PlaybackOutcome(acceptedId, "pending")), error = "")
+                api.onPoll = { _, _, snapshot, acks ->
+                    assertNull(snapshot); assertTrue(acks.isEmpty())
+                    withContext(NonCancellable) { gate.await(); throw inboxEpochConflict(activating.toJson()) }
+                }
+                c.retry(); runCurrent()
+                val views = api.views
+                if (end == "auth") c.authLost() else c.close()
+                gate.complete(Unit); runCurrent()
+                assertTrue(endpoint.starts.isEmpty()); assertNull(c.currentAuthority())
+                assertFalse(endpoint.snapshot.playing); assertEquals(views, api.views)
+                assertEquals(1, api.registers); assertEquals(listOf("phone"), api.selections); assertTrue(api.commands.isEmpty())
+                assertEquals(if (end == "auth") PlaybackConnectionRecovery.AUTH_REQUIRED else PlaybackConnectionRecovery.OWNER_ENDED,
+                    c.state.value.recovery)
+            } finally { gate.complete(Unit); c.close(); runCurrent() }
+        }
     }
 
     @Test fun authLossInvalidatesHeldAuthoritySynchronouslyAndStopsActualAudio() = runTest {

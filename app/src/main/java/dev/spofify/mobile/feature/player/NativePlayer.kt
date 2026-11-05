@@ -157,7 +157,11 @@ fun NativeMiniPlayer(
                     Column(Modifier.weight(1f).padding(start = 12.dp)) {
                         Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
                             style = MaterialTheme.typography.titleSmall)
-                        Text(item.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        val feedback = state.error ?: state.notice
+                        Text(feedback ?: item.subtitle, maxLines = if (feedback == null) 1 else 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.semantics { if (feedback != null) liveRegion = LiveRegionMode.Polite },
+                            color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                             style = MaterialTheme.typography.bodySmall)
                     }
                 }

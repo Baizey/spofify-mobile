@@ -22,6 +22,12 @@ The memory-only, latest-payload admission is bounded to twelve seconds and canno
 
 Native first-Play rendering/audio/history/background acceptance remains **blocked / not complete** under the current isolated-emulator assessment; protocol/service JVM tests and compiled fixtures are not installed-app approval.
 
+## Prepared Pause/Resume admission
+
+Local output can already be paused while its exact paused-state publication still awaits confirmation. A second ordinary Resume is correctly refused during that window, not queued for later replay. The mini-player, expanded player and posted playback notification expose the refusal and its recovery guidance; a fresh deliberate Resume after settlement starts the retained occurrence. Refusal presentation is tied to its original action and cannot label a changed queue/output or hide a later admitted start. Queue-only edits remain distinct from transport: unchanged-current Low/High/Next does not resume it.
+
+The production-path regressions use actual AppGraph/ViewModel/Connection/service/coordinator/API controls, a real Media3 state machine with synthetic PCM, and separately provisioned persistent pinned Go integration tests. Settled Pause→Resume success is checked by observed isPlaying plus progress, not by an optimistic icon or HTTP acceptance. See [prepared transport testing](prepared-transport-testing.md) for the portable unit baseline and mandatory opt-in integration gate. These observations are not installed-Android/acoustic or rendered-app approval.
+
 ## What persists — and what does not
 
 Android Keystore-encrypted local metadata stores an installation UUID and accepted device name, bound to the exact server origin and immutable account ID and excluded from app backup/transfer. This makes the local installation/name more persistent than a screen or login session. It stores no credentials, playback intent, queue or server-issued device authority.

@@ -59,13 +59,13 @@ internal class PlaybackForegroundNotification(
     // ALWAYS binds a real MediaSession token with MediaStyleNotificationHelper.MediaStyle;
     // transport category/actions alone would NOT qualify. Covered for refresh/detach by tests.
     // This exemption does not authorize an FGS start: promote() still uses the platform gate.
-    fun update(session: MediaSession, track: LibraryItem?, playing: Boolean) {
+    fun update(session: MediaSession, track: LibraryItem?, playing: Boolean, notice: String? = null) {
         if (track == null) {
             demote(session, null)
             return
         }
         try {
-            manager().notify(NOTIFICATION_ID, notification(session, track, playing))
+            manager().notify(NOTIFICATION_ID, notification(session, track, playing, notice))
         } catch (_: RuntimeException) {
             // A failed metadata update must not crash the service or promote it as a fallback.
         }
@@ -89,12 +89,12 @@ internal class PlaybackForegroundNotification(
         cancel()
     }
 
-    private fun notification(session: MediaSession, track: LibraryItem?, playing: Boolean): Notification {
+    private fun notification(session: MediaSession, track: LibraryItem?, playing: Boolean, notice: String? = null): Notification {
         manager().createNotificationChannel(NotificationChannel(CHANNEL_ID, "Playback", NotificationManager.IMPORTANCE_LOW))
         return NotificationCompat.Builder(service, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(track?.name?.takeIf { it.isNotBlank() } ?: "Spofify")
-            .setContentText(track?.artists?.joinToString(", ") { it.name }.orEmpty())
+            .setContentText(notice ?: track?.artists?.joinToString(", ") { it.name }.orEmpty())
             .setContentIntent(session.sessionActivity)
             .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)

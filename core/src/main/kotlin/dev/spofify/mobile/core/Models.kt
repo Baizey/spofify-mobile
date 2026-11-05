@@ -156,6 +156,9 @@ data class PlaylistSummary(
 @Serializable
 data class PlaylistPage(val items: List<PlaylistSummary>, val total: Int, val limit: Int = 40, val offset: Int = 0)
 
+/** Allowlisted rejection fact, never authority or permission to replay a request. */
+enum class PlaybackConflictReason { STALE_EPOCH }
+
 /**
  * Messages are local and safe, never a server body or URL. responseBody is optional, strictly
  * validated device reconciliation data only; it must not be logged or rendered as error text.
@@ -165,4 +168,5 @@ class ApiException(
     override val message: String,
     val code: String? = null,
     val responseBody: JsonObject? = null,
+    val playbackConflictReason: PlaybackConflictReason? = null,
 ) : IOException(message)

@@ -11,6 +11,10 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p 'test_specs.py' -v
           python3 scripts/specs.py check
+      - name: Check fixture cleanup and handoff choreography without a browser
+        run: |
+          python3 -B tools/testing/prepared-transport-broker/website_supervisor_test.py
+          python3 -B tools/testing/prepared-transport-broker/handoff_barrier_test.py
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -21,7 +25,9 @@ jobs:
       - name: Provision immutable playback broker integration prerequisite
         env:
           SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL: ${{ vars.SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL }}
+        shell: bash
         run: |
+          set -euo pipefail
           # CI must not silently fall back to the default fast-unit category. The repository
           # administrator supplies a reviewed immutable artifact, never a live backend URL.
           python3 - <<'PY'
@@ -42,15 +48,31 @@ jobs:
           owned="$RUNNER_TEMP/spofify-broker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -m 700 "$owned"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --max-time 60 --max-filesize 33554432 \
+            --max-redirs 3 --connect-timeout 10 --max-time 60 --max-filesize 33554432 \
             "$SPOFIFY_TEST_GO_BROKER_ARTIFACT_URL" -o "$owned/broker"
           printf '%s  %s\n' '425e4bb46efcf1c25e195d92d4d1845ed2389cd35e6ebf9ad8981cd80c2c70f4' "$owned/broker" | sha256sum --check --status
           chmod 500 "$owned/broker"
           runtime="/dev/shm/spofify-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -m 700 "$runtime"
           printf 'SPOFIFY_TEST_GO_BROKER_BINARY=%s\nSPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT=%s\n' "$owned/broker" "$runtime" >> "$GITHUB_ENV"
-      - name: All unit and mandatory real-broker integration checks
-        run: ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug -Pspofify.realBrokerIntegration=true --no-daemon
+          printf 'SPOFIFY_TEST_WEBSITE_RUNTIME_ROOT=%s\n' "$runtime" >> "$GITHUB_ENV"
+      - name: Verify separately provisioned website-receiver prerequisites
+        env:
+          SPOFIFY_TEST_PLAYWRIGHT_MODULE: ${{ vars.SPOFIFY_TEST_PLAYWRIGHT_MODULE }}
+          SPOFIFY_TEST_CHROMIUM_PATH: ${{ vars.SPOFIFY_TEST_CHROMIUM_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SPOFIFY_TEST_PLAYWRIGHT_MODULE:?Provision installed Playwright for mandatory website-receiver integration}"
+          : "${SPOFIFY_TEST_CHROMIUM_PATH:?Provision installed Chromium for mandatory website-receiver integration}"
+          test -f "$SPOFIFY_TEST_PLAYWRIGHT_MODULE/package.json"
+          test -x "$SPOFIFY_TEST_CHROMIUM_PATH"
+          command -v node
+          command -v ffmpeg
+          printf 'SPOFIFY_TEST_PLAYWRIGHT_MODULE=%s\n' "$SPOFIFY_TEST_PLAYWRIGHT_MODULE" >> "$GITHUB_ENV"
+          printf 'SPOFIFY_TEST_CHROMIUM_PATH=%s\n' "$SPOFIFY_TEST_CHROMIUM_PATH" >> "$GITHUB_ENV"
+      - name: Full gate including mandatory real-broker and website integration
+        run: ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug -Pspofify.realBrokerIntegration=true --no-daemon --console=plain
       - name: Verify integration fixtures cleaned their owned runtimes
         if: always() && env.SPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT != ''
         run: |

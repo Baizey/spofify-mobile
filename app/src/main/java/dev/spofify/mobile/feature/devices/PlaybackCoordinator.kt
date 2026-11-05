@@ -211,6 +211,79 @@ class PlaybackCoordinator(
     private var finalCloseVersion = 0L
     private data class Selection(val target: String, val version: Long)
 
+    private enum class HandoffPhase { ACCEPTED, AWAITING_ACTIVATION, RETIRED }
+    /** Memory-only correlation, never a lease or playback permission. After reconciliation
+     * it can only CANCEL/match the future activation, not classify another failed request. */
+    private data class HandoffWitness(val commandId: String, val source: String, val deviceId: String,
+        val baseEpoch: Long, val lifecycle: Long, val choice: Long, val revision: Long,
+        val phase: HandoffPhase = HandoffPhase.ACCEPTED)
+    private var handoffWitness: HandoffWitness? = null
+    private fun retireHandoff() {
+        val old = handoffWitness ?: return
+        if (old.phase == HandoffPhase.RETIRED) return
+        handoffWitness = old.copy(phase = HandoffPhase.RETIRED)
+        abandonedClaims.add(old.commandId)
+        while (abandonedClaims.size > 256) abandonedClaims.remove(abandonedClaims.first())
+        // Keep the one retired record pinned even if unrelated claim tombstones rotate.
+        // Only a subsequently accepted, serialized transfer replaces it: no older poll
+        // can still be suspended behind that response, and Go supersedes the old transfer.
+    }
+    private fun handoffCurrent(value: HandoffWitness) = !closed && serviceActive && work.isActive &&
+        !uncertainConnection && value.lifecycle == lifecycle && value.choice == selectionVersion &&
+        value.revision == actionVersion && value.deviceId == state.value.deviceId
+    private fun handoffView(value: HandoffWitness, view: PlaybackDevicesView, advanced: Boolean): Boolean =
+        view.deviceId == value.deviceId && view.epoch == value.baseEpoch + (if (advanced) 1L else 0L) &&
+            view.activeDeviceId == (if (advanced) value.deviceId else value.source) && view.quarantineMs == 0L &&
+            view.devices.any { it.deviceId == value.deviceId && it.available } &&
+            view.transfer?.let { it.commandId == value.commandId && it.sourceDeviceId == value.source &&
+                it.targetDeviceId == value.deviceId && (if (advanced) it.phase == "activating"
+                else it.phase in setOf("preparing", "releasing")) } == true &&
+            view.commands.singleOrNull { it.commandId == value.commandId }?.status == "pending"
+    private fun rememberHandoff(selection: Selection, id: String, commandId: String, sentEpoch: Long,
+        life: Long, revision: Long, view: PlaybackDevicesView) {
+        val transfer = view.transfer ?: return
+        // Restrict this exception to an accepted selection against the known epoch.
+        // A sequenced selection accepted from a stale epoch still takes normal recovery.
+        if (intent != selection || selection.target != id || view.epoch != sentEpoch || epoch != sentEpoch ||
+            transfer.sourceDeviceId.isEmpty() || transfer.sourceDeviceId == id || view.directives.isNotEmpty() ||
+            pendingCommand != null || playAdmission != null || queueExecution != null || pendingFinalClose != null) return
+        val value = HandoffWitness(commandId, transfer.sourceDeviceId, id, view.epoch, life, selection.version, revision)
+        if (handoffCurrent(value) && handoffView(value, view, advanced = false)) {
+            requireHandoffSidecars(view)
+            handoffWitness = value
+        }
+    }
+    private fun observeHandoff(view: PlaybackDevicesView) {
+        val value = handoffWitness ?: return
+        if (value.phase == HandoffPhase.RETIRED) return
+        if (!handoffCurrent(value)) { retireHandoff(); return }
+        if (value.phase == HandoffPhase.ACCEPTED && handoffView(value, view, advanced = true)) {
+            // Ordinary successful polling needs no rejected-poll exception. Preserve its
+            // existing authority rules; the extra awaiting witness is only for our recovery.
+            handoffWitness = null
+        } else if (!handoffView(value, view, advanced = value.phase == HandoffPhase.AWAITING_ACTIVATION)) retireHandoff()
+    }
+    private suspend fun reconcileHandoffInbox(error: ApiException, value: HandoffWitness, sent: Long): Boolean {
+        if (error.status != 409 || error.playbackConflictReason != PlaybackConflictReason.STALE_EPOCH ||
+            handoffWitness !== value || value.phase != HandoffPhase.ACCEPTED || !handoffCurrent(value) ||
+            pendingCommand != null || playAdmission != null || queueExecution != null || pendingFinalClose != null) return false
+        val view = try { error.responseBody?.let { PlaybackDevicesView.fromJson(it) } }
+            catch (_: IllegalArgumentException) { null } ?: return false
+        if (view.directives.isNotEmpty() || view.queueIntents?.directives?.isNotEmpty() == true ||
+            !handoffView(value, view, advanced = true)) return false
+        requireHandoffSidecars(view) // Validate the original view, never a stripped substitute.
+        val waiting = value.copy(phase = HandoffPhase.AWAITING_ACTIVATION)
+        handoffWitness = waiting
+        // No poll publication, ACK, heartbeat or delivery was accepted. Preserve an already
+        // false uncertainty flag; never clear it, start output, grant a lease, or replay here.
+        consume(view, sent, startsAllowed = false, grantAuthority = false, handoffReconciliation = waiting)
+        return true
+    }
+    private fun handoffActivationCurrent(value: HandoffWitness, directive: PlaybackDirective) =
+        handoffWitness === value && value.phase == HandoffPhase.AWAITING_ACTIVATION && handoffCurrent(value) &&
+            directive.commandId == value.commandId && directive.epoch == value.baseEpoch + 1 &&
+            state.value.view?.let { handoffView(value, it, advanced = true) } == true
+
     // Presentation only. Request identity, not target equality, fences same-target ABA.
     private data class SelectionFeedback(val presentation: PlaybackDeviceSelection,
         val version: Long? = null, val commandId: String? = null)
@@ -253,6 +326,7 @@ class PlaybackCoordinator(
             withContext(NonCancellable) {
                 finishCommandResult(null, "cancelled")
                 if (managedOutput) {
+                    retireHandoff()
                     lifecycle++; generation++; leaseDeadline = 0; released = true
                     revokeAuthority()
                     endpoint.suspendOutput(); managedOutput = false; serviceActive = false
@@ -356,7 +430,8 @@ class PlaybackCoordinator(
         }
     }
 
-    private fun fenceLocal(invalidateActions: Boolean = true) {
+    private fun fenceLocal(invalidateActions: Boolean = true, preserveHandoff: Boolean = false) {
+        if (!preserveHandoff) retireHandoff()
         queueExecution = null
         generation++; leaseDeadline = 0; released = true; activatedEpoch = 0; recoverPaused = true
         revokeAuthority()
@@ -376,6 +451,7 @@ class PlaybackCoordinator(
 
     /** Must run before waiting for transport, even during registration or an output switch. */
     private fun interruptLocal(preserveQueueReceipt: Boolean = false): Boolean {
+        retireHandoff() // Before the queue-receipt early return or any transport suspension.
         abandonAdmission()
         val queue = queueExecution
         if (preserveQueueReceipt && queue != null && queue.lifecycle == lifecycle && queue.epoch == epoch &&
@@ -455,6 +531,8 @@ class PlaybackCoordinator(
             message("That player is unavailable. Open Spofify on it and choose again."); return
         }
         abandonAdmission()
+        val pendingHandoffActivation = activating && handoffWitness?.phase == HandoffPhase.AWAITING_ACTIVATION
+        retireHandoff() // Same-target selection and A -> B -> A also retire the old request.
         val selection = Selection(targetDeviceId, ++selectionVersion)
         // Do not let a queued/suspended explicit local action follow a newer output choice.
         val pendingLocalExecution = commandJob?.isActive == true && endpointJob?.isActive == true
@@ -466,7 +544,7 @@ class PlaybackCoordinator(
         // A remote pending write's coroutine may already be complete. Retire its observer
         // with the command identity, before an unchanged-epoch selection permits a successor.
         finishCommandResult(null, "cancelled")
-        if (pendingLocalExecution || targetDeviceId != state.value.deviceId && activating) {
+        if (pendingLocalExecution || pendingHandoffActivation || targetDeviceId != state.value.deviceId && activating) {
             // Cancel only unfinished endpoint work. A healthy source must remain able
             // to execute and ACK the server's release at its exact final position.
             generation++; actionVersion++; revokeAuthority(); endpointJob?.cancel(); endpoint.suspendOutput()
@@ -490,7 +568,12 @@ class PlaybackCoordinator(
                         selectionFeedback?.takeIf { it.version == latest.version }?.let {
                             selectionFeedback = it.copy(commandId = commandId)
                         }
-                        request { api.transfer(state.value.deviceId, epoch, commandId, latest.target, latest.version) }
+                        val id = state.value.deviceId; val sentEpoch = epoch; val revision = actionVersion
+                        request {
+                            api.transfer(id, sentEpoch, commandId, latest.target, latest.version).validated().also {
+                                rememberHandoff(latest, id, commandId, sentEpoch, life, revision, it)
+                            }
+                        }
                     }
                     if (life == lifecycle && intent == latest) {
                         intent = null
@@ -635,8 +718,11 @@ class PlaybackCoordinator(
             state.value.recovery !in setOf(PlaybackConnectionRecovery.NONE) && state.value.deviceId.isNotEmpty()) {
             message("Reconnect playback and press Play again."); onRejected?.invoke(); return
         }
-        if (selectionPending() || pendingCommand != null) {
+        if (selectionPending()) {
             message("Finish selecting a playback device, then press Play again."); onRejected?.invoke(); return
+        }
+        if (pendingCommand != null) {
+            message("Confirming playback. Try Play again."); onRejected?.invoke(); return
         }
         val value = PlayAdmission(nonce(), lifecycle, actionVersion, selectionVersion, clockMs() + 12_000,
             isCurrent, admissionIsCurrent, staging, payloadVersion, action, onRejected, onCompleted)
@@ -746,7 +832,7 @@ class PlaybackCoordinator(
         if (!interrupt && playAdmission != null) {
             message("An explicit Play is awaiting confirmation. Pause can cancel it."); rejectEarly(); return
         }
-        if (pendingCommand != null && pendingFinalClose == null) { message("An action is awaiting confirmation. Pause or Stop can interrupt it."); rejectEarly(); return }
+        if (pendingCommand != null && pendingFinalClose == null) { message("Confirming playback. Try again shortly."); rejectEarly(); return }
         // A queued NEW intent only holds disposal. It may become stale/rejected while waiting;
         // job completion must return the cleanup obligation unless real replacement state won.
         val heldClose = pendingFinalClose?.also {
@@ -967,8 +1053,23 @@ class PlaybackCoordinator(
         val publication = playAdmission?.takeIf { snapshot != null && it.activatedEpoch == epoch && it.stagedVersion == it.payloadVersion }
             ?.let { it.id to it.payloadVersion }
         val queue = queueExecution
-        request(ownerPoll = true, admissionPublication = publication) {
-            api.poll(id, epoch, if (snapshot != null) ++sequence else null, snapshot, pending, metadata)
+        val requestEpoch = epoch
+        val requestSequence = if (snapshot != null) ++sequence else null
+        val sent = clockMs()
+        // Capture the ACTUAL outgoing request before suspension. The buffers above have
+        // already been cleared; inspecting them in a catch would misclassify sent ACKs.
+        val inbox = handoffWitness?.takeIf { it.phase == HandoffPhase.ACCEPTED && handoffCurrent(it) &&
+            it.baseEpoch == requestEpoch && snapshot == null && requestSequence == null && metadata == null &&
+            pending.isEmpty() && publication == null && pendingCommand == null && playAdmission == null &&
+            queue == null && pendingFinalClose == null && state.value.view?.let { view ->
+                handoffView(it, view, advanced = false)
+            } == true }
+        try {
+            request(ownerPoll = true, admissionPublication = publication) {
+                api.poll(id, requestEpoch, requestSequence, snapshot, pending, metadata)
+            }
+        } catch (error: ApiException) {
+            if (inbox == null || !reconcileHandoffInbox(error, inbox, sent)) throw error
         }
         if (queue?.deliveryId != null && pending.any { it.deliveryId == queue.deliveryId } && queueExecution === queue)
             queueExecution = null
@@ -1017,6 +1118,7 @@ class PlaybackCoordinator(
 
     /** One bounded final publication, NOT request(): its response must never activate/start audio. */
     private suspend fun publishFinalClose(result: PlaybackEndpointResult, ack: PlaybackAck? = null) {
+        retireHandoff()
         val completion = requireNotNull(result.finalClose)
         finalCloseVersion++
         pendingFinalClose = completion
@@ -1067,10 +1169,12 @@ class PlaybackCoordinator(
         sentFeedback: SelectionFeedback? = null,
         sentCommand: CommandFeedback? = null,
         admissionPublication: Pair<String, Long>? = null,
+        handoffReconciliation: HandoffWitness? = null,
     ) {
         if (!registration && view.epoch < epoch) return
         if (!registration && view.epoch == epoch && view.stateSeq < (state.value.view?.stateSeq ?: 0)) return
         requireHandoffSidecars(view)
+        observeHandoff(view)
         val id = if (registration) view.deviceId else state.value.deviceId
         require(validPlaybackProtocolId(id) && view.devices.any { it.deviceId == id })
         val previous = state.value.view
@@ -1101,7 +1205,13 @@ class PlaybackCoordinator(
         // new cancellation either. Repeated suspension would invalidate every async
         // queue preparation that happens to overlap the one-second polling cadence.
         if (changed || view.activeDeviceId != id && (ownerChanged || !released || activatedEpoch != 0L)) {
-            fenceLocal(invalidateActions = !expectedActivation && (!registration || uncertainConnection))
+            val preserve = handoffReconciliation != null && handoffWitness === handoffReconciliation &&
+                handoffCurrent(handoffReconciliation) && handoffView(handoffReconciliation, view, advanced = true)
+            fenceLocal(invalidateActions = !expectedActivation && (!registration || uncertainConnection), preserveHandoff = preserve)
+            // Exactly the synchronous internal fence above advanced actionVersion. Never
+            // refresh a witness after a suspension or an intervening external retirement.
+            if (preserve && handoffWitness === handoffReconciliation)
+                handoffWitness = handoffReconciliation!!.copy(revision = actionVersion)
             acks.clear(); ackState = null; ackQueueIntentState = null
         }
         if (registration) {
@@ -1211,7 +1321,9 @@ class PlaybackCoordinator(
         deliveries[d.deliveryId] = delivered
         while (deliveries.size > 256) deliveries.remove(deliveries.keys.first())
         if (d.epoch != epoch) return
-        if (d.commandId in abandonedClaims) {
+        if (d.commandId in abandonedClaims || handoffWitness?.let {
+                it.phase == HandoffPhase.RETIRED && it.lifecycle == lifecycle && it.commandId == d.commandId
+            } == true) {
             // An obsolete claim cannot stage retained audio or execute a late activation.
             acks += PlaybackAck(d.deliveryId, d.epoch, "rejected")
             // Abandoned activation has no execution authority or truthful imported state;
@@ -1229,6 +1341,7 @@ class PlaybackCoordinator(
         if (authority == null) return // Cannot ACK execution without actual owner state. Server fences on timeout.
         val result = when (d.type) {
             "release" -> {
+                retireHandoff()
                 // Capture final position/intent BEFORE pause. Preserve playing=true in the ACK snapshot
                 // so the destination can resume intentional playback only after the acknowledged stop.
                 val final = if (activatedEpoch == epoch) endpoint.exportSnapshot().validated()
@@ -1243,6 +1356,8 @@ class PlaybackCoordinator(
                 if (!startsAllowed || intent != null && intent?.target != state.value.deviceId) {
                     endpoint.suspendOutput(); currentPublication("rejected")
                 } else {
+                    val handoff = handoffWitness?.takeIf { it.phase == HandoffPhase.AWAITING_ACTIVATION }
+                    require(handoff == null || handoffActivationCurrent(handoff, d)) { "Activation did not match the accepted handoff" }
                     val admission = playAdmission?.takeIf { it.id == d.commandId && it.claimEpoch != null }
                     if (admission != null && !admissionCurrent(admission)) {
                         abandonAdmission()
@@ -1259,8 +1374,18 @@ class PlaybackCoordinator(
                         }
                         return
                     }
+                    // Handoff validation suspends BEFORE endpointJob exists. A Pause,
+                    // selection ABA or owner loss there must not become a fresh start.
+                    if (handoff != null && (!handoffActivationCurrent(handoff, d) || !authority.isValid())) {
+                        if (d.epoch == epoch) acks += PlaybackAck(d.deliveryId, d.epoch, "rejected")
+                        return
+                    }
                     activating = true
                     val activated = try { endpointAction {
+                        if (handoff != null && (!handoffActivationCurrent(handoff, d) || !authority.isValid()))
+                            return@endpointAction null
+                        // Retain cancellation identity through the actual endpoint suspension;
+                        // same-target reselection must also cancel this unfinished activation.
                         var latest: PlaybackEndpointResult
                         do {
                             if (admission != null && !admissionCurrent(admission)) return@endpointAction null
@@ -1279,6 +1404,10 @@ class PlaybackCoordinator(
                         latest
                     } } finally { activating = false }
                     if (activated == null || !authority.isValid()) return
+                    if (handoff != null) {
+                        if (!handoffActivationCurrent(handoff, d)) return
+                        handoffWitness = null // Actual, still-current execution completed exactly once.
+                    }
                     if (admission != null && !admissionCurrent(admission)) {
                         return // Timeout/fencing, never fabricated state under a successor.
                     }
@@ -1299,7 +1428,7 @@ class PlaybackCoordinator(
                 if (!startsAllowed && command.type !in setOf("pause", "close")) {
                     PlaybackEndpointResult("rejected", endpoint.exportSnapshot().paused())
                 } else {
-                    if (command.type in setOf("pause", "close")) { generation++; actionVersion++; revokeAuthority(); endpoint.suspendOutput() }
+                    if (command.type in setOf("pause", "close")) { retireHandoff(); generation++; actionVersion++; revokeAuthority(); endpoint.suspendOutput() }
                     val current = executionAuthority() ?: return
                     val executed = endpointAction {
                         if (command.type == "queueIntent") {

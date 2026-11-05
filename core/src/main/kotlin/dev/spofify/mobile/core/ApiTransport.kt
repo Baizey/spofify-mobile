@@ -133,5 +133,11 @@ private fun safeApiError(response: Response, deviceRequest: Boolean, playbackExt
         in 500..599 -> "The server is temporarily unavailable"
         else -> "The server could not complete the request (HTTP ${response.code})"
     }
-    return ApiException(response.code, message, code, reconciliation)
+    // Preserve exactly one protocol rejection fact only after the authenticated player
+    // error view passed validation. Never retain/render arbitrary server error strings.
+    val playbackConflictReason = if (response.code == 409 && reconciliation != null &&
+        (!playbackExtensions || reconciliation["queueIntents"] is JsonObject) &&
+        (root?.get("error") as? JsonPrimitive)?.takeIf { it.isString }?.content == "stale epoch")
+        PlaybackConflictReason.STALE_EPOCH else null
+    return ApiException(response.code, message, code, reconciliation, playbackConflictReason)
 }

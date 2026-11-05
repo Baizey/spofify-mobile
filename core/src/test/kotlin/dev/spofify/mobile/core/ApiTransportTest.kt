@@ -12,8 +12,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import okhttp3.mockwebserver.MockResponse
@@ -152,6 +158,69 @@ class ApiTransportTest {
         )) {
             web.enqueue(jsonResponse(body, status))
             assertNull(apiFailure { api.get(path) }.responseBody)
+        }
+    }
+
+    @Test fun staleEpochReasonRequiresExact409ValidatedPlayerViewAndNegotiatedSidecars() = runBlocking {
+        web.enqueue(loginResponse()); client.login("listener", "password"); web.takeRequest()
+        val path = listOf("api", "me", "player")
+        val base = PlaybackDevicesView("phone", listOf(PlaybackDevice("phone", "Phone", true), PlaybackDevice("pc", "PC", true)),
+            "pc", 2, 8000, state = null, stateSeq = 0, stateAgeMs = 0, transfer = null,
+            directives = emptyList(), commands = emptyList()).toJson()
+        fun body(error: JsonElement = JsonPrimitive("stale epoch"), view: JsonObject = base) =
+            JsonObject(view + ("error" to error)).toString()
+        val sidecar = QueueIntentsView(1, listOf(QueueIntentReceiver("phone", 1)), null, null, emptyList(), emptyList())
+        val negotiated = JsonObject(base + ("queueIntents" to sidecar.let {
+            PlaybackDevicesView.fromJson(base).copy(queueIntents = it).toJson().getValue("queueIntents")
+        }))
+        val sidecarWithInbox = JsonObject(negotiated.getValue("queueIntents").jsonObject +
+            ("directives" to JsonArray(listOf(buildJsonObject { put("deliveryId", "unexpected"); put("state", JsonNull) }))))
+        val invalidStateView = JsonObject(base + ("state" to
+            JsonObject(PlaybackSnapshot().toJson() + ("position" to JsonPrimitive(0)))))
+        data class Case(val label: String, val status: Int = 409, val endpoint: List<String> = path,
+            val raw: String = body(), val extensions: Boolean = false, val recognized: Boolean = false)
+        val cases = listOf(
+            Case("exact legacy player conflict", recognized = true),
+            Case("exact negotiated player conflict", raw = body(view = negotiated), extensions = true, recognized = true),
+            Case("404 is not stale-epoch admission", status = 404),
+            Case("503 is not stale-epoch admission", status = 503),
+            Case("nonplayer", endpoint = listOf("api", "me", "playlists")),
+            Case("player child path", endpoint = path + "other"),
+            Case("other string", raw = body(JsonPrimitive("other conflict /private/cookie-secret"))),
+            Case("wrong case", raw = body(JsonPrimitive("Stale epoch"))),
+            Case("not exact", raw = body(JsonPrimitive("stale epoch "))),
+            Case("numeric error", raw = body(JsonPrimitive(409))),
+            Case("null error", raw = body(JsonNull)),
+            Case("object is not protocol string", raw = body(buildJsonObject { put("code", "STALE_EPOCH"); put("message", "/private/cookie-secret") })),
+            Case("missing error", raw = JsonObject(base.filterKeys { it != "error" }).toString()),
+            Case("missing view", raw = "{}"),
+            Case("empty body", raw = ""),
+            Case("malformed JSON", raw = body().dropLast(1)),
+            Case("invalid view epoch", raw = body(view = JsonObject(base + ("epoch" to JsonPrimitive(-1))))),
+            Case("invalid musical state", raw = body(view = invalidStateView)),
+            Case("unknown private field", raw = body(view = JsonObject(base + ("libraryPath" to JsonPrimitive("/private/cookie-secret"))))),
+            Case("nonempty inbox", raw = body(view = PlaybackDevicesView.fromJson(base).copy(
+                directives = listOf(PlaybackDirective("delivery", 2, "activate", "selection"))).toJson())),
+            Case("negotiated missing extension", extensions = true),
+            Case("unnegotiated extension", raw = body(view = negotiated)),
+            Case("negotiated invalid version", raw = body(view = negotiated).replace("\"version\":1", "\"version\":2"), extensions = true),
+            Case("negotiated missing members", raw = body(view = JsonObject(base + ("queueIntents" to buildJsonObject { put("version", 1) }))), extensions = true),
+            Case("negotiated nonempty sidecar inbox", raw = body(view = JsonObject(base + ("queueIntents" to sidecarWithInbox))), extensions = true),
+        )
+        for (case in cases) {
+            web.enqueue(jsonResponse(case.raw, case.status))
+            val error = apiFailure { api.send("POST", case.endpoint, buildJsonObject { put("action", "poll") }, playbackExtensions = case.extensions) }
+            assertEquals(case.label, if (case.recognized) PlaybackConflictReason.STALE_EPOCH else null, error.playbackConflictReason)
+            assertNull("Playback reason must not be invented as generic code: ${case.label}", error.code)
+            if (case.recognized) {
+                val safe = requireNotNull(error.responseBody)
+                assertEquals("", PlaybackDevicesView.fromJson(safe).error)
+                assertFalse(safe.toString().contains("stale epoch"))
+            }
+            for (visible in listOf(error.message, error.toString(), error.responseBody?.toString().orEmpty())) {
+                assertFalse(case.label, visible.contains("cookie-secret")); assertFalse(case.label, visible.contains("/private"))
+            }
+            assertNull(case.label, error.cause)
         }
     }
 
