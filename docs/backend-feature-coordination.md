@@ -24,11 +24,16 @@ belong to separately coordinated backend work.
 - Empty Search must not issue match-all search reads; retain focused detail or Home.
 - There is no shipped recommendation engine: no fake Spotify recommendations.
 - Playback belongs to MediaSessionService; Pause/Collapse retain the queue.
-- Support configured HTTP LAN/Tailscale literal-IP origins as well as HTTPS.
-  Hostname/public-HTTP admission needs backend coordination, not silent HTTPS-only
-  client policy. HTTP exposes credentials/session traffic without encryption.
-- Use the exact-origin authenticated client for API, artwork and audio ranges;
-  never forward credentials on redirects or embed them in URLs.
+- Android admits syntactically valid explicit HTTP/HTTPS origins, including
+  hostname/public-IP HTTP, preserving the chosen scheme without Login warnings or
+  opt-in controls. HTTP exposes credentials/session traffic without encryption.
+  A backend may independently reject that transport or require its exact-origin
+  allowlist; client admission is not deployed support. Coordinate server policy
+  changes separately, not as a prerequisite for widening Android admission.
+- Use the exact canonical scheme/host/effective-port authenticated client for API,
+  artwork and every audio/range request; refuse authenticated redirects and never
+  embed credentials in URLs. No inferred scheme, DNS classification, automatic
+  upgrade/downgrade or TLS validation bypass.
 
 ## Current authority, not future promises
 

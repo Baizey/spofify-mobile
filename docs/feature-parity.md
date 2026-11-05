@@ -66,13 +66,13 @@ The user-facing **Close player** button has been removed. Pause and collapse are
 
 ## Plain HTTP is supported
 
-Both `http://` and `https://` server origins are in scope. Do not silently upgrade to HTTPS or depend on browser secure-context features for ordinary listening.
+Accept syntactically valid explicit `http://` and `https://` server origins, including hostname, public/private literal-IP and IPv6 HTTP. Preserve the chosen scheme: no inferred scheme, DNS-based classification, automatic upgrade/downgrade or HTTPS-to-HTTP retry. Reject userinfo, non-root paths, queries, fragments, malformed/ambiguous authorities, unsupported schemes and controls before networking.
 
-The Android app permits cleartext access to concrete private/loopback IPs, IPv6 ULA and shared-space/Tailscale IPs. Sign-in shows a plain-language HTTP warning rather than an unexplained acknowledgement checkbox. API, artwork and audio/range requests use the same selected origin and authenticated client.
+Login has no HTTP warning, acknowledgement or opt-in controls. HTTP exposes passwords/session cookies/media without encryption; admission does not weaken exact canonical scheme/host/effective-port isolation. API, artwork and every audio/range request use the same authenticated client; authenticated redirects remain refused and TLS certificate verification stays intact.
 
-Current backend policy rejects **HTTP hostnames** (for example `http://music.local:8080`) and public HTTP; it requires an allowed exact origin and does not mix HTTP with HTTPS origins in one configured allowlist. These are backend constraints too, not just Android validation. If hostname-based HTTP is required, coordinate server policy before widening client admission. HTTP exposes passwords/session cookies/media to the network; disclose that clearly without presenting all non-HTTPS use as unsupported. Never disable TLS certificate verification as a workaround.
+The inspected backend policy rejects HTTP hostnames and public HTTP, requires an allowed exact origin and does not mix HTTP with HTTPS origins in one configured allowlist. A configured backend may independently enforce those restrictions: Android admission is not deployed backend support. Surface refusal concisely and coordinate any server policy change separately; do not retain Android's private-IP-only restriction or modify the live Go repository.
 
-Evidence: mobile `core/ServerAddress.kt`, sign-in UI, `res/xml/network_security_config.xml`; Go `internal/web/auth.go:authTransportAllowed`, `origins.go`, `docs/authentication.md`.
+Contract touchpoints: mobile `core/ServerAddress.kt`, sign-in UI, `res/xml/network_security_config.xml`; backend snapshot references `internal/web/auth.go:authTransportAllowed`, `origins.go`, `docs/authentication.md`. Source references are not deployed compatibility evidence.
 
 ## Future website direction — do not mistake specs for shipped APIs
 
@@ -90,7 +90,11 @@ The FEAT identifiers here name backend planning areas, not required files in the
 
 ## Remembered sign-in
 
-The old HTTP acknowledgement checkbox is not a remember-me control. It is replaced by a visible HTTP warning and a clearly labeled **Remember sign-in on this device** setting, default on for testing. Successful sign-in can save one exact server origin, username and password in a separate Android Keystore-encrypted record. Passwords are never placed in saved UI state, logs or plaintext preferences. Server-origin or username edits clear the form password. Sign out clears the session but keeps the remembered login; **Forget saved login** deletes the credential record and turns remembering off without destroying an active session.
+Automatically replace one separate Android Keystore-encrypted origin/authenticated-username/unmodified-password record only after fully successful, still-current authentication. No opt-in or legacy remember flag may gate future successful saves; failed, partial, cancelled and stale attempts never replace it. Keep sessions in their existing encrypted format and exclude both records from backup/device transfer. A post-auth save failure preserves the valid session and prior durable record and produces a brief truthful notice.
+
+On first form display, autofill the latest valid successful triple together, regardless of a later failed server preference; never combine its credentials with another origin. Preserve user edits through recomposition/error/retry, clear mismatched passwords and reveal state on canonical-origin or username changes, and never resurrect a cleared password on returning to an old identity. Passwords stay out of saved UI state, StateFlow, parcels, URLs, logs and plaintext preferences. Corrupt encrypted data fails closed to manual login without plaintext fallback.
+
+Sign out/expiry retain that encrypted record for explicit re-authentication; sign out still invalidates session authority and stops locally owned audio. Autofill never auto-submits or starts playback and does not replace existing cookie/session restoration or offline retry. The minimal Login has no checkbox, saved-for/Use/Forget controls, HTTP warning or font-license entry. Preserve the full bundled offline notice through the existing signed-in Account route, without depending on the peer Profile feature.
 
 ## Parallel implementation and integration gates
 

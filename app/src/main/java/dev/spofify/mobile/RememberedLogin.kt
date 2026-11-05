@@ -2,7 +2,7 @@ package dev.spofify.mobile
 
 import dev.spofify.mobile.core.ServerAddress
 
-/** One explicitly remembered login. Never put this object in saved state, parcels, or logs. */
+/** The latest successful login. Never put this object in saved state, parcels, or logs. */
 class RememberedLogin(val server: String, val username: String, val password: String) {
     init {
         require(ServerAddress.parse(server).origin == server) { "A canonical server origin is required" }

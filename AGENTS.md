@@ -7,7 +7,7 @@ Native Android only: Kotlin, Jetpack Compose, Media3. No WebView, Node, Expo or 
 - `../spofify-go` is live and independently developed: **read-only**. Coordinate API changes before implementation.
 - `:core` contains the JVM-only client, DTOs and contract tests; `:app` contains Android storage, UI and playback.
 - Reuse the exact-origin authenticated OkHttp client for API, artwork and every audio/range request. Never credentials in URLs/logs; never authenticated redirects.
-- Persist sessions and explicitly remembered sign-in details only with Android Keystore encryption. Never persist plaintext credentials or private catalog paths. Exclude all app data from backup/device transfer and images from disk caching.
+- Persist sessions and the automatically remembered latest successful login only with Android Keystore encryption. Never persist plaintext credentials or private catalog paths. Exclude all app data from backup/device transfer and images from disk caching.
 - Browsing and Play must not call acquisition, download, source or administrative APIs.
 - Audio belongs to MediaSessionService, not a screen. Never autoplay on startup/restoration.
 - Follow the assigned task contract and record review/validation evidence. Task specs may live under `docs/specs/`; do not recreate deleted historical specs or assume a task board is required. Assignment and integration follow `AGENT_BEHAVIOUR.md` and [docs/worktree-review.md](docs/worktree-review.md).

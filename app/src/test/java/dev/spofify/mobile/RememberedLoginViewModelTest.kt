@@ -93,10 +93,12 @@ class RememberedLoginViewModelTest {
             val old = graph.client!!
             // Let the HTTP worker finish, but deliberately do not dispatch the ViewModel continuation.
             awaitWorker { old.currentSession() != null && old.httpClient.dispatcher.runningCallsCount() == 0 }
+            val before = model.state.value
             graph.configure(ServerAddress.parse("https://other.example.com"))
             runCurrent()
+            assertEquals("A retired continuation must not publish busy/error changes", before, model.state.value)
             assertNull(model.state.value.session)
-            assertFalse(model.state.value.busy)
+            assertTrue(model.state.value.busy)
             assertEquals(0, output.connects)
             assertNull(logins.value)
             assertEquals("https://other.example.com", graph.client!!.server.origin)
@@ -121,7 +123,7 @@ class RememberedLoginViewModelTest {
             assertEquals(1, output.connects)
             assertNull(logins.value)
             assertFalse(model.state.value.hasSavedLogin)
-            assertTrue(model.state.value.notice.orEmpty().contains("could not be saved securely"))
+            assertTrue(model.state.value.notice.orEmpty().contains("Could not save sign-in details securely"))
         } finally { store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain() }
     }
 

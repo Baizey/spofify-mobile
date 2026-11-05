@@ -85,7 +85,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         val serial = PlaybackListActionTickets.commit()
     }
     private val listActionTickets = mutableSetOf<ListActionTicket>()
-    private fun freshState(restoring: Boolean = false, server: String = graph.lastServer.ifBlank { remembered?.server.orEmpty() },
+    private fun freshState(restoring: Boolean = false, server: String = remembered?.server ?: graph.lastServer,
         session: Session? = null, busy: Boolean = false, error: String? = null, notice: String? = null) =
         LibraryState(restoring = restoring, server = server, session = session, busy = busy, error = error, notice = notice,
             rememberLogin = graph.rememberLoginEnabled, hasSavedLogin = remembered != null,
@@ -162,6 +162,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private var listPreparationGeneration = -1
     private var generation = 0
     private var signingOut = false
+    private var authenticationSerial = 0L
     private val likeOperations = LikeOperations(viewModelScope, { graph.client },
         changed = { id, liked ->
             mutable.update { it.copy(likes = it.likes + (id to liked), failedLikeStatus = it.failedLikeStatus - id) }
@@ -174,6 +175,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         viewModelScope.launch {
             graph.sessionExpired.collect { expired ->
                 if (expired && !signingOut) {
+                    authenticationSerial++
                     generation++
                     queueGeneration++
                     loadJob?.cancel()
@@ -190,17 +192,22 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     fun reconnect() {
         if (state.value.busy) return
+        val attempt = ++authenticationSerial
+        val client = graph.client
         mutable.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
                 val session = graph.restore()
-                mutable.update { it.copy(restoring = false, busy = false, canRetryConnection = false, session = session) }
+                if (attempt != authenticationSerial || graph.client !== client || client?.currentSession() !== session) return@launch
+                mutable.update { it.copy(restoring = false, busy = false, canRetryConnection = false, session = session,
+                    server = if (session != null) client!!.server.origin else it.server) }
                 if (session != null) {
                     playback.connect()
                     load(Page.Home)
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
+                if (attempt != authenticationSerial || graph.client !== client) return@launch
                 mutable.update { it.copy(restoring = false, busy = false, canRetryConnection = true,
                     error = "Could not reconnect. Check your network or retry the saved connection.") }
             }
@@ -209,6 +216,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     fun signIn(address: String, username: String, password: String) {
         if (state.value.busy) return
+        val attempt = ++authenticationSerial
+        var client = graph.client
         mutable.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
@@ -217,30 +226,27 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                 queueJob?.cancel(); loadJob?.cancel()
                 clearFeatureState(); tabStacks.clear()
                 playback.stop()
-                val client = graph.configure(server)
-                val session = client.login(username.trim(), password)
-                if (graph.client !== client || client.currentSession() != session) {
-                    mutable.update { it.copy(busy = false, error = "The connection changed. Sign in again.") }
-                    return@launch
-                }
+                val active = graph.configure(server)
+                client = active
+                val session = active.login(username.trim(), password)
+                if (attempt != authenticationSerial || graph.client !== active || active.currentSession() !== session) return@launch
                 var notice: String? = null
                 try {
-                    graph.saveLogin(client, session.username, password)
+                    graph.saveLogin(active, session.username, password, session)
+                    // Read back only after a successful durable write; failures retain the old record.
                     remembered = graph.rememberedLogin()
                 } catch (error: Exception) {
                     if (error is CancellationException) throw error
-                    notice = "Signed in, but sign-in details could not be saved securely on this device."
+                    notice = "Signed in. Could not save sign-in details securely."
                 }
-                if (graph.client !== client || client.currentSession() != session) {
-                    mutable.update { it.copy(busy = false, error = "The connection changed. Sign in again.") }
-                    return@launch
-                }
+                if (attempt != authenticationSerial || graph.client !== active || active.currentSession() !== session) return@launch
                 stack.clear(); stack.add(Page.Home)
                 mutable.value = freshState(server = server.origin, session = session, notice = notice)
                 playback.connect()
                 load(Page.Home)
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
+                if (attempt != authenticationSerial || graph.client !== client) return@launch
                 mutable.update { it.copy(busy = false, error = message(error)) }
             }
         }
@@ -248,6 +254,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     fun logout() {
         if (state.value.busy) return
+        authenticationSerial++
         generation++; queueGeneration++
         loadJob?.cancel(); queueJob?.cancel()
         clearFeatureState(); tabStacks.clear()
@@ -274,7 +281,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         try {
             graph.setRememberLogin(enabled)
             if (!enabled) remembered = null
-            mutable.update { it.copy(rememberLogin = enabled, hasSavedLogin = remembered != null, error = null) }
+            mutable.update { it.copy(rememberLogin = true, hasSavedLogin = remembered != null, error = null) }
         } catch (_: Exception) {
             mutable.update { if (it.session == null) it.copy(error = "Could not update saved sign-in details. Please try again.")
                 else it.copy(notice = "Could not forget saved sign-in details. Please try again.") }
@@ -663,6 +670,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     override fun onCleared() {
+        authenticationSerial++
         clearFeatureState()
         playback.release() // Service keeps playing across Activity recreation.
         super.onCleared()

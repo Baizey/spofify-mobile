@@ -278,7 +278,7 @@ class NativeMediaControlsTest {
             onMain { compose.activity.window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true }
         }
         instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
-        compose.onNodeWithText("Connect & listen").performScrollTo().performClick()
+        compose.onNode(hasText("Sign in") and hasClickAction()).performScrollTo().performClick()
         waitFor(hasText("Recently played"))
         assertEquals(0, fixture.audioRequests.get())
         compose.onNodeWithText("Playlists").performClick()

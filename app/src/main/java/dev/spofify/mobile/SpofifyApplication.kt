@@ -59,34 +59,45 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         coordinationScope = null
     }
     val lastServer: String get() = preferences.getString("server", "") ?: ""
-    val rememberLoginEnabled: Boolean get() = preferences.getBoolean("remember_login", true)
+    // Compatibility for the legacy signed-in account UI. Forgetting is not a future save opt-out.
+    val rememberLoginEnabled: Boolean get() = true
 
+    @Synchronized
     fun rememberedLogin(): RememberedLogin? {
         val saved = logins.read() ?: return null
-        val valid = rememberLoginEnabled && runCatching { ServerAddress.parse(saved.server).origin == saved.server }.getOrDefault(false) &&
+        val valid = runCatching { ServerAddress.parse(saved.server).origin == saved.server }.getOrDefault(false) &&
             saved.username.isNotBlank() && saved.password.isNotEmpty()
         if (!valid) { logins.write(null); return null }
         return saved
     }
 
+    @Synchronized
     fun setRememberLogin(enabled: Boolean) {
         if (!enabled) logins.write(null)
-        check(preferences.edit().putBoolean("remember_login", enabled).commit()) { "Could not save the remember-login setting" }
+        // Retain this compatibility API while the account dialog still calls Forget.
+        // A legacy false flag must never suppress the next successful automatic save.
+        preferences.edit().remove("remember_login").commit()
     }
 
-    fun saveLogin(expected: SpofifyClient, username: String, password: String) {
-        check(client === expected && expected.currentSession() != null) { "The sign-in session changed" }
-        if (rememberLoginEnabled) logins.write(RememberedLogin(expected.server.origin, username, password))
-        else logins.write(null)
+    @Synchronized
+    fun saveLogin(expected: SpofifyClient, username: String, password: String,
+        expectedSession: Session? = expected.currentSession()) {
+        check(client === expected && expectedSession != null && expected.currentSession() === expectedSession &&
+            username == expectedSession.username) { "The sign-in session changed" }
+        logins.write(RememberedLogin(expected.server.origin, username, password))
     }
 
     init {
+        // Ignore even an old false value. Best-effort removal cannot break manual authentication,
+        // and must not recreate data already deleted through the former opt-out action.
+        runCatching { preferences.edit().remove("remember_login").commit() }
         sessions.read()?.let { saved ->
             runCatching { configure(ServerAddress.parse(saved.server)) }
                 .onFailure { sessions.clear() }
         }
     }
 
+    @Synchronized
     fun configure(server: ServerAddress): SpofifyClient {
         endCoordination()
         PlaybackService.stopActivePlayback()
@@ -140,6 +151,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         if (client === active) restored else null
     }
 
+    @Synchronized
     fun clear(expected: SpofifyClient? = client) {
         if (client !== expected) return
         endCoordination()

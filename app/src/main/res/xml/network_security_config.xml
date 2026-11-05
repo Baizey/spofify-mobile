@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- ServerAddress runtime validation restricts HTTP to concrete private,
-         loopback and shared-space IPs; Android XML cannot express IP ranges. -->
+    <!-- ServerAddress accepts explicit HTTP and HTTPS origins, including hostnames
+         and public IPs; authenticated requests remain bound to that exact origin. -->
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors><certificates src="system" /></trust-anchors>
     </base-config>

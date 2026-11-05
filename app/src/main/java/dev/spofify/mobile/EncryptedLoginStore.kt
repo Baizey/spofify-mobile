@@ -5,7 +5,7 @@ import android.content.SharedPreferences
 import org.json.JSONObject
 import javax.crypto.SecretKey
 
-/** One explicitly opted-in login, encrypted separately from the session and excluded from backup. */
+/** The latest successful login, encrypted separately from the session and excluded from backup. */
 class EncryptedLoginStore internal constructor(private val encrypted: EncryptedValueStore) : LoginStore {
     constructor(context: Context) : this(
         context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE),

@@ -11,8 +11,8 @@ A native **Android** listener for your own [spofify-go](../spofify-go) server. K
 - Persistent mini-player, expanded Now Playing, seeking, occurrence-aware queue editing, shuffle and repeat.
 - MediaSessionService-owned audio with notification/system controls, audio focus, headphone-disconnect handling and progress-qualified listening history.
 - Service-lifecycle playback-device registration, selected-output controls and exact-snapshot handoff are enabled in source; native runtime/audio/background acceptance remains unverified. See [device playback](docs/device-playback.md).
-- Android Keystore-encrypted sessions and optional remembered server/username/password, without automatic password sign-in or autoplay.
-- Bundled **JetBrains Mono** typography, including its full offline font-license notice on Sign-in and in Account. Provenance and SIL OFL license: [third_party/jetbrains-mono](third_party/jetbrains-mono/).
+- Android Keystore-encrypted sessions and automatic remembering/autofill of the latest successful server/username/password, without automatic password sign-in or autoplay.
+- Bundled **JetBrains Mono** typography, including its full offline font-license notice in the existing signed-in Account route, not on Sign-in. Provenance and SIL OFL license: [third_party/jetbrains-mono](third_party/jetbrains-mono/).
 
 **This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory. Earlier isolated emulator attempts failed before app launch; those failures do not establish the current environment's condition. Normal isolated synthetic AVD validation is allowed, but no successful after-render is established by this documentation cleanup: **UI validation remains not complete**. See [docs/ui-validation.md](docs/ui-validation.md) and [docs/testing.md](docs/testing.md).
 
@@ -44,13 +44,14 @@ The repository's local tooling convention uses ignored `.tooling/` directories; 
 Enter an **origin**, for example `https://music.example.com` or `http://192.168.1.20:8080`. Do not append `/listen` or `/api`. URL credentials, paths, query strings and fragments are rejected.
 
 - Prefer HTTPS with a certificate trusted by Android. Certificate verification is never disabled.
-- Trusted-LAN HTTP is limited to concrete private, loopback and Tailscale/shared-space IPs. A visible warning explains that HTTP exposes passwords and media; there is no separate acknowledgement checkbox.
-- The URL's exact host/port must already be permitted by your server's origin configuration. The app does not rewrite that configuration.
+- Explicit HTTP origins are accepted for hostnames and public/private/loopback IPs as well as HTTPS; the selected scheme is preserved. HTTP exposes passwords, session traffic and media without encryption, but Login has no HTTP warning, acknowledgement or opt-in controls.
+- Your server may independently reject HTTP transport or require its exact scheme/host/effective-port origin allowlist. Client admission is not a claim of deployed backend support; the app does not rewrite server configuration, silently downgrade or bypass TLS checks.
 - A phone's `127.0.0.1` is the phone, not your development machine. Use its reachable LAN/Tailscale address. An emulator's `10.0.2.2` still needs to be an allowed origin on the server; the app cannot bypass Host checks.
 - Use an existing listener or admin account. Both receive the same listener-only app; no Spotify credentials are needed here.
 - Sessions expire on the server (currently 12 hours). Sign in again after expiry. Sign out before changing servers.
-- **Remember sign-in on this device** defaults on for convenient testing. After successful sign-in, one server/username/password is encrypted separately from the session using Android Keystore; it is never put in backup, saved UI state or logs. Changing the server origin or username clears the form password. It never signs in automatically with a password.
-- Sign out clears the session but keeps that remembered login for next time. **Forget saved login** (on sign-in or in Account) deletes it and turns remembering off without ending an active session. Turn remembering off on shared devices.
+- Only a fully successful, still-current sign-in automatically replaces the single server/authenticated-username/password record, separately encrypted from the session using Android Keystore and excluded from backup/device transfer, saved UI state and logs. Failed, cancelled or stale attempts never replace it. A failure to save after successful authentication keeps the session and prior durable record and reports the save failure.
+- The minimal Login form autofills all three fields together from that latest successful record, even after a failed attempt at another server. Edited values survive error/retry; changing canonical origin or username clears any mismatched form password. No remember checkbox or saved-login Use/Forget controls appear on Login, and autofill never submits a password automatically.
+- Sign out clears the session and stops locally owned audio but retains the encrypted latest successful login; expiry likewise retains it for explicit re-authentication. Existing session restoration/offline retry is separate from password autofill and never autoplays.
 
 ## Structure
 

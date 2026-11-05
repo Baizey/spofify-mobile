@@ -14,6 +14,7 @@ import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModelProvider
@@ -79,8 +80,66 @@ class NativeUiSmokeTest {
             try {
                 writeRunInfo()
                 waitFor(hasText("Server URL"))
+                val signInButton = hasText("Sign in") and hasClickAction()
+                compose.onNode(signInButton).performScrollTo().assertIsNotEnabled()
+                compose.onAllNodes(isToggleable()).assertCountEquals(0)
+                compose.onNodeWithText("Font license").assertDoesNotExist()
+                compose.onNodeWithText("Use saved login").assertDoesNotExist()
+                compose.onNodeWithText("Forget saved login").assertDoesNotExist()
                 screenshot("01-sign-in")
-                compose.onNodeWithText("Font license").performScrollTo().performClick()
+                // Exercise the actual form, native IME and Back at 320dp/font2, not a pre-auth
+                // legal/settings entry. Semantics host checks cannot approve this native path.
+                sizeChanged = true
+                val signInNarrowWidth = (320f * compose.activity.resources.displayMetrics.density).roundToInt()
+                shell("wm size ${signInNarrowWidth}x${baselineDisplaySize.substringAfter('x')}")
+                compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == signInNarrowWidth }
+                screenshot("01c-narrow-sign-in")
+                fontChanged = true
+                shell("settings put system font_scale 2.0")
+                waitForFont(2f)
+                compose.onNode(signInButton).performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+                screenshot("01d-font2-narrow-sign-in")
+                compose.onNodeWithText("Server URL").performScrollTo().performClick()
+                    .performTextReplacement("https://synthetic.example/api")
+                compose.onNodeWithText("Server URL")
+                    .assert(SemanticsMatcher.expectValue(SemanticsProperties.ImeAction, ImeAction.Next)).performImeAction()
+                compose.onNodeWithText("Username").assertIsFocused().performTextReplacement(UiFixtureServer.USERNAME)
+                compose.onNodeWithText("Username")
+                    .assert(SemanticsMatcher.expectValue(SemanticsProperties.ImeAction, ImeAction.Next)).performImeAction()
+                compose.onNodeWithText("Password").assertIsFocused().performTextReplacement(UiFixtureServer.PASSWORD)
+                compose.onNodeWithText("Password")
+                    .assert(SemanticsMatcher.expectValue(SemanticsProperties.ImeAction, ImeAction.Done)).performImeAction()
+                compose.onNode(signInButton).performScrollTo().assertIsNotEnabled()
+                compose.onNodeWithText("Enter only an HTTP(S) origin, without credentials, path, query or fragment")
+                    .performScrollTo().assertIsDisplayed()
+                screenshot("01e-font2-narrow-invalid-origin")
+                compose.onNodeWithText("Server URL").performScrollTo().performClick().performTextReplacement(fixture.origin)
+                compose.onNodeWithText("Server URL").performImeAction()
+                compose.onNodeWithText("Username").assertIsFocused().performTextReplacement(UiFixtureServer.USERNAME)
+                compose.onNodeWithText("Username").performImeAction()
+                compose.onNodeWithText("Password").assertIsFocused().performTextReplacement(UiFixtureServer.PASSWORD)
+                compose.onNodeWithText("Password").assert(SemanticsMatcher.keyIsDefined(SemanticsProperties.Password))
+                compose.onNodeWithContentDescription("Show password").assertHeightIsAtLeast(48.dp)
+                compose.onNode(signInButton).performScrollTo().assertIsDisplayed().assertIsEnabled().assertHeightIsAtLeast(48.dp)
+                waitForIme(true)
+                screenshot("01b-font2-narrow-sign-in-keyboard") // Synthetic password stays masked.
+                pressBack() // Native Back dismisses the IME, not the sign-in screen.
+                waitForIme(false)
+                compose.onNode(signInButton).performScrollTo().assertIsDisplayed().assertIsEnabled()
+                screenshot("01f-font2-narrow-sign-in-after-back")
+                compose.onNodeWithText("Password").performScrollTo().performClick().performImeAction()
+
+                waitFor(hasText("Recently played"))
+                waitFor(hasText(UiFixtureServer.TRACK_NAMES.first()))
+                shell("settings put system font_scale $originalFontScale")
+                waitForFont(originalFontScale)
+                shell("wm size ${originalSizeOverride ?: "reset"}")
+                compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
+                screenshot("02-home")
+                // Login no longer exposes legal controls; the existing signed-in account route
+                // still opens the complete bundled offline notice (no Profile dependency).
+                compose.onNodeWithContentDescription("Account and server").performClick()
+                compose.onNodeWithText("Font license").assertIsDisplayed().performClick()
                 val fontLicenseTitle = hasText("JetBrains Mono font license")
                 waitFor(fontLicenseTitle)
                 compose.onNode(fontLicenseTitle).assertIsDisplayed()
@@ -90,44 +149,32 @@ class NativeUiSmokeTest {
                 compose.onNodeWithText("Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)", substring = true).assertExists()
                 compose.onNodeWithText("SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007", substring = true).assertExists()
                 compose.onNodeWithText("OTHER DEALINGS IN THE FONT SOFTWARE.", substring = true).assertExists()
-                screenshot("00a-font-license")
-                pressBack()
-                waitUntilAbsent(fontLicenseTitle)
-                compose.onNodeWithText("Connect & listen").assertExists()
-                // Typography must also fit before authentication, including its offline dialog.
-                sizeChanged = true
-                val signInNarrowWidth = (320f * compose.activity.resources.displayMetrics.density).roundToInt()
+                compose.onNodeWithText("Done").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+                screenshot("02a-signed-in-font-license")
+                // Retain the narrow/font2 legal-dialog regression after authentication. A real
+                // configuration recreation may close the dialog; reopen only the existing route.
                 shell("wm size ${signInNarrowWidth}x${baselineDisplaySize.substringAfter('x')}")
                 compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == signInNarrowWidth }
-                screenshot("01c-narrow-sign-in")
-                fontChanged = true
                 shell("settings put system font_scale 2.0")
                 waitForFont(2f)
-                compose.onNodeWithText("Connect & listen").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
-                screenshot("01d-font2-narrow-sign-in")
-                compose.onNodeWithText("Font license").performScrollTo().performClick()
+                if (!exists(fontLicenseTitle)) {
+                    compose.onNodeWithContentDescription("Account and server").performClick()
+                    compose.onNodeWithText("Font license").assertIsDisplayed().performClick()
+                }
                 waitFor(fontLicenseTitle)
-                screenshot("00b-font2-narrow-font-license")
+                compose.onNodeWithText(fullFontLicense).assertExists()
+                compose.onNodeWithText("Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)", substring = true).assertExists()
+                compose.onNodeWithText("SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007", substring = true).assertExists()
+                compose.onNodeWithText("OTHER DEALINGS IN THE FONT SOFTWARE.", substring = true).assertExists()
                 compose.onNodeWithText("Done").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+                screenshot("02aa-font2-narrow-signed-in-font-license")
                 pressBack()
                 waitUntilAbsent(fontLicenseTitle)
                 shell("settings put system font_scale $originalFontScale")
                 waitForFont(originalFontScale)
                 shell("wm size ${originalSizeOverride ?: "reset"}")
                 compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
-                compose.onNodeWithText("Server URL").performScrollTo().performClick().performTextReplacement(fixture.origin)
-                compose.onNodeWithText("Username").performScrollTo().performClick().performTextReplacement(UiFixtureServer.USERNAME)
-                compose.onNodeWithText("Password").performScrollTo().performClick().performTextReplacement(UiFixtureServer.PASSWORD)
-                compose.onNodeWithText("Connect & listen").performScrollTo().assertIsDisplayed().assertIsEnabled()
-                waitForIme(true)
-                screenshot("01b-sign-in-keyboard") // Synthetic password stays masked.
-                pressBack() // Native Back dismisses the IME, not the sign-in screen.
-                waitForIme(false)
-                compose.onNodeWithText("Connect & listen").performScrollTo().performClick()
-
                 waitFor(hasText("Recently played"))
-                waitFor(hasText(UiFixtureServer.TRACK_NAMES.first()))
-                screenshot("02-home")
                 compose.onNodeWithText("Liked songs").performClick()
                 waitFor(hasText("Liked songs") and !hasClickAction())
                 screenshot("02b-liked-songs-root")

@@ -108,8 +108,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         return
     }
     if (state.session == null) {
-        SignIn(state, model.rememberedLogin, model::signIn, model::reconnect, model::setRememberLogin,
-            model::forgetSavedLogin, onShowFontLicense = { fontLicense = true })
+        SignIn(state, model.rememberedLogin, model::signIn, model::reconnect)
         return
     }
     val client = model.graph.client ?: return
