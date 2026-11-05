@@ -1121,7 +1121,8 @@ class PlaybackCoordinator(
         view: PlaybackDevicesView? = state.value.view, localDeviceId: String = state.value.deviceId): PlaybackSnapshot? {
         if (!receiverRegistered || expected == null || view == null || view.activeDeviceId != localDeviceId ||
             expected.outputDeviceId != localDeviceId || view.queueIntents?.binding != expected ||
-            view.transfer != null || view.quarantineMs != 0L ||
+            view.transfer != null || view.quarantineMs != 0L || view.directives.isNotEmpty() ||
+            view.commands.any { it.status == "pending" } ||
             view.devices.none { it.deviceId == localDeviceId && it.available }) return null
         val accepted = view.state ?: return null
         val live = endpoint.exportSnapshot().validated()
