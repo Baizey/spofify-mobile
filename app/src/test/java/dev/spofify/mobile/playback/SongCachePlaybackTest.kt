@@ -37,6 +37,7 @@ import java.nio.ByteOrder
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /** Portable service/AppGraph blackbox regressions, not native/acoustic or real-broker evidence.
  * Distinct WAV bytes pass through the production authenticated DataSource and unchanged
@@ -68,12 +69,14 @@ class SongCachePlaybackTest {
      * production receiver. No directives/activation/start ACK or cache result are invented.
      */
     private class Room(private val remote: Boolean = false, private val sampleRate: Int = 8000,
-        private val longCurrent: Boolean = false, private val longFutureB: Boolean = false) : Dispatcher() {
+        private val longCurrent: Boolean = false, private val longFutureB: Boolean = false,
+        private val normalTrackSeconds: Int = 12) : Dispatcher() {
         /** Bytes scheduled at dispatch, not bytes written to a socket or read by a client.
          * A delayed/cancelled response can schedule its full body but transmit less or nothing.
          */
         data class Audio(val id: String, val method: String, val range: String?, val scheduledBodyBytes: Int)
         val audio = CopyOnWriteArrayList<Audio>()
+        @Volatile var onAudioRequest: ((Audio) -> Unit)? = null
         val unexpected = CopyOnWriteArrayList<String>()
         val registrations = AtomicInteger()
         val polls = AtomicInteger()
@@ -119,7 +122,9 @@ class SongCachePlaybackTest {
                 val start = range?.removePrefix("bytes=")?.substringBefore('-')?.toIntOrNull() ?: 0
                 if (start !in wav.indices) return MockResponse().setResponseCode(416)
                 val count = if (request.method == "HEAD") 0 else wav.size - start
-                audio += Audio(id, request.method!!, range, count)
+                val observed = Audio(id, request.method!!, range, count)
+                audio += observed
+                onAudioRequest?.invoke(observed)
                 val response = MockResponse().setHeader("Content-Type", "audio/wav")
                     .setHeader("Cache-Control", "no-store").setHeader("Accept-Ranges", "bytes")
                     .setHeader("Content-Length", wav.size - start)
@@ -162,7 +167,7 @@ class SongCachePlaybackTest {
                 return json(view().toJson().toString())
             }
         }
-        fun durationMillis(id: String) = if (longCurrent && id == "A" || longFutureB && id == "B") 120_000L else 12_000L
+        fun durationMillis(id: String) = if (longCurrent && id == "A" || longFutureB && id == "B") 120_000L else normalTrackSeconds * 1000L
         fun fetched() = audio.filter { it.method == "GET" }.map { it.id }.toSet()
         fun scheduledBodies(id: String) = audio.filter { it.id == id && it.method == "GET" }
             .sumOf { it.scheduledBodyBytes.toLong() }
@@ -188,9 +193,10 @@ class SongCachePlaybackTest {
     }
 
     private inner class Journey(remote: Boolean = false, private val limits: SongCache.Limits = SongCache.Limits(),
-        sampleRate: Int = 8000, longCurrent: Boolean = false, longFutureB: Boolean = false) : AutoCloseable {
+        sampleRate: Int = 8000, longCurrent: Boolean = false, longFutureB: Boolean = false,
+        normalTrackSeconds: Int = 12) : AutoCloseable {
         val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        val room = Room(remote, sampleRate, longCurrent, longFutureB)
+        val room = Room(remote, sampleRate, longCurrent, longFutureB, normalTrackSeconds)
         val web = MockWebServer().apply { dispatcher = room; start(InetAddress.getByName("127.0.0.1"), 0) }
         val server = ServerAddress.parse("http://127.0.0.1:${web.port}")
         val sessions = Sessions()
@@ -513,6 +519,61 @@ class SongCachePlaybackTest {
             assertEquals(setOf("A", "B", "C", "D", "E"), j.room.fetched())
             assertEquals(1, j.room.audio.count { it.id == "B" && it.method == "GET" })
             j.assertHealthy()
+        }
+    }
+
+    @Test fun ordinaryPlayerLoadingAndWorkerRequestsStayWithinThenCurrentPlusFiveEvenForShortTracks() {
+        Journey(limits = SongCache.Limits(maxTracks = 20, maxBytes = 512 * 1024L),
+            normalTrackSeconds = 1).use { j ->
+            j.startService()
+            val queue = listOf("A", "B", "C", "D", "E", "F", "G", "H", "I")
+            data class RequestedAtCurrent(val method: String, val id: String, val current: String?)
+            val current = AtomicReference<String?>(null)
+            val transitions = CopyOnWriteArrayList<String>()
+            val trace = CopyOnWriteArrayList<RequestedAtCurrent>()
+            val listener = object : Player.Listener {
+                override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
+                    current.set(mediaItem?.mediaId)
+                    synchronized(transitions) {
+                        if (transitions.size == 32) transitions.removeAt(0)
+                        transitions += "${mediaItem?.mediaId}:$reason"
+                    }
+                }
+            }
+            // Main-thread callbacks publish immutable identity through the atomic reference.
+            // The authenticated server dispatcher never reads a Player from its own thread.
+            j.session.player.addListener(listener)
+            j.room.onAudioRequest = { request ->
+                synchronized(trace) {
+                    if (trace.size == 64) trace.removeAt(0)
+                    trace += RequestedAtCurrent(request.method, request.id, current.get())
+                }
+            }
+            val previousDiagnostics = timeoutDiagnostics
+            timeoutDiagnostics = { "${previousDiagnostics?.invoke()}; trace=$trace; transitions=$transitions" }
+            try {
+                j.play(*queue.toTypedArray())
+                // Do not stop at first READY: allow ordinary forward loading and natural
+                // current transitions to exercise the entire nine-track queue. Under a
+                // correct bound, I becomes eligible only once actual current reaches D.
+                j.awaitFetched(*queue.toTypedArray())
+                val gets = trace.filter { it.method == "GET" }
+                assertEquals("The bounded trace must retain every authenticated GET", j.room.audio.count { it.method == "GET" }, gets.size)
+                val violations = gets.filter { request ->
+                    val at = request.current?.let(queue::indexOf) ?: -1
+                    at < 0 || request.id !in queue.subList(at, minOf(queue.size, at + 6))
+                }
+                assertTrue("Audio GET escaped then-current + five: $violations; trace=$trace; transitions=$transitions",
+                    violations.isEmpty())
+                assertTrue("A must have produced real distinct PCM, not just prepared metadata", consumed("A") > 0)
+                assertTrue("Natural queue progression must retain healthy actual output", j.controller!!.isPlaying)
+                assertTrue("Observe initial current through the real public transition callback", transitions.any { it.startsWith("A:") })
+                j.assertHealthy()
+            } finally {
+                timeoutDiagnostics = previousDiagnostics
+                j.room.onAudioRequest = null
+                j.session.player.removeListener(listener)
+            }
         }
     }
 
