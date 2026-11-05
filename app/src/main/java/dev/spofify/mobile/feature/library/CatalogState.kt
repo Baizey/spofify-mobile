@@ -459,7 +459,17 @@ class CatalogStateHolder(
             try {
                 val result = reader.detail(item.kind, item.id)
                 if (current()) {
-                    val recovering = state.value.current.detailUnavailable
+                    val previous = state.value.current
+                    if (result.kind != item.kind || result.id != item.id) {
+                        navigationVersion++
+                        throw ApiException(200, "The server returned different music. Try again.")
+                    }
+                    // Resolving a seed can enrich credits/art without changing source identity.
+                    // Once resolved, a changed detail is a new source; availability changes are
+                    // significant even on the first read. Neither can renew a held old action.
+                    if ((previous.detailResolved && previous.item != result) || previous.item?.playable != result.playable)
+                        navigationVersion++
+                    val recovering = previous.detailUnavailable
                     update { it.copy(item = result, detailResolved = true, detailLoading = false,
                         detailNeedsReload = false, detailUnavailable = false,
                         sections = if (recovering) emptyMap() else it.sections) }
@@ -468,11 +478,14 @@ class CatalogStateHolder(
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (current()) update {
-                    if (error is ApiException && error.status == 404) it.copy(detailLoading = false, detailResolved = true,
-                        detailNeedsReload = false, detailUnavailable = true, sections = emptyMap(),
-                        detailError = "This music is no longer saved. Go back to search.")
-                    else it.copy(detailLoading = false,
-                        detailError = if (quiet && it.detailResolved) null else catalogError(error))
+                    if (error is ApiException && error.status == 404) {
+                        navigationVersion++
+                        it.copy(detailLoading = false, detailResolved = true,
+                            detailNeedsReload = false, detailUnavailable = true, sections = emptyMap(),
+                            detailError = "This music is no longer saved. Go back to search.")
+                    } else it.copy(detailLoading = false,
+                        detailError = if (quiet && it.detailResolved && !(error is ApiException && error.status == 200))
+                            null else catalogError(error))
                 }
             } finally {
                 if (current()) { jobs.remove("detail"); requests.remove("detail"); applyPendingRevision() }
@@ -516,8 +529,15 @@ class CatalogStateHolder(
         if (!catchUpAllowed) return
         catchUpAllowed = false
         pendingRevision = null
+        // The first cheap fence also re-reads a detail whose seed has no revision. That
+        // same-baseline read is not a source change and must not retire an already open More.
+        // A real revision advance, or a retained older prefix overtaken by an earlier poll,
+        // still invalidates source authority before rebuilding anything.
+        val sourceChanged = knownRevision?.let { revision > it } == true || state.value.stack.any { screen ->
+            screen.sections.values.any { it.loaded && it.revision != revision }
+        }
         knownRevision = maxOf(knownRevision ?: revision, revision)
-        navigationVersion++
+        if (sourceChanged) navigationVersion++
         mutable.value = mutable.value.copy(stack = mutable.value.stack.map { screen ->
             screen.copy(stale = true, sections = screen.sections.mapValues { (_, section) ->
                 // A new revision invalidates the prefix too, not just a failed/pending expansion.

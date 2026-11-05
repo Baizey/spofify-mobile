@@ -174,6 +174,7 @@ class PlaylistEditorContinuousHostTest {
                 compose.waitForIdle(); assertTrue(cursors.isEmpty())
                 compose.onNodeWithText("Refresh preview").performScrollTo().performClick()
                 waitForRequests(cursors, 1)
+                waitForPublishedPreview()
                 compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("40. Song 39"))
                 waitForRequests(cursors, 2)
                 scrollTo("61. Song 60")
@@ -188,6 +189,7 @@ class PlaylistEditorContinuousHostTest {
                 compose.onNodeWithText("Preview is not current. Draft retained; refresh preview explicitly.").performScrollTo().assertExists()
                 compose.onNodeWithText("Refresh preview").performScrollTo().performClick()
                 waitForRequests(cursors, countAfterEdit + 1)
+                waitForPublishedPreview()
                 assertEquals("initial", cursors.last())
             } finally {
                 compose.runOnIdle { shown.value = false }; compose.waitForIdle()
@@ -195,6 +197,15 @@ class PlaylistEditorContinuousHostTest {
                 client.httpClient.dispatcher.executorService.shutdown()
             }
         }
+    }
+    private fun waitForPublishedPreview() {
+        // Server receipt is not UI publication: response decoding runs on the HTTP dispatcher.
+        compose.waitUntil(5_000) {
+            compose.waitForIdle()
+            compose.onAllNodesWithText("81 matches · 81 with recorded audio. Preview is read-only.")
+                .fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Retry preview").assertDoesNotExist()
     }
     private fun scrollTo(text: String) {
         compose.waitUntil(5_000) {

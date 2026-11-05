@@ -3,15 +3,15 @@
 ## Tracking
 
 - ID: FEAT-118
-- Status: todo
-- Phase: implementation
+- Status: implementation; installed-native acceptance pending
+- Phase: validation
 - Spec readiness: ready
-- Owner: Unassigned
-- Branch: TBD
-- Worktree: TBD
+- Owner: FEAT-118 lead
+- Branch: `feat/automatic-mobile-lists`
+- Worktree: `/var/home/lsm/repos/spofify-mobile-continuous-lists`
 - Depends on: none
 - Touchpoints: `feature/library/SearchRoute.kt`, `CatalogState.kt`; `MainActivity.kt` LikedSongs / `LibraryViewModel.kt`; `feature/playlists/PlaylistsRoute.kt`, `PlaylistEditor.kt`, `AddToPlaylistSheet.kt`; focused host/state/native fixtures; narrow active UX documentation updates
-- Next action: Assign one lead for this complete cross-list interaction feature, focused validation, one proportionate independent exact-SHA review and individual landing. Coordinate FEAT-117 shared hunks; consume only landed successors, not unfinished imports or a combined mega-unit.
+- Next action: Complete focused/full automated validation, one proportionate independent exact-SHA review and individual source landing; keep installed-native acceptance pending the accessible approved Pixel 10 Pro control route. Coordinate FEAT-117 shared hunks; consume only landed successors, not unfinished imports or a combined mega-unit.
 
 ## Authority and scope
 
@@ -57,7 +57,7 @@ Reuse existing holder/job/section/request machinery and lazy-list geometry; a sm
 
 Read current `AGENTS.md`, assigned roles in `AGENT_BEHAVIOUR.md`, **full** `docs/mobile-ux.md`, and `testing.md`, `ui-validation.md`, `worktree-review.md`, `storage-hygiene.md`, `device-playback.md` / relevant prepared-transport guidance. Run mandatory current offline API37 five-task gate including provisioned integration category under BUILD; release before standalone NATIVE/exact APK `--skip-build`. Obtain one focused independent read-only review of exact committed candidate/base, source/contracts/tests and affected images, fix non-nits, individually land/postcheck with normal Git locks only (no MAIN/Git guard/flock). No new Go/browser feature or backend change is authorized by running existing gates.
 
-Capture and inspect installed-APK continuous Search/groups/detail children/Likes/playlist index/manual/derived/preview/chooser/recovery, including loading/end/error/retry, duplicates, held action across append, Back/tab return, narrow + font2. Record exact revision/APK hash, AVD/API/viewport/font and inspected image paths, stable scroll/row/chrome/accessibility findings; required Sign-in/Home/Search/Playlists/Now Playing smoke and parent's combined pass remain. Lead **and reviewer must inspect the user's before-image** recorded in FEAT-117 (`a29283ab…427ea8`), not mistake it for after evidence. The current preboot SIGSEGV/no-KVM native assessment means **no identical repeat ritual** or downloads/personal hardware/live-backend fallback; only materially changed supported isolated prerequisites justify reassessment. Without installed after capture/inspection report **UI validation BLOCKED / NOT COMPLETE**, not a source/component pass or completed feature.
+Capture and inspect installed-APK continuous Search/groups/detail children/Likes/playlist index/manual/derived/preview/chooser/recovery, including loading/end/error/retry, duplicates, held action across append, Back/tab return, narrow + font2. Record exact revision/APK hash, AVD/API/viewport/font and inspected image paths, stable scroll/row/chrome/accessibility findings; required Sign-in/Home/Search/Playlists/Now Playing smoke and parent's combined pass remain. Lead **and reviewer must inspect the user's before-image** recorded in FEAT-117 (`a29283ab…427ea8`), not mistake it for after evidence. The earlier preboot SIGSEGV/no-KVM assessment is historical, not evidence of a current Pixel 10 Pro failure. The current Pixel 10 Pro AVD has a recent boot marker, but its registered emulator-5554 control ports 5554/5555 and existing ADB 5037 returned connection refused from the tool environment; no current boot failure or app inspection was observed. Installed-native validation is **NOT COMPLETE: current control route unavailable**, pending a user-confirmed accessible approved host ADB route through the parent's single native-validation lead. Do not start competing probes, wipe the AVD, repeat old flag rituals, download replacements or use personal physical hardware/live backends. Without installed after capture/inspection, report native acceptance separately from source/automated implementation delivery.
 
 FEAT-117 overlaps playlist host/shared-row tests only; resolve successor hunks from **landed main** normally and preserve its minimal header/shared row geometry. Independent FEAT-115 (`fdd9036d`, song cache/local-media/auth/Service), BUG-103 (`7ff941f2`, transient recovery), FEAT-116 (`e7b3acc7`, only PlaylistOccurrenceActionsTest/TypographyTest cuts + audit docs) are not dependencies; coordinate potential tests/LibraryViewModel overlap, never import unfinished units.
 

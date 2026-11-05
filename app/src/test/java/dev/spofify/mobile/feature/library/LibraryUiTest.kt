@@ -160,7 +160,9 @@ class LibraryUiTest {
             compose.onNodeWithText("Next").assertDoesNotExist()
             compose.onNodeWithText("Back").assertDoesNotExist()
             compose.onNodeWithText("See more artists").assertDoesNotExist()
-            compose.onNodeWithTag("catalog-results").performScrollToNode(hasText("tracks 7"))
+            // Grouped demand deliberately waits for its actual final row, not the old
+            // three-row near-end window, so later result groups cannot be starved.
+            compose.onNodeWithTag("catalog-results").performScrollToNode(hasText("tracks 9"))
             compose.waitUntil(5_000) { compose.runOnIdle {
                 holder.state.value.current.sections.getValue("tracks").items.size == 20
             } }

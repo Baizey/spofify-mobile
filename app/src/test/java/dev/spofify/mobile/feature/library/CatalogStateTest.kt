@@ -467,6 +467,68 @@ class CatalogStateTest {
         holder.close()
     }
 
+    @Test fun firstSameRevisionDetailFencePreservesActionsButRealRevisionAdvanceRetiresThem() = runTest {
+        for (kind in listOf("track", "album")) {
+            val seed = LibraryItem(kind, "detail", "Detail")
+            val reader = Reader().apply { suspendDetails = true }
+            val holder = CatalogStateHolder(reader, backgroundScope, initialItem = seed)
+            holder.setVisible(true); runCurrent()
+            // Albums can establish a baseline through their child read before detail resolves;
+            // tracks have no child section. Both initial cheap-fence paths must stay benign.
+            reader.completePending(1); runCurrent()
+            val openingVersion = holder.navigationVersion
+            holder.checkRevision(); runCurrent()
+            reader.pendingDetails[0].complete(seed); runCurrent()
+            assertEquals("The initial fence must still validate the detail", 2, reader.pendingDetails.size)
+            assertEquals("Same-baseline revalidation is not a source change", openingVersion, holder.navigationVersion)
+            reader.pendingDetails[1].complete(seed)
+            reader.completePending(1); runCurrent()
+            assertEquals(openingVersion, holder.navigationVersion)
+
+            reader.revisionValue = 2
+            holder.checkRevision(); runCurrent()
+            assertTrue("A genuine source revision must still retire a held action", holder.navigationVersion > openingVersion)
+            reader.pendingDetails[2].complete(seed)
+            reader.completePending(2); runCurrent()
+            holder.close()
+        }
+    }
+
+    @Test fun changedResolvedDetailAndWithdrawalRetireActionsEvenAtSamePolledRevision() = runTest {
+        for (change in listOf("metadata", "availability", "identity", "missing")) {
+            val seed = LibraryItem("track", "detail", "Detail", hasAudio = true)
+            val reader = Reader().apply { suspendDetails = true }
+            val holder = CatalogStateHolder(reader, backgroundScope, initialItem = seed)
+            holder.setVisible(true); runCurrent()
+            reader.pendingDetails.single().complete(seed); runCurrent()
+            val openingVersion = holder.navigationVersion
+            if (change == "missing") reader.detailError = ApiException(404, "Missing")
+            // First validation requests a detail read without changing the known revision.
+            holder.checkRevision(); runCurrent()
+            if (change != "missing") {
+                assertEquals(openingVersion, holder.navigationVersion)
+                val changed = when (change) {
+                    "metadata" -> seed.copy(name = "Changed detail")
+                    "availability" -> seed.copy(hasAudio = false)
+                    else -> seed.copy(id = "different-source")
+                }
+                reader.pendingDetails.last().complete(changed); runCurrent()
+            }
+            assertTrue("$change must revoke the previously held detail action", holder.navigationVersion > openingVersion)
+            val current = holder.state.value.current
+            when (change) {
+                "metadata" -> assertEquals("Changed detail", current.item?.name)
+                "availability" -> assertFalse(checkNotNull(current.item).playable)
+                "identity" -> {
+                    assertEquals("detail", current.item?.id)
+                    assertNotNull(current.detailError)
+                }
+                else -> assertTrue(current.detailUnavailable)
+            }
+            holder.close()
+        }
+    }
+
     @Test fun firstParentDetailFenceIsIndependentOfAnEarlierChildListingBaseline() = runTest {
         val reader = Reader().apply { suspendDetails = true; revisionValue = 2 }
         val holder = CatalogStateHolder(reader, backgroundScope, initialItem = LibraryItem("album", "album", "Seed"))

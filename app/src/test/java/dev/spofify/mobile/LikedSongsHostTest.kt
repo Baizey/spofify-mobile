@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.dp
@@ -134,10 +135,17 @@ class LikedSongsHostTest {
                     }
                     "/api/me/likes/status" -> json("""{"items":[${(0..120).joinToString(",") { """{"trackId":"song-$it","liked":true}""" }}]}""")
                     "/api/library/revision" -> json("""{"revision":1}""")
-                    else -> if (path.startsWith("/api/library/tracks/song-")) {
-                        val id = path.substringAfterLast("song-").toInt()
-                        json("""{"item":${track(id)},"revision":1}""")
-                    } else json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
+                    else -> when {
+                        // Artwork uses the same authenticated client/dispatcher as list reads.
+                        // Missing synthetic art must complete, not crash a server worker and
+                        // occupy every per-origin OkHttp slot until its read timeout.
+                        path.endsWith("/artwork") -> MockResponse().setResponseCode(404)
+                        path.matches(Regex("/api/library/tracks/song-[0-9]+")) -> {
+                            val id = path.substringAfterLast("song-").toInt()
+                            json("""{"item":${track(id)},"revision":1}""")
+                        }
+                        else -> json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
+                    }
                 }
             }
         }
@@ -184,19 +192,57 @@ class LikedSongsHostTest {
         } finally { web.shutdown() }
     }
 
-    private fun await(condition: () -> Boolean) = compose.waitUntil(5_000) { compose.runOnIdle(condition) }
+    private fun await(condition: () -> Boolean) {
+        try {
+            compose.waitUntil(5_000) { compose.runOnIdle(condition) }
+        } catch (failure: ComposeTimeoutException) {
+            throw AssertionError("Timed out awaiting real Likes host: ${diagnostics()}", failure)
+        }
+    }
     private fun list() = compose.onNodeWithTag("liked-songs-list")
     private fun row(title: String) = compose.onNode(hasText(title) and SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+    private fun visibleRows(): List<Anchor> {
+        val viewport = list().fetchSemanticsNode().boundsInRoot
+        return compose.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+            .fetchSemanticsNodes().filter { it.boundsInRoot.top < viewport.bottom && it.boundsInRoot.bottom > viewport.top }
+            .map { Anchor(it.config[SemanticsProperties.Text].first().text, it.boundsInRoot) }
+    }
+    private fun diagnostics(): String {
+        // Synthetic paths/public state only; never cookies, credentials or request bodies.
+        val state = if (::model.isInitialized) compose.runOnIdle {
+            model.state.value.let { "page=${it.page}, loaded=${it.items.size}, offset=${it.offset}/${it.total}, " +
+                "loading=${it.loading}, error=${it.error}, stale=${it.likesStale}, end=${it.likesEnded}, generation=${it.likesGeneration}" }
+        } else "model not initialized"
+        val viewport = if (mounted) runCatching {
+            val scroll = list().fetchSemanticsNode().config.getOrNull(SemanticsProperties.VerticalScrollAxisRange)
+            "scroll=${scroll?.value?.invoke()}/${scroll?.maxValue?.invoke()}, visible=${visibleRows()}"
+        }.getOrElse { "Likes viewport unavailable: ${it.message}" } else "host not mounted"
+        return "$state; $viewport; lifecycle=${owner.lifecycle.currentState}; offsets=${offsets.toList()}; " +
+            "http running=${if (::client.isInitialized) client.httpClient.dispatcher.runningCallsCount() else 0}; " +
+            "http queued=${if (::client.isInitialized) client.httpClient.dispatcher.queuedCallsCount() else 0}; " +
+            "recent requests=${requests.takeLast(12).map { "${it.method} ${it.requestUrl?.encodedPath}" }}"
+    }
     private fun touchUntil(condition: () -> Boolean) {
+        val start = list().fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value()
         // Slow physical swipes, not calling VM.more or scrolling directly to a synthetic footer.
-        repeat(35) {
+        repeat(50) {
             if (compose.runOnIdle(condition)) return
             list().performTouchInput {
                 swipe(start = center.copy(y = height * .8f), end = center.copy(y = height * .35f), durationMillis = 600)
             }
             compose.waitForIdle()
+            if (compose.runOnIdle(condition)) return
+            val frontier = compose.runOnIdle { model.state.value.items.takeLast(3).map { it.name } }
+            if (visibleRows().any { it.title in frontier }) {
+                // Compose idleness does not wait for real OkHttp IO. Once touch has exposed
+                // the actual row frontier, hold that viewport and await its bounded read.
+                try { await(condition) } catch (failure: AssertionError) {
+                    throw AssertionError("Touch exposed the real frontier but demand did not complete; startScroll=$start; ${diagnostics()}", failure)
+                }
+                return
+            }
         }
-        assertTrue("Touch scrolling did not reach the loaded frontier", compose.runOnIdle(condition))
+        fail("Touch scrolling did not reach the loaded frontier; startScroll=$start; ${diagnostics()}")
     }
     private fun anchor(): Anchor {
         val viewport = list().fetchSemanticsNode().boundsInRoot
@@ -207,8 +253,8 @@ class LikedSongsHostTest {
     }
     private fun assertAnchor(expected: Anchor) {
         val actual = row(expected.title).fetchSemanticsNode().boundsInRoot
-        assertEquals("Retained row's exact scroll position", expected.bounds.top, actual.top, 1f)
-        assertEquals(expected.bounds.bottom, actual.bottom, 1f)
+        assertEquals("Retained row's exact scroll position; ${diagnostics()}", expected.bounds.top, actual.top, 1f)
+        assertEquals("Retained row's bottom; ${diagnostics()}", expected.bounds.bottom, actual.bottom, 1f)
     }
     private fun systemBack() {
         compose.runOnIdle { checkNotNull(backDispatcher).onBackPressed() }
@@ -224,15 +270,20 @@ class LikedSongsHostTest {
         }
     }
     private fun assertBrowseOnly() {
-        compose.runOnIdle { assertTrue(controls.pending.isEmpty()) }
-        assertTrue("Scrolling/retry must not prepare, acquire or play", requests.none { request ->
-            request.requestUrl!!.encodedPath.endsWith("/playback") ||
-                request.requestUrl!!.encodedPath.startsWith("/api/me/player") || request.method != "GET" &&
-                request.requestUrl!!.encodedPath != "/api/auth/login"
-        })
+        val pending = compose.runOnIdle { controls.pending.size }
+        assertEquals("Browsing dispatched music; ${diagnostics()}", 0, pending)
+        val forbidden = requests.filter { request ->
+            val path = request.requestUrl!!.encodedPath
+            val readOnlyStatus = path == "/api/me/likes/status" && request.method == "POST"
+            path.endsWith("/playback") || path.startsWith("/api/me/player") ||
+                request.method != "GET" && !(path == "/api/auth/login" && request.method == "POST") && !readOnlyStatus
+        }
+        assertTrue("Scrolling/retry must not prepare, acquire, play or mutate; " +
+            "unexpected=${forbidden.map { "${it.method} ${it.requestUrl?.encodedPath}" }}; ${diagnostics()}", forbidden.isEmpty())
     }
-    private fun assertRows(ids: Iterable<Int>) = compose.runOnIdle {
-        assertEquals(ids.map { "song-$it" }, model.state.value.items.map { it.id })
+    private fun assertRows(ids: Iterable<Int>) {
+        val actual = compose.runOnIdle { model.state.value.items.map { it.id } }
+        assertEquals("Retained row order/identity; ${diagnostics()}", ids.map { "song-$it" }, actual)
     }
 
     @Test fun actualTouchFrontierIsSingleFlightAndOffscreenAndTrueEndDoNotFetch() {
