@@ -49,6 +49,10 @@ internal fun ColumnScope.PlaybackDevicesContent(
     onRename: (String, String) -> Unit,
 ) {
     val viewOnly = state.deviceId.isEmpty()
+    val checkingConnection = state.connecting || state.verifyingConnection
+    // A heartbeat checks authority, not whether an accepted device view is usable.
+    val showConnectionProgress = checkingConnection &&
+        (state.view == null || state.recovery == PlaybackConnectionRecovery.VERIFICATION_NEEDED)
     var editing by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
@@ -57,10 +61,10 @@ internal fun ColumnScope.PlaybackDevicesContent(
             Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.bodyMedium)
         if (state.message.isNotEmpty() && state.messagePurpose != PlaybackDevicesMessagePurpose.PROGRESS) Text(state.message,
             Modifier.padding(vertical = 12.dp).semantics { liveRegion = LiveRegionMode.Polite })
-        if (state.connecting || state.verifyingConnection) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (showConnectionProgress) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (state.retryAvailable) TextButton(onClick = onRetry) { Text("Retry connection") }
         if (!viewOnly && state.needsTap) Button(onClick = onContinue) { Text("Continue playback here") }
-        if (state.devices.isEmpty() && !state.connecting && !state.verifyingConnection) Text("No devices available.")
+        if (state.view != null && state.devices.isEmpty()) Text("No devices available.")
         LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).testTag("Playback device list")) {
             items(state.devices, key = { it.deviceId }) { device ->
                 PlaybackDeviceCard(state, device, editing == device.deviceId && !viewOnly, draft,
