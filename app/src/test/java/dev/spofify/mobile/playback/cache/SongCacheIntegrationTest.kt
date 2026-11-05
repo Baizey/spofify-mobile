@@ -6,6 +6,7 @@ import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.ServerAddress
@@ -51,7 +52,8 @@ class SongCacheIntegrationTest {
     private lateinit var upstream: DataSource.Factory
     private val payloads = ConcurrentHashMap<String, ByteArray>()
     private val requests = ConcurrentHashMap<String, Int>()
-    private val bodyBytes = AtomicLong()
+    private val scheduledBytes = AtomicLong()
+    private val readBytes = AtomicLong()
     private val responses = ConcurrentHashMap<String, () -> MockResponse>()
     @Volatile private var authorized = true
     private val audioRequests = mutableListOf<RecordedRequest>()
@@ -77,11 +79,11 @@ class SongCacheIntegrationTest {
                     val start = match.groupValues[1].toInt()
                     val end = match.groupValues[2].toIntOrNull()?.coerceAtMost(body.lastIndex) ?: body.lastIndex
                     val slice = body.copyOfRange(start, end + 1)
-                    bodyBytes.addAndGet(slice.size.toLong())
+                    scheduledBytes.addAndGet(slice.size.toLong())
                     return MockResponse().setResponseCode(206).setHeader("Content-Range", "bytes $start-$end/${body.size}")
                         .setHeader("Cache-Control", "no-store").setBody(Buffer().write(slice))
                 }
-                bodyBytes.addAndGet(body.size.toLong())
+                scheduledBytes.addAndGet(body.size.toLong())
                 return MockResponse().setHeader("Cache-Control", "no-store").setBody(Buffer().write(body))
             }
         }
@@ -92,7 +94,14 @@ class SongCacheIntegrationTest {
             override fun write(value: StoredSession?) { this.value = value }
         })
         client.login("synthetic", "synthetic-password")
-        upstream = OkHttpDataSource.Factory(client.httpClient)
+        val authenticated = OkHttpDataSource.Factory(client.httpClient)
+        upstream = DataSource.Factory {
+            val delegate = authenticated.createDataSource()
+            object : HttpDataSource by delegate {
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+                    delegate.read(buffer, offset, length).also { if (it > 0) readBytes.addAndGet(it.toLong()) }
+            }
+        }
         startCache()
     }
 
@@ -146,14 +155,15 @@ class SongCacheIntegrationTest {
     @Test fun authenticatedWarmPrefetchReuseAndRestartHaveNoFreshnessRequest() {
         assertBytes(bytes("A"), fetch("A"))
         assertTrue(handle.prefetch("B", spec("B"), upstream, ::authorize, SongCache.Cancellation()))
-        val transferred = bodyBytes.get()
+        val transferred = readBytes.get()
+        assertEquals((bytes("A").size + bytes("B").size).toLong(), transferred)
         assertBytes(bytes("B"), fetch("B"))
-        assertEquals(transferred, bodyBytes.get())
+        assertEquals(transferred, readBytes.get())
         cache.close()
         startCache()
         assertBytes(bytes("A"), fetch("A"))
         assertBytes(bytes("B"), fetch("B"))
-        assertEquals(transferred, bodyBytes.get())
+        assertEquals(transferred, readBytes.get())
         assertEquals(1, requests["A"])
         assertEquals(1, requests["B"])
         synchronized(audioRequests) {
@@ -216,6 +226,25 @@ class SongCacheIntegrationTest {
             assertEquals(1, requests["B"])
             assertEquals(2, requests["C"])
         } finally { a.close(); b.close() }
+    }
+
+    @Test fun decodedPlaybackProtectionSkipsOldestWithoutPromotionReservationOrRetirementPin() {
+        cache.close(); startCache(SongCache.Limits(maxTracks = 3))
+        handle.protectPlayback("not-yet-admitted")
+        assertEquals(0, cache.inventory().entries)
+        listOf("A", "B", "C").forEach { fetch(it) }
+        assertEquals(0, cache.inventory().pinned) // All actual DataSources have closed at EOF.
+        handle.protectPlayback("A")
+        fetch("D") // Skip oldest A, evict B, leave A/C/D in their original order.
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(1, requests["A"])
+        handle.protectPlayback(null)
+        fetch("E") // Releasing protection did not promote A: it is still the oldest.
+        fetch("A")
+        assertEquals(2, requests["A"])
+        handle.protectPlayback("A")
+        handle.retire()
+        assertEquals(0L, cache.inventory().ownedBytes) // No I/O pins, so retirement is immediate.
     }
 
     @Test fun productionConstantsAndHundredAndFirstAdmissionIncludingDuplicateReservation() {
@@ -302,7 +331,7 @@ class SongCacheIntegrationTest {
         cache.close()
         cache = SongCache(directory)
         cache.retire() // No bind / no validated auth needed to erase a dormant namespace.
-        assertEquals(0, cache.inventory().ownedBytes)
+        assertEquals(0L, cache.inventory().ownedBytes)
     }
 
     @Test fun failedDeletionRemainsOwnedAndInaccessibleAcrossReopen() {

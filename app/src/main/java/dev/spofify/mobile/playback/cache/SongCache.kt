@@ -87,6 +87,7 @@ class SongCache(
     private var current: SessionCache? = null
     private var speculation: Cancellation? = null
     private var speculativeSession: SessionCache? = null
+    private var playbackProtection: Pair<SessionCache, String>? = null
     private var closed = false
     private var cleanupFailed = false
 
@@ -138,6 +139,19 @@ class SongCache(
             SongCacheDataSource(this, upstream, trackId, authorize, onDemandNetworkChange)
         }
 
+        /**
+         * Protect decoded current playback after its DataSource has reached EOF/closed. This is
+         * only an eviction exclusion: it creates no entry, changes no FIFO order and holds no
+         * file/lifetime pin. The service clears it on pause, authority loss or current replacement.
+         */
+        fun protectPlayback(trackId: String?) = synchronized(lock) {
+            if (active && current === this && !closed) {
+                playbackProtection = trackId?.let { this to key(it) }
+            } else if (playbackProtection?.first === this) {
+                playbackProtection = null
+            }
+        }
+
         /** Explicit successful-play/resume promotion only; reads and fills never call this. */
         fun promote(trackId: String) = synchronized(lock) {
             if (!active || state.retired || state.disabled) return@synchronized
@@ -150,6 +164,7 @@ class SongCache(
         /** Fence immediately, retain bytes dormant. Existing reads fail their next guard. */
         fun suspend() = synchronized(lock) {
             active = false
+            if (playbackProtection?.first === this) playbackProtection = null
             if (speculativeSession === this) speculation?.cancel()
             state.finishIfIdle()
         }
@@ -157,6 +172,7 @@ class SongCache(
         /** Fence first; never delete files under a reader/writer or a successor handle. */
         fun retire() = synchronized(lock) {
             active = false
+            if (playbackProtection?.first === this) playbackProtection = null
             if (speculativeSession === this) speculation?.cancel()
             if (current?.let { it !== this && it.active && it.state === state } == true) return@synchronized
             state.retired = true
@@ -267,6 +283,8 @@ class SongCache(
 
     internal class Entry(val key: String, var length: Long = -1, var digest: ByteArray = ByteArray(32), var artifact: String = "") {
         var pins = 0
+        // An OS-unlinked open staging inode remains owned until its stream actually closes.
+        var openBytes = 0L
     }
 
     internal inner class Writer(
@@ -287,6 +305,7 @@ class SongCache(
                 output.write(bytes, offset, length)
                 hash.update(bytes, offset, length)
                 written += length
+                entry.openBytes = written
                 true
             } catch (_: Exception) {
                 state.disabled = true
@@ -300,8 +319,11 @@ class SongCache(
         private fun stop(complete: Boolean) {
             if (stopped) return
             stopped = true
+            var outputClosed = false
             try {
                 output.close()
+                outputClosed = true
+                entry.openBytes = 0
                 if (complete && authorized() && written > 0 && !state.retired && !state.disabled && makeRoom(0, false)) {
                     val cache = state.cache ?: throw IOException("Cache unavailable")
                     val hole = cache.startReadWriteNonBlocking(entry.key, 0, written)
@@ -322,9 +344,14 @@ class SongCache(
                 entry.length = -1
                 state.disabled = true
             } finally {
-                entry.pins--
-                if (entry.length < 0) state.remove(entry)
-                state.finishIfIdle()
+                if (outputClosed) {
+                    entry.pins--
+                    if (entry.length < 0) state.remove(entry)
+                    state.finishIfIdle()
+                } else {
+                    // Do not delete underneath a stream whose close could not be established.
+                    cleanupFailed = true
+                }
             }
         }
     }
@@ -458,7 +485,10 @@ class SongCache(
         // Insertion order is FIFO; skipping a pin never reorders another track.
         for (state in states.values) {
             for (entry in state.entries.values.toList()) {
-                if (entry.pins == 0 && state.cache != null && state.remove(entry) && fits()) return true
+                val protected = playbackProtection?.let { (handle, key) ->
+                    handle.active && handle.state === state && key == entry.key
+                } == true
+                if (entry.pins == 0 && !protected && state.cache != null && state.remove(entry) && fits()) return true
             }
         }
         return fits()
@@ -473,7 +503,7 @@ class SongCache(
     }
 
     fun inventory(): Inventory = synchronized(lock) {
-        Inventory(ownedBytes(), entryCount(), states.values.sumOf { it.entries.values.count { e -> e.length >= 0 } },
+        Inventory(ownedBytes(), entryCount(), states.values.filter { !it.retired }.sumOf { it.entries.values.count { e -> e.length >= 0 } },
             states.values.sumOf { it.entries.values.count { e -> e.pins > 0 } }, cleanupFailed,
             states.values.any { it.disabled })
     }
@@ -481,14 +511,26 @@ class SongCache(
     private fun ownedBytes(): Long {
         var visited = 0
         fun size(file: File, depth: Int): Long {
-            if (!file.exists()) return 0
+            val attributes = try {
+                java.nio.file.Files.readAttributes(file.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS)
+            } catch (_: java.nio.file.NoSuchFileException) { return 0 }
             if (++visited > 4096 || depth > 8) throw IOException("Unrecognized cache inventory")
-            if (file.isFile) return file.length()
-            if (!file.isDirectory) throw IOException("Unreadable cache inventory")
+            if (attributes.isRegularFile) return attributes.size()
+            if (!attributes.isDirectory) throw IOException("Unreadable cache inventory")
             val children = file.listFiles() ?: throw IOException("Unreadable cache inventory")
             return children.fold(0L) { total, child -> Math.addExact(total, size(child, depth + 1)) }
         }
-        return try { size(root, 0) } catch (_: Exception) { Long.MAX_VALUE / 2 }
+        return try {
+            size(root, 0) + states.values.sumOf { state ->
+                state.entries.values.sumOf { entry ->
+                    val staging = (entry.openBytes - state.stage(entry).length()).coerceAtLeast(0)
+                    val missingPin = if (entry.pins > 0 && entry.length > 0 && entry.artifact.isNotEmpty() &&
+                        !File(state.directory, entry.artifact).exists()) entry.length else 0L
+                    staging + missingPin
+                }
+            }
+        } catch (_: Exception) { Long.MAX_VALUE / 2 }
     }
 
     private fun removeTree(file: File): Boolean {

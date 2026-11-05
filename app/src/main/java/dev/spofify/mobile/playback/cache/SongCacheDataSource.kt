@@ -69,8 +69,8 @@ internal class SongCacheDataSource(
                     cached = source
                     guard()
                     return expected
-                } catch (error: IOException) {
-                    source.close()
+                } catch (_: IOException) {
+                    try { source.close() } catch (_: IOException) { /* cache-only close failure */ }
                     // An authorization failure must not become an upstream/cache fallback.
                     guard()
                 }
@@ -84,12 +84,12 @@ internal class SongCacheDataSource(
     private fun verifies(file: File, entry: SongCache.Entry): Boolean {
         val hash = MessageDigest.getInstance("SHA-256")
         val input = try { file.inputStream() } catch (_: IOException) { return false }
-        input.use {
+        try {
             val buffer = ByteArray(16 * 1024)
             var total = 0L
             while (true) {
                 guard()
-                val count = try { it.read(buffer) } catch (_: IOException) { return false }
+                val count = try { input.read(buffer) } catch (_: IOException) { return false }
                 guard()
                 if (count < 0) break
                 total += count
@@ -97,7 +97,7 @@ internal class SongCacheDataSource(
                 hash.update(buffer, 0, count)
             }
             return total == entry.length && MessageDigest.isEqual(hash.digest(), entry.digest)
-        }
+        } finally { try { input.close() } catch (_: IOException) { /* cache-only close failure */ } }
     }
 
     private fun openNetwork(request: DataSpec, mayRetain: Boolean): Long {
@@ -113,14 +113,11 @@ internal class SongCacheDataSource(
         // Do not catch upstream errors: redirects/auth/media failures retain ordinary semantics.
         val length = source.open(request)
         guard()
-        val fullLength = validateResponse(source, request, length)
-        expected = length
-        if (mayRetain && fullLength != null && id != null && session != null) {
-            writer = session.writer(id!!)
-            expected = fullLength
-        }
+        val coverage = validateResponse(source, request, length)
+        expected = coverage.readLength
+        if (mayRetain && coverage.retain && id != null && session != null) writer = session.writer(id!!)
         if (speculative && writer == null) throw IOException("Audio cache admission unavailable")
-        return length
+        return expected
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
@@ -217,15 +214,22 @@ internal class SongCacheDataSource(
      * completes only at clean EOF. Partial requests stream normally, but are never assembled with
      * other responses. Invalid range coverage fails as an upstream protocol error, even uncached.
      */
-    private fun validateResponse(source: DataSource, request: DataSpec, openedLength: Long): Long? {
-        val http = source as? HttpDataSource ?: return null
+    private data class Coverage(val readLength: Long, val retain: Boolean)
+
+    private fun validateResponse(source: DataSource, request: DataSpec, openedLength: Long): Coverage {
+        val http = source as? HttpDataSource ?: return Coverage(openedLength, false)
         fun header(name: String) = source.responseHeaders.entries.firstOrNull { it.key.equals(name, true) }?.value?.singleOrNull()
         if (source.uri != request.uri) throw IOException("Redirected audio response")
         val code = http.responseCode
-        var total = openedLength
+        var readLength = openedLength
+        var wholeResponse = true
         when (code) {
             200 -> {
                 if (header("Content-Range") != null) throw IOException("Unexpected audio range")
+                val contentLength = header("Content-Length")?.toLongOrNull()
+                if (request.length >= 0 && contentLength != null) {
+                    readLength = minOf(request.length, (contentLength - request.position).coerceAtLeast(0))
+                }
             }
             206 -> {
                 val match = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+)").matchEntire(header("Content-Range").orEmpty())
@@ -233,18 +237,21 @@ internal class SongCacheDataSource(
                 val (start, end, size) = match.destructured
                 val first = start.toLongOrNull() ?: throw IOException("Invalid audio range")
                 val last = end.toLongOrNull() ?: throw IOException("Invalid audio range")
-                total = size.toLongOrNull() ?: throw IOException("Invalid audio range")
-                if (first != request.position || last < first || last >= total ||
-                    (openedLength >= 0 && openedLength != last - first + 1)) throw IOException("Invalid audio range coverage")
-                val declared = header("Content-Length")?.toLongOrNull()
-                if (declared != null && declared != last - first + 1) throw IOException("Invalid audio range length")
-                if (request.length != C.LENGTH_UNSET.toLong() || first != 0L || last != total - 1) return null
+                val total = size.toLongOrNull() ?: throw IOException("Invalid audio range")
+                if (first != request.position || last < first || last >= total) throw IOException("Invalid audio range coverage")
+                readLength = last - first + 1
+                if (request.length >= 0) {
+                    if (readLength != minOf(request.length, total - first)) throw IOException("Invalid audio range coverage")
+                } else if (openedLength >= 0 && openedLength != readLength) throw IOException("Invalid audio range length")
+                val declared = header("Content-Length")?.let { it.toLongOrNull() ?: throw IOException("Invalid audio range length") }
+                if (declared != null && declared != readLength) throw IOException("Invalid audio range length")
+                wholeResponse = first == 0L && last == total - 1
             }
-            416 -> return null // Media3 accepts only a valid empty seek at EOF; never retain it.
+            416 -> return Coverage(0, false) // Media3 accepts only a valid empty seek at EOF; never retain it.
             else -> throw IOException("Unexpected audio response")
         }
-        if (request.httpMethod != DataSpec.HTTP_METHOD_GET || request.position != 0L || request.length != C.LENGTH_UNSET.toLong()) return null
-        if (header("Content-Encoding")?.let { !it.equals("identity", true) } == true) return null
-        return total
+        val retain = wholeResponse && request.httpMethod == DataSpec.HTTP_METHOD_GET && request.position == 0L &&
+            request.length == C.LENGTH_UNSET.toLong() && header("Content-Encoding")?.let { !it.equals("identity", true) } != true
+        return Coverage(readLength, retain)
     }
 }

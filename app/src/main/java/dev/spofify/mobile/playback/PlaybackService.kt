@@ -231,6 +231,7 @@ class PlaybackService : MediaSessionService() {
 
     private fun cancelSongPrefetch() {
         prefetchAllowed = false
+        audioCache?.protectPlayback(null)
         songPrefetch?.cancel()
     }
 
@@ -248,7 +249,7 @@ class PlaybackService : MediaSessionService() {
     private fun reconcileSongPrefetch() {
         val current = player ?: return
         if (!prefetchAllowed || importing || !hasAuthority() || current.currentMediaItem == null) {
-            songPrefetch?.cancel()
+            cancelSongPrefetch()
             return
         }
         // Ask the SAME realized Media3 timeline that drives progression, including repeat.
@@ -276,7 +277,10 @@ class PlaybackService : MediaSessionService() {
         if (promotionPending == null || (!startSucceeded && promotionPending === startAttempt) ||
             player?.isPlaying != true || !hasAuthority() || audioFocus?.isGranted != true) return
         promotionPending = null
-        player?.currentMediaItem?.mediaId?.let { audioCache?.promote(it) }
+        player?.currentMediaItem?.mediaId?.let {
+            audioCache?.protectPlayback(it)
+            audioCache?.promote(it)
+        }
     }
 
     private val interactionKeys = PlaybackInteractionKeys()
@@ -573,6 +577,7 @@ class PlaybackService : MediaSessionService() {
                 if (importing) return
                 val occurrence = PlaybackMedia.occurrence(mediaItem)
                 if (occurrence != promotionOccurrence || reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
+                    audioCache?.protectPlayback(null)
                     promotionOccurrence = occurrence
                     promotionPending = if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
                         reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) Any() else null
@@ -1217,6 +1222,7 @@ class PlaybackService : MediaSessionService() {
         // Raw queue selection commits establish their own history separately. For a generic
         // start with no history, only genuinely observed audible playback may establish it.
         val installed = exportPrepared()
+        if (play) cancelSongPrefetch()
         val attempt = Any()
         startAttempt = attempt
         startAttemptValidity = attempt

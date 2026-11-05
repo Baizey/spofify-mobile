@@ -92,7 +92,7 @@ class SongCachePlaybackMedia {
                                         check(next == marker) { "Mixed/corrupt synthetic PCM consumed" }
                                         checked += 2
                                     }
-                                    check(consumed.size < 32 || marker in consumed)
+                                    check(consumed.size < 32 || consumed.containsKey(marker))
                                     consumed.computeIfAbsent(marker) { AtomicLong() }.addAndGet(checked.toLong())
                                 }
                             }
