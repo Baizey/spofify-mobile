@@ -3,7 +3,7 @@
 ## Tracking
 
 - ID: FEAT-117
-- Status: implementing — native acceptance remains blocked/not complete
+- Status: implementing — native acceptance pending current Pixel 10 Pro assessment
 - Phase: implementation
 - Spec readiness: ready
 - Owner: FEAT-117 lead (`subagent-b1ba2769-d065-449e-837c-714159e5cbb2`)
@@ -45,7 +45,7 @@ FEAT-118 separately owns replacing paging/See-more mechanics with automatic cont
 - Compare actual shared-row bounds (art/title/one-line credit/More, adjoining pitch) against Home/Search at narrow width and font scale 2; duplicates/current, unavailable, missing art and long credits. Prove old row/More/held-gesture work cancels on source/session/output replacement, benign progress does not, and browsing/navigation cannot prepare/start playback. No snapshot bloat, arbitrary test counts or unrelated suite rewrite.
 - Read `AGENTS.md`, assigned roles in `AGENT_BEHAVIOUR.md`, full `docs/mobile-ux.md`, and `testing.md`, `ui-validation.md`, `worktree-review.md`, `storage-hygiene.md`, `device-playback.md` / relevant prepared-transport testing guidance. Run the current mandatory offline API37 five-task gate including provisioned integration category under BUILD, then release it before standalone NATIVE/exact-APK `--skip-build`. One focused independent read-only review of the committed candidate/base, source, tests **and relevant images**, fixing non-nits before individual reviewed landing/postchecks.
 - Capture/inspect installed-APK manual/derived normal, overflow, removal, loading/empty/error/stale and reorder states on an isolated synthetic AVD; narrow + large font, Back/scroll/row gesture and last-row reachability. Record device/API/viewport/font/APK hash/revision/image paths, actual row counts/pitch/chrome and menu/accessibility findings per UX checklist. Required Sign-in/Home/Search/Playlists/Now Playing smoke remains; parent owns combined smoke after parallel landings.
-- Existing environment assessment is preboot SIGSEGV/no usable KVM: **no identical repeat ritual**, downloads, live backend, personal data or real-phone fallback. A materially changed supported isolated setup may be assessed under policy. Without inspected installed after-renders report **UI validation BLOCKED / NOT COMPLETE**; build/component-render/semantics and this before-image cannot waive native acceptance. Landing with an explicitly blocked gate is not feature completion.
+- The earlier environment assessment was preboot SIGSEGV/no usable KVM: **no identical repeat ritual**, downloads, live backend, personal data or real-phone fallback. User subsequently identified an available Pixel 10 Pro emulator; its current supported isolated setup is being assessed by the dedicated native-validation lead, not assumed broken from history. Without inspected installed after-renders report native acceptance pending, or **UI validation BLOCKED / NOT COMPLETE** if the current assessment cannot proceed; build/component-render/semantics and this before-image cannot waive native acceptance. Landing with an explicitly blocked gate is not feature completion.
 
 ## Coordination and storage
 

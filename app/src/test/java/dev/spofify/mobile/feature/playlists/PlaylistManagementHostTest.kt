@@ -6,12 +6,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
-import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.junit4.createComposeRule
 import dev.spofify.mobile.core.*
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -40,10 +37,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], qualifiers = "w400dp-h850dp-mdpi")
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
-@OptIn(ExperimentalCoroutinesApi::class)
 class PlaylistManagementHostTest {
-    private val scheduler = TestCoroutineScheduler()
-    @get:Rule val compose = createComposeRule(effectContext = StandardTestDispatcher(scheduler))
+    // These are HTTP/UI behavior tests, not virtual-delay tests. Use the standard editor-host
+    // rule (as in PlaybackDevicesSheetTest/SignInUiTest): a v2 effect TestDispatcher also
+    // auto-advances recurring TextField effects and can prevent the editor from becoming idle.
+    @get:Rule val compose = createComposeRule()
 
     @Test fun manualHeaderHasOneFullCollectionCountAndNoEmptyDescriptionOrManagementBar() = withHost(
         total = 204,
@@ -313,6 +311,7 @@ class PlaylistManagementHostTest {
     ) {
         val fixture = Fixture(derived, total, description, capabilities)
         val shown = mutableStateOf(true)
+        var testFailure: Throwable? = null
         try {
             fixture.beforeMount()
             runBlocking { fixture.client.login("listener", "synthetic") }
@@ -326,16 +325,31 @@ class PlaylistManagementHostTest {
             assertTrue("Browsing must not hit a playback preparation endpoint", fixture.requests.none {
                 it.requestUrl?.encodedPath?.endsWith("/playback") == true
             })
+        } catch (failure: Throwable) {
+            testFailure = failure
+            throw failure
         } finally {
             fixture.evaluationGate.countDown()
-            try {
-                compose.runOnIdle { shown.value = false }
+            var cleanupFailure: Throwable? = null
+            fun cleanup(action: () -> Unit) {
+                try { action() }
+                catch (failure: Throwable) {
+                    val previous = cleanupFailure
+                    if (previous == null) cleanupFailure = failure else previous.addSuppressed(failure)
+                }
+            }
+            cleanup {
+                // Do not require an already-broken editor to become idle before removing it.
+                compose.runOnUiThread { shown.value = false }
                 compose.waitForIdle()
-            } finally {
-                fixture.client.httpClient.dispatcher.cancelAll()
-                fixture.client.httpClient.connectionPool.evictAll()
-                fixture.client.httpClient.dispatcher.executorService.shutdown()
-                fixture.web.shutdown()
+            }
+            cleanup { fixture.client.httpClient.dispatcher.cancelAll() }
+            cleanup { fixture.client.httpClient.connectionPool.evictAll() }
+            cleanup { fixture.client.httpClient.dispatcher.executorService.shutdown() }
+            cleanup { fixture.web.shutdown() }
+            cleanupFailure?.let { failure ->
+                val original = testFailure
+                if (original == null) throw failure else original.addSuppressed(failure)
             }
         }
     }
@@ -418,7 +432,14 @@ class PlaylistManagementHostTest {
             trackCount = if (derived) null else (total - if (removed.get()) 1 else 0).toLong(),
             availableCount = if (derived) null else (total - if (removed.get()) 1 else 0).toLong(),
             capabilities = capabilities, revision = if (removed.get()) 6 else 5)
-        fun writes() = requests.filter { it.method in listOf("POST", "PATCH", "PUT", "DELETE") && it.requestUrl?.encodedPath != "/api/auth/login" }
+        fun writes() = requests.filter { request ->
+            val path = request.requestUrl?.encodedPath
+            // Like-status accepts a batch body via POST but does not mutate saved data.
+            // Exempt only this exact read; like writes and every other unexpected POST still fail.
+            val readOnlyStatus = request.method == "POST" && path == "/api/me/likes/status"
+            request.method in listOf("POST", "PATCH", "PUT", "DELETE") &&
+                path != "/api/auth/login" && !readOnlyStatus
+        }
         fun awaitLoaded() = await {
             noProgress() && compose.onAllNodesWithContentDescription(songMore).fetchSemanticsNodes().size == if (removed.get()) 1 else 2
         }

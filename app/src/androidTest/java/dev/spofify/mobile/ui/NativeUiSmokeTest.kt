@@ -342,13 +342,14 @@ class NativeUiSmokeTest {
                 waitFor(hasText(UiFixtureServer.DERIVED_NAME))
                 screenshot("07-playlists")
                 compose.onNodeWithText(UiFixtureServer.DERIVED_NAME).performClick()
-                waitFor(hasText("Complete result evaluated.", substring = true))
-                screenshot("07b-rules-playlist")
+                waitFor(hasText("4 songs"))
+                assertMinimalPlaylistPresentation(UiFixtureServer.DERIVED_NAME, "4 songs", derived = true, "07b-rules-playlist")
                 pressBack()
                 waitFor(hasText(UiFixtureServer.MANUAL_NAME))
                 compose.onNodeWithText(UiFixtureServer.MANUAL_NAME).performClick()
-                waitFor(hasText("Reorder all occurrences"))
-                screenshot("08-playlist-details")
+                waitFor(hasText("6 songs"))
+                assertMinimalPlaylistPresentation(UiFixtureServer.MANUAL_NAME, "6 songs", derived = false, "08-playlist-details")
+                compose.onNodeWithContentDescription("More actions for ${UiFixtureServer.MANUAL_NAME}").performClick()
                 compose.onNodeWithText("Edit details").performScrollTo().performClick()
                 waitFor(hasText("Name"))
                 compose.onNodeWithText("Name").performClick().performTextReplacement("Night walk · edited")
@@ -531,6 +532,11 @@ class NativeUiSmokeTest {
                 compose.onNodeWithText("Playlists").performClick()
                 waitFor(hasText(UiFixtureServer.DERIVED_NAME))
                 screenshot("10g-narrow-playlists")
+                compose.onNodeWithText(UiFixtureServer.DERIVED_NAME).performClick()
+                waitFor(hasText("4 songs"))
+                assertMinimalPlaylistPresentation(UiFixtureServer.DERIVED_NAME, "4 songs", derived = true, "10ga-narrow-rules-playlist")
+                pressBack()
+                waitFor(hasText(UiFixtureServer.DERIVED_NAME))
                 activateSearchAndAssertEmpty(fixture, "10h-narrow-reselect-keyboard")
                 dismissSearchImeAndAssertEmptyRoot()
                 search("Orbit")
@@ -567,6 +573,16 @@ class NativeUiSmokeTest {
                 waitFor(hasText(UiFixtureServer.DERIVED_NAME))
                 assertPlayingTransition(beforeLargePlaylistsTab, fixture, "font2 Playlists navigation")
                 screenshot("11b-font2-narrow-playlists")
+                compose.onNodeWithText(UiFixtureServer.DERIVED_NAME).performClick()
+                waitFor(hasText("4 songs"))
+                assertMinimalPlaylistPresentation(UiFixtureServer.DERIVED_NAME, "4 songs", derived = true, "11ba-font2-narrow-rules-playlist")
+                pressBack()
+                waitFor(hasText("Night walk · edited"))
+                compose.onNodeWithText("Night walk · edited").performClick()
+                waitFor(hasText("6 songs"))
+                assertMinimalPlaylistPresentation("Night walk · edited", "6 songs", derived = false, "11bb-font2-narrow-manual-playlist")
+                pressBack()
+                waitFor(hasText(UiFixtureServer.DERIVED_NAME))
                 assertProfileAttribution(fixture, "11c-font2-narrow-profile", playing = true)
                 val beforeLargeSearchTab = capturePlaying(fixture)
                 activateSearchAndAssertEmpty(fixture, "12a-font2-narrow-empty-search-keyboard")
@@ -639,6 +655,54 @@ class NativeUiSmokeTest {
                 }
             }
         }
+    }
+
+    /** Current installed playlist presentation. Captures still need independent human inspection. */
+    private fun assertMinimalPlaylistPresentation(name: String, count: String, derived: Boolean, prefix: String) {
+        val more = "More actions for $name"
+        val management = listOf("Refresh", "Edit details", "Edit rules", "Make editable copy", "Delete", "Reorder all occurrences")
+        compose.onAllNodesWithContentDescription(more).assertCountEquals(1)
+        compose.onNodeWithContentDescription(more).assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText(count).assertIsDisplayed()
+        management.forEach { compose.onNodeWithText(it).assertDoesNotExist() }
+        compose.onNodeWithText("Remove this occurrence").assertDoesNotExist()
+        compose.onNodeWithText("Complete result evaluated", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Playback prepares up to", substring = true).assertDoesNotExist()
+        screenshot(prefix)
+        val viewport = compose.onAllNodes(hasScrollToIndexAction()).onFirst().dpBounds()
+        val rows = compose.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions) and
+            hasAnyDescendant(hasContentDescription("More actions for ", substring = true))).fetchSemanticsNodes()
+            .map { compose.onNode(SemanticsMatcher("row ${it.id}") { node -> node.id == it.id }).dpBounds() }
+        File(evidence, "$prefix-rows.txt").writeText("viewportDp=$viewport\ncompleteVisibleSongRows=${rows.count { it.top >= viewport.top && it.bottom <= viewport.bottom }}\nrowBoundsDp=$rows\nvisualReview=required\n")
+        compose.onNodeWithContentDescription(more).performClick()
+        listOf("Queue Low", "Queue High", "Play next", "Play now", "Refresh", "Edit details", "Delete").forEach {
+            compose.onNodeWithText(it).performScrollTo().assertIsEnabled().assertHeightIsAtLeast(48.dp)
+        }
+        if (derived) {
+            compose.onNodeWithText("Edit rules").performScrollTo().assertIsEnabled()
+            compose.onNodeWithText("Make editable copy").performScrollTo().assertIsEnabled()
+        } else compose.onNodeWithText("Reorder all occurrences").performScrollTo().assertIsEnabled()
+        screenshot("$prefix-more")
+        pressBack()
+        compose.onNodeWithContentDescription(more).assertIsDisplayed()
+        if (!derived) {
+            val first = UiFixtureServer.TRACK_NAMES.first()
+            scrollToCatalogItem(first)
+            compose.onNodeWithContentDescription("More actions for $first").performClick()
+            waitFor(hasText("Remove this occurrence") and isEnabled())
+            compose.onNodeWithText("Remove this occurrence").performScrollTo().assertIsEnabled().performClick()
+            waitFor(hasText("Remove occurrence?"))
+            screenshot("$prefix-remove-confirmation")
+            compose.onNodeWithText("Cancel").performClick()
+            // Explicit editing is the only layout retaining reorder controls; cancel saves nothing.
+            compose.onAllNodes(hasScrollToIndexAction()).onFirst().performScrollToIndex(0)
+            compose.onNodeWithContentDescription(more).performClick()
+            compose.onNodeWithText("Reorder all occurrences").performScrollTo().performClick()
+            waitFor(hasText("Save order"))
+            screenshot("$prefix-reorder")
+            compose.onNodeWithText("Cancel reorder").performScrollTo().performClick()
+        }
+        compose.onAllNodes(hasScrollToIndexAction()).onFirst().performScrollToIndex(0)
     }
 
     /** Real pointer transport on the production dock; restore exact fixture state for later checks. */
