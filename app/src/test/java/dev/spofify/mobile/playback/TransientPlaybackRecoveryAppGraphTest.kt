@@ -198,10 +198,11 @@ class TransientPlaybackRecoveryAppGraphTest {
                     val projected = connected.state.value
                     val local = PlaybackService.exportLocalSnapshot()
                     state.connected && state.recovery == PlaybackConnectionRecovery.NONE && settled(owner) &&
-                        !model.state.value.preparing && state.canQueueIntent && projected.canQueueIntent &&
-                        projected.queueIntentBinding != null && projected.queueIntentBinding == state.queueIntentBinding &&
-                        projected.interactionKey === PlaybackService.interactionKey() &&
-                        (local.queue.isEmpty() || projected.interactionKey != null)
+                        !model.state.value.preparing &&
+                        (local.queue.isEmpty() && receipts.isEmpty() ||
+                            state.canQueueIntent && projected.canQueueIntent && projected.queueIntentBinding != null &&
+                            projected.queueIntentBinding == state.queueIntentBinding &&
+                            projected.interactionKey === PlaybackService.interactionKey() && projected.interactionKey != null)
                 }
                 val count = receipts.size
                 val queueCount = PlaybackService.exportLocalSnapshot().queue.size
