@@ -136,10 +136,13 @@ class NativeUiSmokeTest {
                 shell("wm size ${originalSizeOverride ?: "reset"}")
                 compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
                 screenshot("02-home")
-                // Login no longer exposes legal controls; the existing signed-in account route
-                // still opens the complete bundled offline notice (no Profile dependency).
-                compose.onNodeWithContentDescription("Account and server").performClick()
-                compose.onNodeWithText("Font license").assertIsDisplayed().performClick()
+                // Login no longer exposes legal controls; Profile → Credits opens the
+                // complete bundled offline notice through the signed-in destination.
+                compose.onNodeWithTag("nav-profile").performClick()
+                waitFor(hasTestTag("profile-screen"))
+                compose.onNodeWithText("Credits").performScrollTo().performClick()
+                waitFor(hasTestTag("credits-screen"))
+                compose.onNodeWithText("View full font license").performScrollTo().assertIsDisplayed().performClick()
                 val fontLicenseTitle = hasText("JetBrains Mono font license")
                 waitFor(fontLicenseTitle)
                 compose.onNode(fontLicenseTitle).assertIsDisplayed()
@@ -152,14 +155,19 @@ class NativeUiSmokeTest {
                 compose.onNodeWithText("Done").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
                 screenshot("02a-signed-in-font-license")
                 // Retain the narrow/font2 legal-dialog regression after authentication. A real
-                // configuration recreation may close the dialog; reopen only the existing route.
+                // configuration recreation may close the dialog; reopen through Profile/Credits.
                 shell("wm size ${signInNarrowWidth}x${baselineDisplaySize.substringAfter('x')}")
                 compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == signInNarrowWidth }
                 shell("settings put system font_scale 2.0")
                 waitForFont(2f)
                 if (!exists(fontLicenseTitle)) {
-                    compose.onNodeWithContentDescription("Account and server").performClick()
-                    compose.onNodeWithText("Font license").assertIsDisplayed().performClick()
+                    compose.onNodeWithTag("nav-profile").performClick()
+                    if (!exists(hasTestTag("credits-screen"))) {
+                        waitFor(hasTestTag("profile-screen"))
+                        compose.onNodeWithText("Credits").performScrollTo().performClick()
+                    }
+                    waitFor(hasTestTag("credits-screen"))
+                    compose.onNodeWithText("View full font license").performScrollTo().assertIsDisplayed().performClick()
                 }
                 waitFor(fontLicenseTitle)
                 compose.onNodeWithText(fullFontLicense).assertExists()
@@ -170,10 +178,14 @@ class NativeUiSmokeTest {
                 screenshot("02aa-font2-narrow-signed-in-font-license")
                 pressBack()
                 waitUntilAbsent(fontLicenseTitle)
+                compose.onNodeWithTag("credits-screen").assertIsDisplayed()
+                pressBack()
+                waitFor(hasTestTag("profile-screen"))
                 shell("settings put system font_scale $originalFontScale")
                 waitForFont(originalFontScale)
                 shell("wm size ${originalSizeOverride ?: "reset"}")
                 compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
+                compose.onNodeWithTag("nav-home").performClick()
                 waitFor(hasText("Recently played"))
                 compose.onNodeWithText("Liked songs").performClick()
                 waitFor(hasText("Liked songs") and !hasClickAction())
@@ -349,22 +361,26 @@ class NativeUiSmokeTest {
                 compose.waitUntil(15_000) { fixture.playlistWrites.get() == 1 }
                 screenshot("08b-playlist-edited")
 
-                val devices = hasContentDescription("Playback devices · read-only")
-                if (exists(devices)) {
-                    compose.onNode(devices).performClick()
-                    waitFor(hasText("Studio speaker"))
-                    // Commands may be hidden rather than disabled. Never require unsupported actions.
-                    val deviceCommand = hasText("Play from here") or hasText("Rename") or
-                        hasText("Continue playback here") or hasText("Save")
-                    compose.onAllNodes(deviceCommand and hasClickAction())
-                        .fetchSemanticsNodes().forEach { node ->
-                            assertTrue("Device picker must be read-only: ${node.config}",
-                                node.config.contains(SemanticsProperties.Disabled))
-                        }
-                    screenshot("08c-playback-devices-read-only")
-                    pressBack()
-                    waitFor(hasText("Night walk · edited"))
-                }
+                // The picker remains discoverable from the normal Profile destination,
+                // not an account/connection toolbar or popup. Returning retains playlist detail.
+                compose.onNodeWithTag("nav-profile").performClick()
+                waitFor(hasTestTag("profile-screen"))
+                compose.onNodeWithText("Playback devices").performScrollTo().performClick()
+                waitFor(hasText("Studio speaker"))
+                // Commands may be hidden rather than disabled. Never require unsupported actions.
+                val deviceCommand = hasText("Play from here") or hasText("Rename") or
+                    hasText("Continue playback here") or hasText("Save")
+                compose.onAllNodes(deviceCommand and hasClickAction())
+                    .fetchSemanticsNodes().forEach { node ->
+                        assertTrue("Device picker must be read-only: ${node.config}",
+                            node.config.contains(SemanticsProperties.Disabled))
+                    }
+                screenshot("08c-playback-devices-read-only")
+                pressBack()
+                waitFor(hasTestTag("profile-screen"))
+                assertProfileAttribution(fixture, "08d-profile", playing = false)
+                compose.onNodeWithTag("nav-playlists").performClick()
+                waitFor(hasText("Night walk · edited"))
                 assertNoAutoplayOnBrowse(fixture)
                 val playlistPlay = hasText("Play") and hasClickAction()
                 compose.waitUntil(15_000) {
@@ -537,6 +553,7 @@ class NativeUiSmokeTest {
                 waitFor(hasText(UiFixtureServer.DERIVED_NAME))
                 assertPlayingTransition(beforeLargePlaylistsTab, fixture, "font2 Playlists navigation")
                 screenshot("11b-font2-narrow-playlists")
+                assertProfileAttribution(fixture, "11c-font2-narrow-profile", playing = true)
                 val beforeLargeSearchTab = capturePlaying(fixture)
                 activateSearchAndAssertEmpty(fixture, "12a-font2-narrow-empty-search-keyboard")
                 assertPlayingTransition(beforeLargeSearchTab, fixture, "font2 Search activation")
@@ -959,7 +976,7 @@ class NativeUiSmokeTest {
 
     private fun assertCompactNavigationTargets() {
         assertListeningChrome(editing = false)
-        val targets = listOf("Home", "Search", "Playlists").map { label ->
+        val targets = listOf("Home", "Search", "Playlists", "Profile").map { label ->
             compose.onNode(hasText(label) and hasAnyAncestor(hasTestTag("primary-navigation")))
                 .assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
                 .getUnclippedBoundsInRoot()
@@ -968,27 +985,93 @@ class NativeUiSmokeTest {
             assertTrue("Navigation destinations must not overlap", left.right <= right.left)
         }
         // Actual targets exclude the outer bar's legitimate system bottom inset.
-        // Large labels may grow instead of being clipped to the default budget.
+        // Four tabs can wrap at the retained 280dp viewport: allow the necessary second
+        // label line, not an 80dp Material bar clipped into a shorter fixed container.
         if (compose.activity.resources.configuration.fontScale <= 1.01f) {
             targets.forEach { bounds ->
-                assertTrue("Default navigation content must be compact, not clipped 80dp Material content",
-                    (bounds.bottom - bounds.top).value in 48f..60f)
+                assertTrue("Four-tab navigation must keep a bounded compact wrapping budget",
+                    (bounds.bottom - bounds.top).value in 48f..80f)
             }
+        }
+        listOf("Home", "Search", "Playlists", "Profile").forEach { label ->
+            val text = compose.onNode(hasText(label) and hasAnyAncestor(hasTestTag("primary-navigation")), useUnmergedTree = true)
+            val target = compose.onNodeWithTag("nav-${label.lowercase()}").fetchSemanticsNode().boundsInRoot
+            val textBounds = text.fetchSemanticsNode().boundsInRoot
+            assertTrue("The entire navigation label must remain in its target",
+                textBounds.left >= target.left && textBounds.right <= target.right &&
+                    textBounds.top >= target.top && textBounds.bottom <= target.bottom)
+            val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+            text.performSemanticsAction(SemanticsActions.GetTextLayoutResult) { assertTrue(it(layouts)) }
+            val layout = layouts.single()
+            assertTrue("Navigation labels must not ellipsize", (0 until layout.lineCount).none(layout::isLineEllipsized))
+            assertTrue("Navigation glyphs must fit their allocated text bounds", (0 until layout.lineCount).all {
+                layout.getLineLeft(it) >= -1f && layout.getLineRight(it) <= layout.size.width + 1f &&
+                    layout.getLineTop(it) >= -1f && layout.getLineBottom(it) <= layout.size.height + 1f
+            })
         }
     }
 
     private fun assertListeningChrome(editing: Boolean) {
-        listOf("primary-navigation", "app-actions").forEach { tag ->
-            if (editing) {
-                waitUntilAbsent(hasTestTag(tag))
-                compose.onNodeWithTag(tag).assertDoesNotExist()
-            } else {
-                waitFor(hasTestTag(tag))
-                compose.onNodeWithTag(tag).assertIsDisplayed()
-            }
+        // Signed-in connection actions were removed entirely, including their reserved bar.
+        compose.onNodeWithTag("app-actions").assertDoesNotExist()
+        if (editing) {
+            waitUntilAbsent(hasTestTag("primary-navigation"))
+            compose.onNodeWithTag("primary-navigation").assertDoesNotExist()
+            compose.onNodeWithTag("search-query").assertIsFocused()
+        } else {
+            waitFor(hasTestTag("primary-navigation"))
+            compose.onNodeWithTag("primary-navigation").assertIsDisplayed()
+            compose.onNodeWithTag("search-query").assertIsNotFocused()
         }
-        if (editing) compose.onNodeWithTag("search-query").assertIsFocused()
-        else compose.onNodeWithTag("search-query").assertIsNotFocused()
+    }
+
+    /** Profile-owned signed-in notice journey; pre-auth attribution belongs to the Login peer. */
+    private fun assertProfileAttribution(fixture: UiFixtureServer, name: String, playing: Boolean) {
+        val before = if (playing) capturePlaying(fixture) else null
+        compose.onNodeWithTag("nav-profile").performClick()
+        waitFor(hasTestTag("profile-screen"))
+        compose.onNodeWithText("Username").assertExists()
+        compose.onNodeWithText(UiFixtureServer.USERNAME).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText(fixture.origin).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithContentDescription("Account and server").assertDoesNotExist()
+        compose.onNodeWithText("Your connection").assertDoesNotExist()
+        compose.onNodeWithText("Forget saved login").assertDoesNotExist()
+        compose.onNodeWithText("Use saved login").assertDoesNotExist()
+        compose.onNodeWithText("Remember sign-in on this device").assertDoesNotExist()
+        compose.onNodeWithText("Font license").assertDoesNotExist()
+        compose.onNodeWithTag("app-actions").assertDoesNotExist()
+        listOf("home", "search", "playlists", "profile").forEach {
+            compose.onNodeWithTag("nav-$it").assertIsDisplayed()
+                .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
+        }
+        compose.onNodeWithText("Sign out").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        screenshot(name)
+        compose.onNodeWithText("Credits").performScrollTo().assertHeightIsAtLeast(48.dp).performClick()
+        waitFor(hasTestTag("credits-screen"))
+        compose.onNodeWithText("JetBrains Mono").assertExists()
+        compose.onNodeWithText("View full font license").performScrollTo()
+            .assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        screenshot("$name-credits")
+        compose.onNodeWithText("View full font license").performClick()
+        waitFor(hasText("JetBrains Mono font license"))
+        val notice = instrumentation.targetContext.assets.open("licenses/jetbrains-mono/OFL.txt")
+            .bufferedReader(Charsets.UTF_8).use { it.readText() }
+        compose.onNodeWithText(notice).assertExists()
+        compose.onNodeWithText("OTHER DEALINGS IN THE FONT SOFTWARE.", substring = true).assertExists()
+        compose.onNodeWithText("Done").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        screenshot("$name-full-notice")
+        pressBack()
+        waitUntilAbsent(hasText("JetBrains Mono font license"))
+        compose.onNodeWithTag("credits-screen").assertIsDisplayed()
+        pressBack()
+        waitFor(hasTestTag("profile-screen"))
+        compose.runOnIdle {
+            val state = ViewModelProvider(compose.activity)[LibraryViewModel::class.java].state.value
+            assertEquals(Page.Profile, state.page)
+            assertFalse("Profile root must not synthesize Back to Home", state.canGoBack)
+        }
+        if (before != null) assertPlayingTransition(before, fixture, "Profile/Credits/license/Back presentation")
+        else assertNoAutoplayOnBrowse(fixture)
     }
 
     private fun assertSearchGroupOrdering() {
@@ -1350,6 +1433,13 @@ class NativeUiSmokeTest {
         list.performScrollToIndex(8) // 1 artist + 3 albums + the fifth song.
         val anchorTop = compose.onNode(catalogItem(anchor)).assertIsDisplayed().fetchSemanticsNode().boundsInRoot.top
         val contentTop = list.fetchSemanticsNode().boundsInRoot.top
+        var safeTop = 0f
+        instrumentation.runOnMainSync {
+            safeTop = checkNotNull(compose.activity.window.decorView.rootWindowInsets)
+                .getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()).top.toFloat()
+        }
+        compose.onNodeWithTag("app-actions").assertDoesNotExist()
+        assertTrue("Results must start at the safe top boundary without a reserved toolbar gap", kotlin.math.abs(contentTop - safeTop) <= 2f)
         val query = queryText()
         val requests = fixture.searchCalls.size
         val preparations = fixture.playbackPreparations.get()
@@ -1359,7 +1449,9 @@ class NativeUiSmokeTest {
             compose.onNodeWithTag("search-query").performClick()
             waitForIme(true)
             assertSearchInThumbZone(imeVisible = true)
-            assertTrue("Editing must remove reserved top-toolbar space", list.fetchSemanticsNode().boundsInRoot.top < contentTop)
+            compose.onNodeWithTag("app-actions").assertDoesNotExist()
+            assertTrue("Editing must preserve the safe top boundary without introducing toolbar space",
+                kotlin.math.abs(list.fetchSemanticsNode().boundsInRoot.top - safeTop) <= 2f)
             if (playing) {
                 compose.onNode(expandPlayer).assertIsDisplayed().assertTextContains(UiFixtureServer.TRACK_NAMES.first())
                 assertPlayingTransition(checkNotNull(beforeFocus), fixture, "Search focus/IME opening")

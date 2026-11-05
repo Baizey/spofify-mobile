@@ -92,14 +92,11 @@ internal fun SpofifyApp(model: LibraryViewModel) {
     val state by model.state.collectAsStateWithLifecycle()
     val player by model.playback.state.collectAsStateWithLifecycle()
     var expanded by rememberSaveable { mutableStateOf(false) }
-    var account by remember { mutableStateOf(false) }
-    var fontLicense by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.notice) { state.notice?.let { snackbar.showSnackbar(it); model.clearNotice() } }
     LaunchedEffect(state.session) { if (state.session == null) expanded = false }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     BackHandler(state.canGoBack && !expanded && state.session != null && !imeVisible) { model.back() }
-    if (fontLicense) AppFontLicenseDialog(onDismiss = { fontLicense = false })
 
     if (state.restoring) {
         Box(Modifier.fillMaxSize().background(Background), contentAlignment = Alignment.Center) {
@@ -134,6 +131,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
     key(client, state.session?.accountId) {
         val pages = rememberSaveableStateHolder()
         var devices by remember { mutableStateOf(false) }
+        var creditsLicense by remember(state.page) { mutableStateOf(false) }
         var more by remember { mutableStateOf<CatalogMoreSelection?>(null) }
         var addToPlaylist by remember { mutableStateOf<LibraryItem?>(null) }
         var initialPlaylistId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -172,12 +170,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         ListeningChrome(
             chromeHidden = hideListeningChrome(searchPage, searchEditing.value, imeVisible),
             snackbarHost = { SnackbarHost(snackbar) },
-            connectionActions = {
-                if (model.graph.playbackCoordinator != null) IconButton(onClick = { devices = true }) {
-                    Icon(Icons.Default.DevicesOther, "Playback devices · read-only")
-                }
-                IconButton(onClick = { account = true }) { Icon(Icons.Default.AccountCircle, "Account and server") }
-            },
+            connectionActions = null,
             miniPlayer = {
                 NativeMiniPlayer(player, model.playback, {
                     model.cancelSearchActivation(client, accountId)
@@ -188,7 +181,8 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             navigation = {
                 CompactNavigation(modifier = Modifier.testTag("primary-navigation")) {
                     listOf(Tab.HOME to Icons.Default.Home, Tab.SEARCH to Icons.Default.Search,
-                        Tab.PLAYLISTS to Icons.AutoMirrored.Filled.QueueMusic).forEach { (tab, icon) ->
+                        Tab.PLAYLISTS to Icons.AutoMirrored.Filled.QueueMusic,
+                        Tab.PROFILE to Icons.Default.AccountCircle).forEach { (tab, icon) ->
                         CompactNavigationItem(selected = state.tab == tab,
                             onClick = {
                                 if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
@@ -206,6 +200,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                 val pageKey = when (val page = state.page) {
                     is Page.Detail -> "detail:${page.item.kind}:${page.item.id}:${page.navigationId}"
                     Page.Likes -> "likes"
+                    Page.Credits -> "credits"
                     else -> state.tab.name
                 }
                 pages.SaveableStateProvider(pageKey) {
@@ -240,22 +235,19 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                             initialPlaylistId = (page as? Page.Playlist)?.playlist?.id ?: initialPlaylistId)
                         Page.Likes -> LikedSongs(state, model, openExternal, play, showMore, queue, art,
                             feedback, likeStates, contentModifier)
+                        Page.Profile -> ProfileScreen(
+                            username = state.session?.username.orEmpty(), origin = client.server.origin,
+                            busy = state.busy, onCredits = { model.open(Page.Credits) },
+                            onPlaybackDevices = if (model.graph.playbackCoordinator != null) ({ devices = true }) else null,
+                            onSignOut = model::logout, modifier = contentModifier)
+                        Page.Credits -> CreditsScreen(onFontLicense = { creditsLicense = true }, modifier = contentModifier)
                     }
                 }
             }
         }
-        if (account) AlertDialog(onDismissRequest = { account = false }, title = { Text("Your connection") },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(state.session?.username.orEmpty(), fontWeight = FontWeight.Bold)
-                Text(state.server, style = MaterialTheme.typography.bodyMedium)
-                Text("Sign out to change servers. Your music and playlists stay on your server.", style = MaterialTheme.typography.bodySmall)
-                if (state.hasSavedLogin) {
-                    Text("Sign out keeps your saved login on this device for next time.", style = MaterialTheme.typography.bodySmall)
-                    TextButton(enabled = !state.busy, onClick = model::forgetSavedLogin) { Text("Forget saved login") }
-                }
-                TextButton(onClick = { account = false; fontLicense = true }) { Text("Font license") }
-            } }, confirmButton = { TextButton(enabled = !state.busy, onClick = { account = false; model.logout() }) { Text("Sign out") } },
-            dismissButton = { TextButton(onClick = { account = false }) { Text("Done") } })
+        if (creditsLicense && state.page == Page.Credits) {
+            AppFontLicenseDialog(onDismiss = { creditsLicense = false })
+        }
         if (expanded && player.item != null) {
             val item = player.item!!
             LaunchedEffect(item.id) { model.checkLike(item) }

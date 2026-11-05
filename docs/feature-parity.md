@@ -16,11 +16,13 @@ Android baseline: `MainActivity.kt`, `LibraryViewModel.kt`, `PlaybackContexts.kt
 
 ## Product direction: listening, not a catalog dump
 
-The server can contain far too much music for an all-artists/albums/songs landing page to be useful. The user explicitly rejected that top-level Library model. Main navigation is **Home / Search / Playlists**:
+The server can contain far too much music for an all-artists/albums/songs landing page to be useful. The user explicitly rejected that top-level Library model. Main navigation is **Home / Search / Playlists / Profile**:
 
 - **Home:** bounded recently played, a real Liked Songs shortcut/count, and a small set of personal playlists. Each shelf loads and recovers independently. No invented recommendations.
 - **Search:** query-driven grouped artists/albums/songs with bounded results and intentional pagination. An empty query is a prompt, not a request for the complete catalog.
 - **Playlists:** manual and rules-based personal listening collections, not every album on the server.
+- **Profile:** authenticated username and canonical server origin, Credits, Playback devices and Sign out; no saved-login controls or account popup. Credits is nested and exposes the complete bundled JetBrains Mono notice offline. System Back dismisses the notice before popping Credits; Profile root uses normal Android root Back.
+- Ordinary tab restoration retains Search query/results/paging/scroll; explicit Search activation/reselect clears to its empty root with a one-shot focus intent. Leaving for Profile cancels pending activation. These presentation transitions preserve selected-output playback and never issue transport commands.
 - Artist, album and track details remain reachable intentionally from search, recent listening, playlists and linked credits. Release groups and complete playback contexts remain useful there.
 
 ## Listener parity requirements

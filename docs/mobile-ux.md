@@ -14,7 +14,8 @@ These are this app's requirements, not claims that every Android app must use th
 
 ### Listening destinations, not a catalog dump
 
-- Main navigation is **Home / Search / Playlists**.
+- Main navigation is **Home / Search / Playlists / Profile**.
+- Profile is a normal destination for authenticated username/server origin, Credits, Playback devices and Sign out—not an account popup or saved-login settings inventory. Credits nests under Profile and opens the complete bundled font notice locally.
 - Home contains bounded recently played, a Liked Songs shortcut/count and a small selection of personal playlists. Shelves recover independently.
 - Do not present all artists, albums or tracks as a top-level Library to browse. The server catalog is too large for that to be a useful starting point.
 - Empty Search is a useful prompt and issues no match-all catalog request. Entering a query yields artists, albums and songs.
@@ -34,7 +35,7 @@ These are this app's requirements, not claims that every Android app must use th
 
 ### Context without redundant titles
 
-- Selected navigation and surrounding content often already explain where the user is. Avoid repeating `spofify`, Home, Search or Playlists as large generic headings/app bars.
+- Selected navigation and surrounding content often already explain where the user is. Avoid repeating `spofify`, Home, Search, Playlists or Profile as large generic headings/app bars.
 - Remove decorative filler headings that push music and primary actions away from the user's hand.
 - Keep meaningful **song, album, artist and playlist names**, necessary detail-group headers and action-dialog context. Main Search's type/count rows are the specific exception above, not a ban on identity or accessible labels.
 - Empty chrome is not a solution: removing an app-bar title should not leave an unnecessary blank bar. Account and other necessary actions must remain discoverable.
@@ -44,7 +45,8 @@ These are this app's requirements, not claims that every Android app must use th
 - Use system Back, edge Back and three-button Back. Do not duplicate them with in-app Back arrows or text buttons.
 - Back order is contextual: dismiss IME first; then an open menu/dialog/sheet; then pop the current nested destination; at a root, allow normal Android behavior.
 - Now Playing collapses through Back or its sheet gesture. Collapse/navigation never stops audio, resets position or replaces the queue.
-- Preserve the preceding query, results, paging and scroll when returning from details or switching destinations. Returning is not a new search or full reset.
+- Preserve the preceding query, results, paging and scroll when returning from details or switching destinations programmatically. An explicit Search navigation activation/reselect instead opens its empty root with a one-shot IME focus intent; leaving Search for Profile cancels any pending intent.
+- Credits returns to Profile through system Back after any open notice/sheet is dismissed. Profile root allows normal Android root Back, not a synthetic jump to Home. Presentation navigation never prepares, stops or seeks playback.
 - Do not install competing BackHandlers that double-pop, swallow root navigation or jump behind an open sheet. Prefer platform/Compose navigation behavior; support predictive Back correctly where applicable.
 - Previous/restart in the **music transport** is not navigation Back and remains a visible playback control. Cancel/Save in an editor are also distinct actions.
 
@@ -124,7 +126,7 @@ Use the familiar **sheet**, not a fixed-fullscreen replacement. The requirements
 ### Privacy and connection UX
 
 - Accept syntactically valid explicit `http://` and `https://` origins, including hostname and public-IP HTTP, without an HTTP warning, acknowledgement or opt-in on Login. HTTP is unencrypted; the backend may independently reject the transport or require an exact-origin allowlist. Preserve the chosen scheme, exact scheme/host/effective-port isolation and authenticated redirect refusal; never infer a scheme, classify hosts through DNS, downgrade or bypass TLS validation.
-- Keep Login minimal: a modest Sign in heading, labeled Server URL / Username / Password, named password reveal/hide, Sign in, progress and concise necessary error/recovery. No marketing/tutorial prose, remember checkbox, saved-for/Use/Forget controls or font-license entry. The full bundled offline font notice remains accessible through the existing signed-in Account route; Login does not depend on the peer Profile feature.
+- Keep Login minimal: a modest Sign in heading, labeled Server URL / Username / Password, named password reveal/hide, Sign in, progress and concise necessary error/recovery. No marketing/tutorial prose, remember checkbox, saved-for/Use/Forget controls or font-license entry. The full bundled offline font notice is accessible through signed-in Profile → Credits.
 - Automatically save one exact origin/authenticated username/unmodified password only after fully successful, still-current client/session authentication, separately encrypted with Android Keystore and excluded from backup/device transfer. Failed, partial, cancelled or stale authentication must not replace it. If saving fails after authentication, preserve the valid session and prior durable record and show a brief truthful failure-to-save notice.
 - On first form display, autofill the latest valid encrypted successful record as one origin/username/password triple, not mixed with a later failed server preference. Preserve edits through recomposition/error/retry. Canonical-origin changes (including invalid addresses) or username edits clear mismatched passwords and reveal state; returning to an old identity must not resurrect a cleared password. Keep raw password whitespace intact and secrets out of saved UI state, StateFlow, parcels, URLs and logs.
 - Sign out clears session authority and stops locally owned audio but retains the encrypted latest successful login; expiry also retains it for explicit re-authentication. Autofill never submits a password, starts playback or changes session-restoration/offline-retry behavior. Legacy remember flags, including false, must not gate future successful saves; corrupt encrypted data fails closed to usable manual login without plaintext fallback.

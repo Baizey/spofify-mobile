@@ -75,6 +75,7 @@ class LibraryViewModelTest {
         invalidateBeforeLaunch: Boolean = false,
         response: () -> MockResponse = { json("""{"items":[{"kind":"track","id":"song","name":"Song","hasAudio":true}],"total":1001,"truncated":true}""") },
         retry: Boolean = false,
+        retireThroughProfile: Boolean = false,
     ) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val queueStarted = CountDownLatch(1)
@@ -112,7 +113,16 @@ class LibraryViewModelTest {
             runCurrent()
             assertTrue(queueStarted.await(5, TimeUnit.SECONDS))
             assertTrue(model.state.value.preparing)
-            if (!invalidateBeforeLaunch) PlaybackRequests.invalidate()
+            if (retireThroughProfile) {
+                val playing = playback.state.value
+                // Retire the route even when no composition samples the intermediate tabs.
+                model.switchTab(Tab.PROFILE)
+                model.open(Page.Credits)
+                model.back()
+                model.switchTab(Tab.HOME)
+                assertEquals(Page.Home, model.state.value.page)
+                assertEquals(playing, playback.state.value)
+            } else if (!invalidateBeforeLaunch) PlaybackRequests.invalidate()
             releaseQueue.countDown()
             // Unlike cancellation through stopPlayback(), only the completing fetch clears this.
             until { !model.state.value.preparing }
@@ -160,6 +170,84 @@ class LibraryViewModelTest {
 
     @Test fun cancelledEmptyQueueDoesNotPublishAStaleNotice() =
         cancelledQueueCompletion(response = { json("""{"items":[],"total":0}""") })
+
+    @Test fun profileCreditsRoundTripRetiresHeldPlayPreparationWithoutAutoplay() =
+        cancelledQueueCompletion(retireThroughProfile = true)
+
+    @Test fun profileCreditsRoundTripRetiresHeldRowAddWithoutTransportOrStaleNotice() =
+        cancelledQueueCompletion(enqueue = true, retireThroughProfile = true)
+
+    @Test fun expiryRetiresPrivateProfileRoutesAndIgnoresLateNavigationBeforeNewSignIn() =
+        profileSessionRetirement(expire = true)
+
+    @Test fun accountReplacementCannotRestorePreviousAccountsCreditsStack() =
+        profileSessionRetirement(expire = false)
+
+    private fun profileSessionRetirement(expire: Boolean) = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val web = MockWebServer()
+        var account = "first-account"
+        web.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl?.encodedPath) {
+                "/api/auth/login" -> json("""{"accountId":"$account","username":"$account","role":"user","csrfToken":"csrf"}""")
+                    .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
+                else -> json("""{"items":[],"total":0}""")
+            }
+        }
+        web.start()
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val logins = object : LoginStore {
+            private var value: RememberedLogin? = null
+            override fun read() = value
+            override fun write(value: RememberedLogin?) { this.value = value }
+        }
+        val graph = AppGraph(app, MemoryStore(), logins)
+        val store = ViewModelStore()
+        try {
+            val origin = "http://127.0.0.1:${web.port}"
+            val retired = graph.configure(ServerAddress.parse(origin))
+            retired.login("first-account", "synthetic-password")
+            val model = LibraryViewModel(app, graph, FakePlayback())
+            store.put("subject", model)
+            until { model.state.value.session != null && !model.state.value.busy }
+            model.switchTab(Tab.PROFILE)
+            assertEquals(Page.Profile, model.state.value.page)
+            assertFalse(model.state.value.canGoBack)
+            model.open(Page.Credits)
+            assertTrue(model.state.value.canGoBack)
+            model.switchTab(Tab.PLAYLISTS)
+            model.switchTab(Tab.PROFILE)
+            assertEquals(Page.Credits, model.state.value.page)
+            if (expire) {
+                retired.clearSession()
+                retired.onUnauthorized!!.invoke()
+                shadowOf(Looper.getMainLooper()).idle()
+                until { model.state.value.session == null }
+                assertEquals(Page.Home, model.state.value.page)
+                assertFalse(model.state.value.canGoBack)
+                assertNull(model.state.value.searchActivationId)
+                val signedOut = model.state.value
+                // Stale callbacks cannot re-expose Credits/identity or rebuild private stacks.
+                model.switchTab(Tab.PROFILE)
+                model.open(Page.Credits)
+                model.back()
+                assertEquals(signedOut, model.state.value)
+            }
+            account = "replacement-account"
+            model.signIn(origin, account, "synthetic-password")
+            until { model.state.value.session?.accountId == account && !model.state.value.busy }
+            assertNotSame(retired, graph.client)
+            assertEquals(Page.Home, model.state.value.page)
+            model.switchTab(Tab.PROFILE)
+            assertEquals(Page.Profile, model.state.value.page)
+            assertFalse(model.state.value.canGoBack)
+            model.back()
+            assertEquals(Page.Profile, model.state.value.page)
+            assertEquals(account, model.state.value.session?.username)
+        } finally {
+            store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain()
+        }
+    }
 
     @Test fun expiryDuringPendingLogoutDoesNotReenableSignInOrReplaceItsClient() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))

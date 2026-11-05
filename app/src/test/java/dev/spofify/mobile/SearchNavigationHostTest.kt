@@ -227,7 +227,7 @@ class SearchNavigationHostTest {
         systemBack() // IME-hidden editing ends first, not host navigation.
         field().assertIsNotFocused()
         compose.onNodeWithTag("primary-navigation").assertIsDisplayed()
-        compose.onNodeWithTag("app-actions").assertIsDisplayed()
+        compose.onNodeWithTag("app-actions").assertDoesNotExist()
         tap("playlists")
         compose.onNodeWithText("Create playlist").assertIsDisplayed()
         tap("search")
@@ -294,7 +294,7 @@ class SearchNavigationHostTest {
         compose.onNodeWithText("Synthetic song").assertIsDisplayed()
         systemBack()
         assertText("preserved query")
-        for (tab in listOf(Tab.HOME, Tab.PLAYLISTS)) {
+        for (tab in listOf(Tab.HOME, Tab.PLAYLISTS, Tab.PROFILE)) {
             compose.runOnIdle { model.switchTab(tab) }
             compose.waitForIdle()
             compose.runOnIdle { model.switchTab(Tab.SEARCH) }
@@ -369,9 +369,10 @@ class SearchNavigationHostTest {
         compose.runOnIdle {
             model.activateSearch()
             pending = checkNotNull(model.state.value.searchActivationId)
-            model.switchTab(Tab.HOME)
+            model.switchTab(Tab.PROFILE)
         }
         compose.waitForIdle()
+        compose.onNodeWithTag("profile-screen").assertIsDisplayed()
         assertNull(model.state.value.searchActivationId)
         assertEquals(0, keyboard.shows)
         compose.runOnIdle {

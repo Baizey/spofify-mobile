@@ -81,7 +81,7 @@ internal fun RowScope.CompactNavigationItem(
 @Composable
 internal fun ListeningChrome(
     chromeHidden: Boolean,
-    connectionActions: @Composable RowScope.() -> Unit,
+    connectionActions: (@Composable RowScope.() -> Unit)?,
     miniPlayer: @Composable () -> Unit,
     navigation: @Composable () -> Unit,
     snackbarHost: @Composable () -> Unit,
@@ -95,7 +95,7 @@ internal fun ListeningChrome(
         contentWindowInsets = systemInsets,
         snackbarHost = snackbarHost,
         topBar = {
-            if (!chromeHidden) {
+            if (!chromeHidden && connectionActions != null) {
                 Row(
                     Modifier.fillMaxWidth().testTag("app-actions")
                         .windowInsetsPadding(systemInsets.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))

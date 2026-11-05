@@ -40,11 +40,13 @@ sealed interface Page {
     data class Search(val query: String = "") : Page
     data object Likes : Page
     data object Playlists : Page
+    data object Profile : Page
+    data object Credits : Page
     data class Detail(val item: LibraryItem, val navigationId: Long = 0) : Page
     data class Playlist(val playlist: PlaylistSummary) : Page
 }
 
-enum class Tab { HOME, SEARCH, PLAYLISTS }
+enum class Tab { HOME, SEARCH, PLAYLISTS, PROFILE }
 
 data class LibraryState(
     val restoring: Boolean = true,
@@ -323,13 +325,14 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             client.currentSession()?.accountId == account
 
     fun switchTab(tab: Tab) {
-        if (tab == state.value.tab) return
+        if (!ownsNavigation() || tab == state.value.tab) return
         tabStacks[state.value.tab] = stack.toList()
         stack.clear()
         val page = when (tab) {
             Tab.HOME -> Page.Home
             Tab.SEARCH -> Page.Search()
             Tab.PLAYLISTS -> Page.Playlists
+            Tab.PROFILE -> Page.Profile
         }
         stack.addAll(tabStacks[tab] ?: listOf(page))
         mutable.update { it.copy(tab = tab, searchActivationId = null) }
@@ -337,14 +340,20 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     fun open(page: Page) {
+        if (!ownsNavigation()) return
         mutable.update { it.copy(searchActivationId = null) }
         val destination = if (page is Page.Detail) page.copy(navigationId = ++navigationSerial) else page
         stack.add(destination)
         load(destination)
     }
 
+    private fun ownsNavigation(): Boolean {
+        val account = state.value.session?.accountId ?: return false
+        return !state.value.busy && graph.client?.currentSession()?.accountId == account
+    }
+
     fun back() {
-        if (stack.size <= 1) return
+        if (!ownsNavigation() || stack.size <= 1) return
         mutable.update { it.copy(searchActivationId = null) }
         stack.removeAt(stack.lastIndex)
         load(stack.last())

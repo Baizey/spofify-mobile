@@ -33,7 +33,7 @@ fun AppFontLicenseDialog(onDismiss: () -> Unit) {
             )
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Done") }
+            TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("Done") }
         },
     )
 }

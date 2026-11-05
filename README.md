@@ -5,14 +5,15 @@ A native **Android** listener for your own [spofify-go](../spofify-go) server. K
 ## Current listener scope
 
 - Enter your server URL and sign in with an existing Spofify account.
-- **Home / Search / Playlists**: bounded personal shelves, Liked Songs, bottom-positioned query entry, grouped results and progressive See more actions. Empty Search does not fetch the global catalog. The [mobile UX contract](docs/mobile-ux.md) requires editing-focused chrome, compact inline credits, no main-Search type/count heading rows and a flat full-width mini-player; these are rendered acceptance requirements, not a claim of visual approval.
+- **Home / Search / Playlists / Profile**: bounded personal shelves, Liked Songs, bottom-positioned query entry, grouped results and progressive See more actions. Empty Search does not fetch the global catalog. The [mobile UX contract](docs/mobile-ux.md) requires editing-focused chrome, compact inline credits, no main-Search type/count heading rows and a flat full-width mini-player; these are rendered acceptance requirements, not a claim of visual approval.
+- Profile shows the authenticated username and canonical server origin, with Credits, Playback devices and Sign out. Credits is nested; Profile root uses normal Android Back.
 - Open artist/album/song details and play complete contexts, not just the visible page.
 - Create/edit manual personal playlists and build/evaluate server-supported derived playlists.
 - Persistent mini-player, expanded Now Playing, seeking, occurrence-aware queue editing, shuffle and repeat.
 - MediaSessionService-owned audio with notification/system controls, audio focus, headphone-disconnect handling and progress-qualified listening history.
 - Service-lifecycle playback-device registration, selected-output controls and exact-snapshot handoff are enabled in source; native runtime/audio/background acceptance remains unverified. See [device playback](docs/device-playback.md).
 - Android Keystore-encrypted sessions and automatic remembering/autofill of the latest successful server/username/password, without automatic password sign-in or autoplay.
-- Bundled **JetBrains Mono** typography, including its full offline font-license notice in the existing signed-in Account route, not on Sign-in. Provenance and SIL OFL license: [third_party/jetbrains-mono](third_party/jetbrains-mono/).
+- Bundled **JetBrains Mono** typography, including its full offline font-license notice under Profile → Credits, not on Sign-in. Provenance and SIL OFL license: [third_party/jetbrains-mono](third_party/jetbrains-mono/).
 
 **This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory. Earlier isolated emulator attempts failed before app launch; those failures do not establish the current environment's condition. Normal isolated synthetic AVD validation is allowed, but no successful after-render is established by this documentation cleanup: **UI validation remains not complete**. See [docs/ui-validation.md](docs/ui-validation.md) and [docs/testing.md](docs/testing.md).
 
