@@ -206,8 +206,16 @@ class TransientPlaybackRecoveryAppGraphTest {
                 }
                 val count = receipts.size
                 val queueCount = PlaybackService.exportLocalSnapshot().queue.size
-                more(name, label)
-                await("SETUP: actual More $label has a terminal receipt", details = diagnostic) { receipts.size == count + 1 }
+                if (count == 0) {
+                    // Explicit public VM track selection establishes exactly A. Actual catalog
+                    // More Play now correctly expands its album context (six fixture tracks),
+                    // so it is not a single-row setup oracle. Recovery below still uses ONLY
+                    // actual fresh mini/More controls, never a replacement helper.
+                    compose.runOnIdle { model.queueIntentFrom(client,
+                        LibraryItem("track", broker.fixture.tracks.getValue(name), name, hasAudio = true),
+                        PlaybackListAction.PLAY_NOW) }
+                } else more(name, label)
+                await("SETUP: initial $label has a terminal receipt", details = diagnostic) { receipts.size == count + 1 }
                 val receipt = receipts.last()
                 val result = receipt.queueIntentResult
                 val installed = PlaybackService.exportLocalSnapshot()
