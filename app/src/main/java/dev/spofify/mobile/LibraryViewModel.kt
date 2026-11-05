@@ -69,6 +69,9 @@ data class LibraryState(
     val total: Int = 0,
     val offset: Int = 0,
     val loading: Boolean = false,
+    val likesStale: Boolean = false,
+    val likesEnded: Boolean = false,
+    val likesGeneration: Int = 0,
     val error: String? = null,
     val notice: String? = null,
     val preparing: Boolean = false,
@@ -108,7 +111,12 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private var home: HomeStateHolder? = null
     private var personalJob: Job? = null
     private var likesCache: LibraryPage? = null
+    private var likesNextOffset = 0
+    private var likesFailure: String? = null
+    private var likesStale = false
+    private var likesEnded = false
     private var likesDirty = true
+    private var loadSerial = 0L
 
     private fun ensureFeatureOwner(): SpofifyClient? {
         val client = graph.client ?: return null
@@ -157,6 +165,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         home?.setVisible(false); home = null
         personalJob?.cancel(); personalJob = null
         likesCache = null; likesDirty = true
+        likesNextOffset = 0; likesFailure = null; likesStale = false; likesEnded = false
+        loadSerial++
         featureClient = null; featureAccount = null
     }
 
@@ -387,44 +397,86 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     fun refresh() { if (state.value.page == Page.Likes) likesDirty = true; load(state.value.page) }
     fun more() {
         val current = state.value
-        if (!current.loading && current.offset < current.total) load(current.page, append = true)
+        if (current.page == Page.Likes && !current.loading && current.error == null && !current.likesStale && !current.likesEnded &&
+            current.offset < current.total) load(current.page, append = true)
+    }
+
+    /** A failed append is retried at its retained raw offset, never by resetting the prefix. */
+    fun retryLikes() {
+        val current = state.value
+        if (current.page != Page.Likes || current.loading || current.error == null || current.likesStale) return
+        load(Page.Likes, append = current.offset > 0)
     }
 
     private fun load(page: Page, append: Boolean = false) {
         val client = graph.client ?: return
-        if (state.value.session == null) return
+        val session = client.currentSession() ?: return
+        if (state.value.session == null || append && state.value.loading) return
         loadJob?.cancel()
-        val request = ++generation
+        val request = ++loadSerial
+        // Read lifetime is not source/action lifetime: an unchanged held row survives append.
+        if (!append) generation++
         // These routes own independent bounded state holders. Never prefetch a global catalog or
         // decode rules playlists through the old manual-only compatibility API.
         if (page != Page.Likes) {
             mutable.update { it.copy(page = page, canGoBack = stack.size > 1, loading = false,
-                error = null, items = emptyList(), playlists = emptyList(), total = 0, offset = 0) }
+                error = null, likesStale = false, items = emptyList(), playlists = emptyList(), total = 0, offset = 0) }
             return
         }
         val cached = likesCache
         if (!append && !likesDirty && cached != null) {
-            mutable.update { it.copy(page = page, canGoBack = stack.size > 1, loading = false, error = null,
-                items = cached.items, total = cached.total, offset = cached.items.size) }
+            mutable.update { it.copy(page = page, canGoBack = stack.size > 1, loading = false,
+                error = likesFailure, likesStale = likesStale, likesEnded = likesEnded,
+                items = cached.items, total = cached.total, offset = likesNextOffset) }
             return
         }
+        if (!append) { likesFailure = null; likesStale = false; likesEnded = false }
         val offset = if (append) state.value.offset else 0
-        mutable.update { it.copy(page = page, canGoBack = stack.size > 1, loading = true, error = null,
+        val expectedTotal = state.value.total
+        val personalRevision = client.personalRevision.value.likes
+        fun isCurrent() = request == loadSerial && graph.client === client && client.currentSession() === session &&
+            state.value.page == Page.Likes && state.value.session?.accountId == session.accountId
+        mutable.update { it.copy(page = page, canGoBack = stack.size > 1, loading = true, error = null, likesStale = likesStale, likesEnded = likesEnded,
+            likesGeneration = if (append) it.likesGeneration else generation,
             items = if (append || it.page == page) it.items else emptyList(), playlists = if (append) it.playlists else emptyList(),
             total = if (append) it.total else 0, offset = offset) }
         loadJob = viewModelScope.launch {
             try {
                 val result = client.likes(offset)
-                if (request == generation && graph.client === client && state.value.session != null) {
-                    val items = (if (append) state.value.items else emptyList()) + result.items
-                    likesCache = result.copy(items = items, offset = 0)
-                    likesDirty = false
-                    mutable.update { it.copy(items = items, total = result.total,
-                        offset = offset + result.items.size, loading = false) }
+                if (!isCurrent()) return@launch
+                if (result.offset != offset || result.total < 0 || result.limit !in 1..100 ||
+                    result.items.size > result.limit || offset + result.items.size > result.total ||
+                    result.items.any { it.kind != "track" || it.id.isBlank() })
+                    throw IllegalArgumentException("Could not continue liked songs. Retry this batch.")
+                if (append && (result.total != expectedTotal || client.personalRevision.value.likes != personalRevision)) {
+                    likesStale = true
+                    generation++
+                    throw IllegalArgumentException("Liked songs changed. Refresh to load the current list.")
                 }
+                val prefix = if (append) state.value.items else emptyList()
+                val items = (prefix + result.items).distinctBy { it.id }
+                if (append && result.items.isNotEmpty() && items.size == prefix.size)
+                    throw IllegalArgumentException("Could not continue liked songs. Retry this batch.")
+                // Empty pages stop at the real available frontier without repeatedly requesting it.
+                val next = offset + result.items.size
+                val total = result.total
+                likesEnded = result.items.isEmpty() || next >= total
+                likesNextOffset = next
+                likesCache = result.copy(items = items, offset = 0, total = total)
+                likesFailure = null
+                likesDirty = false
+                mutable.update { it.copy(items = items, total = total,
+                    offset = next, loading = false, error = null, likesStale = false, likesEnded = likesEnded) }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                if (request == generation && graph.client === client) mutable.update { it.copy(loading = false, error = message(error)) }
+                if (isCurrent()) {
+                    likesFailure = message(error)
+                    likesNextOffset = offset
+                    // Keep exact failed batch and its latch even after Back/tab restoration.
+                    if (likesCache != null) likesDirty = false
+                    mutable.update { it.copy(loading = false, error = likesFailure, likesStale = likesStale,
+                        likesGeneration = if (likesStale) generation else it.likesGeneration) }
+                }
             }
         }
     }

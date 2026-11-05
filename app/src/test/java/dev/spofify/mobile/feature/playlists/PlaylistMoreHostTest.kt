@@ -55,7 +55,7 @@ class PlaylistMoreHostTest {
                         "/api/me/playlists" -> json("""{"items":[$summary],"total":1,"offset":0,"limit":40}""")
                         "/api/me/playlists/fixture" -> json(summary)
                         "/api/me/playlists/fixture/entries" -> json("""{"items":[{"id":"exact-entry","position":0,"track":$track}],"total":1,"offset":0,"limit":40}""")
-                        "/api/me/playlists/fixture/evaluation" -> json("""{"items":[{"occurrenceId":"exact-path","selectionToken":"opaque.signature","position":1001,"track":$track}],"total":1002,"availableTotal":1002,"limit":40,"nextCursor":null,"revision":5,"fence":"exact-fence","complete":true}""")
+                        "/api/me/playlists/fixture/evaluation" -> json("""{"items":[{"occurrenceId":"exact-path","selectionToken":"opaque.signature","position":0,"track":$track}],"total":1,"availableTotal":1,"limit":40,"nextCursor":null,"revision":5,"fence":"exact-fence","complete":true}""")
                         "/api/me/likes/status" -> json("""{"items":[{"trackId":"same","liked":false}]}""")
                         else -> MockResponse().setResponseCode(404)
                     }

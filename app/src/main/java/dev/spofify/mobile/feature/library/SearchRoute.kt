@@ -44,6 +44,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.SpofifyClient
+import dev.spofify.mobile.ui.AutomaticListDemand
+import dev.spofify.mobile.ui.AppendStatus
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -192,19 +194,43 @@ internal fun CatalogScreenContent(
     onSearchActivationConsumed: (Long) -> Unit = {},
 ) {
     val screen = navigation.current
-    val scroll = remember(screen.key, screen.kind, screen.query, screen.includeMissing, screen.releaseGroup) {
+    val scroll = remember(screen.key, screen.resultGeneration) {
         LazyListState(screen.scrollIndex, screen.scrollOffset)
+    }
+    val rowKinds = remember(screen.key, screen.resultGeneration, screen.sections) {
+        screen.sectionKinds.flatMap { kind -> screen.sections[kind]?.items.orEmpty().map { item ->
+            catalogRowKey(screen, kind, item) to kind
+        } }.toMap()
+    }
+    val lastVisibleKind by remember(scroll, rowKinds) { derivedStateOf {
+        val layout = scroll.layoutInfo
+        layout.visibleItemsInfo.lastOrNull { row ->
+            row.offset < layout.viewportEndOffset && row.offset + row.size > layout.viewportStartOffset && row.key in rowKinds
+        }?.let { rowKinds[it.key] }
+    } }
+    LaunchedEffect(screen.key, screen.resultGeneration, lastVisibleKind) {
+        holder.visibleSection(screen.key, screen.resultGeneration, lastVisibleKind)
+    }
+    screen.sectionKinds.forEach { kind ->
+        val section = screen.sections[kind]
+        val grouped = screen.item == null && screen.search && screen.kind == "all"
+        AutomaticListDemand(scroll, Triple(screen.key, screen.resultGeneration, holder.navigationVersion),
+            section?.items.orEmpty().takeLast(if (grouped) 1 else 3).map { catalogRowKey(screen, kind, it) },
+            enabled = lastVisibleKind == kind && section?.hasNext == true && !section.loading &&
+                (!section.demandPaused || !screen.hasLaterGroups(kind)) &&
+                section.error == null && !section.needsReload && !screen.stale && !screen.detailUnavailable,
+            onLoad = { holder.demandMore(kind) })
     }
     LaunchedEffect(scroll, screen.key) {
         snapshotFlow { scroll.firstVisibleItemIndex to scroll.firstVisibleItemScrollOffset }.distinctUntilChanged()
             .collect { (index, offset) -> holder.rememberScroll(screen.key, index, offset, screen.query, screen.releaseGroup) }
     }
     Column(modifier.fillMaxSize()) {
-    LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll,
+    LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("catalog-results"), state = scroll,
         contentPadding = PaddingValues(horizontal = MusicListLayout.horizontalPadding, vertical = 8.dp),
         verticalArrangement = MusicListLayout.arrangement) {
         val detail = screen.item
-        if (detail == null && !screen.emptySearch && screen.sections.values.any { it.loading }) item(key = "search-loading") {
+        if (detail == null && !screen.emptySearch && screen.sections.values.any { it.loading && !it.loaded }) item(key = "search-loading") {
             LinearProgressIndicator(Modifier.fillMaxWidth().semantics { contentDescription = "Searching saved music" })
         }
         if (detail != null && screen.detailUnavailable) {
@@ -264,19 +290,29 @@ internal fun CatalogScreenContent(
                     if (section.loading) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 }
             }
-            section.error?.let { error -> item(key = "$kind:error") { LoadError(error, "Retry ${catalogLabel(kind).lowercase()}") { holder.retry(kind) } } }
             if (detail != null && section.loaded && section.items.isEmpty()) item(key = "$kind:empty") {
                 Text("No saved ${catalogLabel(kind).lowercase()} in this group.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
             }
-            musicRows(section.items, key = { index, item -> "$kind:${section.offset}:$index:${item.id}" },
+            musicRows(section.items, key = { _, item -> catalogRowKey(screen, kind, item) },
                 onOpen, onPlay, onMore, onQueue, artwork, playback, likes, onToggleLike)
-            if (section.hasNext) item(key = "$kind:more") {
-                TextButton(onClick = { holder.more(kind) }, enabled = !section.loading,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                    Text("See more ${catalogLabel(kind).lowercase()}")
-                }
+            if (section.loading && section.loaded || section.error != null) item(key = "$kind:status") {
+                AppendStatus(section.loading, section.error, { holder.retry(kind) },
+                    loadingLabel = "Loading more ${catalogLabel(kind).lowercase()}",
+                    retryLabel = "${if (section.refreshRequired) "Refresh" else "Retry"} ${catalogLabel(kind).lowercase()}")
             }
+            if (detail != null && section.loaded && !section.loading && section.error == null && !section.needsReload && section.ended && section.items.isNotEmpty())
+                item(key = "$kind:end") {
+                    Text("End of ${catalogLabel(kind).lowercase()}", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+        }
+        if (detail == null && !screen.emptySearch && screen.sections.values.any { it.items.isNotEmpty() } &&
+            screen.sectionKinds.all { kind -> screen.sections[kind]?.let {
+                it.loaded && it.ended && !it.loading && !it.needsReload && it.error == null
+            } == true }) item(key = "search-end") {
+            Text("End of results", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (detail == null && !screen.emptySearch && screen.sectionKinds.all { kind ->
             screen.sections[kind]?.let { it.loaded && !it.loading && it.items.isEmpty() && it.error == null } == true
@@ -296,6 +332,10 @@ internal fun CatalogScreenContent(
     }
     }
 }
+
+/** Stable through append/revalidation; a result reset (including ABA) gets a new incarnation. */
+internal fun catalogRowKey(screen: CatalogScreen, kind: String, item: LibraryItem): String =
+    "${screen.key}:${screen.resultGeneration}:$kind:${item.id}"
 
 @Composable
 internal fun CommittedSearchField(

@@ -1,5 +1,18 @@
 package dev.spofify.mobile.feature.playlists
 
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.v2.createComposeRule
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import org.junit.Rule
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import dev.spofify.mobile.core.ApiException
 import dev.spofify.mobile.core.LibraryItem
 import java.io.IOException
@@ -25,6 +38,97 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+
+/** Production modal/finite lazy viewport, not direct state.more() as a substitute for scroll. */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35], qualifiers = "w400dp-h850dp-mdpi")
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+@OptIn(ExperimentalCoroutinesApi::class)
+class AddToPlaylistSheetHostTest {
+    private val scheduler = TestCoroutineScheduler()
+    @get:Rule val compose = createComposeRule(effectContext = StandardTestDispatcher(scheduler))
+
+    @Test fun visibleFrontierRetriesSameOffsetAndAppendRetainsChosenTarget() = host(uncertainCreate = false)
+    @Test fun verificationFrontierIsReadOnlyAfterLostCreateAndCannotRestoreWriteAuthority() = host(uncertainCreate = true)
+
+    private fun host(uncertainCreate: Boolean) {
+        val requests = CopyOnWriteArrayList<Pair<String, String?>>()
+        val failAppend = AtomicBoolean(!uncertainCreate)
+        MockWebServer().use { web ->
+            web.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val url = request.requestUrl!!
+                    requests += request.method!! to url.queryParameter("offset")
+                    if (request.method == "POST") return if (uncertainCreate) json("{}", 503)
+                        else json(summary("p2", 8))
+                    val offset = url.queryParameter("offset")!!.toInt()
+                    if (offset == 40 && failAppend.compareAndSet(true, false)) return json("{}", 503)
+                    val items = (offset until minOf(offset + 40, 41)).joinToString(",") { summary("p$it", 7) }
+                    return json("""{"items":[$items],"total":41,"limit":40,"offset":$offset}""")
+                }
+            }
+            web.start()
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), object : SessionStore {
+                override fun read(): StoredSession? = null
+                override fun write(value: StoredSession?) = Unit
+            })
+            val shown = mutableStateOf(true)
+            try {
+                compose.setContent { MaterialTheme {
+                    if (shown.value) AddToPlaylistSheet(client, LibraryItem("track", "t", "Song"), { shown.value = false })
+                } }
+                waitFor("Playlist p2")
+                assertEquals(listOf("0"), requests.filter { it.first == "GET" }.map { it.second })
+                if (uncertainCreate) {
+                    compose.onNodeWithText("Create playlist").performClick()
+                    compose.onNodeWithText("Name").performTextInput("Retained draft")
+                    compose.onNodeWithText("Create manual playlist").performScrollTo().performClick()
+                    waitFor("Verify saved playlists")
+                    compose.onNodeWithText("Verify saved playlists").performScrollTo().performClick()
+                    waitFor("Playlist p0")
+                    compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Playlist p39"))
+                    waitFor("Playlist p40", scroll = true)
+                    compose.onNodeWithText("Create manual playlist").performScrollTo().assertIsNotEnabled()
+                    compose.onNodeWithText("Add track").assertDoesNotExist()
+                    assertEquals(1, requests.count { it.first == "POST" })
+                    assertEquals(listOf("0", "0", "40"), requests.filter { it.first == "GET" }.map { it.second })
+                } else {
+                    compose.onNode(hasText("Playlist p2") and hasClickAction()).performClick()
+                    compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Playlist p39"))
+                    waitFor("Retry loading playlists")
+                    compose.waitForIdle()
+                    assertEquals(listOf("0", "40"), requests.filter { it.first == "GET" }.map { it.second })
+                    compose.onNodeWithText("Retry loading playlists").performScrollTo().performClick()
+                    waitFor("Playlist p40", scroll = true)
+                    assertEquals(listOf("0", "40", "40"), requests.filter { it.first == "GET" }.map { it.second })
+                    compose.onNodeWithText("Add track").performClick()
+                    compose.waitUntil(5_000) { requests.any { it.first == "POST" } }
+                    val add = (0 until web.requestCount).map { web.takeRequest(1, TimeUnit.SECONDS)!! }.last()
+                    assertEquals("/api/me/playlists/p2/entries", add.path)
+                    assertTrue(add.body.readUtf8().contains("\"expectedRevision\":7"))
+                }
+            } finally {
+                compose.runOnIdle { shown.value = false }; compose.waitForIdle()
+                client.httpClient.dispatcher.cancelAll(); client.httpClient.connectionPool.evictAll()
+                client.httpClient.dispatcher.executorService.shutdown()
+            }
+        }
+    }
+
+    private fun waitFor(text: String, scroll: Boolean = false) {
+        compose.waitUntil(5_000) {
+            compose.waitForIdle()
+            try {
+                if (scroll) compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(text))
+                compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
+            } catch (_: AssertionError) { false }
+        }
+    }
+    private fun summary(id: String, revision: Int) =
+        """{"id":"$id","name":"Playlist $id","kind":"manual","trackCount":0,"availableCount":0,"revision":$revision,"capabilities":{"addTracks":true}}"""
+    private fun json(body: String, status: Int = 200) = MockResponse().setResponseCode(status)
+        .setHeader("Content-Type", "application/json").setBody(body)
+}
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AddToPlaylistSheetTest {
@@ -75,8 +179,12 @@ class AddToPlaylistSheetTest {
             assertEquals("manual", first.requestUrl!!.queryParameter("kind"))
             assertEquals("40", first.requestUrl!!.queryParameter("limit"))
             assertEquals("0", first.requestUrl!!.queryParameter("offset"))
-            state.loadTargets(40)
+            state.select("p2")
+            state.moreTargets(); state.moreTargets()
             until { !state.busy }
+            assertEquals("p2", state.selected!!.id)
+            assertEquals(41, state.targets!!.items.size)
+            state.select("last")
             assertEquals("last", state.selected!!.id)
             assertEquals("40", web.takeRequest(1, TimeUnit.SECONDS)!!.requestUrl!!.queryParameter("offset"))
             state.add()
@@ -88,6 +196,75 @@ class AddToPlaylistSheetTest {
             assertTrue(add.body.readUtf8().contains("\"expectedRevision\":12"))
             assertTrue(state.finished)
             assertEquals(3, web.requestCount)
+        }
+    }
+
+    @Test fun failedAppendLatchesExactRawOffsetAndKeepsSelectionUntilExplicitRetry() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            web.enqueue(response(page((0 until 40).map { summary("p$it") }, total = 81)))
+            web.enqueue(response("{}", 503))
+            web.enqueue(response(page((40 until 80).map { summary("p$it") }, total = 81, offset = 40)))
+            web.enqueue(response(page(listOf(summary("p80")), total = 81, offset = 80)))
+            val state = state(web)
+            state.loadTargets(0); until { !state.busy }; state.select("p3")
+            state.moreTargets(); state.moreTargets(); until { !state.busy }
+            assertNotNull(state.targetError)
+            repeat(5) { state.moreTargets(); state.loadTargets(40) }
+            assertEquals(2, web.requestCount)
+            assertEquals("p3", state.selected!!.id)
+            assertEquals(40, state.targets!!.items.size)
+            state.retryTargets(); state.retryTargets(); until { !state.busy }
+            assertEquals(80, state.targets!!.items.size)
+            state.moreTargets(); until { !state.busy }
+            assertTrue(state.targetsEnded)
+            repeat(3) { state.moreTargets() }
+            assertEquals(listOf("0", "40", "40", "80"), (0 until 4).map {
+                web.takeRequest(1, TimeUnit.SECONDS)!!.requestUrl!!.queryParameter("offset")
+            })
+        }
+    }
+
+    @Test fun detectedPersonalChangeBlocksRetainedSelectionInsteadOfInventingSnapshotAuthority() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            web.enqueue(response(page((0 until 40).map { summary("p$it") }, total = 41)))
+            var revision = 0L
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), EmptyStore())
+            val state = AddToPlaylistState(PersonalCollectionsApi(client), track, this, personalRevision = { revision })
+            state.loadTargets(0); until { !state.busy }
+            revision++
+            assertFalse(state.canAdd)
+            state.moreTargets(); until { !state.busy }
+            assertTrue(state.targetsStale)
+            assertEquals(40, state.targets!!.items.size)
+            state.add()
+            assertEquals(1, web.requestCount)
+        }
+    }
+
+    @Test fun verificationAppendsReadOnlyAndRetryCannotReplayUncertainCreate() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            web.enqueue(response("{}", 503))
+            web.enqueue(response(page((0 until 40).map { summary("p$it") }, total = 41)))
+            web.enqueue(response("{}", 503))
+            web.enqueue(response(page(listOf(summary("p40")), total = 41, offset = 40)))
+            val state = state(web)
+            state.beginCreate(); state.name = "Retained draft"; state.create(); until { !state.busy }
+            val blocked = state.blocked
+            state.verify(); until { !state.busy }
+            state.moreVerification(); state.moreVerification(); until { !state.busy }
+            repeat(4) { state.moreVerification(); state.add(); state.create() }
+            assertEquals(3, web.requestCount)
+            assertEquals(40, state.verifiedTargets!!.items.size)
+            state.retryVerification(); state.retryVerification(); until { !state.busy }
+            assertEquals(41, state.verifiedTargets!!.items.size)
+            assertTrue(state.verificationEnded)
+            assertEquals(blocked, state.blocked)
+            assertFalse(state.canAdd)
+            assertEquals("Retained draft", state.name)
+            assertEquals(listOf("POST", "GET", "GET", "GET"), (0 until 4).map { web.takeRequest(1, TimeUnit.SECONDS)!!.method })
         }
     }
 
@@ -308,7 +485,7 @@ class AddToPlaylistSheetTest {
             until { !state.busy }
             assertNull(state.targets)
             assertFalse(state.canAdd)
-            state.loadTargets(0)
+            state.refreshTargets()
             until { !state.busy }
             assertNull(state.targets)
             assertFalse(state.canAdd)

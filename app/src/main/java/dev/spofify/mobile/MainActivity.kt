@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.*
@@ -42,6 +43,8 @@ import dev.spofify.mobile.feature.player.NativeNowPlaying
 import dev.spofify.mobile.feature.player.NativeNowPlayingDialog
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
+import dev.spofify.mobile.ui.AutomaticListDemand
+import dev.spofify.mobile.ui.AppendStatus
 import dev.spofify.mobile.ui.ListeningChrome
 import dev.spofify.mobile.ui.CompactNavigation
 import dev.spofify.mobile.ui.CompactNavigationItem
@@ -169,7 +172,8 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         val catalogRoute = catalogScreen?.let { Triple(catalog.navigationVersion, it.key, it.query) }
         // Own accepted intents outside the sheet: dismissal is presentation, not cancellation.
         // Inner catalog navigation/query changes also retire the old route (including A→B→A).
-        val actionLifetime = remember(state.page, catalog, catalogRoute) { RowActionLifetime() }
+        val likesSource = state.likesGeneration.takeIf { state.page == Page.Likes }
+        val actionLifetime = remember(state.page, catalog, catalogRoute, likesSource) { RowActionLifetime() }
         DisposableEffect(actionLifetime) { onDispose { actionLifetime.invalidate() } }
         val showMore: (LibraryItem) -> Unit = { more = CatalogMoreSelection(it, player.interactionKey, actionLifetime, player.queueIntentBinding, player.unselectedQueueOrigin) }
         val openExternal: (LibraryItem) -> Unit = { item ->
@@ -319,7 +323,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
 }
 
 @Composable
-private fun LikedSongs(
+internal fun LikedSongs(
     state: LibraryState, model: LibraryViewModel,
     onOpen: (LibraryItem) -> Unit, onPlay: (LibraryItem, Boolean) -> Unit,
     onMore: (LibraryItem) -> Unit, onQueue: (LibraryItem) -> Unit,
@@ -327,23 +331,30 @@ private fun LikedSongs(
     feedback: CatalogPlaybackFeedback, likes: Map<String, CatalogLikeState>, modifier: Modifier,
 ) {
     LaunchedEffect(state.items) { model.checkVisibleLikes(state.items) }
-    LazyColumn(modifier, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    val list = rememberLazyListState()
+    AutomaticListDemand(list, model to state.likesGeneration, state.items.takeLast(3).map { "liked:${it.id}" },
+        state.page == Page.Likes && !state.loading && state.error == null && !state.likesStale &&
+            !state.likesEnded && state.offset < state.total, model::more)
+    LazyColumn(modifier.testTag("liked-songs-list"), state = list, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
             Text("Liked songs", style = MaterialTheme.typography.headlineLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = { model.playPage(false) }, enabled = state.items.any { it.playable } && !state.preparing) { Text("Play") }
                 OutlinedButton(onClick = { model.playPage(true) }, enabled = state.items.any { it.playable } && !state.preparing) { Text("Shuffle") }
             }
-            if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            state.error?.let { LoadError(it, "Retry liked songs", model::refresh) }
+            if (state.items.isEmpty()) AppendStatus(state.loading, state.error, model::retryLikes,
+                loadingLabel = "Loading liked songs", retryLabel = "Retry liked songs")
+            if (state.likesStale) TextButton(onClick = model::refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text("Refresh liked songs") }
             if (!state.loading && state.items.isEmpty() && state.error == null) Text("No liked songs yet.")
         }
-        itemsIndexed(state.items, key = { index, item -> "${item.id}:$index" }) { _, item ->
+        itemsIndexed(state.items, key = { _, item -> "liked:${item.id}" }) { _, item ->
             MusicRow(item, onOpen, onPlay, onMore, onQueue, artwork, playback = feedback,
                 like = likes[item.id], onToggleLike = model::likeAction)
         }
-        if (!state.loading && state.offset < state.total) item {
-            TextButton(onClick = model::more, modifier = Modifier.fillMaxWidth()) { Text("Show more (${state.offset} of ${state.total})") }
+        if (state.items.isNotEmpty()) item(key = "likes-continuation") {
+            if (state.likesStale) state.error?.let { Text(it) }
+            else AppendStatus(state.loading, state.error, model::retryLikes,
+                loadingLabel = "Loading more liked songs", retryLabel = "Retry liked songs")
         }
     }
 }

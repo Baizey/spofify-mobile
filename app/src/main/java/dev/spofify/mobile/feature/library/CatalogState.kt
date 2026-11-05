@@ -58,10 +58,17 @@ data class CatalogSection(
     val needsReload: Boolean = false,
     val appendPending: Boolean = false,
     val revalidateCount: Int = 0,
+    /** Raw server positions consumed, independent of deduplicated visible identities. */
+    val consumed: Int = 0,
+    val revision: Long? = null,
+    val ended: Boolean = false,
+    val refreshRequired: Boolean = false,
+    /** Earlier grouped results yield after one append until a later group is visited. */
+    val demandPaused: Boolean = false,
 ) {
     val hasPrevious get() = offset > 0
-    val nextOffset get() = offset + maxOf(items.size, limit)
-    val hasNext get() = nextOffset < total && nextOffset <= 1_000_000
+    val nextOffset get() = offset + consumed
+    val hasNext get() = loaded && !ended && nextOffset < total && nextOffset <= 1_000_000
 }
 
 data class CatalogScreen(
@@ -81,6 +88,8 @@ data class CatalogScreen(
     val scrollIndex: Int = 0,
     val scrollOffset: Int = 0,
     val stale: Boolean = false,
+    /** Row identity incarnation; unlike requests/scroll this changes on query/filter ABA. */
+    val resultGeneration: Long = 0,
 ) {
     val emptySearch get() = item == null && search && query.isBlank()
     val sectionKinds: List<String> get() = when (item?.kind) {
@@ -89,6 +98,11 @@ data class CatalogScreen(
         "track" -> emptyList()
         else -> if (kind == "all") CatalogKinds else listOf(kind)
     }
+
+    fun hasLaterGroups(kind: String): Boolean = item == null && search && this.kind == "all" &&
+        sectionKinds.drop(sectionKinds.indexOf(kind) + 1).any { later ->
+            sections[later]?.let { !it.loaded || it.items.isNotEmpty() || it.error != null } != false
+        }
 
     fun request(section: String): CatalogRequest {
         val child = item != null
@@ -227,7 +241,7 @@ class CatalogStateHolder(
         navigationVersion++
         cancelReads()
         update { it.copy(query = cleaned, search = true, item = null, sections = emptyMap(),
-            scrollIndex = 0, scrollOffset = 0, detailResolved = false) }
+            scrollIndex = 0, scrollOffset = 0, detailResolved = false, resultGeneration = ++serial) }
         if (cleaned.isBlank()) return
         val token = generation
         queryJob = scope.launch {
@@ -254,7 +268,7 @@ class CatalogStateHolder(
     private fun changeResults(change: (CatalogScreen) -> CatalogScreen) {
         navigationVersion++
         cancelReads()
-        update { change(it).copy(sections = emptyMap(), scrollIndex = 0, scrollOffset = 0) }
+        update { change(it).copy(sections = emptyMap(), scrollIndex = 0, scrollOffset = 0, resultGeneration = ++serial) }
         loadVisible()
     }
 
@@ -262,13 +276,34 @@ class CatalogStateHolder(
         if (group !in ReleaseGroups.map { it.first } || group == state.value.current.releaseGroup) return
         navigationVersion++
         cancelReads()
-        update { it.copy(releaseGroup = group, sections = emptyMap(), scrollIndex = 0, scrollOffset = 0) }
+        update { it.copy(releaseGroup = group, sections = emptyMap(), scrollIndex = 0, scrollOffset = 0, resultGeneration = ++serial) }
         loadVisible()
+    }
+
+    /** Geometry demand, distinct from explicit compatibility/test expansion. Never starve a
+     * later result group: one earlier append yields until that later group is actually seen. */
+    fun demandMore(kind: String) {
+        val screen = state.value.current
+        val section = screen.sections[kind] ?: return
+        if (screen.hasLaterGroups(kind) && section.demandPaused) return
+        more(kind)
+        if (screen.hasLaterGroups(kind) && state.value.current.sections[kind]?.loading == true)
+            update { it.copy(sections = it.sections + (kind to it.sections.getValue(kind).copy(demandPaused = true))) }
+    }
+
+    fun visibleSection(screenKey: Long, resultGeneration: Long, kind: String?) {
+        val screen = state.value.current
+        if (screen.key != screenKey || screen.resultGeneration != resultGeneration || kind == null) return
+        val prior = screen.sectionKinds.takeWhile { it != kind }.toSet()
+        if (screen.sections.none { (name, section) -> name in prior && section.demandPaused }) return
+        update { it.copy(sections = it.sections.mapValues { (name, section) ->
+            if (name in prior) section.copy(demandPaused = false) else section
+        }) }
     }
 
     fun more(kind: String) {
         val section = state.value.current.sections[kind] ?: return
-        if (section.loading || !section.hasNext) return
+        if (!visible || section.loading || section.error != null || section.needsReload || !section.hasNext) return
         update { it.copy(sections = it.sections + (kind to section.copy(
             requestedOffset = section.nextOffset, appendPending = true))) }
         loadSection(kind)
@@ -282,7 +317,16 @@ class CatalogStateHolder(
         loadSection(kind)
     }
 
-    fun retry(kind: String) = loadSection(kind)
+    /** Explicit recovery alone clears a failed batch; Retry retains its exact requested offset. */
+    fun retry(kind: String) {
+        if (state.value.current.sections[kind]?.refreshRequired == true) {
+            navigationVersion++
+            update { screen -> screen.copy(sections = screen.sections + (kind to screen.sections.getValue(kind).copy(
+                appendPending = false, requestedOffset = null, refreshRequired = false,
+                revalidateCount = screen.sections.getValue(kind).items.size))) }
+        }
+        loadSection(kind)
+    }
     fun retryDetail() = loadDetail()
 
     private fun loadVisible(preservePending: Boolean = false) {
@@ -294,55 +338,106 @@ class CatalogStateHolder(
             (!preservePending || !screen.detailLoading)) loadDetail(quiet = stale || screen.detailResolved)
         if (!screen.detailUnavailable) screen.sectionKinds.forEach { kind ->
             val section = screen.sections[kind]
-            if ((section?.loaded != true || section.needsReload || stale) && (!preservePending || section?.loading != true))
+            if ((section?.error == null || stale) && (section?.loaded != true || section.needsReload || stale) &&
+                (!preservePending || section?.loading != true))
                 loadSection(kind, quiet = stale || section?.loaded == true)
         }
         update { it.copy(stale = false) }
     }
 
     private fun loadSection(kind: String, quiet: Boolean = false) {
-        if (!visible || kind !in state.value.current.sectionKinds || state.value.current.emptySearch || state.value.current.detailUnavailable) return
+        if (!visible || kind !in state.value.current.sectionKinds || state.value.current.emptySearch || state.value.current.detailUnavailable ||
+            state.value.current.sections[kind]?.loading == true) return
         val token = generation
         val screen = state.value.current
         val request = screen.request(kind)
         val existing = screen.sections[kind]
         val append = existing?.appendPending == true
         val retainedCount = if (!append && existing != null && existing.offset == request.offset)
-            maxOf(existing.items.size, existing.revalidateCount, request.limit) else request.limit
+            maxOf(existing.consumed, existing.items.size, existing.revalidateCount, request.limit) else request.limit
         val jobKey = "section:$kind"
         jobs.remove(jobKey)?.cancel()
         val requestId = ++requestSerial
         requests[jobKey] = requestId
         fun current() = token == generation && requests[jobKey] == requestId && screen.key == state.value.current.key
-        update { it.copy(sections = it.sections + (kind to (it.sections[kind] ?: CatalogSection(limit = request.limit)).copy(loading = true, error = null, needsReload = true))) }
+        // Reserve before launching: repeated layout/demand callbacks cannot replace this flight.
+        // A benign append read does not revoke existing source/row actions.
+        update { it.copy(sections = it.sections + (kind to (it.sections[kind] ?: CatalogSection(limit = request.limit)).copy(
+            loading = true, error = null, needsReload = !append || existing?.needsReload == true))) }
         jobs[jobKey] = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                var result = reader.browse(request.copy(limit = minOf(retainedCount, 100)))
-                // Revalidate only the prefix the listener explicitly expanded, in bounded reads.
-                // Never fetch the whole catalog just to create a recommendation/ranking illusion.
-                while (retainedCount > request.limit && result.items.size < retainedCount && request.offset + result.items.size < result.total && result.items.isNotEmpty()) {
+                var batchRequest = request.copy(limit = minOf(retainedCount, 100))
+                var result = reader.browse(batchRequest)
+                if (!current()) return@launch
+                validateCatalogBatch(result, batchRequest)
+                var exhausted = result.items.isEmpty()
+                // Recover only the retained extent, never a hidden whole-catalog scan. Every
+                // component must agree on revision/total before any rebuilt prefix is published.
+                while (retainedCount > request.limit && result.items.size < retainedCount &&
+                    request.offset + result.items.size < result.total && !exhausted) {
                     if (!current()) return@launch
-                    val next = reader.browse(request.copy(offset = request.offset + result.items.size,
-                        limit = minOf(retainedCount - result.items.size, 100)))
-                    if (next.items.isEmpty()) break
-                    result = result.copy(items = result.items + next.items, total = next.total,
-                        revision = minOf(result.revision, next.revision))
+                    val nextOffset = request.offset + result.items.size
+                    if (nextOffset > 1_000_000) throw CatalogProgressException()
+                    batchRequest = request.copy(offset = nextOffset, limit = minOf(retainedCount - result.items.size, 100))
+                    val next = reader.browse(batchRequest)
+                    if (!current()) return@launch
+                    validateCatalogBatch(next, batchRequest)
+                    if (result.revision != next.revision || result.total != next.total) throw CatalogSnapshotException()
+                    val seen = result.items.mapTo(hashSetOf()) { it.kind to it.id }
+                    if (next.items.isNotEmpty() && next.items.none { (it.kind to it.id) !in seen })
+                        throw CatalogProgressException()
+                    exhausted = next.items.isEmpty()
+                    result = result.copy(items = result.items + next.items)
                 }
                 if (!current() || state.value.current.detailUnavailable) return@launch
                 val baseline = knownRevision
                 if (baseline == null) knownRevision = result.revision
                 val outdated = baseline != null && result.revision < baseline
                 if (baseline != null && outdated) pendingRevision = maxOf(pendingRevision ?: baseline, latestObservedRevision ?: baseline)
+                if (baseline != null && result.revision > baseline) {
+                    pendingRevision = maxOf(pendingRevision ?: result.revision, result.revision)
+                    if (!append) {
+                        navigationVersion++
+                        // A newer sibling response is not proof that the retained groups are
+                        // current. Keep them usable but fenced until the revision poll rebuilds.
+                        update { current -> current.copy(sections = current.sections.mapValues { (_, section) ->
+                            if (section.loaded && section.revision != result.revision) section.copy(needsReload = true) else section
+                        }) }
+                    }
+                }
+                if (append && (existing?.revision != result.revision || existing?.total != result.total || outdated)) {
+                    if (baseline == null || result.revision > baseline)
+                        pendingRevision = maxOf(pendingRevision ?: result.revision, result.revision)
+                    throw CatalogSnapshotException()
+                }
+                val prefix = if (append) existing?.items.orEmpty() else emptyList()
+                val identities = prefix.associateBy { it.kind to it.id }.toMutableMap()
+                val added = result.items.filter { item ->
+                    val previous = identities.put(item.kind to item.id, item)
+                    if (previous != null && previous != item) throw CatalogProgressException()
+                    previous == null
+                }
+                if (append && result.items.isNotEmpty() && added.isEmpty()) throw CatalogProgressException()
+                val consumed = (if (append) existing?.consumed ?: 0 else 0) + result.items.size
+                val origin = if (append) existing?.offset ?: request.offset else request.offset
+                if (!exhausted && origin + consumed < result.total && origin + consumed > 1_000_000)
+                    throw CatalogProgressException()
                 update { it.copy(sections = it.sections + (kind to CatalogSection(
-                    (if (append) existing?.items.orEmpty() else emptyList()) + result.items, result.total,
-                    if (append) existing?.offset ?: request.offset else request.offset,
-                    request.limit, loaded = true, needsReload = outdated))) }
+                    items = prefix + added, total = result.total, offset = origin,
+                    limit = request.limit, loaded = true, needsReload = outdated,
+                    consumed = consumed, revision = result.revision,
+                    ended = exhausted || origin + consumed >= result.total,
+                    demandPaused = state.value.current.sections[kind]?.demandPaused == true))) }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (current()) update { current ->
                     val old = current.sections[kind] ?: return@update current
+                    val invalidSnapshot = error is CatalogSnapshotException || error is CatalogProgressException
+                    if (invalidSnapshot) navigationVersion++
                     current.copy(sections = current.sections + (kind to old.copy(loading = false,
-                        error = if (quiet && old.loaded) null else catalogError(error))))
+                        needsReload = old.needsReload || invalidSnapshot,
+                        refreshRequired = old.refreshRequired || invalidSnapshot,
+                        error = if (quiet && old.loaded && !append && !invalidSnapshot) null else catalogError(error))))
                 }
             } finally {
                 if (current()) { jobs.remove(jobKey); requests.remove(jobKey); applyPendingRevision() }
@@ -422,11 +517,12 @@ class CatalogStateHolder(
         catchUpAllowed = false
         pendingRevision = null
         knownRevision = maxOf(knownRevision ?: revision, revision)
+        navigationVersion++
         mutable.value = mutable.value.copy(stack = mutable.value.stack.map { screen ->
             screen.copy(stale = true, sections = screen.sections.mapValues { (_, section) ->
                 // A new revision invalidates the prefix too, not just a failed/pending expansion.
                 // Preserve the listener's requested extent, but rebuild it from a fresh snapshot.
-                section.copy(appendPending = false, requestedOffset = null,
+                section.copy(appendPending = false, requestedOffset = null, error = null, refreshRequired = false, demandPaused = false,
                     revalidateCount = maxOf(section.revalidateCount,
                         if (section.appendPending) section.nextOffset + section.limit - section.offset else 0))
             })
@@ -450,7 +546,17 @@ fun cleanCatalogQuery(value: String): String = buildString {
         count++
     }
 }
+private class CatalogSnapshotException : IOException("Music changed. Refresh these results.")
+private class CatalogProgressException : IOException("Could not continue these results. Refresh to try again.")
+
+private fun validateCatalogBatch(page: LibraryPage, request: CatalogRequest) {
+    if (page.offset != request.offset || page.items.size > request.limit || page.total < 0 ||
+        (page.items.isNotEmpty() && page.offset.toLong() + page.items.size > page.total.toLong()) ||
+        page.items.any { it.id.isBlank() }) throw CatalogProgressException()
+}
+
 internal fun catalogError(error: Exception): String = when (error) {
+    is CatalogSnapshotException, is CatalogProgressException -> error.message ?: "Refresh these results."
     is ApiException -> error.message
     is IOException -> "Cannot reach your server. Try again."
     else -> "Could not load this music. Try again."
