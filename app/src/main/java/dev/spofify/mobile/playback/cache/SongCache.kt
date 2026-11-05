@@ -15,6 +15,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 /**
@@ -98,12 +99,10 @@ class SongCache(
     fun bind(origin: String, accountId: String): SessionCache = synchronized(lock) {
         val scope = opaque("scope", origin, accountId)
         current?.takeIf { it.active && it.state.scope == scope && !it.state.retired && !it.state.disabled }?.let { return it }
+        // Fence preserves this inactive handle, so identity switches still retire its released
+        // state. Older tracked scopes were already retired by their own identity transition.
         current?.let { if (it.state.scope != scope) it.retire() else it.suspend() }
-        // Old scopes are retired only after successful validation of a different identity. An
-        // offline/failed restore never calls bind and therefore leaves the directory dormant.
-        root.listFiles()?.filter { it.isDirectory && it.name != scope && it.name !in states }?.forEach {
-            if (!removeTree(it)) cleanupFailed = true
-        }
+        root.listFiles()?.filter { it.isDirectory && it.name != scope && it.name !in states }?.forEach(::retireDirectory)
         val state = states[scope]?.takeUnless { it.released } ?: State(scope).also { states[scope] = it }
         SessionCache(state).also { current = it; if (closed) it.suspend() }
     }
@@ -119,14 +118,25 @@ class SongCache(
             state.persistSafely()
             state.finishIfIdle()
         }
-        root.listFiles().orEmpty().filter { it.isDirectory && it.name !in states }.forEach { directory ->
-            // Mark the existing fixed-size header before cleanup. No new bytes are allocated.
-            try {
-                val manifest = File(directory, "order")
-                if (manifest.isFile) java.io.RandomAccessFile(manifest, "rw").use { it.seek(4); it.writeBoolean(true) }
-            } catch (_: Exception) { cleanupFailed = true }
-            if (!removeTree(directory)) cleanupFailed = true
+        root.listFiles().orEmpty().filter { it.isDirectory && it.name !in states }.forEach(::retireDirectory)
+    }
+
+    /** Mark before deletion so a failed wipe cannot leave an apparently reusable manifest. */
+    private fun markRetired(directory: File): Boolean = try {
+        val manifest = File(directory, "order")
+        if (java.nio.file.Files.isSymbolicLink(directory.toPath()) || java.nio.file.Files.isSymbolicLink(manifest.toPath())) {
+            throw IOException("Invalid cache retirement path")
         }
+        // Missing/truncated manifests already fail closed. Never grow a malformed header.
+        if (manifest.isFile && manifest.length() >= 9) {
+            java.io.RandomAccessFile(manifest, "rw").use { it.seek(4); it.writeBoolean(true) }
+        }
+        true
+    } catch (_: Exception) { cleanupFailed = true; false }
+
+    private fun retireDirectory(directory: File) {
+        markRetired(directory)
+        if (!removeTree(directory)) cleanupFailed = true
     }
 
     inner class SessionCache internal constructor(@Volatile internal var state: State) {
@@ -177,7 +187,7 @@ class SongCache(
             active = false
             if (playbackProtection?.first === this) playbackProtection = null
             if (speculativeSession === this) speculation?.cancel()
-            if (current?.let { it !== this && it.active && it.state === state } == true) return@synchronized
+            if (current?.let { it !== this && it.state === state } == true) return@synchronized
             state.retired = true
             state.persistSafely()
             state.finishIfIdle()
@@ -288,7 +298,13 @@ class SongCache(
         }
     }
 
-    internal class Entry(val key: String, var length: Long = -1, var digest: ByteArray = ByteArray(32), var artifact: String = "") {
+    internal class Entry(
+        val key: String,
+        var length: Long = -1,
+        var digest: ByteArray = ByteArray(32),
+        var artifact: String = "",
+        var modifiedAt: Long = 0,
+    ) {
         var pins = 0
         // An OS-unlinked open staging inode remains owned until its stream actually closes.
         var openBytes = 0L
@@ -310,9 +326,13 @@ class SongCache(
             if (!authorized() || state.disabled || state.retired || !makeRoom(length.toLong(), false)) {
                 stop(false); return false
             }
+            // Keep the entire reserved chunk owned if write partially succeeds and close also
+            // fails, including an OS-unlinked inode that cannot be found by directory accounting.
+            entry.openBytes = written + length
             try {
                 output.write(bytes, offset, length)
-                hash.update(bytes, offset, length)
+                val prefixBytes = minOf(length.toLong(), (VERIFY_PREFIX_BYTES - written).coerceAtLeast(0)).toInt()
+                hash.update(bytes, offset, prefixBytes)
                 written += length
                 entry.openBytes = written
                 true
@@ -345,6 +365,7 @@ class SongCache(
                         if (!state.stage(entry).renameTo(target)) throw IOException("Cache commit failed")
                         cache.commitFile(target, written)
                         entry.length = written
+                        entry.modifiedAt = target.lastModified()
                         entry.digest = hash.digest()
                         if (!state.persistSafely()) entry.length = -1
                     } finally { if (!hole.isCached) cache.releaseHoleSpan(hole) }
@@ -394,6 +415,7 @@ class SongCache(
                 entries.values.toList().filter { it.length < 0 }.forEach { remove(it) }
                 val known = entries.keys
                 cache!!.keys.filter { it !in known }.forEach { key ->
+                    if (!key.matches(Regex("[0-9a-f]{64}"))) throw IOException("Invalid cache key")
                     // An interrupted commit may leave a span before manifest completion. Adopt a
                     // tombstone before trying deletion so failed cleanup still consumes a slot.
                     entries[key] = Entry(key)
@@ -421,25 +443,28 @@ class SongCache(
                     if (!key.matches(Regex("[0-9a-f]{64}")) || key in entries) throw IOException("Invalid cache key")
                     val length = input.readLong()
                     if (length < -1 || length > limits.maxBytes) throw IOException("Invalid cache length")
+                    val modifiedAt = input.readLong()
+                    if (modifiedAt < 0) throw IOException("Invalid cache modification time")
                     val digest = ByteArray(32).also { input.readFully(it) }
                     val artifact = input.readUTF()
                     if (artifact.isNotEmpty() && !artifact.matches(Regex("media/[0-9]+/[0-9]+\\.[0-9]+\\.[0-9]+\\.v3\\.exo"))) throw IOException("Invalid cache artifact")
-                    entries[key] = Entry(key, length, digest, artifact)
+                    entries[key] = Entry(key, length, digest, artifact, modifiedAt)
                 }
                 if (input.read() != -1) throw IOException("Invalid cache index")
             }
         }
 
         fun persistSafely(): Boolean = try {
-            if (released) true else if (!initialized) {
-                if (retired && manifest.isFile) java.io.RandomAccessFile(manifest, "rw").use { it.seek(4); it.writeBoolean(true) }
-                true
+            if (released) {
+                if (retired && states[scope] === this) markRetired(directory) else true
+            } else if (!initialized) {
+                if (retired) markRetired(directory) else true
             } else { persist(); true }
         } catch (_: Exception) { disabled = true; cleanupFailed = true; false }
 
         private fun persist() {
             // This reserve bounds the simultaneous old/new manifest and Media3 index copies.
-            val manifestBytes = 9L + entries.values.sumOf { 110L + it.artifact.length }
+            val manifestBytes = 9L + entries.values.sumOf { 118L + it.artifact.length }
             if (ownedBytes() > limits.maxBytes - manifestBytes) throw IOException("Cache metadata budget unavailable")
             DataOutputStream(FileOutputStream(pending)).use { out ->
                 out.writeInt(MAGIC)
@@ -448,6 +473,7 @@ class SongCache(
                 entries.values.forEach { entry ->
                     out.writeUTF(entry.key)
                     out.writeLong(entry.length)
+                    out.writeLong(entry.modifiedAt)
                     out.write(entry.digest)
                     out.writeUTF(entry.artifact)
                 }
@@ -473,17 +499,22 @@ class SongCache(
         }
 
         fun finishIfIdle() {
-            if (released || entries.values.any { it.pins != 0 }) return
+            if (entries.values.any { it.pins != 0 }) return
+            if (released) {
+                // Late old-handle cleanup is inert once a successor owns this scope's path.
+                if (retired && states[scope] === this) retireDirectory(directory)
+                return
+            }
             val liveHandle = current?.let { it.active && it.state === this } == true
             if (!retired && liveHandle) return
             if (!initialized) {
-                if (retired) { released = true; if (!removeTree(directory)) cleanupFailed = true }
+                if (retired) { released = true; if (states[scope] === this) retireDirectory(directory) }
                 return
             }
             try { cache?.release() } catch (_: Exception) { cleanupFailed = true }
             cache = null
             released = true
-            if (retired && !removeTree(directory)) cleanupFailed = true
+            if (retired && states[scope] === this) retireDirectory(directory)
         }
     }
 
@@ -544,7 +575,8 @@ class SongCache(
 
     private fun removeTree(file: File): Boolean {
         return try {
-            if (!file.exists()) true else if (file.isDirectory) {
+            if (java.nio.file.Files.isSymbolicLink(file.toPath())) deleteFile(file)
+            else if (!file.exists()) true else if (file.isDirectory) {
                 val children = file.listFiles() ?: return false
                 val removed = children.map { removeTree(it) }.all { it }
                 removed && deleteFile(file)
@@ -562,7 +594,10 @@ class SongCache(
     companion object {
         const val MAX_TRACKS = 100
         const val MAX_BYTES = 1_000_000_000L
-        private const val MAGIC = 0x53434731
+        // v2 records mtime and a bounded-prefix digest. Never interpret a v1 whole-file digest
+        // as this format; unsupported/corrupt manifests follow the existing safe bypass path.
+        private const val MAGIC = 0x53434732
+        internal const val VERIFY_PREFIX_BYTES = 16 * 1024
 
         fun authorizedFactory(
             cache: SessionCache?,
@@ -577,9 +612,9 @@ class SongCache(
         private val cancellations = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "song-cache-cancel").apply { isDaemon = true }
         }
-        private val deadlines = Executors.newSingleThreadScheduledExecutor { runnable ->
+        private val deadlines = ScheduledThreadPoolExecutor(1) { runnable ->
             Thread(runnable, "song-cache-deadline").apply { isDaemon = true }
-        }
+        }.apply { removeOnCancelPolicy = true }
         private fun opaque(vararg values: String): String {
             val hash = MessageDigest.getInstance("SHA-256")
             values.forEach { value ->

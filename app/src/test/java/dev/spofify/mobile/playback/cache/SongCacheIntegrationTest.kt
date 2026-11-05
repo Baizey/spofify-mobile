@@ -304,6 +304,35 @@ class SongCacheIntegrationTest {
         assertEquals(4, requests["A"])
     }
 
+    @Test fun boundedPrefixAndModificationTimeDetectKnownCorruptionAcrossRestart() {
+        assertEquals(16 * 1024, SongCache.VERIFY_PREFIX_BYTES)
+        bytes("A", 48 * 1024)
+        assertBytes(bytes("A"), fetch("A"))
+        cache.close(); startCache()
+        val transferred = readBytes.get()
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(transferred, readBytes.get())
+
+        var media = directory.walkTopDown().single { it.isFile && it.name.endsWith(".exo") }
+        val beyondPrefix = SongCache.VERIFY_PREFIX_BYTES + 7
+        val previousTime = media.lastModified()
+        java.io.RandomAccessFile(media, "rw").use {
+            it.seek(beyondPrefix.toLong())
+            it.writeByte(bytes("A")[beyondPrefix].toInt() xor 0xff)
+        }
+        assertTrue(media.setLastModified(previousTime + 2_000))
+        assertBytes(bytes("A"), fetch("A")) // Known metadata change outside the checked prefix.
+        assertEquals(2, requests["A"])
+
+        media = directory.walkTopDown().single { it.isFile && it.name.endsWith(".exo") }
+        val committedTime = media.lastModified()
+        java.io.RandomAccessFile(media, "rw").use { it.writeByte(bytes("A")[0].toInt() xor 0xff) }
+        assertTrue(media.setLastModified(committedTime))
+        assertEquals(committedTime, media.lastModified())
+        assertBytes(bytes("A"), fetch("A")) // Prefix digest catches corruption with preserved mtime.
+        assertEquals(3, requests["A"])
+    }
+
     @Test fun authorizationIsCheckedOnHitEveryReadAndSameScopeDormancyKeepsPinsSafe() {
         fetch("A")
         authorized = false
@@ -340,6 +369,37 @@ class SongCacheIntegrationTest {
         cache = SongCache(directory)
         cache.retire() // No bind / no validated auth needed to erase a dormant namespace.
         assertEquals(0L, cache.inventory().ownedBytes)
+    }
+
+    @Test fun fencedReleasedScopeIsRetiredOnAccountSwitchAndCannotReappear() = runBlocking {
+        fetch("A")
+        val originalHandle = handle
+        cache.fence()
+        loginAccount = "second-account"
+        client.login("second-listener", "synthetic-password")
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(2, requests["A"])
+        cache.fence()
+        loginAccount = "synthetic-account"
+        client.login("synthetic", "synthetic-password")
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(3, requests["A"])
+        originalHandle.retire() // Released predecessor no longer owns this same-scope path.
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(3, requests["A"])
+    }
+
+    @Test fun explicitRetirementAfterFenceWipesReleasedScopeBeforeNextManager() {
+        fetch("A")
+        cache.fence()
+        assertTrue(cache.inventory().ownedBytes > 0)
+        cache.retire()
+        assertEquals(0L, cache.inventory().ownedBytes)
+        cache.close(); startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(2, requests["A"])
     }
 
     @Test fun failedDeletionRemainsOwnedAndInaccessibleAcrossReopen() {
@@ -543,7 +603,14 @@ class SongCacheIntegrationTest {
         try {
             val pending = worker.submit<Boolean> { handle.prefetch("slow", spec("slow"), upstream, ::authorize, cancellation) }
             assertTrue(entered.await(3, TimeUnit.SECONDS))
-            assertBytes(bytes("current"), fetch("current"))
+            val notifications = mutableListOf<Boolean>()
+            val demand = handle.factory(upstream, { "current" }, ::authorize) { active ->
+                notifications += active
+                if (active) assertFalse("Block scheduler before cancelling speculation", cancellation.isCancelled)
+            }.createDataSource()
+            try { demand.open(spec("current")); assertBytes(bytes("current"), drain(demand)) }
+            finally { demand.close() }
+            assertEquals(listOf(true, false), notifications)
             assertTrue(cancellation.isCancelled)
             assertFalse(pending.get(3, TimeUnit.SECONDS))
             assertEquals(1, requests["current"])

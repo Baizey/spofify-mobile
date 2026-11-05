@@ -80,32 +80,41 @@ internal class SongCacheDataSource(
         return openNetwork(dataSpec, mayRetain = true)
     }
 
-    /** Hash before exposing a hit, so same-length corruption cannot silently produce wrong audio. */
+    /**
+     * Best-effort corruption detection, not strong whole-file integrity/freshness. First-byte work
+     * is bounded to 16 KiB regardless of song size; same-size, same-mtime corruption beyond that
+     * prefix may go undetected. Do not scan an entire retained song before playback can become ready.
+     */
     private fun verifies(file: File, entry: SongCache.Entry): Boolean {
+        fun metadataMatches(): Boolean = try {
+            file.isFile && file.length() == entry.length && file.lastModified() == entry.modifiedAt
+        } catch (_: Exception) { false }
+        guard()
+        if (!metadataMatches()) return false
         val hash = MessageDigest.getInstance("SHA-256")
         val input = try { file.inputStream() } catch (_: IOException) { return false }
         try {
-            val buffer = ByteArray(16 * 1024)
-            var total = 0L
-            while (true) {
+            val buffer = ByteArray(SongCache.VERIFY_PREFIX_BYTES)
+            var remaining = minOf(entry.length, buffer.size.toLong()).toInt()
+            while (remaining > 0) {
                 guard()
-                val count = try { input.read(buffer) } catch (_: IOException) { return false }
+                val count = try { input.read(buffer, 0, remaining) } catch (_: IOException) { return false }
                 guard()
-                if (count < 0) break
-                total += count
-                if (total > entry.length) return false
+                if (count <= 0) return false
+                remaining -= count
                 hash.update(buffer, 0, count)
             }
-            return total == entry.length && MessageDigest.isEqual(hash.digest(), entry.digest)
+            guard()
+            return metadataMatches() && MessageDigest.isEqual(hash.digest(), entry.digest)
         } finally { try { input.close() } catch (_: IOException) { /* cache-only close failure */ } }
     }
 
     private fun openNetwork(request: DataSpec, mayRetain: Boolean): Long {
         guard()
         if (!speculative) {
-            session?.demandNetwork()
             networkNotified = true
             onDemandNetworkChange(true)
+            session?.demandNetwork()
         }
         val source = upstream.createDataSource()
         network = source

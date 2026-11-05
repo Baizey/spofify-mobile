@@ -76,7 +76,7 @@ internal class SongPrefetchCancellation {
  * One speculative blocking transfer, never current-track completion or a second player.
  * Requests must be immutable and correspond positionally to plan.trackIds. The transfer streams
  * through the store/data source and registers its close/cancel handle before opening the network.
- * All failed/cancelled attempts are skipped for this plan; heartbeat reconciliation never retries.
+ * Once admitted to IO, failed/cancelled attempts are skipped; heartbeats never retry them.
  * The service gates reconciliation on local authority and explicitly cancels on pause/session loss.
  */
 internal class SongPrefetchScheduler<T>(
@@ -139,10 +139,22 @@ internal class SongPrefetchScheduler<T>(
     private fun pumpLocked() {
         val work = pending ?: return
         if (closed || suspended || demandActive || active != null || !scope.isActive || work.next >= work.requests.size) return
-        // Consume before launch, including exceptions/cancellation. Never retry this request in a loop.
-        val request = work.requests[work.next++]
+        // Merely queueing a coroutine is not an attempt: demand may cancel it before IO starts.
+        val request = work.requests[work.next]
         val attempt = Attempt()
-        attempt.job = scope.launch(start = CoroutineStart.LAZY) { runAttempt(request) }
+        attempt.job = scope.launch(start = CoroutineStart.LAZY) {
+            runAttempt(request) {
+                synchronized(lock) {
+                    if (closed || suspended || demandActive || pending !== work || active !== attempt || !attempt.job.isActive) {
+                        false
+                    } else {
+                        // Admission is the point of no retry, even if the callback fails or is cancelled.
+                        work.next++
+                        true
+                    }
+                }
+            }
+        }
         active = attempt
         attempt.job.invokeOnCompletion {
             synchronized(lock) {
@@ -154,12 +166,12 @@ internal class SongPrefetchScheduler<T>(
         attempt.job.start()
     }
 
-    private suspend fun runAttempt(request: T) = coroutineScope {
+    private suspend fun runAttempt(request: T, admit: () -> Boolean) = coroutineScope {
         val cancellation = SongPrefetchCancellation()
         val io = launch(ioDispatcher, start = CoroutineStart.LAZY) {
             try {
                 cancellation.ensureActive()
-                transfer(request, cancellation)
+                if (admit()) transfer(request, cancellation)
             } catch (_: Exception) {
                 // Best effort only: no visible error and no unchanged-plan retry.
             }

@@ -93,6 +93,25 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
             AuthenticationChangeKind.INVALIDATED, AuthenticationChangeKind.EXPIRED -> {
                 audioCache = null
                 songCache.retire()
+                if (change.kind == AuthenticationChangeKind.EXPIRED) revokePlayback(source)
+            }
+        }
+    }
+
+    private fun revokePlayback(source: SpofifyClient) {
+        // Expiry is observed on audio/cache reads as well as API responses. Fence pending
+        // work and cancel authenticated calls synchronously; only player mutation is posted.
+        // onUnauthorized runs under the client's auth-generation lock: do not borrow
+        // the cache lock here (cache authentication fencing also reads client authority).
+        if (client !== source || source.currentSession() != null) return
+        PlaybackRequests.invalidate()
+        source.httpClient.dispatcher.cancelAll()
+        Handler(Looper.getMainLooper()).post {
+            if (client === source && source.currentSession() == null) {
+                playbackCoordinator?.authLost()
+                PlaybackService.stopActivePlayback()
+                context.stopService(Intent(context, PlaybackService::class.java))
+                expired.value = true
             }
         }
     }
@@ -168,21 +187,9 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         expired.value = false
         val next = SpofifyClient(server, lease)
         next.onAuthenticationChanged = { authenticationChanged(next, it) }
-        next.onUnauthorized = {
-            // Invalidate pending continuations synchronously on the auth callback thread.
-            // Player mutation remains confined to its main looper below.
-            if (client === next && next.currentSession() == null) PlaybackRequests.invalidate()
-            // Range/image requests can fail without an Activity. Stop buffered audio too;
-            // stopService alone cannot destroy a still-bound MediaSessionService.
-            Handler(Looper.getMainLooper()).post {
-                if (client === next && next.currentSession() == null) {
-                    playbackCoordinator?.authLost()
-                    PlaybackService.stopActivePlayback()
-                    context.stopService(Intent(context, PlaybackService::class.java))
-                    expired.value = true
-                }
-            }
-        }
+        // Range/image requests can fail without an Activity or a player request. Stop
+        // buffered audio too; stopService alone cannot destroy a still-bound service.
+        next.onUnauthorized = { revokePlayback(next) }
         synchronized(cacheAuthenticationLock) {
             client = next
             cacheSource = next

@@ -12,6 +12,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.*
@@ -91,6 +92,39 @@ class SongPrefetchTest {
         scheduler.reconcile(SongPrefetch.plan("X", listOf("Y")), listOf("Y"))
         runCurrent()
         assertEquals(listOf("Y"), seen)
+        scheduler.close()
+    }
+
+    @Test fun demandCancellingQueuedWorkerDoesNotConsumeTheNeverAttemptedRequest() = runTest {
+        val seen = mutableListOf<String>()
+        val scheduler = SongPrefetchScheduler<String>(this, ioDispatcher = StandardTestDispatcher(testScheduler)) { id, _ -> seen.add(id) }
+        val plan = SongPrefetch.plan("A", listOf("B", "C"))
+        scheduler.reconcile(plan, plan.trackIds)
+        scheduler.setDemandActive(true)
+        runCurrent()
+        assertTrue(seen.isEmpty())
+        scheduler.setDemandActive(false)
+        runCurrent()
+        assertEquals(listOf("B", "C"), seen)
+        scheduler.reconcile(plan, plan.trackIds)
+        runCurrent()
+        assertEquals("Heartbeat must not retry admitted callbacks", listOf("B", "C"), seen)
+        scheduler.close()
+    }
+
+    @Test fun demandCancellingQueuedIoAfterWorkerStartsAlsoPreservesTheRequest() = runTest {
+        val seen = mutableListOf<String>()
+        // Start the worker immediately, but leave its blocking IO coroutine queued.
+        val owner = CoroutineScope(coroutineContext + UnconfinedTestDispatcher(testScheduler))
+        val scheduler = SongPrefetchScheduler<String>(owner, ioDispatcher = StandardTestDispatcher(testScheduler)) { id, _ -> seen.add(id) }
+        val plan = SongPrefetch.plan("A", listOf("B", "C"))
+        scheduler.reconcile(plan, plan.trackIds)
+        scheduler.setDemandActive(true)
+        runCurrent()
+        assertTrue(seen.isEmpty())
+        scheduler.setDemandActive(false)
+        runCurrent()
+        assertEquals(listOf("B", "C"), seen)
         scheduler.close()
     }
 
