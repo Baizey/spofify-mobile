@@ -2,6 +2,7 @@ package dev.spofify.mobile.feature.playlists
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import dev.spofify.mobile.core.*
@@ -23,6 +24,8 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /** Actual manual/derived Source -> More path, never a stand-alone menu callback test.
  * The tokens here are opaque wire fixtures, not valid signed evaluator integration tokens. */
@@ -125,6 +128,100 @@ class PlaylistMoreHostTest {
                     }
                 }
             } finally {
+                compose.runOnIdle { shown.value = false }; compose.waitForIdle()
+                client.httpClient.dispatcher.cancelAll(); client.httpClient.connectionPool.evictAll()
+                client.httpClient.dispatcher.executorService.shutdown()
+            }
+        }
+    }
+    @Test fun manualAccessibilityPlayFallbackDeliversExactSecondDuplicateOnce() = fallback(derived = false)
+    @Test fun derivedAccessibilityPlayFallbackDeliversExactSignedSecondDuplicateOnce() = fallback(derived = true)
+    @Test fun manualAccessibilityPlayFallbackRejectsHeldResponseAfterSourceReplacement() = fallback(derived = false, replaceSource = true)
+    @Test fun derivedAccessibilityPlayFallbackRejectsHeldResponseAfterSourceReplacement() = fallback(derived = true, replaceSource = true)
+
+    private fun fallback(derived: Boolean, replaceSource: Boolean = false) {
+        val release = CountDownLatch(if (replaceSource) 1 else 0)
+        val preparations = AtomicInteger()
+        val selected = mutableStateOf("fixture")
+        val shown = mutableStateOf(true)
+        val delivered = mutableListOf<Triple<PlaybackQueue, String?, String?>>()
+        val track = """{"kind":"track","id":"same","name":"Fixture song","hasAudio":true,"durationMs":1000}"""
+        fun summary(id: String) = """{"id":"$id","name":"Playlist $id","kind":"${if (derived) "derived" else "manual"}","countState":"${if (derived) "unevaluated" else "exact"}","trackCount":${if (derived) "null" else "2"},"availableCount":${if (derived) "null" else "2"},"revision":5}"""
+        MockWebServer().use { web ->
+            web.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val path = request.requestUrl!!.encodedPath
+                    val id = if (path.contains("/replacement")) "replacement" else "fixture"
+                    return when {
+                        path == "/api/auth/login" -> json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
+                            .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
+                        path == "/api/me/playlists" -> json("""{"items":[${summary("fixture")}],"total":1,"offset":0,"limit":40}""")
+                        path.endsWith("/entries") -> json("""{"items":[{"id":"first-entry","position":0,"track":$track},{"id":"second-entry","position":1,"track":$track}],"total":2,"offset":0,"limit":40}""")
+                        path.endsWith("/evaluation") -> json("""{"items":[{"occurrenceId":"first-path","selectionToken":"opaque.first","position":0,"track":$track},{"occurrenceId":"second-path","selectionToken":"opaque.second","position":1,"track":$track}],"total":2,"availableTotal":2,"limit":40,"nextCursor":null,"revision":5,"fence":"fence","complete":true}""")
+                        path.endsWith("/playback") -> {
+                            preparations.incrementAndGet()
+                            check(release.await(10, TimeUnit.SECONDS)) { "Owned preparation hold timed out" }
+                            val context = """{"kind":"${if (derived) "derived" else "playlist"}","id":"fixture","name":"Playlist fixture","revision":5${if (derived) ",\"fence\":\"fence\"" else ""}}"""
+                            if (derived) {
+                                val body = ApiJson.parseToJsonElement(request.body.readUtf8()).toString()
+                                assertTrue(body.contains("\"selectionToken\":\"opaque.second\""))
+                                json("""{"context":$context,"items":[${track.dropLast(1)},"occurrenceId":"first-path","selectionToken":"opaque.first"},${track.dropLast(1)},"occurrenceId":"second-path","selectionToken":"opaque.second"}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"fence","startOccurrenceId":"second-path","notice":null}""")
+                            } else json("""{"context":$context,"items":[${track.dropLast(1)},"entryId":"first-entry"},${track.dropLast(1)},"entryId":"second-entry"}],"total":2,"limit":1000,"truncated":false,"revision":5}""")
+                        }
+                        path == "/api/me/playlists/$id" -> json(summary(id))
+                        else -> MockResponse().setResponseCode(404)
+                    }
+                }
+            }
+            web.start()
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), object : SessionStore {
+                override fun read(): StoredSession? = null
+                override fun write(value: StoredSession?) = Unit
+            })
+            try {
+                runBlocking { client.login("listener", "synthetic") }
+                compose.setContent {
+                    MaterialTheme {
+                        if (shown.value) PlaylistsRoute(client, {}, { queue, trackId, entryId ->
+                            delivered += Triple(queue, trackId, entryId)
+                        }, {}, initialPlaylistId = selected.value) // Real supported fallback: no queue-intent callback.
+                    }
+                }
+                compose.waitUntil(5_000) {
+                    compose.waitForIdle()
+                    compose.onAllNodesWithContentDescription("More actions for Fixture song").fetchSemanticsNodes().size == 2
+                }
+                val second = compose.onAllNodes(hasText("Fixture song") and
+                    SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))[1]
+                val play = second.fetchSemanticsNode().config[SemanticsActions.CustomActions].single { it.label == "Play now" }
+                compose.runOnIdle { assertTrue(delivered.isEmpty()); assertTrue(play.action()) }
+                if (replaceSource) {
+                    compose.waitUntil(5_000) { preparations.get() == 1 }
+                    compose.runOnIdle { selected.value = "replacement" }
+                    compose.waitUntil(5_000) {
+                        compose.waitForIdle(); compose.onAllNodesWithText("Playlist replacement").fetchSemanticsNodes().size == 1
+                    }
+                    release.countDown()
+                    compose.waitUntil(5_000) {
+                        compose.waitForIdle()
+                        client.httpClient.dispatcher.runningCallsCount() == 0 && client.httpClient.dispatcher.queuedCallsCount() == 0
+                    }
+                    compose.runOnIdle { assertTrue("Old source cannot deliver a late exact selection", delivered.isEmpty()) }
+                } else {
+                    compose.waitUntil(5_000) { compose.waitForIdle(); delivered.size == 1 }
+                    compose.runOnIdle {
+                        val (queue, trackId, entryId) = delivered.single()
+                        assertEquals(if (derived) null else "same", trackId)
+                        assertEquals(if (derived) "second-path" else "second-entry", entryId)
+                        assertEquals(listOf("same", "same"), queue.items.map { it.id })
+                        assertEquals(if (derived) listOf("first-path", "second-path") else listOf("first-entry", "second-entry"), queue.items.map { it.entryId })
+                        assertEquals("fixture", queue.context?.id)
+                        assertEquals(5L, queue.revision)
+                    }
+                }
+                assertEquals(1, preparations.get())
+            } finally {
+                release.countDown()
                 compose.runOnIdle { shown.value = false }; compose.waitForIdle()
                 client.httpClient.dispatcher.cancelAll(); client.httpClient.connectionPool.evictAll()
                 client.httpClient.dispatcher.executorService.shutdown()

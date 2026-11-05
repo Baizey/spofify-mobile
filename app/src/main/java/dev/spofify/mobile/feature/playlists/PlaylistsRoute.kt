@@ -175,6 +175,8 @@ private fun PlaylistDetail(
     val derived = remember(client) { DerivedPlaylistsApi(client) }
     val scope = rememberCoroutineScope()
     val generation = remember(id) { PlaylistRequestGeneration() }
+    // Preparing one musical action must not retire its own captured source/More lifetime.
+    val preparationGeneration = remember(id) { PlaylistRequestGeneration() }
     var summary by remember(id) { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var entries by remember(id) { mutableStateOf<PersonalEntriesPage?>(null) }
     var evaluation by remember(id) { mutableStateOf<DerivedEvaluationPage?>(null) }
@@ -330,31 +332,33 @@ private fun PlaylistDetail(
         }
         if (action != null && (onPreparedAction == null || expectedKey == null || latestInteractionKey !== expectedKey)) return
         val result = evaluation
-        val request = PlaylistPlaybackRequest(generation); busy = true
+        val sourceTicket = generation.ticket()
+        val sourceCurrent = captureCurrent(isCurrent)
+        val request = PlaylistPlaybackRequest(preparationGeneration); busy = true
         scope.launch {
             try {
                 if (saved.kind == PlaylistKind.DERIVED && result != null) {
                     val queue = derived.playback(id, saved.revision, result.fence, selectionToken)
                     request.deliver {
-                        if (!isCurrent()) return@deliver
+                        if (!sourceCurrent()) return@deliver
                         message = when (queue.notice) { "CLICKED_OCCURRENCE_ONLY" -> "Only the selected occurrence was prepared because it is beyond the first 1,000 available occurrences."
                             "PLAYBACK_LIMIT" -> "Playback is limited to the first 1,000 available occurrences."; else -> null }
                         if (action == null) onPlayQueue(queue.queue, null, queue.startOccurrenceId)
-                        else if (latestInteractionKey === expectedKey && isCurrent()) onPreparedAction?.invoke(queue.queue, null,
-                            queue.startOccurrenceId, action, expectedKey, isCurrent)
+                        else if (latestInteractionKey === expectedKey && sourceCurrent()) onPreparedAction?.invoke(queue.queue, null,
+                            queue.startOccurrenceId, action, expectedKey, sourceCurrent)
                     }
                 } else if (saved.kind == PlaylistKind.MANUAL) {
                     val queue = api.playback(id)
                     request.deliver {
-                        if (!isCurrent()) return@deliver
+                        if (!sourceCurrent()) return@deliver
                         if (entryId != null && queue.items.none { it.entryId == entryId }) message = "This occurrence is outside the prepared playback limit. No queue was replaced."
                         else if (action == null) onPlayQueue(queue.queue, trackId, entryId)
-                        else if (latestInteractionKey === expectedKey && isCurrent()) onPreparedAction?.invoke(queue.queue, trackId, entryId, action, expectedKey, isCurrent)
+                        else if (latestInteractionKey === expectedKey && sourceCurrent()) onPreparedAction?.invoke(queue.queue, trackId, entryId, action, expectedKey, sourceCurrent)
                     }
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { request.deliver { if (isCurrent()) { message = playlistFailure(e); stale = true } } }
-            finally { request.finish { busy = false } }
+            catch (e: Exception) { request.deliver { if (sourceCurrent()) { message = playlistFailure(e); stale = true } } }
+            finally { request.finish { if (generation.accepts(sourceTicket)) busy = false } }
         }
     }
     occurrenceActions?.let { selection ->
