@@ -1,11 +1,11 @@
 # Spofify Mobile
 
-A native **Android** listener for your own [spofify-go](../spofify-go) server. Kotlin, Jetpack Compose and Media3—not a website wrapper, and no server-management screens.
+A native **Android** listener for your own [spofify-server](../spofify-go) (local checkout alias `spofify-go`). Kotlin, Jetpack Compose and Media3—not a website wrapper, and no server-management screens.
 
 ## Current listener scope
 
 - Enter your server URL and sign in with an existing Spofify account.
-- **Home / Search / Playlists / Profile**: bounded personal shelves, Liked Songs, bottom-positioned query entry, grouped results and progressive See more actions. Empty Search does not fetch the global catalog. The [mobile UX contract](docs/mobile-ux.md) requires editing-focused chrome, compact inline credits, no main-Search type/count heading rows and a flat full-width mini-player; these are rendered acceptance requirements, not a claim of visual approval.
+- **Home / Search / Playlists / Profile**: bounded personal shelves, Liked Songs, bottom-positioned query entry, grouped results and progressive See more actions. Empty Search does not fetch the global catalog. The mobile UX contract in hmem (see the [bootstrap](AGENTS.md#hmem-bootstrap)) requires editing-focused chrome, compact inline credits, no main-Search type/count heading rows and a flat full-width mini-player; these are rendered acceptance requirements, not a claim of visual approval.
 - Profile shows the authenticated username and canonical server origin, with Credits, Playback devices and Sign out. Credits is nested; Profile root uses normal Android Back.
 - Open artist/album/song details and play complete contexts, not just the visible page.
 - Create/edit manual personal playlists and build/evaluate server-supported derived playlists.
@@ -15,11 +15,11 @@ A native **Android** listener for your own [spofify-go](../spofify-go) server. K
 - Android Keystore-encrypted sessions and automatic remembering/autofill of the latest successful server/username/password, without automatic password sign-in or autoplay.
 - Bundled **JetBrains Mono** typography, including its full offline font-license notice under Profile → Credits, not on Sign-in. Provenance and SIL OFL license: [third_party/jetbrains-mono](third_party/jetbrains-mono/).
 
-**This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory. Earlier isolated emulator attempts failed before app launch; those failures do not establish the current environment's condition. Normal isolated synthetic AVD validation is allowed, but no successful after-render is established by this documentation cleanup: **UI validation remains not complete**. See [docs/ui-validation.md](docs/ui-validation.md) and [docs/testing.md](docs/testing.md).
+**This is an initial implementation, not a production release.** Automated checks and APK builds do not establish visual quality. Actual rendered AVD screenshots and native interactions are mandatory. Earlier isolated emulator attempts failed before app launch; those failures do not establish the current environment's condition. Normal isolated synthetic AVD validation is allowed, but no successful after-render is established by this documentation cleanup: **UI validation remains not complete**. Historical evidence is preserved in [docs/testing.md](docs/testing.md#native-evidence-status); current validation practices are in hmem via the [bootstrap](AGENTS.md#hmem-bootstrap).
 
 ## Task contracts and review
 
-Follow the assigned task specs, when present under `docs/specs/`, and the roles in [AGENT_BEHAVIOUR.md](AGENT_BEHAVIOUR.md). Deleted historical specs and board metadata are not required scaffolding. Assigned leads follow [exact-SHA review and coordinated self-integration](docs/worktree-review.md), never self-approval or parallel main writes. Blocked native validation is not a blanket source-work dependency.
+Use the [hmem bootstrap](AGENTS.md#hmem-bootstrap) for current practices, assigned task contracts, status and handoffs. Repository-manager agents own feature/bug/task migration; retained `docs/specs/` records are historical provenance, not a local board to maintain. hmem's role/review and validation topics distinguish source integration from native acceptance.
 
 ## Run
 
@@ -34,11 +34,11 @@ Open this directory in Android Studio and install the **Android API 37.0 compile
 tools/ui/validate-native.sh --skip-build
 ```
 
-Agents must not target real phones, personal AVDs or live accounts. The runner disables ADB mDNS/wireless discovery and USB transports, verifies the selected virtual device, and never downloads a system image automatically. See [the native workflow](docs/ui-validation.md) for installed-image prerequisites and screenshot review.
+Agents must not target real phones, personal AVDs or live accounts. The runner disables ADB mDNS/wireless discovery and USB transports, verifies the selected virtual device, and never downloads a system image automatically. See the [runner interface](docs/ui-validation.md#technical-runner-interface) for installed-image prerequisites, and hmem via the [bootstrap](AGENTS.md#hmem-bootstrap) for native safety and screenshot-review practices.
 
 Depending on AGP, the debug APK is under `app/build/outputs/apk/debug/` or `app/build/intermediates/apk/debug/`; the runner locates the actual artifact. Debug builds are not store releases; no release signing key is included.
 
-The repository's local tooling convention uses ignored `.tooling/` directories; verify installed SDK/JDK prerequisites rather than assuming an old run's environment still exists. Agents use the absolute shared `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle` with own-worktree outputs, `--offline --no-daemon` and the separate exclusive Gradle advisory lease described in [docs/worktree-review.md](docs/worktree-review.md); do not overlap builds.
+The repository's local tooling convention uses ignored `.tooling/` directories; verify installed SDK/JDK prerequisites rather than assuming an old run's environment still exists. Agent build/cache ownership, guarded BUILD/NATIVE coordination and automated gates are defined in hmem's resource and toolchain topics; read them via the [bootstrap](AGENTS.md#hmem-bootstrap) before running tools. Fixture provisioning remains documented in [prepared transport testing](docs/prepared-transport-testing.md).
 
 ## Connect your server
 
@@ -69,4 +69,4 @@ Offline downloads, server management/acquisition, Android Auto, persistent queue
 
 ## Backend coordination
 
-**spofify-go is read-only for this project while it is being developed live.** This app consumes shipped APIs; it does not modify or launch that repository, run migrations, seed accounts, or call acquisition/admin endpoints. Coordinate any backend contract or configuration changes with its owner first. See [docs/api-contract.md](docs/api-contract.md).
+**spofify-server (local alias `spofify-go`) is read-only for this project while it is being developed live.** This app consumes shipped APIs; it does not modify or launch that repository, run migrations, seed accounts, or call acquisition/admin endpoints. Coordinate any backend contract or configuration changes with its owner first. See [docs/api-contract.md](docs/api-contract.md).

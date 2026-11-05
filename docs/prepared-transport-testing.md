@@ -117,6 +117,7 @@ paused activation and retained-current mini/full Resume/history checks.
 Installed-Android rendering, native audio/background/FGS delivery and AVD-to-website
 acceptance remain separate mandatory gates. Current native execution is blocked
 under the recorded preboot-emulator assessment; no JVM/broker result turns that
-into a native pass. Follow [testing.md](testing.md), [ui-validation.md](ui-validation.md)
-and [worktree-review.md](worktree-review.md) for resource fencing and exact-candidate
-review/integration.
+into a native pass. Current resource fencing, native validation and exact-candidate
+review/integration practices live in hmem; use the [bootstrap](../AGENTS.md#hmem-bootstrap)
+to read the applicable project details. [Historical native evidence](testing.md#native-evidence-status)
+is retained separately from this technical fixture contract.
