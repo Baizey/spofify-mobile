@@ -9,6 +9,9 @@ interface PlaybackControls {
     val state: StateFlow<PlaybackState>
     fun connect()
     fun release()
+    /** Capture an immutable host-origin fence for deliberate in-app Play/Resume at gesture
+     * time. No screen ownership of audio; existing controls need not implement this hook. */
+    fun bindExplicitPlayOrigin(capture: () -> (() -> Boolean)) {}
     fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String? = null,
         shuffle: Boolean = false, startEntryId: String? = null)
     /** Already server-prepared musical intent. Production preserves the optional exact wire
@@ -18,6 +21,14 @@ interface PlaybackControls {
         context: LibraryItem? = null) {
         play(queue.items, client, startTrackId, shuffle, startEntryId)
         setContext(queue.context?.let { LibraryItem(it.kind, it.id, it.name) } ?: context)
+    }
+    /** Explicit originating selection. The predicate survives forwarding/binding/admission;
+     * it is not a screen-attachment flag or permission to replay after reconnect. Legacy
+     * synchronous controls remain source-compatible and check it before delegating. */
+    fun playPreparedGuarded(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
+        startTrackId: String? = null, shuffle: Boolean = false, startEntryId: String? = null,
+        context: LibraryItem? = null, isCurrent: () -> Boolean, admissionIsCurrent: () -> Boolean = isCurrent) {
+        if (admissionIsCurrent() && isCurrent()) playPrepared(queue, client, startTrackId, shuffle, startEntryId, context)
     }
     /** Captured expectedKey must precede asynchronous preparation. Unknown controls fail closed. */
     fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,

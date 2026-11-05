@@ -31,6 +31,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -401,6 +402,467 @@ class PlaybackServiceBridgeTest {
         assertEquals("genuine-tap", player.currentMediaItem?.mediaId)
         assertSilent()
         owner.close()
+    }
+
+    /** Deliberately unselected room with separately held guarded write/activation ACK.
+     * The endpoint is still the real Media3 service; only server progression is synthetic. */
+    private class PreparedResumeRoom : PlaybackDevicesProtocol {
+        var current = PlaybackDevicesView("phone", listOf(PlaybackDevice("phone", "Phone", true)), "", 3,
+            0, state = PlaybackSnapshot(), stateSeq = 0, stateAgeMs = 0, transfer = null,
+            directives = emptyList(), commands = emptyList())
+        val claimEntered = CompletableDeferred<Unit>()
+        val claimGate = CompletableDeferred<Unit>()
+        val ackEntered = CompletableDeferred<Unit>()
+        val ackGate = CompletableDeferred<Unit>()
+        var claims = 0
+        var ordinaryTransfers = 0
+        var claimId: String? = null
+        var staged: PlaybackSnapshot? = null
+        private val delivered = mutableSetOf<String>()
+        override suspend fun register(name: String) = current
+        override suspend fun view() = current
+        override suspend fun rename(deviceId: String, name: String) = current
+        override suspend fun leave(deviceId: String) = Unit
+        override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView =
+            error("Prepared local Resume must not become a remote musical command")
+        override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView {
+            ordinaryTransfers++
+            error("Prepared Resume must never use ordinary takeover")
+        }
+        override suspend fun claimUnselected(deviceId: String, epoch: Long, commandId: String, selectionSeq: Long): PlaybackDevicesView {
+            claims++; claimId = commandId; claimEntered.complete(Unit); claimGate.await()
+            assertEquals(current.epoch, epoch)
+            assertEquals("", current.activeDeviceId)
+            current = current.copy(transfer = dev.spofify.mobile.core.PlaybackTransfer(commandId, "", deviceId, "preparing"),
+                directives = listOf(PlaybackDirective("prepare-$commandId", epoch, "prepare", commandId, state = PlaybackSnapshot())),
+                commands = listOf(dev.spofify.mobile.core.PlaybackOutcome(commandId, "pending")))
+            return current.copy(directives = emptyList())
+        }
+        override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView {
+            val id = claimId
+            if (id != null && acks.any { it.deliveryId == "prepare-$id" && it.status == "ok" }) {
+                current = current.copy(activeDeviceId = deviceId, epoch = epoch + 1, leaseMs = 8000,
+                    transfer = dev.spofify.mobile.core.PlaybackTransfer(id, "", deviceId, "activating"),
+                    directives = listOf(PlaybackDirective("activate-$id", epoch + 1, "activate", id, state = PlaybackSnapshot())))
+            } else if (id != null && acks.any { it.deliveryId == "activate-$id" }) {
+                assertEquals("ok", acks.single { it.deliveryId == "activate-$id" }.status)
+                staged = requireNotNull(state)
+                assertFalse(state.playing)
+                ackEntered.complete(Unit); ackGate.await()
+                current = current.copy(transfer = null, directives = emptyList(), state = state,
+                    commands = listOf(dev.spofify.mobile.core.PlaybackOutcome(id, "ok")))
+            }
+            return current.copy(directives = current.directives.filter { delivered.add(it.deliveryId) })
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun inAppPreparedResumeCannotOutliveItsOriginDuringGuardedClaimOrActivationAck() = runTest {
+        for (stage in listOf("claim", "ack")) for (cancellation in listOf("route-aba", "dispose", "connection-failure")) {
+            graph.playbackCoordinator!!.close()
+            val room = PreparedResumeRoom()
+            val owner = PlaybackCoordinator(room, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            AppGraph::class.java.getDeclaredField("playbackCoordinator").apply { isAccessible = true; set(graph, owner) }
+            owner.setServiceActive(true); runCurrent()
+            val live = snapshot().paused()
+            assertEquals("ok", endpoint.activate(live, authority()).status)
+            val connection = connectedPlayback()
+            val binding = PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true }
+            val originalBinding = requireNotNull(binding.get(connection))
+            val model = dev.spofify.mobile.LibraryViewModel(ApplicationProvider.getApplicationContext<SpofifyApplication>(), graph, connection)
+            val store = androidx.lifecycle.ViewModelStore().apply { put("resume-origin", model) }
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+            try {
+                assertFalse(model.state.value.busy)
+                val before = endpoint.exportSnapshot()
+                val queueEpoch = PlaybackRequests.queueEpoch
+                connection.toggle(); runCurrent()
+                assertTrue("$stage/$cancellation must actually enter conditional acquisition", room.claimEntered.isCompleted)
+                assertEquals(1, room.claims)
+                assertFalse(player.playWhenReady)
+                if (stage == "ack") {
+                    room.claimGate.complete(Unit); runCurrent()
+                    repeat(3) {
+                        if (!room.ackEntered.isCompleted) { advanceTimeBy(1000); runCurrent() }
+                    }
+                    assertTrue("Hold the actual activation-ACK response, not only preparation", room.ackEntered.isCompleted)
+                    assertEquals(before, room.staged)
+                    assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
+                }
+                when (cancellation) {
+                    "route-aba" -> {
+                        val route = model.state.value.page
+                        model.open(dev.spofify.mobile.Page.Detail(dev.spofify.mobile.core.LibraryItem("album", "away", "Other route")))
+                        assertNotEquals(route, model.state.value.page)
+                        model.back(); assertEquals(route, model.state.value.page)
+                    }
+                    "dispose" -> store.clear()
+                    else -> PlaybackConnection::class.java.getDeclaredMethod("retirePlayRequest").apply { isAccessible = true }.invoke(connection)
+                }
+                room.claimGate.complete(Unit); room.ackGate.complete(Unit); runCurrent()
+                repeat(3) { advanceTimeBy(1000); runCurrent() }
+                // Robolectric's service-component bind has no session binder here. Rebind the
+                // same controls to the actual existing MediaSession, as at initial attachment;
+                // only binding is synthetic, never the admission/queue/start path under test.
+                connection.release()
+                connectedPlayback(connection)
+                assertNotSame("Recovery must exercise a new controller on the same live service", originalBinding, binding.get(connection))
+                connection.connect() // Reattachment/recovery is never another Play authorization.
+                shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
+                if (cancellation == "dispose") {
+                    // Even invoking a retained callback AFTER disposal cannot capture a fresh
+                    // lifetime and resume a now-selected phone or issue another guarded claim.
+                    connection.toggle(); runCurrent()
+                }
+                assertEquals("$stage/$cancellation must not replay its claim", 1, room.claims)
+                assertEquals(0, room.ordinaryTransfers)
+                assertEquals(before, endpoint.exportSnapshot())
+                assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
+                assertFalse(player.playWhenReady)
+                assertFalse(player.isPlaying)
+                assertSilent()
+            } finally {
+                room.claimGate.complete(Unit); room.ackGate.complete(Unit)
+                store.clear(); connection.release(); owner.close(); runCurrent()
+            }
+        }
+    }
+
+    private fun explicitQueue(id: String = "clicked") = dev.spofify.mobile.core.PlaybackQueue(
+        listOf(dev.spofify.mobile.core.LibraryItem("track", id, "First duplicate", hasAudio = true, entryId = "entry-1"),
+            dev.spofify.mobile.core.LibraryItem("track", id, "Clicked duplicate", hasAudio = true, entryId = "entry-2")),
+        total = 2, context = dev.spofify.mobile.core.LibraryPlaybackContext("playlist", "manual", "Complete context"))
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun replaceableLatestPayloadCannotRefreshTheOriginalAdmissionRouteLifetime() = runTest {
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
+        runCurrent()
+        val connection = connectedPlayback()
+        val model = dev.spofify.mobile.LibraryViewModel(ApplicationProvider.getApplicationContext<SpofifyApplication>(), graph, connection)
+        shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+        val pending = PlaybackConnection::class.java.getDeclaredField("pendingPlay").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        fun guard(request: Any, name: String) = request.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(request) as () -> Boolean
+        try {
+            model.playPrepared(client, client.currentSession()!!.accountId, explicitQueue("first"), null, "entry-1")
+            val first = requireNotNull(pending.get(connection))
+            val payload = guard(first, "isCurrent")
+            val lifetime = guard(first, "admissionIsCurrent")
+            assertTrue(payload()); assertTrue(lifetime())
+            model.playPrepared(client, client.currentSession()!!.accountId, explicitQueue("latest"), null, "entry-2")
+            assertFalse("New Play replaces the old music, not its immutable admission lifetime", payload())
+            assertTrue("Same-route latest Play may reuse a still-valid conditional claim", lifetime())
+            val route = model.state.value.page
+            model.open(dev.spofify.mobile.Page.Detail(dev.spofify.mobile.core.LibraryItem("album", "away", "Other route")))
+            assertNotEquals(route, model.state.value.page)
+            model.back()
+            model.playPrepared(client, client.currentSession()!!.accountId, explicitQueue("after-aba"), null, "entry-2")
+            assertEquals(route, model.state.value.page)
+            assertFalse("A later same-route payload must never refresh the old admission's route generation", lifetime())
+            val successor = requireNotNull(pending.get(connection))
+            assertTrue(guard(successor, "isCurrent")())
+            assertTrue(guard(successor, "admissionIsCurrent")())
+            PlaybackConnection::class.java.getDeclaredMethod("retirePlayRequest").apply { isAccessible = true }.invoke(connection)
+            assertFalse(guard(successor, "admissionIsCurrent")())
+            assertEquals(0, player.mediaItemCount)
+            assertSilent()
+        } finally { connection.release(); owner.close() }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun originatingRouteAbaAfterForwardingCannotInstallTheOldExplicitSelection() = runTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val entered = CompletableDeferred<Unit>()
+        val published = mutableListOf<PlaybackSnapshot>()
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", published,
+            onPoll = { _, _ -> gate?.let { entered.complete(Unit); it.await() } })
+        runCurrent()
+        val connection = connectedPlayback()
+        val model = dev.spofify.mobile.LibraryViewModel(ApplicationProvider.getApplicationContext<SpofifyApplication>(), graph, connection)
+        shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+        try {
+            gate = CompletableDeferred()
+            owner.retry(); runCurrent()
+            assertTrue(entered.isCompleted)
+            val route = model.state.value.page
+            model.playPrepared(client, client.currentSession()!!.accountId, explicitQueue(), null, "entry-2")
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
+            assertNull("The request must already have left Connection, not just be cancelled before forwarding",
+                PlaybackConnection::class.java.getDeclaredField("pendingPlay").apply { isAccessible = true }.get(connection))
+            assertEquals(0, player.mediaItemCount)
+            model.open(dev.spofify.mobile.Page.Detail(dev.spofify.mobile.core.LibraryItem("album", "away", "Other route")))
+            assertNotEquals(route, model.state.value.page)
+            model.back()
+            assertEquals(route, model.state.value.page)
+            val held = gate!!; gate = null; held.complete(Unit); runCurrent()
+            assertEquals("Unsampled route A→B→A must retire the originating request", 0, player.mediaItemCount)
+            assertTrue(published.none { it.queue.isNotEmpty() })
+            assertSilent()
+        } finally { gate?.complete(Unit); connection.release(); owner.close() }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun newerExplicitPlayAfterForwardingInstallsOnlyTheLatestExactPayload() = runTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val published = mutableListOf<PlaybackSnapshot>()
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", published,
+            onPoll = { _, _ -> gate?.await() })
+        runCurrent()
+        val connection = connectedPlayback()
+        val model = dev.spofify.mobile.LibraryViewModel(ApplicationProvider.getApplicationContext<SpofifyApplication>(), graph, connection)
+        shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+        shadowOf(controller!!.get()).setThrowInStartForeground(
+            android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
+        try {
+            gate = CompletableDeferred(); owner.retry(); runCurrent()
+            model.playPrepared(client, client.currentSession()!!.accountId, explicitQueue("obsolete"), null, "entry-1")
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
+            assertNull(PlaybackConnection::class.java.getDeclaredField("pendingPlay").apply { isAccessible = true }.get(connection))
+            model.playPrepared(client, client.currentSession()!!.accountId, explicitQueue("latest"), null, "entry-2")
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
+            val held = gate!!; gate = null; held.complete(Unit); runCurrent()
+            val actual = published.single { it.queue.isNotEmpty() }
+            assertEquals(listOf("latest", "latest"), actual.queue.map { it.id })
+            assertEquals(listOf("entry-1", "entry-2"), actual.queue.map { it.entryId })
+            assertEquals("entry-2", actual.queue[actual.position].entryId)
+            assertEquals("manual", actual.context!!.id)
+            assertEquals("blocked", actual.error)
+            assertFalse(player.playWhenReady)
+            assertSilent()
+        } finally { gate?.complete(Unit); connection.release(); owner.close() }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun equalValuedReauthenticationAfterForwardingRetiresTheExactOriginalSession() = runTest {
+        var gate: CompletableDeferred<Unit>? = null
+        val published = mutableListOf<PlaybackSnapshot>()
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", published,
+            onPoll = { _, _ -> gate?.await() })
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            gate = CompletableDeferred(); owner.retry(); runCurrent()
+            val original = client.currentSession()!!
+            connection.playPrepared(explicitQueue(), client, startEntryId = "entry-2")
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
+            assertNull(PlaybackConnection::class.java.getDeclaredField("pendingPlay").apply { isAccessible = true }.get(connection))
+            login()
+            assertEquals(original, client.currentSession())
+            assertNotSame(original, client.currentSession())
+            val held = gate!!; gate = null; held.complete(Unit); runCurrent()
+            assertEquals(0, player.mediaItemCount)
+            assertTrue(published.none { it.queue.isNotEmpty() })
+            assertSilent()
+        } finally { gate?.complete(Unit); connection.release(); owner.close() }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun uncertainConnectionRetiresPendingAndForwardedPlayRatherThanReplayingOnReconnect() = runTest {
+        val published = mutableListOf<PlaybackSnapshot>()
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", published)
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            connection.playPrepared(explicitQueue(), client, startEntryId = "entry-2")
+            val pending = PlaybackConnection::class.java.getDeclaredField("pendingPlay").apply { isAccessible = true }
+            val request = requireNotNull(pending.get(connection))
+            @Suppress("UNCHECKED_CAST")
+            val current = request.javaClass.getDeclaredField("isCurrent").apply { isAccessible = true }.get(request) as () -> Boolean
+            assertTrue(current())
+            // Same production retirement boundary used by both failed buildAsync completion
+            // and onDisconnected; no synthetic start/permit bypasses admission here.
+            PlaybackConnection::class.java.getDeclaredMethod("retirePlayRequest").apply { isAccessible = true }.invoke(connection)
+            assertFalse("Already-forwarded work must also lose its origin predicate", current())
+            assertNull(pending.get(connection))
+            connection.connect()
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
+            assertEquals(0, player.mediaItemCount)
+            assertTrue(published.none { it.queue.isNotEmpty() })
+            assertSilent()
+        } finally { connection.release(); owner.close() }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun endedInAppResumeAdoptsOnlyItsOwnTraversalRestartWithoutLosingOriginFences() = runTest {
+        for (cancelDuringRestart in listOf(false, true)) {
+            val published = mutableListOf<PlaybackSnapshot>()
+            val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", published)
+            runCurrent()
+            owner.localAction { endpoint.activate(snapshot().paused(), it) }; runCurrent()
+            val connection = connectedPlayback()
+            val model = dev.spofify.mobile.LibraryViewModel(ApplicationProvider.getApplicationContext<SpofifyApplication>(), graph, connection)
+            val store = androidx.lifecycle.ViewModelStore().apply { put("ended-resume", model) }
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+            val service = controller!!.get()
+            val field = PlaybackService::class.java.getDeclaredField("player").apply { isAccessible = true }
+            val real = player
+            var ended = true
+            var restarts = 0
+            var prepares = 0
+            var plays = 0
+            // Only terminal output timing is controlled. Queue/position/history/seek and all
+            // Resume admission still use the actual service and its service-created ExoPlayer.
+            val terminalOutput = java.lang.reflect.Proxy.newProxyInstance(ExoPlayer::class.java.classLoader,
+                arrayOf(ExoPlayer::class.java)) { proxy, method, args ->
+                when (method.name) {
+                    "equals" -> proxy === args?.get(0)
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "getPlaybackState" -> if (ended) Player.STATE_ENDED else real.playbackState
+                    else -> {
+                        if (method.name == "prepare") prepares++
+                        if (method.name == "play") plays++
+                        val result = try { method.invoke(real, *(args ?: emptyArray())) }
+                            catch (error: java.lang.reflect.InvocationTargetException) { throw error.targetException }
+                        if (method.name == "seekToDefaultPosition") {
+                            restarts++; ended = false
+                            if (cancelDuringRestart) {
+                                val route = model.state.value.page
+                                model.open(dev.spofify.mobile.Page.Detail(dev.spofify.mobile.core.LibraryItem("album", "away", "Other route")))
+                                assertNotEquals(route, model.state.value.page)
+                                model.back(); assertEquals(route, model.state.value.page)
+                            }
+                        }
+                        result
+                    }
+                }
+            } as ExoPlayer
+            shadowOf(service).setThrowInStartForeground(android.app.ForegroundServiceStartNotAllowedException("Synthetic start block"))
+            try {
+                field.set(service, terminalOutput)
+                assertEquals(Player.STATE_ENDED, player.playbackState)
+                val before = endpoint.exportSnapshot()
+                val queueEpoch = PlaybackRequests.queueEpoch
+                published.clear()
+                connection.toggle(); runCurrent()
+                val after = endpoint.exportSnapshot()
+                assertEquals("Exactly the admitted ended traversal may restart", 1, restarts)
+                assertEquals(before.queue, after.queue)
+                assertEquals(before.position, after.position)
+                assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
+                val restarted = requireNotNull(after.occurrence)
+                assertEquals(before.occurrence!!.key, restarted.key)
+                assertNotEquals(before.occurrence!!.eventId, restarted.eventId)
+                assertEquals(0.0, restarted.progress, 0.0)
+                assertFalse(restarted.reported)
+                assertEquals(0L, player.currentPosition)
+                assertEquals(0, prepares)
+                assertEquals(0, plays)
+                assertEquals(if (cancelDuringRestart) "" else "blocked", after.error)
+                assertEquals(after, published.last())
+                assertEquals("Later snapshots cannot invent another traversal receipt", restarted, endpoint.exportSnapshot().occurrence)
+                field.set(service, real)
+                assertSilent()
+            } finally {
+                field.set(service, real)
+                store.clear(); connection.release(); owner.close(); runCurrent()
+            }
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun inAppResumeWithoutALivePreparedOccurrenceDoesNotImportServerDisplayMusic() = runTest {
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", initial = snapshot().paused())
+        runCurrent()
+        val connection = connectedPlayback()
+        try {
+            assertEquals(0, player.mediaItemCount)
+            connection.toggle(); runCurrent()
+            assertEquals(0, player.mediaItemCount)
+            assertTrue(connection.state.value.error!!.contains("Choose music"))
+            assertSilent()
+        } finally { connection.release(); owner.close() }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun connectionPositivePlayOfCurrentOccurrencePreservesLiveQueuePositionAndHistory() = runTest {
+        val retained = snapshot(false).paused().let { it.copy(queue = it.queue.map { track ->
+            track.copy(targetId = "", occurrenceId = "", playbackContext = null)
+        }) }
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
+        runCurrent()
+        owner.localAction { endpoint.activate(retained, it) }; runCurrent()
+        val connection = connectedPlayback()
+        shadowOf(controller!!.get()).setThrowInStartForeground(
+            android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
+        try {
+            val before = endpoint.exportSnapshot()
+            val epoch = PlaybackRequests.queueEpoch
+            val queue = dev.spofify.mobile.core.PlaybackQueue(before.queue.map(PlaybackSnapshotCodec::libraryItem),
+                total = before.queue.size, context = dev.spofify.mobile.core.LibraryPlaybackContext("playlist", "saved-playlist", "Prepared queue"))
+            connection.playPrepared(queue, client, startEntryId = before.queue[before.position].entryId)
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
+            val after = endpoint.exportSnapshot()
+            assertEquals("blocked", after.error)
+            assertEquals(before.queue, after.queue)
+            assertEquals(epoch, PlaybackRequests.queueEpoch)
+            assertCurrentPreserved(before, after)
+            assertSilent()
+        } finally { connection.release(); owner.close() }
+    }
+
+    @Test fun typedPreparedResumeActivationAcceptsNewAuthorityWithoutReinstallingQueueOrHistory() = runBlocking {
+        val original = snapshot().paused()
+        assertEquals("ok", endpoint.activate(original, authority()).status)
+        val before = endpoint.exportSnapshot()
+        val epoch = PlaybackRequests.queueEpoch
+        val media = physicalMedia()
+        assertEquals("ok", endpoint.activatePreparedResume(before, PlaybackAuthority(24, 5) { true }).status)
+        assertEquals(epoch, PlaybackRequests.queueEpoch)
+        assertEquals(media, physicalMedia())
+        assertEquals(before, endpoint.exportSnapshot())
+        assertCurrentPreserved(before, endpoint.exportSnapshot())
+        assertSilent()
+    }
+
+    @Test fun typedPreparedResumeRejectsEmptyRestoredAndDifferentOccurrenceSnapshotsWithoutImporting() = runBlocking {
+        val supplied = snapshot().paused()
+        val emptyEpoch = PlaybackRequests.queueEpoch
+        assertEquals("rejected", endpoint.activatePreparedResume(supplied, authority()).status)
+        assertEquals(0, player.mediaItemCount)
+        assertEquals(emptyEpoch, PlaybackRequests.queueEpoch)
+        assertEquals("rejected", endpoint.activatePreparedResume(PlaybackSnapshot(), authority()).status)
+        assertEquals("ok", endpoint.activate(supplied, authority()).status)
+        val before = endpoint.exportSnapshot()
+        val epoch = PlaybackRequests.queueEpoch
+        val changed = before.copy(position = before.position + 1, occurrence = null)
+        for (invalid in listOf(changed, before.copy(playing = true), before.copy(waiting = true), before.copy(loading = true))) {
+            assertEquals("rejected", endpoint.activatePreparedResume(invalid, PlaybackAuthority(24, 5) { true }).status)
+            assertEquals(before, endpoint.exportSnapshot())
+            assertEquals(epoch, PlaybackRequests.queueEpoch)
+        }
+        assertEquals("rejected", endpoint.activatePreparedResume(before, PlaybackAuthority(24, 5) { false }).status)
+        assertEquals(before, endpoint.exportSnapshot())
+        assertEquals(epoch, PlaybackRequests.queueEpoch)
+        assertSilent()
+    }
+
+    @Test fun unsupportedPreparedResumeEndpointFailsClosedWithoutGenericActivationFallback() = runBlocking {
+        var genericActivations = 0
+        val unsupported = object : dev.spofify.mobile.feature.devices.NativePlaybackEndpoint {
+            override val supportsExactHandoff = true
+            override fun suspendOutput() = Unit
+            override fun exportSnapshot() = endpoint.exportSnapshot()
+            override suspend fun prepare(snapshot: PlaybackSnapshot) = true
+            override suspend fun activate(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): dev.spofify.mobile.feature.devices.PlaybackEndpointResult {
+                genericActivations++
+                return endpoint.activate(snapshot, authority)
+            }
+            override suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority) = endpoint.execute(command, authority)
+        }
+        assertEquals("rejected", unsupported.activatePreparedResume(snapshot().paused(), authority()).status)
+        assertEquals(0, genericActivations)
+        assertEquals(0, player.mediaItemCount)
+        assertSilent()
+    }
+
+    @Test fun genericExactPausedActivationStillReimportsInsteadOfUsingPreparedResumeShortcut() = runBlocking {
+        assertEquals("ok", endpoint.activate(snapshot().paused(), authority()).status)
+        val before = endpoint.exportSnapshot()
+        val epoch = PlaybackRequests.queueEpoch
+        assertEquals("ok", endpoint.activate(before, PlaybackAuthority(24, 5) { true }).status)
+        assertTrue("Generic activation must retain its queue/provenance reset boundary", PlaybackRequests.queueEpoch > epoch)
+        assertEquals(before, endpoint.exportSnapshot())
+        assertSilent()
     }
 
     @Test fun pausedActivationRoundTripsExactWireStateForBothShuffleFlagsAndHistoryFlags() = runBlocking {

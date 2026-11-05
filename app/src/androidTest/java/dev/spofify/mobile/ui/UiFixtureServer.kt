@@ -5,6 +5,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.Log
+import android.util.JsonReader
+import android.util.JsonToken
 import android.os.SystemClock
 import dev.spofify.mobile.core.*
 import kotlinx.serialization.json.*
@@ -12,10 +14,13 @@ import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import okio.Buffer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.StringReader
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -47,6 +52,10 @@ class UiFixtureServer : AutoCloseable {
 
     /** Freeze only the fixture coordinator, not Android audio or the client's lease watchdog. */
     @Synchronized fun freezePlayerClock() { playerRoom.freezeClock() }
+    /** Opt-in startup quarantine; only a pristine synthetic room may enter it. */
+    @Synchronized fun beginPlayerStartupDrain() { playerRoom.beginStartupDrain() }
+    /** Apply one ACK poll, then lose its reply. The client must not replay the write. */
+    @Synchronized fun loseNextPlayerAckResponse() { playerRoom.loseNextAckResponse() }
     @Synchronized fun advancePlayerClockBy(milliseconds: Long) {
         require(milliseconds >= 0)
         playerRoom.advanceClock(milliseconds)
@@ -338,9 +347,12 @@ class UiFixtureServer : AutoCloseable {
         private var stateAccepted = 0L
         private var transfer: PlaybackTransfer? = null
         private var frozenNow: Long? = null
+        private var loseAckResponse = false
         private fun now() = frozenNow ?: SystemClock.elapsedRealtime()
         fun freezeClock() { frozenNow = now() }
         fun advanceClock(ms: Long) { frozenNow = Math.addExact(now(), ms) }
+        fun beginStartupDrain() { check(!registered); quarantineUntil = now() + 8000 }
+        fun loseNextAckResponse() { check(!loseAckResponse); loseAckResponse = true }
 
         fun route(request: RecordedRequest): MockResponse {
             if (request.requestUrl?.query != null) return invalid()
@@ -353,10 +365,23 @@ class UiFixtureServer : AutoCloseable {
                 return json(JSONObject().put("error", "Content-Type must be application/json"), 415)
             if (request.body.size > 2 * 1024 * 1024) return json(JSONObject().put("error", "JSON body is too large"), 413)
             val q = try {
-                Json.parseToJsonElement(request.body.readUtf8()).jsonObject.also(::validate)
-            } catch (_: RuntimeException) { return invalid() }
-            prune()
+                val raw = request.body.readUtf8()
+                // JsonObject parsing alone overwrites duplicate names. Reject ambiguous envelopes
+                // before validating the guard, just as Go's strict decoder does.
+                JsonReader(StringReader(raw)).use { reader ->
+                    val names = mutableSetOf<String>()
+                    reader.beginObject()
+                    while (reader.hasNext()) { require(names.add(reader.nextName())); reader.skipValue() }
+                    reader.endObject(); require(reader.peek() == JsonToken.END_DOCUMENT)
+                }
+                Json.parseToJsonElement(raw).jsonObject.also(::validate)
+            } catch (_: RuntimeException) { return invalid() } catch (_: IOException) { return invalid() }
             playerCalls.add(q.string("action"))
+            // Conditional denials and exact retained retries are observational, even when
+            // housekeeping would otherwise expire an owner, delivery, or outcome.
+            if (q["requireUnselected"] == JsonPrimitive(true)) guardedTransfer(q)?.let { return it }
+            prune()
+            if (q["requireUnselected"] == JsonPrimitive(true)) guardedTransfer(q)?.let { return it }
             val action = q.string("action")
             if (action == "register") {
                 if (devices.size >= 16) return response(status = 429, error = "device limit reached")
@@ -393,7 +418,36 @@ class UiFixtureServer : AutoCloseable {
                 else -> error("Validated action missing implementation")
             }
             val status = when (error) { "" -> 200; "command limit reached" -> 429; else -> 409 }
-            return response(id, status, error, deliver = action == "poll" && error.isEmpty())
+            val result = response(id, status, error, deliver = action == "poll" && error.isEmpty())
+            if (loseAckResponse && action == "poll" && error.isEmpty() && q["acks"]?.jsonArray?.isNotEmpty() == true) {
+                loseAckResponse = false
+                result.setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST)
+            }
+            return result
+        }
+
+        /** Null means admitted to the ordinary transfer state machine, not active ownership. */
+        private fun guardedTransfer(q: JsonObject): MockResponse? {
+            val id = q.string("deviceId")
+            val device = devices[id]?.takeIf { now() - it.seen < 30000 }
+                ?: return response(id, 404, "device not found")
+            outcomes[q.string("commandId")]?.let { old ->
+                return when {
+                    old.deviceId != id || old.request != q -> response(id, 409, "commandId already used")
+                    old.status != "pending" && now() >= old.expires -> response(id, 409, "command outcome expired")
+                    else -> response(id)
+                }
+            }
+            if (q.number("epoch") != epoch) return response(id, 409, "stale epoch")
+            if (q.string("targetDeviceId") != id) return response(id, 409, "guarded transfer must target its issuer")
+            if (active.isNotEmpty() || transfer != null || deliveries.isNotEmpty() || now() < leaseUntil || now() < quarantineUntil)
+                return response(id, 409, "output already selected or recovering")
+            val selection = q["selectionSeq"]?.jsonPrimitive?.long
+            if (selection != null && selection <= device.selectionSeq || selection == null && device.selectionSeq != 0L)
+                return response(id, 409, "stale selection sequence")
+            if (outcomes.size >= 128 && outcomes.values.none { it.status != "pending" })
+                return response(id, 429, "command limit reached")
+            return null
         }
 
         private fun invalid(): MockResponse {
@@ -418,10 +472,11 @@ class UiFixtureServer : AutoCloseable {
             }
             val optional = when (q.string("action")) {
                 "poll" -> setOf("state", "stateSeq", "acks")
-                "transfer" -> setOf("selectionSeq")
+                "transfer" -> setOf("selectionSeq", "requireUnselected")
                 else -> emptySet()
             }
             require(q.keys.containsAll(required) && q.keys.all { it in required || it in optional })
+            if (q.containsKey("requireUnselected")) require(q.getValue("requireUnselected") == JsonPrimitive(true))
             listOf("deviceId", "commandId", "targetDeviceId").forEach { if (q.containsKey(it)) require(validPlaybackProtocolId(q.string(it))) }
             if (q.containsKey("name")) require(validPlaybackDeviceName(q.string("name")))
             listOf("epoch", "stateSeq", "selectionSeq").forEach { if (q.containsKey(it)) q.number(it) }

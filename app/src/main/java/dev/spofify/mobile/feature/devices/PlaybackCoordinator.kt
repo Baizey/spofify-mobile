@@ -133,6 +133,37 @@ class PlaybackCoordinator(
     private var commandJob: Job? = null
     private var endpointJob: Job? = null
     private var actionVersion = 0L
+    /** One memory-only explicit admission. Never a retry queue or server authority. */
+    private class PlayAdmission(val id: String, val lifecycle: Long, val revision: Long,
+        var choice: Long, val deadline: Long, var origin: () -> Boolean, val lifetime: () -> Boolean,
+        var staging: PlaybackSnapshot, var payloadVersion: Long,
+        var action: suspend (PlaybackAuthority) -> PlaybackEndpointResult, var onRejected: (() -> Unit)?) {
+        var claimEpoch: Long? = null
+        var activatedEpoch: Long? = null
+        var activationDelivery: String? = null
+        var activationAckSent = false
+        var stagedVersion: Long? = null
+        val accepted = CompletableDeferred<Boolean>()
+    }
+    private var playAdmission: PlayAdmission? = null
+    private var admissionJob: Job? = null
+    private var explicitActionJob: Job? = null
+    private val explicitExecutionVersion = java.util.concurrent.atomic.AtomicLong()
+    private val abandonedClaims = LinkedHashSet<String>()
+    private fun abandonAdmission() {
+        val old = playAdmission ?: return
+        playAdmission = null
+        if (old.claimEpoch != null) {
+            uncertainConnection = true
+            abandonedClaims.add(old.id)
+            while (abandonedClaims.size > 256) abandonedClaims.remove(abandonedClaims.first())
+        }
+        old.accepted.complete(false)
+        admissionJob?.cancel()
+    }
+    private fun admissionCurrent(value: PlayAdmission) = playAdmission === value && !closed && serviceActive &&
+        lifecycle == value.lifecycle && actionVersion == value.revision && selectionVersion == value.choice &&
+        clockMs() < value.deadline && value.lifetime() && value.origin() && work.isActive
     private var nextRegistrationAt = 0L
     private var registrationBackoffMs = 8000L
     private var selectionVersion = 0L
@@ -284,6 +315,7 @@ class PlaybackCoordinator(
         generation++; leaseDeadline = 0; released = true; activatedEpoch = 0; recoverPaused = true
         revokeAuthority()
         if (invalidateActions) {
+            abandonAdmission()
             finishCommandResult(null, "cancelled")
             actionVersion++
             endpointJob?.cancel()
@@ -298,6 +330,7 @@ class PlaybackCoordinator(
 
     /** Must run before waiting for transport, even during registration or an output switch. */
     private fun interruptLocal() {
+        abandonAdmission()
         generation++; actionVersion++; revokeAuthority()
         commandJob?.cancel(); endpointJob?.cancel()
         // An explicit Pause also cancels a pre-bind request before this coordinator owns output.
@@ -358,6 +391,7 @@ class PlaybackCoordinator(
         if (state.value.devices.none { it.deviceId == targetDeviceId && it.available }) {
             message("That player is unavailable. Open Spofify on it and choose again."); return
         }
+        abandonAdmission()
         val selection = Selection(targetDeviceId, ++selectionVersion)
         // Do not let a queued/suspended explicit local action follow a newer output choice.
         val pendingLocalExecution = commandJob?.isActive == true && endpointJob?.isActive == true
@@ -449,6 +483,110 @@ class PlaybackCoordinator(
         action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) =
         submitAction(action = action, isCurrent = isCurrent, onRejected = onRejected, onCompleted = onCompleted)
 
+    /** A deliberate app Play may conditionally acquire a genuinely empty room. Generic edits,
+     * system transport and recovery never call this path. The payload stays with its origin. */
+    fun explicitLocalPlay(isCurrent: () -> Boolean = { true }, onRejected: (() -> Unit)? = null,
+        preparedResume: PlaybackSnapshot? = null, admissionIsCurrent: () -> Boolean = isCurrent,
+        action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) {
+        val payloadVersion = explicitExecutionVersion.incrementAndGet()
+        val staging = try { (preparedResume ?: PlaybackSnapshot()).paused().publicationValidated() }
+            catch (_: IllegalArgumentException) { onRejected?.invoke(); return }
+        val retained = playAdmission
+        if (retained != null && retained.claimEpoch != null && retained.lifecycle == lifecycle &&
+            retained.revision == actionVersion && retained.choice == selectionVersion &&
+            clockMs() < retained.deadline && retained.lifetime() && admissionIsCurrent() && isCurrent() &&
+            !uncertainConnection && serviceActive && !closed) {
+            // The claim is still this exact attempt, but ONLY the newest unsent music survives.
+            // Retaining cannot extend its deadline or retry a failed/uncertain claim.
+            retained.onRejected?.invoke()
+            retained.origin = isCurrent; retained.action = action; retained.onRejected = onRejected
+            retained.staging = staging; retained.payloadVersion = payloadVersion
+            return
+        }
+        abandonAdmission()
+        // A new Play retires an older uninstalled start, not healthy audible output.
+        explicitActionJob?.takeIf { it.isActive }?.let { old ->
+            old.cancel()
+            if (commandJob === old) { endpointJob?.cancel(); pendingCommand = null }
+        }
+        if (closed || !serviceActive || !isCurrent() || !admissionIsCurrent() || uncertainConnection ||
+            state.value.recovery !in setOf(PlaybackConnectionRecovery.NONE) && state.value.deviceId.isNotEmpty()) {
+            message("Reconnect playback and press Play again."); onRejected?.invoke(); return
+        }
+        if (selectionPending() || pendingCommand != null) {
+            message("Finish selecting a playback device, then press Play again."); onRejected?.invoke(); return
+        }
+        val value = PlayAdmission(nonce(), lifecycle, actionVersion, selectionVersion, clockMs() + 12_000,
+            isCurrent, admissionIsCurrent, staging, payloadVersion, action, onRejected)
+        playAdmission = value
+        var dispatched = false
+        admissionJob = work.launch {
+            try {
+                withTimeout(12_000) {
+                    transport.withLock {
+                        if (!admissionCurrent(value)) return@withLock
+                        exchange {
+                            // Initial service binding already owns the single registration. Never
+                            // register/recover again to keep an old click alive.
+                            if (!state.value.connected || state.value.deviceId.isEmpty()) return@exchange
+                            val self = state.value.deviceId
+                            if (state.value.activeDeviceId.isEmpty()) {
+                                poll() // Device-scoped, serialized fresh observation, NOT cached UI emptiness.
+                                if (!admissionCurrent(value)) return@exchange
+                                val fresh = state.value.view ?: return@exchange
+                                if (fresh.activeDeviceId.isNotEmpty() || fresh.transfer != null ||
+                                    fresh.directives.isNotEmpty() || fresh.leaseMs != 0L || fresh.quarantineMs != 0L ||
+                                    !state.value.connected || uncertainConnection) return@exchange
+                                value.claimEpoch = epoch
+                                value.choice = ++selectionVersion
+                                request { api.claimUnselected(self, epoch, value.id, value.choice) }
+                            } else if (state.value.activeDeviceId == self && executionAuthority() != null) {
+                                value.accepted.complete(true) // Legitimate pristine idle registration/current owner.
+                            }
+                        }
+                    }
+                    if (!admissionCurrent(value)) return@withTimeout
+                    // No mutex while waiting: heartbeat owns prepare/activate ACK progression.
+                    if (value.claimEpoch == null && !value.accepted.isCompleted) return@withTimeout
+                    if (!value.accepted.await() || !admissionCurrent(value)) return@withTimeout
+                    val claimed = value.claimEpoch != null
+                    playAdmission = null
+                    dispatched = true
+                    val execution = value.payloadVersion
+                    submitAction(action = { authority ->
+                        // Only unfinished startup is attempt-scoped. Once terminally accepted,
+                        // healthy output retains its normal ownership permit across a newer tap.
+                        val installed = java.util.concurrent.atomic.AtomicBoolean()
+                        val guarded = PlaybackAuthority(authority.epoch, authority.generation) {
+                            authority.isValid() && (installed.get() || execution == explicitExecutionVersion.get() && clockMs() < value.deadline)
+                        }
+                        val result = value.action(guarded)
+                        if (execution == explicitExecutionVersion.get() && guarded.isValid()) installed.set(true)
+                        result
+                    }, isCurrent = {
+                        execution == explicitExecutionVersion.get() && clockMs() < value.deadline && value.lifetime() && value.origin() &&
+                            lifecycle == value.lifecycle && selectionVersion == value.choice &&
+                            (!claimed || value.activatedEpoch == epoch)
+                    }, initialize = !claimed && preparedResume == null, onRejected = value.onRejected)
+                    explicitActionJob = commandJob
+                }
+            } catch (error: TimeoutCancellationException) {
+                message("Playback could not be confirmed. Check the output and press Play again.")
+            } finally {
+                if (playAdmission === value) {
+                    // Retain only the bounded abandoned command identity, never its music.
+                    playAdmission = null
+                    if (value.claimEpoch != null) {
+                        abandonedClaims.add(value.id)
+                        while (abandonedClaims.size > 256) abandonedClaims.remove(abandonedClaims.first())
+                    }
+                    message("Playback could not be confirmed. Check the output and press Play again.")
+                }
+                if (!dispatched) value.onRejected?.invoke()
+            }
+        }
+    }
+
     /** Existing prepared queue only: a cancelled edit must NEVER initialize/import output. */
     internal fun editPreparedQueue(isCurrent: () -> Boolean, onRejected: (() -> Unit)? = null,
         onCompleted: ((PlaybackEndpointResult) -> Unit)? = null,
@@ -472,6 +610,9 @@ class PlaybackCoordinator(
         if (!serviceActive) { message("Connect the playback service and choose this phone before pressing Play."); rejectEarly(); return }
         if (!interrupt && selectionPending()) {
             message("Finish selecting a playback device before changing playback."); rejectEarly(); return
+        }
+        if (!interrupt && playAdmission != null) {
+            message("An explicit Play is awaiting confirmation. Pause can cancel it."); rejectEarly(); return
         }
         if (pendingCommand != null && pendingFinalClose == null) { message("An action is awaiting confirmation. Pause or Stop can interrupt it."); rejectEarly(); return }
         // A queued NEW intent only holds disposal. It may become stale/rejected while waiting;
@@ -610,10 +751,34 @@ class PlaybackCoordinator(
     private suspend fun poll(): Unit = verifyConnection {
         val id = state.value.deviceId
         if (id.isEmpty()) return@verifyConnection
+        playAdmission?.takeIf { admissionCurrent(it) && it.activatedEpoch == epoch && it.stagedVersion != it.payloadVersion }?.let { admission ->
+            val authority = executionAuthority() ?: return@let
+            val staged = endpointAction {
+                var result: PlaybackEndpointResult
+                do {
+                    if (!admissionCurrent(admission)) return@endpointAction null
+                    val payload = admission.payloadVersion
+                    result = if (admission.staging.queue.isEmpty()) endpoint.activate(admission.staging, authority)
+                        else endpoint.activatePreparedResume(admission.staging, authority)
+                    if (payload == admission.payloadVersion && result.status == "ok") admission.stagedVersion = payload
+                } while (admissionCurrent(admission) && admission.stagedVersion != admission.payloadVersion && result.status == "ok")
+                result
+            }
+            if (staged == null || staged.status != "ok" || !admissionCurrent(admission)) {
+                abandonAdmission(); return@verifyConnection
+            }
+            ackState = staged.snapshot
+        }
         val pending = acks.toList(); acks.clear()
+        playAdmission?.let { admission ->
+            if (pending.any { it.deliveryId == admission.activationDelivery && it.status == "ok" && it.epoch == admission.activatedEpoch })
+                admission.activationAckSent = true
+        }
         val final = ackState; ackState = null
         val snapshot = if (state.value.activeDeviceId == id && (authorized() && activatedEpoch == epoch || final != null)) final ?: endpoint.exportSnapshot().validated() else null
-        request(ownerPoll = true) { api.poll(id, epoch, if (snapshot != null) ++sequence else null, snapshot, pending) }
+        val publication = playAdmission?.takeIf { snapshot != null && it.activatedEpoch == epoch && it.stagedVersion == it.payloadVersion }
+            ?.let { it.id to it.payloadVersion }
+        request(ownerPoll = true, admissionPublication = publication) { api.poll(id, epoch, if (snapshot != null) ++sequence else null, snapshot, pending) }
     }
     /** One bounded final publication, NOT request(): its response must never activate/start audio. */
     private suspend fun publishFinalClose(result: PlaybackEndpointResult, ack: PlaybackAck? = null) {
@@ -641,7 +806,8 @@ class PlaybackCoordinator(
         }
     }
 
-    private suspend fun request(registration: Boolean = false, ownerPoll: Boolean = false, call: suspend () -> PlaybackDevicesView) {
+    private suspend fun request(registration: Boolean = false, ownerPoll: Boolean = false,
+        admissionPublication: Pair<String, Long>? = null, call: suspend () -> PlaybackDevicesView) {
         if (closed || !serviceActive) return
         val life = lifecycle; val sent = clockMs(); val revision = actionVersion
         val sentFeedback = selectionFeedback
@@ -650,7 +816,11 @@ class PlaybackCoordinator(
         if (life != lifecycle || closed || !serviceActive || !work.isActive) return
         consume(view, sent, registration, startsAllowed = revision == actionVersion,
             grantAuthority = registration || ownerPoll || state.value.connected, sentFeedback = sentFeedback,
-            sentCommand = sentCommand)
+            sentCommand = sentCommand, admissionPublication = admissionPublication)
+        // A successful fresh observation may make a NEW explicit tap possible; it never
+        // resurrects the retired intent or treats pending recovery as an empty room.
+        if (ownerPoll && state.value.connected && view.transfer == null && view.directives.isEmpty() &&
+            view.quarantineMs == 0L) uncertainConnection = false
     }
     private suspend fun consume(
         view: PlaybackDevicesView,
@@ -660,6 +830,7 @@ class PlaybackCoordinator(
         grantAuthority: Boolean = true,
         sentFeedback: SelectionFeedback? = null,
         sentCommand: CommandFeedback? = null,
+        admissionPublication: Pair<String, Long>? = null,
     ) {
         if (!registration && view.epoch < epoch) return
         if (!registration && view.epoch == epoch && view.stateSeq < (state.value.view?.stateSeq ?: 0)) return
@@ -668,11 +839,28 @@ class PlaybackCoordinator(
         val previous = state.value.view
         val changed = view.epoch != epoch
         val ownerChanged = previous?.activeDeviceId != view.activeDeviceId
+        val admission = playAdmission
+        val matchingTransfer = admission?.claimEpoch != null && view.transfer?.let {
+            it.commandId == admission.id && it.targetDeviceId == id && it.sourceDeviceId.isEmpty()
+        } == true
+        val expectedActivation = admission != null && admissionCurrent(admission) && matchingTransfer &&
+            view.epoch == admission.claimEpoch!! + 1 && view.activeDeviceId == id &&
+            view.transfer?.phase == "activating" && view.directives.any {
+                it.type == "activate" && it.commandId == admission.id && it.epoch == view.epoch
+            }
+        if (admission != null && admission.claimEpoch != null) {
+            val legitimate = admissionCurrent(admission) && (matchingTransfer &&
+                (view.epoch == admission.claimEpoch && view.activeDeviceId.isEmpty() || expectedActivation ||
+                    view.epoch == admission.activatedEpoch && view.activeDeviceId == id) ||
+                admission.activationAckSent && view.epoch == admission.activatedEpoch && view.activeDeviceId == id &&
+                    view.transfer == null && view.commands.any { it.commandId == admission.id && it.status == "ok" })
+            if (!legitimate) abandonAdmission()
+        }
         // A stable REMOTE owner's heartbeat grants no local authority, but is not a
         // new cancellation either. Repeated suspension would invalidate every async
         // queue preparation that happens to overlap the one-second polling cadence.
         if (changed || view.activeDeviceId != id && (ownerChanged || !released || activatedEpoch != 0L)) {
-            fenceLocal(invalidateActions = !registration || uncertainConnection)
+            fenceLocal(invalidateActions = !expectedActivation && (!registration || uncertainConnection))
             acks.clear(); ackState = null
         }
         if (registration) {
@@ -755,6 +943,14 @@ class PlaybackCoordinator(
             runDirective(directive, startsAllowed && directiveRevision == actionVersion)
             if (closeVersion != finalCloseVersion) return // Never execute directives after a final close.
         }
+        playAdmission?.let { pending ->
+            if (pending.claimEpoch != null && pending.activationAckSent &&
+                view.commands.any { it.commandId == pending.id && it.status == "ok" } &&
+                pending.activatedEpoch == epoch && pending.stagedVersion == pending.payloadVersion &&
+                admissionPublication == (pending.id to pending.payloadVersion) &&
+                view.transfer == null && currentAuthority()?.isValid() == true &&
+                admissionCurrent(pending)) pending.accepted.complete(true)
+        }
     }
     private fun authorizedFor(id: String, view: PlaybackDevicesView) = view.activeDeviceId == id && !released && clockMs() < leaseDeadline && activatedEpoch == view.epoch
 
@@ -762,6 +958,12 @@ class PlaybackCoordinator(
         if (!deliveries.add(d.deliveryId)) return
         while (deliveries.size > 256) deliveries.remove(deliveries.first())
         if (d.epoch != epoch) return
+        if (d.commandId in abandonedClaims) {
+            // An obsolete claim cannot stage retained audio or execute a late activation.
+            acks += PlaybackAck(d.deliveryId, d.epoch, "rejected")
+            if (d.type == "activate") ackState = PlaybackSnapshot()
+            return
+        }
         if (d.type == "prepare") {
             val valid = try { withTimeout(4000) { endpoint.prepare((d.state ?: PlaybackSnapshot()).validated()) } } catch (_: Exception) { false }
             if (d.epoch == epoch) acks += PlaybackAck(d.deliveryId, d.epoch, if (valid) "ok" else "rejected")
@@ -783,14 +985,41 @@ class PlaybackCoordinator(
                 if (!startsAllowed || intent != null && intent?.target != state.value.deviceId) {
                     endpoint.suspendOutput(); PlaybackEndpointResult("rejected", endpoint.exportSnapshot().paused())
                 } else {
-                    val snapshot = (d.state ?: PlaybackSnapshot()).validated()
-                    // A normal handoff has an explicit source release. Recovery/no source is paused by server.
-                    val safe = if (uncertainConnection || recoverPaused && state.value.view?.transfer?.sourceDeviceId.isNullOrEmpty()) snapshot.paused() else snapshot
+                    val admission = playAdmission?.takeIf { it.id == d.commandId && it.claimEpoch != null }
+                    if (admission != null && !admissionCurrent(admission)) {
+                        abandonAdmission()
+                        acks += PlaybackAck(d.deliveryId, d.epoch, "rejected"); ackState = PlaybackSnapshot()
+                        return
+                    }
                     activating = true
-                    val activated = try { endpointAction { endpoint.activate(safe, authority) } }
-                        finally { activating = false }
+                    val activated = try { endpointAction {
+                        var latest: PlaybackEndpointResult
+                        do {
+                            if (admission != null && !admissionCurrent(admission)) return@endpointAction null
+                            val payload = admission?.payloadVersion
+                            // Replacement stages empty. A captured live Resume is paused, never
+                            // retained server music. If latest payload changes across activation,
+                            // re-stage before ACK; the obsolete completion grants nothing.
+                            val snapshot = admission?.staging ?: (d.state ?: PlaybackSnapshot()).validated()
+                            val safe = if (admission != null || uncertainConnection || recoverPaused &&
+                                state.value.view?.transfer?.sourceDeviceId.isNullOrEmpty()) snapshot.paused() else snapshot
+                            latest = if (admission != null && safe.queue.isNotEmpty()) endpoint.activatePreparedResume(safe, authority)
+                                else endpoint.activate(safe, authority)
+                            if (admission != null && payload == admission.payloadVersion && latest.status == "ok")
+                                admission.stagedVersion = payload
+                        } while (admission != null && admissionCurrent(admission) && payload != admission.payloadVersion)
+                        latest
+                    } } finally { activating = false }
                     if (activated == null || !authority.isValid()) return
+                    if (admission != null && !admissionCurrent(admission)) {
+                        acks += PlaybackAck(d.deliveryId, d.epoch, "rejected"); ackState = PlaybackSnapshot()
+                        return
+                    }
                     activatedEpoch = epoch; recoverPaused = false
+                    if (admission != null && activated.status == "ok") {
+                        admission.activatedEpoch = epoch
+                        admission.activationDelivery = d.deliveryId
+                    }
                     activated
                 }
             }

@@ -215,6 +215,10 @@ interface PlaybackDevicesProtocol {
     suspend fun rename(deviceId: String, name: String): PlaybackDevicesView
     suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView
     suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView
+    /** Explicit first-Play admission only. Unsupported implementations must never fall back to
+     * picker takeover. Acceptance still requires the normal prepare/activate/terminal ACK path. */
+    suspend fun claimUnselected(deviceId: String, epoch: Long, commandId: String, selectionSeq: Long): PlaybackDevicesView =
+        throw UnsupportedOperationException("Conditional playback selection is unavailable")
     suspend fun leave(deviceId: String)
 }
 class PlaybackDevicesApi(client: SpofifyClient) : PlaybackDevicesProtocol {
@@ -238,6 +242,13 @@ class PlaybackDevicesApi(client: SpofifyClient) : PlaybackDevicesProtocol {
     override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView {
         require(validPlaybackProtocolId(commandId) && validPlaybackProtocolId(targetDeviceId) && selectionSeq in 1..MAX_SAFE)
         return post("transfer") { identity(deviceId, epoch); put("commandId", commandId); put("targetDeviceId", targetDeviceId); put("selectionSeq", selectionSeq) }
+    }
+    override suspend fun claimUnselected(deviceId: String, epoch: Long, commandId: String, selectionSeq: Long): PlaybackDevicesView {
+        require(validPlaybackProtocolId(commandId) && selectionSeq in 1..MAX_SAFE)
+        return post("transfer") {
+            identity(deviceId, epoch); put("commandId", commandId); put("targetDeviceId", deviceId)
+            put("selectionSeq", selectionSeq); put("requireUnselected", true)
+        }
     }
     override suspend fun leave(deviceId: String) { require(validPlaybackProtocolId(deviceId)); post("leave") { put("deviceId", deviceId) } }
     private fun JsonObjectBuilder.identity(id: String, epoch: Long) { require(validPlaybackProtocolId(id) && epoch in 1..MAX_SAFE); put("deviceId", id); put("epoch", epoch) }

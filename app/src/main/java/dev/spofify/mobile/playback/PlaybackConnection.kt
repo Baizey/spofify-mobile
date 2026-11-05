@@ -65,6 +65,17 @@ data class PlaybackState(
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 class PlaybackConnection(context: Context) : PlaybackControls {
+    private companion object {
+        // New explicit Play on another (including rotated-out) connection retires the old tap,
+        // without revoking the healthy player's authority or resetting its queue.
+        val latestPlay = java.util.concurrent.atomic.AtomicLong()
+    }
+    private var requestGeneration = 0L
+    private var explicitPlayOrigin: (() -> (() -> Boolean))? = null
+
+    override fun bindExplicitPlayOrigin(capture: () -> (() -> Boolean)) {
+        explicitPlayOrigin = capture
+    }
     private val context = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
     private val mainExecutor = Executor { command -> handler.post(command) }
@@ -128,6 +139,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         val shouldPlay: Boolean = true,
         val preparedState: PlaybackSnapshot? = null,
         val selectionAuthority: PreparedPlaybackAuthority? = null,
+        val isCurrent: () -> Boolean,
+        val admissionIsCurrent: () -> Boolean,
     )
 
     private val listener = object : Player.Listener {
@@ -166,7 +179,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         connectionError = null
         val currentGeneration = ++generation
         val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
-        val future = MediaController.Builder(context, token)
+        val future = try { MediaController.Builder(context, token)
             .setListener(object : MediaController.Listener {
                 override fun onDisconnected(controller: MediaController) {
                     if (this@PlaybackConnection.controller !== controller) return
@@ -178,11 +191,19 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                     controllerFuture = null
                     controller.removeListener(listener)
                     controller.release()
+                    retirePlayRequest()
                     connectionError = "Playback stopped. Sign in or reconnect to try again."
                     publishConnectionFailure()
                 }
             })
             .buildAsync()
+        } catch (_: RuntimeException) {
+            retirePlayRequest()
+            connectionError = "Unable to connect to playback. Sign in and try again."
+            publishConnectionFailure()
+            if (releaseAfterPending) releaseInternal()
+            return
+        }
         controllerFuture = future
         future.addListener({
             if (currentGeneration != generation) return@addListener
@@ -197,9 +218,10 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                 handler.post(pollPosition)
                 maybeReleaseAfterPending()
             } catch (_: Exception) {
+                // An uncertain binding is not permission to replay a click on reconnect.
+                retirePlayRequest()
                 connectionError = "Unable to connect to playback. Sign in and try again."
                 publishConnectionFailure()
-                // Keep the latest explicit play request for a subsequent connect/play.
                 if (releaseAfterPending) releaseInternal()
             }
         }, mainExecutor)
@@ -267,66 +289,93 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         startTrackId: String?,
         shuffle: Boolean,
         startEntryId: String?,
-    ) = onMainWithEpoch { requestEpoch ->
-        val playable = items.filter { it.kind == "track" && it.playable }
-        val chosen = playbackStartIndex(playable, startTrackId, startEntryId)
-        // Never substitute a different first track when the explicitly selected entry is beyond the cap.
-        val tracks = if (chosen >= PlaybackQueue.LIMIT) listOf(playable[chosen]) else playable.take(PlaybackQueue.LIMIT)
-        if (tracks.isEmpty()) {
-            mutableState.value = mutableState.value.copy(error = "No playable tracks in this queue.")
-            return@onMainWithEpoch
+    ) {
+        val session = client.currentSession()
+        val serial = latestPlay.incrementAndGet()
+        val failureGeneration = requestGeneration
+        onMainWithEpoch { requestEpoch ->
+            val lifetime = { session != null && client.currentSession() === session &&
+                failureGeneration == requestGeneration && client === (context as SpofifyApplication).graph.client &&
+                requestEpoch == PlaybackRequests.epoch }
+            val live = { serial == latestPlay.get() && lifetime() }
+            if (!live()) return@onMainWithEpoch
+            val playable = items.filter { it.kind == "track" && it.playable }
+            val chosen = playbackStartIndex(playable, startTrackId, startEntryId)
+            // Never substitute a different first track when the explicitly selected entry is beyond the cap.
+            val tracks = if (chosen >= PlaybackQueue.LIMIT) listOf(playable[chosen]) else playable.take(PlaybackQueue.LIMIT)
+            if (tracks.isEmpty()) {
+                mutableState.value = mutableState.value.copy(error = "No playable tracks in this queue.")
+                return@onMainWithEpoch
+            }
+            val request = try {
+                PlayRequest(
+                    tracks.map { PlaybackMedia.create(it, client) },
+                    playbackStartIndex(tracks, startTrackId, startEntryId),
+                    shuffle,
+                    client,
+                    requestEpoch,
+                    when {
+                        chosen >= PlaybackQueue.LIMIT -> "This selection is beyond the 1,000-song limit. Only the selected occurrence is loaded."
+                        playable.size > PlaybackQueue.LIMIT -> "First 1,000 playable songs loaded. This context has more music."
+                        else -> null
+                    },
+                    isCurrent = live, admissionIsCurrent = lifetime,
+                )
+            } catch (_: IllegalArgumentException) {
+                mutableState.value = mutableState.value.copy(error = "This queue contains an invalid track.")
+                return@onMainWithEpoch
+            }
+            connectionError = null
+            cancelDeferredRelease()
+            // A later Play replaces any earlier not-yet-delivered Add actions.
+            pendingEnqueues.clear()
+            requestedContext = null
+            pendingPlay = request
+            // Keep the accepted queue visible while binding/permission/remote confirmation is pending.
+            connectInternal()
+            if (controller != null) applyPlay()
         }
-        val request = try {
-            PlayRequest(
-                tracks.map { PlaybackMedia.create(it, client) },
-                playbackStartIndex(tracks, startTrackId, startEntryId),
-                shuffle,
-                client,
-                requestEpoch,
-                when {
-                    chosen >= PlaybackQueue.LIMIT -> "This selection is beyond the 1,000-song limit. Only the selected occurrence is loaded."
-                    playable.size > PlaybackQueue.LIMIT -> "First 1,000 playable songs loaded. This context has more music."
-                    else -> null
-                },
-            )
-        } catch (_: IllegalArgumentException) {
-            mutableState.value = mutableState.value.copy(error = "This queue contains an invalid track.")
-            return@onMainWithEpoch
-        }
-        connectionError = null
-        cancelDeferredRelease()
-        // A later Play replaces any earlier not-yet-delivered Add actions.
-        pendingEnqueues.clear()
-        requestedContext = null
-        pendingPlay = request
-        // Keep the accepted queue visible while binding/permission/remote confirmation is pending.
-        connectInternal()
-        if (controller != null) applyPlay()
     }
 
     override fun playPrepared(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
-        startTrackId: String?, shuffle: Boolean, startEntryId: String?, context: LibraryItem?) = onMainWithEpoch { requestEpoch ->
-        val prepared = try {
-            PlaybackSnapshotCodec.preparedQueue(queue, startTrackId, startEntryId, shuffle, context)
-        } catch (_: IllegalArgumentException) {
-            mutableState.value = mutableState.value.copy(error = "This prepared selection is unavailable. Reload the collection and try again.")
-            return@onMainWithEpoch
+        startTrackId: String?, shuffle: Boolean, startEntryId: String?, context: LibraryItem?) =
+        playPreparedGuarded(queue, client, startTrackId, shuffle, startEntryId, context, isCurrent = { true })
+
+    override fun playPreparedGuarded(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
+        startTrackId: String?, shuffle: Boolean, startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean,
+        admissionIsCurrent: () -> Boolean) {
+        val session = client.currentSession()
+        val serial = latestPlay.incrementAndGet()
+        val failureGeneration = requestGeneration
+        onMainWithEpoch { requestEpoch ->
+            val lifetime = { admissionIsCurrent() && session != null && client.currentSession() === session &&
+                failureGeneration == requestGeneration && client === (this.context as SpofifyApplication).graph.client &&
+                requestEpoch == PlaybackRequests.epoch }
+            val live = { isCurrent() && serial == latestPlay.get() && lifetime() }
+            if (!live()) return@onMainWithEpoch
+            val prepared = try {
+                PlaybackSnapshotCodec.preparedQueue(queue, startTrackId, startEntryId, shuffle, context)
+            } catch (_: IllegalArgumentException) {
+                mutableState.value = mutableState.value.copy(error = "This prepared selection is unavailable. Reload the collection and try again.")
+                return@onMainWithEpoch
+            }
+            if (prepared.context?.kind == "derived" && queue.selectionAuthority?.isValidFor(client, prepared) != true) {
+                mutableState.value = mutableState.value.copy(error = "This prepared selection expired. Reload the collection and choose again.")
+                return@onMainWithEpoch
+            }
+            val plan = PlaybackSnapshotCodec.plan(prepared)
+            val media = try { plan.mediaItems(client) } catch (_: IllegalArgumentException) {
+                mutableState.value = mutableState.value.copy(error = "Sign in again before playing this selection.")
+                return@onMainWithEpoch
+            }
+            connectionError = null
+            cancelDeferredRelease(); pendingEnqueues.clear(); requestedContext = null
+            pendingPlay = PlayRequest(media, plan.currentIndex.coerceAtLeast(0), prepared.shuffle, client, requestEpoch,
+                remotePlaybackState(prepared).notice, preparedState = prepared, selectionAuthority = queue.selectionAuthority,
+                isCurrent = live, admissionIsCurrent = lifetime)
+            connectInternal()
+            if (controller != null) applyPlay()
         }
-        if (prepared.context?.kind == "derived" && queue.selectionAuthority?.isValidFor(client, prepared) != true) {
-            mutableState.value = mutableState.value.copy(error = "This prepared selection expired. Reload the collection and choose again.")
-            return@onMainWithEpoch
-        }
-        val plan = PlaybackSnapshotCodec.plan(prepared)
-        val media = try { plan.mediaItems(client) } catch (_: IllegalArgumentException) {
-            mutableState.value = mutableState.value.copy(error = "Sign in again before playing this selection.")
-            return@onMainWithEpoch
-        }
-        connectionError = null
-        cancelDeferredRelease(); pendingEnqueues.clear(); requestedContext = null
-        pendingPlay = PlayRequest(media, plan.currentIndex.coerceAtLeast(0), prepared.shuffle, client, requestEpoch,
-            remotePlaybackState(prepared).notice, preparedState = prepared, selectionAuthority = queue.selectionAuthority)
-        connectInternal()
-        if (controller != null) applyPlay()
     }
 
     override fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
@@ -431,7 +480,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         val requestContext = requestedContext
         // A rotated-out connection can finish binding AFTER a different connection
         // stopped playback or replaced the account. Never replay its stale tap.
-        if (request.epoch != PlaybackRequests.epoch ||
+        if (!request.isCurrent() || request.epoch != PlaybackRequests.epoch ||
             request.client !== (context as SpofifyApplication).graph.client ||
             request.client.currentSession() == null) {
             pendingEnqueues.clear()
@@ -448,7 +497,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             connectionError = PlaybackService.replacePrepared(request.items, request.client,
                 request.startIndex, request.shuffle, request.shouldPlay,
                 context = requestContext, notice = request.notice, requestEpoch = request.epoch,
-                preparedState = request.preparedState, selectionAuthority = request.selectionAuthority)
+                preparedState = request.preparedState, selectionAuthority = request.selectionAuthority,
+                isCurrent = request.isCurrent, admissionIsCurrent = request.admissionIsCurrent)
         } finally {
             applyingPlay = false
         }
@@ -568,14 +618,37 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         publish()
     }
 
-    override fun toggle() = onMainQueue {
-        // A pause before deferred Play delivery must also cancel that request's autoplay intent.
-        val pending = pendingPlay
-        val snapshot = if (hasRemoteOutput()) remoteSnapshot() else PlaybackService.exportLocalSnapshot()
-        val playing = pending?.shouldPlay ?: (snapshot?.playing == true)
-        if (pending != null) pendingPlay = pending.copy(shouldPlay = !playing)
-        send(PlaybackDeviceCommand.transport(if (playing) "pause" else if (!snapshot?.error.isNullOrEmpty()) "retry" else "resume"))
-        publish()
+    override fun toggle() {
+        // Capture BEFORE posting. A retained callback cannot acquire a fresh route/session
+        // lifetime when the main queue eventually delivers it or a claim finishes.
+        val origin = explicitPlayOrigin?.invoke() ?: { false }
+        val source = (context as SpofifyApplication).graph.client
+        val session = source?.currentSession()
+        val failureGeneration = requestGeneration
+        val requestEpoch = PlaybackRequests.epoch
+        val serial = latestPlay.incrementAndGet()
+        val lifetime = { origin() && source != null && session != null && source.currentSession() === session &&
+            source === (context as SpofifyApplication).graph.client && failureGeneration == requestGeneration &&
+            requestEpoch == PlaybackRequests.epoch }
+        val current = { serial == latestPlay.get() && lifetime() }
+        onMainQueue {
+            // A disposed/stale callback must neither acquire output nor pause healthy audio
+            // that completed before its host disappeared. Unknown origins fail closed.
+            if (!current()) {
+                connectionError = "Playback changed. Choose music again."
+                publish()
+                return@onMainQueue
+            }
+            // A pause before deferred Play delivery must also cancel that request's autoplay intent.
+            val pending = pendingPlay
+            val snapshot = if (hasRemoteOutput()) remoteSnapshot() else PlaybackService.exportLocalSnapshot()
+            val playing = pending?.shouldPlay ?: (snapshot?.playing == true)
+            if (playing) retirePlayRequest()
+            if (!playing && !hasRemoteOutput()) {
+                connectionError = PlaybackService.resumePrepared(isCurrent = current, admissionIsCurrent = lifetime)
+            } else send(PlaybackDeviceCommand.transport(if (playing) "pause" else if (!snapshot?.error.isNullOrEmpty()) "retry" else "resume"))
+            publish()
+        }
     }
 
     override fun next() = command("next")
@@ -689,7 +762,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         // Every connection checks this epoch before applying a deferred request.
         PlaybackRequests.invalidate()
         onMain {
-            pendingPlay = null
+            retirePlayRequest()
             pendingEnqueues.clear()
             requestedContext = null
             actionNotice = null
@@ -702,6 +775,13 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             displayingRemote = false
             mutableState.value = PlaybackState()
         }
+    }
+
+    private fun retirePlayRequest() {
+        ++requestGeneration
+        pendingPlay = null
+        requestedContext = null
+        handler.removeCallbacks(deliverPlay)
     }
 
     private fun publishConnectionFailure() {

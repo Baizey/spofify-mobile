@@ -14,6 +14,14 @@ The existing authenticated `GET/POST /api/me/player` protocol coordinates availa
 
 Preparation validates the complete snapshot without replacing a queue, opening audio, starting playback or writing history. Activation requires current coordinator authority and session/generation checks. Actual readiness/start results determine `ok`, `blocked`, `media` or `rejected`; receiving a directive alone is not a successful playback ACK.
 
+## Explicit first app Play in an unselected room
+
+A deliberate app musical Play retains its exact prepared selection and originating route/session/request fence while binding. If the current device already has legitimate idle ownership from pristine registration, normal explicit execution applies. Otherwise a serialized device-scoped fresh observation must show no selected output or pending recovery/work before the client sends one typed `claimUnselected` request: ordinary `transfer` plus exact-self target, current epoch, monotonic selection sequence and literal `requireUnselected: true`. Unsupported/older servers fail closed; there is no ordinary-transfer fallback. Rounded public lease/quarantine values never replace server admission.
+
+The memory-only, latest-payload admission is bounded to twelve seconds and cannot reroute to a competing owner. Its matching prepare/activate must stage empty paused state for replacement Play (or the exact captured live paused queue for deliberate app Resume), then receive matching terminal activation-ACK acceptance before requested playback executes once. Preparation/active-ID display is not a start permit. Uncertain writes/ACKs, expiry, Pause/Stop, output choice, stale origin/session/service and authority loss retire the musical intent; subsequent polling/reconnect never replays it. System/headset/notification prepared-only Play, Add, Play next and queue edits do not enter this conditional-acquisition path. Their established behavior under already-legitimate authority is unchanged.
+
+Native first-Play rendering/audio/history/background acceptance remains **blocked / not complete** under the current isolated-emulator assessment; protocol/service JVM tests and compiled fixtures are not installed-app approval.
+
 ## What persists — and what does not
 
 Android Keystore-encrypted local metadata stores an installation UUID and accepted device name, bound to the exact server origin and immutable account ID and excluded from app backup/transfer. This makes the local installation/name more persistent than a screen or login session. It stores no credentials, playback intent, queue or server-issued device authority.

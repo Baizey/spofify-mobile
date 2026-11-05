@@ -6,13 +6,17 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.test.core.app.ApplicationProvider
+import androidx.lifecycle.ViewModelStore
 import dev.spofify.mobile.AppGraph
+import dev.spofify.mobile.LibraryViewModel
 import dev.spofify.mobile.LoginStore
 import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
 import dev.spofify.mobile.core.*
 import java.net.InetAddress
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Dispatchers
@@ -120,6 +124,210 @@ class AppGraphPlaybackParticipationTest {
         fun ackStatus(id: String) = polls.asSequence().flatMap { it.getValue("acks").jsonArray.asSequence() }
             .map { it.jsonObject }.firstOrNull { it.getValue("deliveryId").jsonPrimitive.content == id }
             ?.getValue("status")?.jsonPrimitive?.content
+    }
+
+    /** Narrow Go-shaped room: registration is already unselected, never pristine idle ownership.
+     * The activation ACK reply is held so POST acceptance/active-ID cannot stand in for terminal
+     * confirmation. No direct coordinator/service admission method is invoked by this fixture. */
+    private inner class GuardedAdmissionFixture : Dispatcher() {
+        val registrations = AtomicInteger()
+        val claims = CopyOnWriteArrayList<JsonObject>()
+        val polls = CopyOnWriteArrayList<JsonObject>()
+        val unexpected = CopyOnWriteArrayList<String>()
+        val prepareDeliveries = AtomicInteger()
+        val activationDeliveries = AtomicInteger()
+        val terminalAck = AtomicReference<JsonObject?>()
+        val terminalReply = CountDownLatch(1)
+        val terminalResponses = AtomicInteger()
+        val freshEmptyPolls = AtomicInteger()
+        private var epoch = 7L
+        private var active = ""
+        private var sequence = 0L
+        private var snapshot: PlaybackSnapshot = seed.paused()
+        private var transfer: PlaybackTransfer? = null
+        private var commandId = ""
+        private var outcome = "pending"
+        private fun view(directives: List<PlaybackDirective> = emptyList()) = PlaybackDevicesView(
+            "guard-phone", listOf(PlaybackDevice("guard-phone", "Phone", true)), active, epoch,
+            if (active.isEmpty()) 0 else 8000, state = snapshot, stateSeq = sequence, stateAgeMs = 0,
+            transfer = transfer, directives = directives,
+            commands = if (commandId.isEmpty()) emptyList() else listOf(PlaybackOutcome(commandId, outcome)),
+        )
+        private fun response(value: PlaybackDevicesView = view()) = MockResponse()
+            .setHeader("Content-Type", "application/json").setBody(value.toJson().toString())
+        @Synchronized override fun dispatch(request: RecordedRequest): MockResponse {
+            if (request.method == "POST" && request.path == "/api/auth/login") return MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setHeader("Set-Cookie", "spofify_session=fixture-session; Path=/; HttpOnly; Max-Age=3600")
+                .setBody("""{"accountId":"fixture-participant","username":"listener","role":"user","csrfToken":"fixture-csrf"}""")
+            if (request.path != "/api/me/player") {
+                unexpected += "${request.method} ${request.path}"
+                return MockResponse().setResponseCode(500)
+            }
+            assertEquals("spofify_session=fixture-session", request.getHeader("Cookie"))
+            if (request.method == "GET") return response()
+            assertEquals("POST", request.method)
+            assertEquals("fixture-csrf", request.getHeader("X-CSRF-Token"))
+            assertNotNull(request.getHeader("Origin"))
+            val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+            return when (body.getValue("action").jsonPrimitive.content) {
+                "register" -> { registrations.incrementAndGet(); response() }
+                "transfer" -> {
+                    assertTrue("Admission must refresh the cached empty observation", freshEmptyPolls.get() > 0)
+                    assertEquals(setOf("action", "deviceId", "epoch", "commandId", "targetDeviceId", "selectionSeq", "requireUnselected"), body.keys)
+                    assertEquals(JsonPrimitive(true), body["requireUnselected"])
+                    assertEquals("guard-phone", body.getValue("deviceId").jsonPrimitive.content)
+                    assertEquals("guard-phone", body.getValue("targetDeviceId").jsonPrimitive.content)
+                    assertEquals(epoch, body.getValue("epoch").jsonPrimitive.long)
+                    assertTrue(body.getValue("selectionSeq").jsonPrimitive.long > 0)
+                    assertEquals("", active); assertNull(transfer)
+                    claims += body
+                    assertEquals("One guarded write, never takeover/replay", 1, claims.size)
+                    commandId = body.getValue("commandId").jsonPrimitive.content
+                    transfer = PlaybackTransfer(commandId, "", "guard-phone", "preparing")
+                    response() // Go transfer replies do NOT deliver prepare.
+                }
+                "poll" -> {
+                    polls += body
+                    assertEquals("guard-phone", body.getValue("deviceId").jsonPrimitive.content)
+                    assertEquals(epoch, body.getValue("epoch").jsonPrimitive.long)
+                    body["state"]?.let {
+                        val published = PlaybackSnapshot.fromJson(it.jsonObject)
+                        if (terminalResponses.get() == 0) assertEquals("No retained/requested queue before terminal confirmation", PlaybackSnapshot(), published)
+                        assertEquals("guard-phone", active)
+                        val next = body.getValue("stateSeq").jsonPrimitive.long
+                        assertTrue(next > sequence); sequence = next; snapshot = published
+                    }
+                    val acks = body.getValue("acks").jsonArray.map { it.jsonObject }
+                    when {
+                        acks.any { it.getValue("deliveryId").jsonPrimitive.content == "guard-prepare" } -> {
+                            assertEquals("preparing", transfer?.phase)
+                            assertEquals("ok", acks.single().getValue("status").jsonPrimitive.content)
+                            assertEquals(7L, acks.single().getValue("epoch").jsonPrimitive.long)
+                            assertFalse(body.containsKey("state"))
+                            epoch++; active = "guard-phone"; sequence = 0
+                            transfer = transfer!!.copy(phase = "activating")
+                            activationDeliveries.incrementAndGet()
+                            response(view(listOf(PlaybackDirective("guard-activate", epoch, "activate", commandId, state = seed.paused()))))
+                        }
+                        acks.any { it.getValue("deliveryId").jsonPrimitive.content == "guard-activate" } -> {
+                            assertEquals("activating", transfer?.phase)
+                            assertEquals("ok", acks.single().getValue("status").jsonPrimitive.content)
+                            assertEquals(8L, acks.single().getValue("epoch").jsonPrimitive.long)
+                            assertEquals(PlaybackSnapshot(), snapshot)
+                            assertTrue(body.containsKey("stateSeq"))
+                            terminalAck.set(body)
+                            check(terminalReply.await(3, TimeUnit.SECONDS)) { "Terminal reply was not released" }
+                            transfer = null; outcome = "ok"; terminalResponses.incrementAndGet()
+                            response()
+                        }
+                        transfer?.phase == "preparing" && prepareDeliveries.get() == 0 -> {
+                            prepareDeliveries.incrementAndGet()
+                            response(view(listOf(PlaybackDirective("guard-prepare", epoch, "prepare", commandId, state = seed.paused()))))
+                        }
+                        else -> {
+                            if (commandId.isEmpty() && active.isEmpty()) freshEmptyPolls.incrementAndGet()
+                            response()
+                        }
+                    }
+                }
+                "leave" -> response()
+                else -> { unexpected += "Unexpected player action"; MockResponse().setResponseCode(500) }
+            }
+        }
+        fun states() = polls.mapNotNull { it["state"]?.jsonObject?.let(PlaybackSnapshot::fromJson) }
+    }
+
+    @Test fun viewModelPreparedDuplicatePlayClaimsThroughProductionApiAndWaitsForTerminalEmptyActivationAck() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
+        app.graph.clear()
+        val graph = AppGraph(app, Sessions(), Logins())
+        SpofifyApplication::class.java.getDeclaredField("graph").apply { isAccessible = true; set(app, graph) }
+        val fixture = GuardedAdmissionFixture()
+        val web = MockWebServer().apply { dispatcher = fixture; start(InetAddress.getByName("127.0.0.1"), 0) }
+        var service: ServiceController<PlaybackService>? = null
+        var connection: PlaybackConnection? = null
+        val models = ViewModelStore()
+        try {
+            val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
+            client.login("listener", "synthetic-password")
+            val owner = requireNotNull(graph.playbackCoordinator)
+            service = Robolectric.buildService(PlaybackService::class.java).create()
+            await("Production service registers in an already-unselected room") { owner.state.value.connected }
+            assertEquals("", owner.state.value.activeDeviceId)
+            assertEquals(0, fixture.claims.size)
+            val actualService = service.get()
+            shadowOf(actualService).setThrowInStartForeground(ForegroundServiceStartNotAllowedException("Synthetic restriction"))
+            val session = PlaybackService::class.java.getDeclaredField("session").let {
+                it.isAccessible = true; it.get(actualService) as androidx.media3.session.MediaSession
+            }
+            val future = androidx.media3.session.MediaController.Builder(actualService, session.token).buildAsync()
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+            val controller = future.get(1, TimeUnit.SECONDS)
+            val connected = PlaybackConnection(actualService).also {
+                // Binding injection only, as in PlaybackServiceBridgeTest.connectedPlayback.
+                // All musical delivery/admission/installation uses real production methods.
+                PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true; set(it, controller) }
+            }
+            connection = connected
+            val model = LibraryViewModel(app, graph, connected).also { models.put("explicit-play", it) }
+            await("ViewModel restores the existing exact authenticated session") { model.state.value.session != null && !model.state.value.busy }
+            val queue = PlaybackQueue(
+                listOf(
+                    LibraryItem("track", "requested-duplicate", "First occurrence", hasAudio = true, entryId = "entry-1"),
+                    LibraryItem("track", "requested-duplicate", "Clicked occurrence", hasAudio = true, entryId = "entry-2"),
+                    LibraryItem("track", "requested-tail", "Complete-context tail", hasAudio = true, entryId = "entry-3"),
+                ), total = 3, context = LibraryPlaybackContext("playlist", "requested-manual", "Requested full context"), revision = 9,
+            )
+            val expected = PlaybackSnapshotCodec.preparedQueue(queue, null, "entry-2", false, null)
+            model.playPrepared(client, client.currentSession()!!.accountId, queue, null, "entry-2")
+            await("VM → connection → service must issue exactly one guarded production HTTP claim") { fixture.claims.size == 1 }
+            owner.retry()
+            await("Only polling delivers preparation") { fixture.prepareDeliveries.get() == 1 }
+            owner.retry()
+            await("Prepare ACK advances one epoch and delivers activation") { fixture.activationDeliveries.get() == 1 }
+            owner.retry()
+            await("Real endpoint stages empty paused state and sends exact activation ACK") { fixture.terminalAck.get() != null }
+            assertEquals(0, fixture.terminalResponses.get())
+            val staged = PlaybackService.exportLocalSnapshot()
+            assertEquals(PlaybackSnapshot(), staged)
+            assertNull("Empty activation staging must not create listening history", staged.occurrence)
+            assertTrue(fixture.states().all { it == PlaybackSnapshot() })
+            val raw = PlaybackService::class.java.getDeclaredField("player").let { it.isAccessible = true; it.get(actualService) as ExoPlayer }
+            assertEquals("Neither retained nor requested music is installed before terminal acceptance", 0, raw.mediaItemCount)
+            assertFalse(raw.playWhenReady)
+            fixture.terminalReply.countDown()
+            await("Requested complete context installs only after terminal ok, with honest FGS denial") {
+                fixture.states().any { it.error == "blocked" && it.queue.size == 3 } && owner.state.value.view?.state?.error == "blocked"
+            }
+            val blocked = fixture.states().last { it.error == "blocked" }
+            assertEquals(listOf("requested-duplicate", "requested-duplicate", "requested-tail"), blocked.queue.map { it.id })
+            assertEquals(listOf("entry-1", "entry-2", "entry-3"), blocked.queue.map { it.entryId })
+            assertEquals(1, blocked.position)
+            assertEquals("entry-2", blocked.queue[blocked.position].entryId)
+            assertEquals(expected.context, blocked.context)
+            assertEquals("Clicked occurrence", blocked.queue[blocked.position].name)
+            assertEquals(1, raw.currentMediaItemIndex)
+            assertEquals("requested-duplicate", raw.currentMediaItem!!.mediaId)
+            assertEquals("wire-${blocked.queue[blocked.position].key}", PlaybackMedia.occurrence(raw.currentMediaItem!!))
+            // FGS denial precedes prepare/play. The selected queue occurrence exists, but
+            // sampleHistory deliberately does not create a listening record while silent.
+            // Do not require a later Media3 transition callback to manufacture a history nonce.
+            assertNull("Denied startup must not inherit or fabricate listening history", blocked.occurrence)
+            assertEquals(0.0, blocked.elapsed, 0.0)
+            assertFalse(blocked.playing); assertFalse(raw.playWhenReady)
+            assertEquals(1, fixture.registrations.get())
+            assertEquals(1, fixture.claims.size)
+            assertEquals(1, fixture.prepareDeliveries.get())
+            assertEquals(1, fixture.activationDeliveries.get())
+            assertEquals(1, fixture.terminalResponses.get())
+            assertTrue("No audio/history/catalog refetch permitted: ${fixture.unexpected}", fixture.unexpected.isEmpty())
+        } finally {
+            fixture.terminalReply.countDown()
+            models.clear(); connection?.release()
+            graph.clear(); service?.destroy(); runCurrent(); web.shutdown(); Dispatchers.resetMain()
+        }
     }
 
     private fun TestScope.await(description: String, condition: () -> Boolean) {

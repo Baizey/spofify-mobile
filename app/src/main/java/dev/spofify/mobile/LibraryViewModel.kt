@@ -165,6 +165,19 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private var generation = 0
     private var signingOut = false
     private var authenticationSerial = 0L
+    private var cleared = false
+
+    private fun captureExplicitPlayOrigin(): () -> Boolean {
+        val client = graph.client
+        val session = client?.currentSession()
+        val account = state.value.session?.accountId
+        val route = state.value.page
+        val routeGeneration = generation
+        val playbackEpoch = PlaybackRequests.epoch
+        return { !cleared && client != null && session != null && account != null &&
+            graph.client === client && client.currentSession() === session && state.value.session?.accountId == account &&
+            state.value.page == route && generation == routeGeneration && playbackEpoch == PlaybackRequests.epoch }
+    }
     private val likeOperations = LikeOperations(viewModelScope, { graph.client },
         changed = { id, liked ->
             mutable.update { it.copy(likes = it.likes + (id to liked), failedLikeStatus = it.failedLikeStatus - id) }
@@ -174,6 +187,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         statusFailed = { id -> mutable.update { it.copy(failedLikeStatus = it.failedLikeStatus + id) } })
 
     init {
+        playback.bindExplicitPlayOrigin(::captureExplicitPlayOrigin)
         viewModelScope.launch {
             graph.sessionExpired.collect { expired ->
                 if (expired && !signingOut) {
@@ -497,7 +511,16 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         if (!preparedSelectionValid(queue, expectedClient)) {
             mutable.update { it.copy(notice = "This prepared selection expired. Reload the collection and choose again.") }; return
         }
-        playback.playPrepared(queue, expectedClient, startTrackId, startEntryId = startEntryId)
+        val request = queueGeneration
+        val playbackEpoch = PlaybackRequests.epoch
+        val session = expectedClient.currentSession()
+        val route = state.value.page
+        val routeGeneration = generation
+        fun originLifetime() = !cleared && playbackEpoch == PlaybackRequests.epoch && graph.client === expectedClient &&
+            session != null && expectedClient.currentSession() === session &&
+            state.value.session?.accountId == expectedAccountId && state.value.page == route && generation == routeGeneration
+        playback.playPreparedGuarded(queue, expectedClient, startTrackId, startEntryId = startEntryId,
+            isCurrent = { request == queueGeneration && originLifetime() }, admissionIsCurrent = ::originLifetime)
         if (queue.truncated) mutable.update { it.copy(notice = "This queue is limited to 1,000 available songs.") }
     }
 
@@ -617,9 +640,10 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         val session = client.currentSession()
         val route = state.value.page
         val routeGeneration = generation
-        fun isCurrent() = callerIsCurrent() && request == queueGeneration && playbackEpoch == PlaybackRequests.epoch &&
+        fun originLifetime() = !cleared && callerIsCurrent() && playbackEpoch == PlaybackRequests.epoch &&
             graph.client === client && account != null && client.currentSession() === session &&
             state.value.session?.accountId == account && state.value.page == route && generation == routeGeneration
+        fun isCurrent() = request == queueGeneration && originLifetime()
         mutable.update { it.copy(preparing = true, playbackIntentGeneration = request) }
         queueJob = viewModelScope.launch {
             try {
@@ -631,7 +655,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                         mutable.update { it.copy(notice = "This prepared selection expired. Reload the collection and choose again.") }
                         return@launch
                     }
-                    playback.playPrepared(queue, client, start?.id, shuffle, startEntryId = start?.entryId, context = context)
+                    playback.playPreparedGuarded(queue, client, start?.id, shuffle, startEntryId = start?.entryId,
+                        context = context, isCurrent = ::isCurrent, admissionIsCurrent = ::originLifetime)
                     if (queue.truncated) mutable.update { it.copy(notice = "This queue is limited to 1,000 available songs.") }
                 }
             } catch (error: Exception) {
@@ -679,6 +704,10 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     override fun onCleared() {
+        cleared = true // Even a retained callback invoked AFTER disposal cannot capture a fresh origin.
+        // Retire only this host's still-pending intent, never healthy service-owned audio.
+        queueGeneration++
+        generation++
         authenticationSerial++
         clearFeatureState()
         playback.release() // Service keeps playing across Activity recreation.

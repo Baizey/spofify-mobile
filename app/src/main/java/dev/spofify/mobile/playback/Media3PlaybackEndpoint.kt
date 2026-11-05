@@ -35,6 +35,13 @@ class Media3PlaybackEndpoint : NativePlaybackEndpoint {
         return PlaybackService.activateSnapshot(snapshot, authority)
     }
 
+    override suspend fun activatePreparedResume(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult {
+        checkMain()
+        snapshot.validated()
+        if (!authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())
+        return PlaybackService.activatePreparedResumeSnapshot(snapshot, authority)
+    }
+
     override suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority): PlaybackEndpointResult {
         checkMain()
         if (!authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())

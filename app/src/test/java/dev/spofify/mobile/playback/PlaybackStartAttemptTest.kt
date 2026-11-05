@@ -260,6 +260,20 @@ class PlaybackStartAttemptTest {
         assertEquals("Only synthetic login may reach HTTP", 1, web.requestCount)
     }
 
+    @Test fun retiredOriginBeforeImportCannotReplacePreparedQueueHistoryOrSuccessorAttempt() = runTest {
+        val before = endpoint.exportSnapshot()
+        val queueEpoch = PlaybackRequests.queueEpoch
+        val replacement = before.copy(queue = before.queue.map { it.copy(id = "obsolete-selection") }, occurrence = null, playing = true)
+        val result = importGuarded(replacement, PlaybackAuthority(24, 5) { true }) { false }
+        assertEquals("rejected", result.status)
+        assertEquals(before, endpoint.exportSnapshot())
+        assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
+        assertEquals(0, fixture.output.prepares)
+        assertEquals(0, fixture.output.plays)
+        assertFalse(fixture.focus.isGranted)
+        assertEquals(1, web.requestCount)
+    }
+
     @Test fun callerBecomesFalseWhileAwaitingReadyDrainsOwnedOutputFocusAndForeground() = runTest {
         val permit = PlaybackAuthority(23, 4) { true }
         fixture.permit(permit)

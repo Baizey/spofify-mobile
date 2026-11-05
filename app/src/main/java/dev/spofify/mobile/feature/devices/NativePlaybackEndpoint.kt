@@ -21,6 +21,12 @@ interface NativePlaybackEndpoint {
     suspend fun prepare(snapshot: PlaybackSnapshot): Boolean
     /** Atomically replace queue with snapshot and attempt its explicit playing intent, under live authority. */
     suspend fun activate(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult
+    /** Explicit in-app Resume staging only: accept authority over an EXACT already-live paused
+     * occurrence without importing/replacing its queue or resetting local provenance/history.
+     * The admission caller must retain the original service/queue/current lifetime fence.
+     * Unsupported endpoints fail closed; never fall back to generic snapshot activation. */
+    suspend fun activatePreparedResume(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult =
+        PlaybackEndpointResult("rejected", exportSnapshot())
     /** Explicit musical/queue/transport action. Pause/close cancel older async work before acting. */
     suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority): PlaybackEndpointResult
 }

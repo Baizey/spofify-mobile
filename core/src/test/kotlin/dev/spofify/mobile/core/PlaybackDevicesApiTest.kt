@@ -47,8 +47,11 @@ class PlaybackDevicesApiTest {
             web.enqueue(response(view()))
             api.transfer("phone", 2, "command-1", "phone", 7)
             val transfer = Json.parseToJsonElement(web.takeRequest().body.readUtf8()).jsonObject
-            assertEquals("transfer", transfer["action"]?.jsonPrimitive?.content)
-            assertEquals(7L, transfer["selectionSeq"]?.jsonPrimitive?.long)
+            assertEquals(buildJsonObject {
+                put("action", "transfer"); put("deviceId", "phone"); put("epoch", 2)
+                put("commandId", "command-1"); put("targetDeviceId", "phone"); put("selectionSeq", 7)
+            }, transfer)
+            assertFalse(transfer.containsKey("requireUnselected"))
             web.enqueue(response(view(snapshot())))
             api.poll("phone", 2, 1, snapshot(), listOf(PlaybackAck("delivery-1", 2, "ok")))
             val poll = Json.parseToJsonElement(web.takeRequest().body.readUtf8()).jsonObject
@@ -56,6 +59,98 @@ class PlaybackDevicesApiTest {
             assertEquals("delivery-1", poll["acks"]?.jsonArray?.single()?.jsonObject?.get("deliveryId")?.jsonPrimitive?.content)
             assertEquals(4, web.requestCount)
         } finally { web.shutdown() }
+    }
+
+    @Test fun guardedClaimUsesExactSelfTrueEnvelopeAndExistingAuthentication() = runBlocking {
+        val web = MockWebServer(); web.start()
+        try {
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), MemorySessionStore())
+            web.enqueue(loginResponse()); client.login("synthetic", "password"); web.takeRequest()
+            val api = PlaybackDevicesApi(client)
+            web.enqueue(response(view()))
+            assertEquals(2L, api.claimUnselected("phone", 2, "first-play", 9).epoch)
+            val claim = web.takeRequest()
+            assertEquals("POST", claim.method)
+            assertEquals("/api/me/player", claim.path)
+            assertEquals("spofify_session=cookie-secret", claim.getHeader("Cookie"))
+            assertEquals("csrf-secret", claim.getHeader("X-CSRF-Token"))
+            assertEquals("http://127.0.0.1:${web.port}", claim.getHeader("Origin"))
+            assertEquals(buildJsonObject {
+                put("action", "transfer"); put("deviceId", "phone"); put("epoch", 2)
+                put("commandId", "first-play"); put("targetDeviceId", "phone")
+                put("selectionSeq", 9); put("requireUnselected", true)
+            }, Json.parseToJsonElement(claim.body.readUtf8()))
+            assertEquals(2, web.requestCount)
+        } finally { web.shutdown() }
+    }
+
+    @Test fun guardedClaimRejectsInvalidIdentityEpochAndSequenceBeforeNetwork() = runBlocking {
+        val web = MockWebServer(); web.start()
+        try {
+            val api = PlaybackDevicesApi(SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), MemorySessionStore()))
+            val invalid = listOf<suspend () -> Unit>(
+                { api.claimUnselected("", 1, "claim", 1) },
+                { api.claimUnselected("phone/other", 1, "claim", 1) },
+                { api.claimUnselected("phone", 0, "claim", 1) },
+                { api.claimUnselected("phone", 9007199254740992L, "claim", 1) },
+                { api.claimUnselected("phone", 1, "bad command", 1) },
+                { api.claimUnselected("phone", 1, "claim", 0) },
+                { api.claimUnselected("phone", 1, "claim", 9007199254740992L) },
+            )
+            for (call in invalid) try { call(); fail("Invalid claim reached transport") } catch (_: IllegalArgumentException) { }
+            assertEquals(0, web.requestCount)
+        } finally { web.shutdown() }
+    }
+
+    @Test fun guardedConflictAndOlderServerRejectionNeverFallBackToOrdinaryTransfer() = runBlocking {
+        val web = MockWebServer(); web.start()
+        try {
+            val api = PlaybackDevicesApi(SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), MemorySessionStore()))
+            for (status in listOf(409, 400)) {
+                web.enqueue(response(view(extra = ",\"error\":\"conditional selection rejected\""), status))
+                try { api.claimUnselected("phone", 2, "claim-$status", 1); fail("Rejected claim succeeded") }
+                catch (error: ApiException) {
+                    assertEquals(status, error.status)
+                    if (status == 409) assertEquals(2L, PlaybackDevicesView.fromJson(requireNotNull(error.responseBody)).epoch)
+                    else assertNull(error.responseBody)
+                }
+                val sent = Json.parseToJsonElement(web.takeRequest().body.readUtf8()).jsonObject
+                assertEquals(JsonPrimitive(true), sent["requireUnselected"])
+            }
+            assertEquals(2, web.requestCount)
+        } finally { web.shutdown() }
+    }
+
+    @Test fun guardedClaimDeadlineDoesNotReplayOrFallBack() = runBlocking {
+        val web = MockWebServer(); web.start()
+        try {
+            val api = PlaybackDevicesApi(SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), MemorySessionStore()))
+            web.enqueue(response(view()).setBodyDelay(6, TimeUnit.SECONDS))
+            val start = System.nanoTime()
+            try { api.claimUnselected("phone", 2, "claim", 1); fail("Deadline not enforced") }
+            catch (_: TimeoutCancellationException) { }
+            assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) < 5500)
+            assertEquals(1, web.requestCount)
+            assertEquals(JsonPrimitive(true), Json.parseToJsonElement(web.takeRequest().body.readUtf8()).jsonObject["requireUnselected"])
+        } finally { web.shutdown() }
+    }
+
+    @Test fun unsupportedProtocolGuardFailsClosedWithoutCallingOrdinaryTransfer() = runBlocking {
+        var ordinaryTransfers = 0
+        val legacy = object : PlaybackDevicesProtocol {
+            override suspend fun view(): PlaybackDevicesView = error("Unexpected view")
+            override suspend fun register(name: String): PlaybackDevicesView = error("Unexpected register")
+            override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView = error("Unexpected poll")
+            override suspend fun rename(deviceId: String, name: String): PlaybackDevicesView = error("Unexpected rename")
+            override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView = error("Unexpected command")
+            override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView {
+                ordinaryTransfers++; error("Ordinary transfer must not implement conditional selection")
+            }
+            override suspend fun leave(deviceId: String) = Unit
+        }
+        try { legacy.claimUnselected("phone", 1, "claim", 1); fail("Unsupported claim succeeded") }
+        catch (_: UnsupportedOperationException) { }
+        assertEquals(0, ordinaryTransfers)
     }
 
     @Test fun conflictRetainsValidatedViewAndDoesNotReplayCommand() = runBlocking {
