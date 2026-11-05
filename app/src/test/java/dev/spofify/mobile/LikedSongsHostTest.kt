@@ -201,11 +201,18 @@ class LikedSongsHostTest {
     }
     private fun list() = compose.onNodeWithTag("liked-songs-list")
     private fun row(title: String) = compose.onNode(hasText(title) and SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+    private fun rowBounds(title: String): Rect {
+        val bounds = row(title).getUnclippedBoundsInRoot()
+        return with(compose.density) {
+            Rect(bounds.left.toPx(), bounds.top.toPx(), bounds.right.toPx(), bounds.bottom.toPx())
+        }
+    }
     private fun visibleRows(): List<Anchor> {
         val viewport = list().fetchSemanticsNode().boundsInRoot
         return compose.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
-            .fetchSemanticsNodes().filter { it.boundsInRoot.top < viewport.bottom && it.boundsInRoot.bottom > viewport.top }
-            .map { Anchor(it.config[SemanticsProperties.Text].first().text, it.boundsInRoot) }
+            .fetchSemanticsNodes().map { it.config[SemanticsProperties.Text].first().text }
+            .map { Anchor(it, rowBounds(it)) }
+            .filter { it.bounds.top < viewport.bottom && it.bounds.bottom > viewport.top }
     }
     private fun diagnostics(): String {
         // Synthetic paths/public state only; never cookies, credentials or request bodies.
@@ -246,15 +253,16 @@ class LikedSongsHostTest {
     }
     private fun anchor(): Anchor {
         val viewport = list().fetchSemanticsNode().boundsInRoot
-        val first = compose.onAllNodes(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
-            .fetchSemanticsNodes().filter { it.boundsInRoot.top >= viewport.top && it.boundsInRoot.bottom <= viewport.bottom }
-            .minByOrNull { it.boundsInRoot.top } ?: error("No complete real music row in viewport")
-        return Anchor(first.config[SemanticsProperties.Text].first().text, first.boundsInRoot)
+        // boundsInRoot is clipped: a partly hidden row can falsely appear to start at 0.
+        // Select using full layout bounds so only a genuinely complete row is the witness.
+        return visibleRows().filter { it.bounds.top >= viewport.top && it.bounds.bottom <= viewport.bottom }
+            .minByOrNull { it.bounds.top } ?: error("No complete real music row in viewport; ${diagnostics()}")
     }
-    private fun assertAnchor(expected: Anchor) {
-        val actual = row(expected.title).fetchSemanticsNode().boundsInRoot
-        assertEquals("Retained row's exact scroll position; ${diagnostics()}", expected.bounds.top, actual.top, 1f)
-        assertEquals("Retained row's bottom; ${diagnostics()}", expected.bounds.bottom, actual.bottom, 1f)
+    private fun assertAnchor(expected: Anchor, phase: String = "append/Back") {
+        val actual = rowBounds(expected.title)
+        assertEquals("$phase retained ${expected.title}'s exact scroll position; expected=$expected; ${diagnostics()}",
+            expected.bounds.top, actual.top, 1f)
+        assertEquals("$phase retained row's bottom; expected=$expected; ${diagnostics()}", expected.bounds.bottom, actual.bottom, 1f)
     }
     private fun systemBack() {
         compose.runOnIdle { checkNotNull(backDispatcher).onBackPressed() }
@@ -343,10 +351,11 @@ class LikedSongsHostTest {
 
     @Test fun failedAppendStaysLatchedAcrossVisibleDemandAndDetailBackUntilExactBatchRetry() {
         val append = gate()
+        val retry = gate()
         likesReply = { offset, attempt -> when {
             offset == 0 -> page(0, 80, 0 until 40)
             offset == 40 && attempt == 1 -> append.hold(MockResponse().setResponseCode(503))
-            offset == 40 -> page(40, 80, 40 until 80)
+            offset == 40 -> retry.hold(page(40, 80, 40 until 80))
             else -> MockResponse().setResponseCode(400)
         } }
         mountLikes()
@@ -367,10 +376,21 @@ class LikedSongsHostTest {
         compose.runOnIdle { assertNotNull(model.state.value.error); assertEquals(40, model.state.value.offset) }
         assertEquals("Returning to the failed visible frontier must not auto-retry", listOf(0, 40), offsets.toList())
         list().performScrollToNode(hasText("Retry liked songs"))
+        compose.onNodeWithText("Retry liked songs").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        // Capture AFTER deliberate footer scrolling, before Retry changes any geometry.
         val retryAnchor = anchor()
-        compose.onNodeWithText("Retry liked songs").assertHeightIsAtLeast(48.dp).performClick()
+        compose.onNodeWithText("Retry liked songs").performClick()
+        await { retry.started.count == 0L && model.state.value.loading }
+        // Isolate loading-footer shrink/clamping from the later successful append. Both
+        // phases must preserve the same pre-click full-row witness, not a resampled anchor.
+        assertAnchor(retryAnchor, "Retry loading before HTTP response")
+        progressFrames(4)
+        assertAnchor(retryAnchor, "Held Retry loading before HTTP response")
+        assertRows(0 until 40)
+        assertEquals(listOf(0, 40, 40), offsets.toList())
+        retry.release.countDown()
         await { model.state.value.offset == 80 && !model.state.value.loading }
-        assertAnchor(retryAnchor)
+        assertAnchor(retryAnchor, "Retry append after HTTP response")
         assertRows(0 until 80)
         compose.runOnIdle { assertNull(model.state.value.error); assertTrue(model.state.value.likesEnded) }
         progressFrames()

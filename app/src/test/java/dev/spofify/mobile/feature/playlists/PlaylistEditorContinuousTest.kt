@@ -179,14 +179,18 @@ class PlaylistEditorContinuousHostTest {
                 waitForRequests(cursors, 2)
                 scrollTo("61. Song 60")
                 assertEquals(listOf("initial", "cursor-40"), cursors.toList())
+                // Discover the offscreen lazy form before targeting its descendant control.
                 // Edit through the actual form before the next frontier is visible.
+                scrollTo("Add source")
                 compose.onNodeWithText("Add source").performScrollTo().performClick()
                 compose.waitForIdle()
                 val countAfterEdit = cursors.size
                 scrollTo("80. Song 79")
                 compose.waitForIdle()
                 assertEquals(countAfterEdit, cursors.size)
-                compose.onNodeWithText("Preview is not current. Draft retained; refresh preview explicitly.").performScrollTo().assertExists()
+                scrollTo("Preview is not current. Draft retained; refresh preview explicitly.")
+                compose.onNodeWithText("Preview is not current. Draft retained; refresh preview explicitly.").assertExists()
+                scrollTo("Refresh preview")
                 compose.onNodeWithText("Refresh preview").performScrollTo().performClick()
                 waitForRequests(cursors, countAfterEdit + 1)
                 waitForPublishedPreview()
