@@ -114,9 +114,23 @@ same-cookie observer negotiates extensions itself. No fresh login, catalog Now o
 replacement music shortcuts the old-row disposal, passive silence, actual picker
 paused activation and retained-current mini/full Resume/history checks.
 
+BUG-103 adds `TransientPlaybackRecoveryAppGraphTest`: a real accepted ordinary
+playing heartbeat response is lost after actual A PCM/position plus High/Low setup.
+Scalar witnesses establish no command/ACK/directive in that fault. Healthy same-owner
+polls stay silent; a fresh actual mini Play resumes exact retained A, while fresh
+actual More High inserts without starting unchanged current. Short-held response
+continuity and an old pre-failure More capture are separate regressions. Focused
+coordinator tests supplement these host paths with metadata/semantic/origin/lifecycle
+and pending-work refusal checks; their recording endpoint is not broker acceptance.
+Initial single-track setup uses the public VM Now path: actual catalog More Now
+correctly expands its complete album context, not a one-row replacement oracle.
+
 Installed-Android rendering, native audio/background/FGS delivery and AVD-to-website
-acceptance remain separate mandatory gates. Current native execution is blocked
-under the recorded preboot-emulator assessment; no JVM/broker result turns that
-into a native pass. Follow [testing.md](testing.md), [ui-validation.md](ui-validation.md)
+acceptance remain separate mandatory gates. Current Pixel 10 Pro validation is
+not complete: the assigned native assessment found its AVD/recent boot marker but
+the existing control route was unavailable from the tool environment. No current
+boot failure or app inspection was observed; an approved accessible ADB route is
+pending. The recorded preboot-emulator failure is historical, not a verdict about
+that AVD; no JVM/broker result turns into a native pass. Follow [testing.md](testing.md), [ui-validation.md](ui-validation.md)
 and [worktree-review.md](worktree-review.md) for resource fencing and exact-candidate
 review/integration.
