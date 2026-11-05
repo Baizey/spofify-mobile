@@ -1,42 +1,28 @@
-READ AGENT_BEHAVIOUR.md according to your role(s)
-
 # Spofify Mobile
 
-Native Android only: Kotlin, Jetpack Compose, Media3. No WebView, Node, Expo or management UI.
+## hmem bootstrap
 
-- `../spofify-go` is live and independently developed: **read-only**. Coordinate API changes before implementation.
-- `:core` contains the JVM-only client, DTOs and contract tests; `:app` contains Android storage, UI and playback.
-- Reuse the exact-origin authenticated OkHttp client for API, artwork and every audio/range request. Never credentials in URLs/logs; never authenticated redirects.
-- Persist sessions and the automatically remembered latest successful login only with Android Keystore encryption. Never persist plaintext credentials or private catalog paths. Exclude all app data from backup/device transfer and images from disk caching.
-- Browsing and Play must not call acquisition, download, source or administrative APIs.
-- Audio belongs to MediaSessionService, not a screen. Never autoplay on startup/restoration.
-- Follow the assigned task contract and record review/validation evidence. Task specs may live under `docs/specs/`; do not recreate deleted historical specs or assume a task board is required. Assignment and integration follow `AGENT_BEHAVIOUR.md` and [docs/worktree-review.md](docs/worktree-review.md).
-- Run the automated gate in [docs/testing.md](docs/testing.md) with the API 37.0 compile platform under the separate exclusive Gradle advisory lease. Assigned leads may acquire it themselves for their own worktree outputs. Independently review the exact candidate commit before integration; automated/source checks do not waive native validation.
-- Use the bundled **JetBrains Mono** family through central `AppTypography`; preserve the type hierarchy and Android Unicode/emoji fallback. Ship its full license in the APK and keep the offline notice accessible.
+Canonical repository and local checkout alias: **spofify-mobile**. The canonical backend is **spofify-server**; `spofify-go` is its local checkout alias, not a separate project.
 
-## Mobile product and interaction rules
+1. Initialize hmem identity with `set_workspace` using `workspace_id: null`, your assigned role, and `model-id` in `harness:model:reasoning` format (use your actual identity).
+2. List workspaces, then select **Mobile app**, workspace `a60c384f-6e02-4a53-9279-6e4d58e5c163`. Group Git worktrees with this repository workspace.
+3. Read project details for **Spofify Mobile** `910ea120-36cd-4fe4-a293-2ab345cbd181` and **Mobile working practices** `df5cec55-12c3-458c-aabb-f2603861aebe`, then the relevant focused topics below. Browse existing assigned task/project details before work; use full IDs and explicit workspace boundaries.
 
-Read `docs/mobile-ux.md` before changing a screen. Native Android UX is not a compressed website.
+| Focused practice topic | Project ID (Mobile workspace) |
+| --- | --- |
+| Android architecture, origin and credential security | `c214a755-1c02-4bca-b1b3-d8b7efa449bd` |
+| Roles, source review and individual integration | `3cc44d1c-1fd9-415f-9907-8cd839d7f67d` |
+| Toolchain, automated gates and provisioned fixtures | `bbe6b0dd-cd65-44d6-8226-c822701a79da` |
+| Build/native ownership, storage and cleanup | `c49a1930-06b9-46bf-96ae-882f60f2fe6b` |
+| Isolated Android native validation and evidence | `893c1026-8b6c-4d80-934c-cac7987e8c6d` |
+| Music-first Android UX and rendered review | `fb35f4ae-37f7-43e2-a4e6-d9355947bc01` |
+| Playback authority and narrow policy exceptions | `b496bd3b-9f34-4a96-af90-8544bf861c69` |
 
-- Main destinations are **Home / Search / Playlists / Profile**. Home is bounded and personal; empty Search issues no match-all request. No global-catalog Library dump or fabricated recommendations.
-- Put Search input in the **lower thumb zone** and keep it reachable with the IME open. While actively editing the query, hide bottom navigation and unnecessary top toolbar chrome (including its reserved blank space); restore them when editing ends. Keep one query, grouped ordering and generous progressive See more/retry actions, not filters or tiny paging knobs.
-- Main Search has **no visible result-type headings or count rows**. Convey type through existing artwork geometry/small overlay icons without adding height, retaining accessible type context. Meaningful entity titles and necessary detail-group headers remain allowed.
-- Use reusable compact **two-line** media rows: aligned artwork/title plus **one inline credit/metadata line**, modest artist typography and reserved action geometry. Artist count, unavailable audio and refresh must not change row pitch at a given font scale; no stacked artist TextButtons. Keep rich ID-backed artist/album navigation in intentional details/More, not a capability inventory on every row.
-- The mini-player is a **full-width flat dock**, not a rounded floating card. Repeated rows, collections, artwork and focus/feedback surfaces are square, with a native circular **artist-avatar** exception; individual controls retain appropriate shapes. Avoid arbitrary shadows, pills, padding stacks and empty toolbar spacers. See the website-to-native lessons in `docs/mobile-ux.md`.
-- Use Android system Back/edge gesture/three-button navigation; no duplicate in-app Back arrows/buttons. IME, menus and sheets dismiss before nested screens pop. Preserve query/scroll and playback. Music transport Previous remains a separate action.
-- Respect 48dp targets, font scaling, contrast, gesture/safe-drawing/IME insets and responsive phone-sized layouts. Keep usable content during refresh; gestures supplement accessible music controls.
+Shared destinations (select the corresponding workspace before reading project details):
 
-## Mandatory native UI/UX validation — every agent
+- **General practice**, workspace `8c030c78-4418-4a51-9981-2b00b5da39ec`: **Spofify engineering practices** `3fc89965-22a1-406f-9523-ee53c50a1439`; **hmem knowledge and coordination model** `575dbbbd-c662-402a-81a7-305171f94b72`.
+- **Planning**, workspace `3f54babf-484d-492f-bf3b-ce136daa9b1c`: cross-repository information/planning `9379df08-a5ee-4b44-a687-d62053c5365e`; architecture/product coordination `84c6c8ef-b178-425b-977e-e49a795deaa2`.
 
-**The user requires actual rendered-app validation. This is a completion gate, not an optional follow-up.** Unit tests, Robolectric semantics, compilation, lint and a built APK do not establish visual quality.
+hmem owns practices, planning, specifications, task/status/dependency records and handoffs; it is authority, **not a Markdown mirror**. Repository-manager agents own feature/bug/task migration and lifecycle. Do not maintain local shadow boards, status tables, plans or handwritten handoff logs, or follow historical instructions to update them. Legacy practice paths retained for task links are compatibility pointers, not competing guidance.
 
-- **Use virtual devices for normal development and validation. Agents must not connect to, install on or target real phones.** Exercise the current APK on an explicitly selected isolated test AVD with synthetic fixtures. Any exceptional real-hardware check must be explicitly coordinated **through the user**; do not make physical-device access a routine prerequisite. Do not use personal AVD data or unapproved live accounts/servers. Disable ADB wireless/mDNS discovery and USB transports; target the emulator serial explicitly.
-- Capture and actually inspect screenshots of affected flows, including their relevant loading, empty and error states. When changing presentation, capture a before/after comparison where a baseline is available. Do not approve UI from source code or accessibility trees alone.
-- Smoke-test Sign-in, Home, query-driven Search, Playlists and Now Playing. Exercise the changed interactions with taps, scrolling, Back and relevant gestures. Verify the keyboard does not cover sign-in controls and that player collapse preserves playback/queue/position.
-- Check a narrow phone viewport and large-font rendering for overflow, clipping, cramped controls and unreadable hierarchy. Preserve touch targets, contrast and visible/accessibility alternatives to gestures. Do not replace a coherent music-first design with dense stock-button/debug layouts merely to expose more features.
-- Main navigation is **Home / Search / Playlists / Profile**. Home is bounded and personal; empty Search is prompt-only. Do not reintroduce a giant global-catalog Library landing page or fabricated recommendations.
-- Record device/API/viewport, APK revision, flows exercised, screenshot paths, findings and fixes in the validation evidence. Use the workflow in `docs/ui-validation.md`; generated images/logs stay in ignored `.tooling/ui-testing/` unless intentionally approved as non-sensitive test assets.
-- Normal isolated synthetic AVD validation and synthetic in-process/loopback test fixtures are allowed. Historical failed emulator attempts are not a standing emulator/ADB prohibition or proof of current environment health. This does not authorize live-backend access, personal data, external network diagnosis or bypassing denied permissions.
-- Visual regressions are blockers. Fix and re-capture before completion. If an emulator cannot run, explicitly report **UI validation blocked / not complete** with the reason; never silently substitute unit tests or claim the app was visually validated.
-- Answer the rendered-review checklist in `docs/mobile-ux.md` using actual screen evidence: visible row count, row/cardinality uniformity, IME/chrome budget, large-font/long credits and actionable versus metadata targets. A before-only screenshot is not an approved after-render.
-- Delegated UI implementers and independent reviewers must inspect the relevant rendered screenshots. The parent must run the combined native smoke pass after integrating parallel changes. Report genuinely hardware-specific behavior that emulators cannot establish as unverified and coordinate any needed check through the user. This is not a reason to block ordinary emulator-validated development or silently substitute a real phone.
+If hmem is inaccessible, report the access blocker rather than resurrecting old local guidance or inferring permission. Normal README/setup, technical/API/protocol/fixture documentation and licenses remain source documents; verify technical claims against current source and evidence. Historical receipts do not establish current acceptance. This bootstrap grants no additional execution, integration or migration authority.
