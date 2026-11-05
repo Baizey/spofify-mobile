@@ -227,13 +227,24 @@ class RootCopyHostTest {
     }
 
     @Test fun homePartialFailureKeepsMusicAndPlaylistNavigationAndRetry() {
+        val releaseHealthyRecent = hold()
         respond = { request -> when (request.requestUrl?.encodedPath) {
-            "/api/me/recent" -> page("""{"track":$song}""")
+            "/api/me/recent" -> {
+                releaseHealthyRecent.await(15, TimeUnit.SECONDS)
+                page("""{"track":$song}""")
+            }
             "/api/me/playlists" -> failure()
             else -> null
         } }
         mount()
         waitText("Retry playlists")
+        // Force the ordering that exposed the merged-result failure: playlist failure
+        // is visible while the independent healthy recent response is still held.
+        compose.onNodeWithText("Evening song").assertDoesNotExist()
+        compose.runOnIdle { assertTrue(model.homeHolder()!!.state.value.recent.loading) }
+        releaseHealthyRecent.countDown()
+        // A failed playlist response is not a completion barrier for healthy shelves.
+        waitText("Evening song")
         compose.onNodeWithText("Evening song").assertIsDisplayed()
         compose.onNodeWithText("All playlists").performScrollTo().assertIsEnabled()
         respond = { request -> when (request.requestUrl?.encodedPath) {
