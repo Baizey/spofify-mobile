@@ -98,15 +98,14 @@ class PlaylistOccurrenceActionsTest {
                     compose.onAllNodesWithText("Like song").fetchSemanticsNodes().size == 1
                 }
                 compose.runOnIdle { assertEquals(emptyList<String>(), events) }
-                val swipeLabel = "$contextualLabel (swipe action)"
-                compose.onAllNodesWithText("Add to queue").assertCountEquals(1)
+                val swipeLabel = "Queue High"
+                compose.onAllNodesWithText("Queue Low").assertCountEquals(1)
                 compose.onAllNodesWithText("Play now").assertCountEquals(1)
                 compose.onAllNodesWithText(swipeLabel).assertCountEquals(1)
-                val otherLabel = if (contextualLabel == "Play now") "Add to queue" else "Play now"
-                compose.onNodeWithText("$otherLabel (swipe action)").assertDoesNotExist()
+                compose.onAllNodesWithText("Play next").assertCountEquals(1)
                 // Long intentional credits force a finite scroll body; both kinds of intent stay reachable.
                 compose.onNodeWithText("Credited artist 12").performScrollTo().assertIsDisplayed()
-                compose.onNodeWithText("Add to queue").performScrollTo().assertIsDisplayed()
+                compose.onNodeWithText("Queue Low").performScrollTo().assertIsDisplayed()
                     .assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
                 compose.runOnIdle { assertEquals(listOf("enqueue"), events) }
                 compose.onNodeWithText(swipeLabel).performScrollTo().assertIsDisplayed()

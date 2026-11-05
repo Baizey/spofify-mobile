@@ -30,6 +30,7 @@ class ApiTransport(val client: SpofifyClient) {
         path: List<String>,
         body: JsonObject? = null,
         query: Map<String, String> = emptyMap(),
+        playbackExtensions: Boolean = false,
     ): JsonObject? {
         require(method in setOf("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")) { "Unsupported API method" }
         require(path.isNotEmpty() && path.none { segment -> segment.isEmpty() || segment == "." || segment == ".." || segment.any { it.isISOControl() } }) { "Invalid API path" }
@@ -42,16 +43,20 @@ class ApiTransport(val client: SpofifyClient) {
             method in setOf("POST", "PUT", "PATCH") -> "".toRequestBody(JSON_MEDIA_TYPE)
             else -> null
         }
-        val request = Request.Builder().url(url).header("Accept", "application/json").method(method, payload).build()
         val deviceRequest = path == listOf("api", "me", "player")
-        return client.response(request, errorFactory = { safeApiError(it, deviceRequest) }) { response ->
+        require(!playbackExtensions || deviceRequest)
+        val request = Request.Builder().url(url).header("Accept", "application/json").apply {
+            if (playbackExtensions) header("X-Spofify-Playback-Extensions", "queue-intents-v1")
+        }.method(method, payload).build()
+        return client.response(request, errorFactory = { safeApiError(it, deviceRequest, playbackExtensions) }) { response ->
             if (response.code == 204) null
             else {
                 requireJson(response)
                 val text = readBounded(response, MAX_RESPONSE_BYTES)
                     ?: throw ApiException(response.code, "The server returned an oversized JSON response")
                 try {
-                    ApiJson.parseToJsonElement(text) as? JsonObject
+                    if (deviceRequest) PlaybackRawJson.parse(text, maxBytes = MAX_RESPONSE_BYTES)
+                    else ApiJson.parseToJsonElement(text) as? JsonObject
                         ?: throw IllegalArgumentException()
                 } catch (_: IllegalArgumentException) {
                     throw ApiException(response.code, "The server returned an incompatible JSON response")
@@ -94,13 +99,13 @@ private val SAFE_ERROR_CODES = setOf(
     "EVALUATION_BUSY", "EVALUATION_TIMEOUT", "EVALUATION_FAILED",
 )
 
-private fun safeApiError(response: Response, deviceRequest: Boolean): ApiException {
+private fun safeApiError(response: Response, deviceRequest: Boolean, playbackExtensions: Boolean): ApiException {
     // A server's free-form message is never surfaced, even when the typed code is recognized.
     val deviceConflict = deviceRequest && response.code in setOf(404, 409)
     val root = if (isJson(response)) {
         try {
             val text = readBounded(response, if (deviceConflict) 2L * 1024 * 1024 else MAX_ERROR_BYTES)
-            text?.let { ApiJson.parseToJsonElement(it) } as? JsonObject
+            text?.let { if (deviceConflict) PlaybackRawJson.parse(it) else ApiJson.parseToJsonElement(it) } as? JsonObject
         } catch (_: IllegalArgumentException) { null }
     } else null
     val error = root?.get("error") as? JsonObject
@@ -113,8 +118,9 @@ private fun safeApiError(response: Response, deviceRequest: Boolean): ApiExcepti
     val directives = root?.get("directives") as? JsonArray
     val reconciliation = if (deviceConflict && root != null && directives != null && directives.isEmpty()) {
         try {
-            val view = PlaybackDevicesView.fromJson(JsonObject(root.filterKeys { it != "error" }))
-            ApiJson.encodeToJsonElement(PlaybackDevicesView.serializer(), view).jsonObject
+            require(root["queueIntents"]?.jsonObject?.get("directives")?.let { it is JsonArray && it.isEmpty() } != false)
+            val view = PlaybackDevicesView.fromJson(JsonObject(root.filterKeys { it != "error" }), playbackExtensions)
+            view.toJson()
         } catch (_: IllegalArgumentException) { null }
     } else null
     val message = when (response.code) {

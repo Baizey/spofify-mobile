@@ -18,6 +18,7 @@ import dev.spofify.mobile.AppGraph
 import dev.spofify.mobile.LoginStore
 import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
+import dev.spofify.mobile.core.PlaybackDeviceCommand
 import dev.spofify.mobile.core.PlaybackOccurrence
 import dev.spofify.mobile.core.PlaybackSnapshot
 import dev.spofify.mobile.core.PlaybackTrack
@@ -223,8 +224,10 @@ class PlaybackStartAttemptTest {
         guard: () -> Boolean): PlaybackEndpointResult = suspendCoroutineUninterceptedOrReturn { continuation ->
         val method = PlaybackService::class.java.declaredMethods.single { it.name == "importSnapshot" }
         method.isAccessible = true
-        // List playback adds an optional installation observer; generic imports opt out.
-        try { method.invoke(fixture.service, snapshot, permit, guard, null, continuation) }
+        // Exact suspend ABI: snapshot, lease, start guard, installation observer,
+        // nullable provenance sidecar, continuation. Generic/legacy import opts out of both.
+        assertEquals(6, method.parameterCount)
+        try { method.invoke(fixture.service, snapshot, permit, guard, null, null, continuation) }
         catch (failure: InvocationTargetException) { throw failure.targetException }
     }
 
@@ -313,6 +316,42 @@ class PlaybackStartAttemptTest {
         assertTrue(pending.isCompleted)
         assertSilenced(fixture, pending.await(), before)
         assertSame(focusRequest, fixture.audio.lastAbandonedAudioFocusRequest)
+    }
+
+    @Test fun independentSemanticEditCancelsGenericStartAndRetainsCleanupOwnerBeforeRawPlay() =
+        semanticEditRetainsCleanupOwner(afterRawPlay = false)
+
+    @Test fun independentSemanticEditCancelsGenericStartAndRetainsCleanupOwnerAfterRawPlay() =
+        semanticEditRetainsCleanupOwner(afterRawPlay = true)
+
+    // Each @Test owns its normal setup fixture/session; do not create a second live
+    // production MediaSession with the same ID just to exercise the second timing phase.
+    private fun semanticEditRetainsCleanupOwner(afterRawPlay: Boolean) = runTest {
+        val target = fixture
+        target.output.readyOnPrepare = afterRawPlay
+        val permit = PlaybackAuthority(23, 4) { true }
+        target.permit(permit)
+        val before = endpoint.exportSnapshot()
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(target, permit) { true } }
+        assertFalse(pending.isCompleted)
+        assertPendingOwnership(target)
+        assertEquals(if (afterRawPlay) 1 else 0, target.output.plays)
+        assertEquals(afterRawPlay, target.output.wantsPlay)
+        val token = target.token()
+        val focusRequest = requireNotNull(target.audio.lastAudioFocusRequest).audioFocusRequest
+        // Same lease, distinct permit object: a nonstarting edit is NOT resource takeover.
+        endpoint.execute(PlaybackDeviceCommand.transport("repeat"), PlaybackAuthority(23, 4) { true })
+        assertSame(token, target.token())
+        assertNull(field(target.service, "startAttemptValidity"))
+        advanceTimeBy(30); runCurrent()
+        val result = pending.await()
+        assertEquals("all", result.snapshot.repeat)
+        assertSilenced(target, result, before)
+        assertSame(focusRequest, target.audio.lastAbandonedAudioFocusRequest)
+        target.output.rawPlaying = target.output.wantsPlay && target.output.state == Player.STATE_READY
+        advanceTimeBy(600); runCurrent()
+        assertFalse(target.output.rawPlaying)
+        assertEquals(if (afterRawPlay) 1 else 0, target.output.plays)
     }
 
     @Test fun oldCompletionCannotSilenceSuccessorStartEvenWithSamePermitAndOccurrence() = runTest {

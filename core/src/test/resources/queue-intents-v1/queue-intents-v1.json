@@ -1,0 +1,1032 @@
+{
+  "version": 1,
+  "contract": "FEAT-023 queue-intents-v1; corrected exact-current-change playback trigger",
+  "requests": [
+    {
+      "name": "capable-register",
+      "raw": "{\"action\":\"register\",\"name\":\"PC\",\"queueIntentsVersion\":1}",
+      "valid": true
+    },
+    {
+      "name": "low-row",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"low\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120},\"context\":null}}}",
+      "valid": true
+    },
+    {
+      "name": "low-collection",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"low\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"collection\",\"context\":{\"kind\":\"album\",\"id\":\"album_B\",\"name\":\"Album B\"}}}}",
+      "valid": true
+    },
+    {
+      "name": "low-occurrence",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"low\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"occurrence\",\"key\":105}}}",
+      "valid": true
+    },
+    {
+      "name": "high-row",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120},\"context\":null}}}",
+      "valid": true
+    },
+    {
+      "name": "high-collection",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"collection\",\"context\":{\"kind\":\"album\",\"id\":\"album_B\",\"name\":\"Album B\"}}}}",
+      "valid": true
+    },
+    {
+      "name": "high-occurrence",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"occurrence\",\"key\":105}}}",
+      "valid": true
+    },
+    {
+      "name": "next-row",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"next\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120},\"context\":null}}}",
+      "valid": true
+    },
+    {
+      "name": "next-collection",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"next\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"collection\",\"context\":{\"kind\":\"album\",\"id\":\"album_B\",\"name\":\"Album B\"}}}}",
+      "valid": true
+    },
+    {
+      "name": "next-occurrence",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"next\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"occurrence\",\"key\":105}}}",
+      "valid": true
+    },
+    {
+      "name": "now-row",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"now\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120},\"context\":null}}}",
+      "valid": true
+    },
+    {
+      "name": "now-collection",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"now\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"collection\",\"context\":{\"kind\":\"album\",\"id\":\"album_B\",\"name\":\"Album B\"}}}}",
+      "valid": true
+    },
+    {
+      "name": "now-occurrence",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"now\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"occurrence\",\"key\":105}}}",
+      "valid": true
+    },
+    {
+      "name": "manual-duplicate-row",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"same/track?with=space inside\",\"name\":\"Second occurrence\",\"artists\":[],\"albumName\":\"Album\",\"albumId\":\"album\",\"duration\":120,\"entryId\":\"entry_two\"},\"context\":{\"kind\":\"playlist\",\"id\":\"playlist\",\"name\":\"Playlist\",\"revision\":4}}}}",
+      "valid": true
+    },
+    {
+      "name": "derived-exact-row",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"low\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"same\",\"name\":\"Exact derived path\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"targetId\":\"rules\",\"occurrenceId\":\"o1_synthetic_exact_path\",\"selectionToken\":\"q1_synthetic_payload.synthetic_signature\",\"playbackContext\":{\"kind\":\"derived\",\"id\":\"rules\",\"name\":\"Rules\",\"revision\":5,\"fence\":\"f1_synthetic_fence\"}},\"context\":{\"kind\":\"derived\",\"id\":\"rules\",\"name\":\"Rules\",\"revision\":5,\"fence\":\"f1_synthetic_fence\"}}}}",
+      "valid": true
+    },
+    {
+      "name": "unknown-intent",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"add\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "unknown-command-field",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120},\"context\":null},\"fallback\":true}}",
+      "valid": false
+    },
+    {
+      "name": "unknown-selection-field",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120},\"context\":null,\"owner\":\"other\"}}}",
+      "valid": false
+    },
+    {
+      "name": "keyed-new-track",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "ordered-new-track",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":20,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "bad-revision-zero",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":0,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "bad-revision-overflow",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver_pc_1\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "bad-receiver-grammar",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "null-selection",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":null}}",
+      "valid": false
+    },
+    {
+      "name": "missing-null-context",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1}}}}",
+      "valid": false
+    },
+    {
+      "name": "context-on-keyed-selection",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"occurrence\",\"key\":105,\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "forbid-array-position",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"occurrence\",\"key\":105,\"position\":4}}}",
+      "valid": false
+    },
+    {
+      "name": "invalid-context-kind",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":{\"kind\":\"radio\",\"id\":\"x\",\"name\":\"X\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "explicit-null-version",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}},\"queueIntentsVersion\":null}",
+      "valid": false
+    },
+    {
+      "name": "register-version-2",
+      "raw": "{\"action\":\"register\",\"name\":\"PC\",\"queueIntentsVersion\":2}",
+      "valid": false
+    },
+    {
+      "name": "register-version-null",
+      "raw": "{\"action\":\"register\",\"name\":\"PC\",\"queueIntentsVersion\":null}",
+      "valid": false
+    },
+    {
+      "name": "duplicate-intent-raw",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"intent\":\"low\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "case-variant-intent-raw",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"Intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "exponent-revision-raw",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "fraction-key-raw",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101.0,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}}",
+      "valid": false
+    },
+    {
+      "name": "trailing-json",
+      "raw": "{\"action\":\"command\",\"deviceId\":\"phone\",\"epoch\":7,\"commandId\":\"intent_x\",\"command\":{\"type\":\"queueIntent\",\"intent\":\"high\",\"expected\":{\"outputDeviceId\":\"pc\",\"receiverId\":\"receiver/pc\",\"revision\":9007199254740992,\"currentKey\":101,\"currentEventId\":\"history_A\"},\"selection\":{\"kind\":\"track\",\"track\":{\"id\":\"X\",\"name\":\"X\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":5,\"order\":1},\"context\":null}}} {}",
+      "valid": false
+    }
+  ],
+  "states": [
+    {
+      "name": "empty-owner",
+      "state": {
+        "version": 1,
+        "queue": [],
+        "position": -1,
+        "context": null,
+        "shuffle": false,
+        "repeat": "off",
+        "elapsed": 0,
+        "duration": 0,
+        "playing": false,
+        "waiting": false,
+        "loading": false,
+        "error": "",
+        "truncated": false,
+        "notice": "",
+        "occurrence": null
+      },
+      "metadata": {
+        "receiverId": "receiver_pc_1",
+        "revision": 1,
+        "provenance": "tracked",
+        "origins": [],
+        "highKeys": []
+      }
+    },
+    {
+      "name": "confirmed-P1-final",
+      "state": {
+        "version": 1,
+        "queue": [
+          {
+            "id": "A",
+            "name": "A",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 101,
+            "order": 1
+          },
+          {
+            "id": "H1",
+            "name": "H1",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 102,
+            "order": 2
+          },
+          {
+            "id": "C1",
+            "name": "C1",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 103,
+            "order": 3
+          },
+          {
+            "id": "C2",
+            "name": "C2",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 104,
+            "order": 4
+          },
+          {
+            "id": "B1",
+            "name": "B1",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 105,
+            "order": 5
+          },
+          {
+            "id": "B2",
+            "name": "B2",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 106,
+            "order": 6
+          }
+        ],
+        "position": 0,
+        "context": null,
+        "shuffle": false,
+        "repeat": "off",
+        "elapsed": 42,
+        "duration": 120,
+        "playing": false,
+        "waiting": false,
+        "loading": false,
+        "error": "",
+        "truncated": false,
+        "notice": "",
+        "occurrence": {
+          "key": 101,
+          "trackId": "A",
+          "eventId": "history_A",
+          "progress": 0,
+          "reported": false
+        }
+      },
+      "metadata": {
+        "receiverId": "receiver_pc_1",
+        "revision": 32,
+        "provenance": "tracked",
+        "origins": [
+          {
+            "key": 101,
+            "intent": "low"
+          },
+          {
+            "key": 102,
+            "intent": "high"
+          },
+          {
+            "key": 103,
+            "intent": "low"
+          },
+          {
+            "key": 104,
+            "intent": "low"
+          },
+          {
+            "key": 105,
+            "intent": "low"
+          },
+          {
+            "key": 106,
+            "intent": "low"
+          }
+        ],
+        "highKeys": [
+          102
+        ]
+      }
+    },
+    {
+      "name": "legacy-reset",
+      "state": {
+        "version": 1,
+        "queue": [
+          {
+            "id": "A",
+            "name": "A",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 101,
+            "order": 1
+          },
+          {
+            "id": "M1",
+            "name": "M1",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 102,
+            "order": 2
+          },
+          {
+            "id": "C1",
+            "name": "C1",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 103,
+            "order": 3
+          }
+        ],
+        "position": 0,
+        "context": null,
+        "shuffle": false,
+        "repeat": "off",
+        "elapsed": 42,
+        "duration": 120,
+        "playing": false,
+        "waiting": false,
+        "loading": false,
+        "error": "",
+        "truncated": false,
+        "notice": "",
+        "occurrence": {
+          "key": 101,
+          "trackId": "A",
+          "eventId": "history_A",
+          "progress": 0,
+          "reported": false
+        }
+      },
+      "metadata": {
+        "receiverId": "receiver_pc_1",
+        "revision": 8,
+        "provenance": "legacy-reset",
+        "origins": [
+          {
+            "key": 101,
+            "intent": "legacy"
+          },
+          {
+            "key": 102,
+            "intent": "legacy"
+          },
+          {
+            "key": 103,
+            "intent": "legacy"
+          }
+        ],
+        "highKeys": []
+      }
+    },
+    {
+      "name": "postcommit-Pause-aligned-owncommit",
+      "state": {
+        "version": 1,
+        "queue": [
+          {
+            "id": "X",
+            "name": "X",
+            "artists": [],
+            "albumName": "",
+            "albumId": "",
+            "duration": 120,
+            "key": 101,
+            "order": 1
+          }
+        ],
+        "position": 0,
+        "context": null,
+        "shuffle": false,
+        "repeat": "off",
+        "elapsed": 42,
+        "duration": 120,
+        "playing": false,
+        "waiting": false,
+        "loading": false,
+        "error": "",
+        "truncated": false,
+        "notice": "",
+        "occurrence": {
+          "key": 101,
+          "trackId": "X",
+          "eventId": "history_X",
+          "progress": 0,
+          "reported": false
+        }
+      },
+      "metadata": {
+        "receiverId": "receiver_pc_1",
+        "revision": 21,
+        "provenance": "tracked",
+        "origins": [
+          {
+            "key": 101,
+            "intent": "high"
+          }
+        ],
+        "highKeys": []
+      }
+    }
+  ],
+  "results": [
+    {
+      "name": "corrected-P1-queued-B-keeps-paused-A",
+      "result": {
+        "outcome": "queued",
+        "acceptedCount": 2,
+        "commitRevision": 32,
+        "placement": "low",
+        "playback": "unchanged",
+        "playbackKey": null,
+        "notice": ""
+      }
+    },
+    {
+      "name": "empty-first-actual-start",
+      "result": {
+        "outcome": "playing",
+        "acceptedCount": 1,
+        "commitRevision": 3,
+        "placement": "low",
+        "playback": "started",
+        "playbackKey": 101,
+        "notice": ""
+      }
+    },
+    {
+      "name": "empty-selection-blocked-start",
+      "result": {
+        "outcome": "blocked",
+        "acceptedCount": 2,
+        "commitRevision": 32,
+        "placement": "low",
+        "playback": "blocked",
+        "playbackKey": 101,
+        "notice": ""
+      }
+    },
+    {
+      "name": "empty-selection-media-start",
+      "result": {
+        "outcome": "media",
+        "acceptedCount": 2,
+        "commitRevision": 32,
+        "placement": "low",
+        "playback": "media",
+        "playbackKey": 101,
+        "notice": ""
+      }
+    },
+    {
+      "name": "BR-001-accepted-then-superseded",
+      "result": {
+        "outcome": "queued",
+        "acceptedCount": 2,
+        "commitRevision": 21,
+        "placement": "replace",
+        "playback": "superseded",
+        "playbackKey": null,
+        "notice": ""
+      }
+    },
+    {
+      "name": "postcommit-Pause-aligned-owncommit",
+      "result": {
+        "outcome": "queued",
+        "acceptedCount": 1,
+        "commitRevision": 21,
+        "placement": "high",
+        "playback": "superseded",
+        "playbackKey": null,
+        "notice": ""
+      }
+    },
+    {
+      "name": "BR-001-limited-then-superseded",
+      "result": {
+        "outcome": "limited",
+        "acceptedCount": 2,
+        "commitRevision": 21,
+        "placement": "replace",
+        "playback": "superseded",
+        "playbackKey": null,
+        "notice": "PLAYBACK_LIMIT"
+      }
+    },
+    {
+      "name": "paused-deduplicated-no-resume",
+      "result": {
+        "outcome": "no_op",
+        "acceptedCount": 0,
+        "commitRevision": null,
+        "placement": "none",
+        "playback": "unchanged",
+        "playbackKey": null,
+        "notice": ""
+      }
+    },
+    {
+      "name": "active-no-op",
+      "result": {
+        "outcome": "no_op",
+        "acceptedCount": 0,
+        "commitRevision": null,
+        "placement": "none",
+        "playback": "unchanged",
+        "playbackKey": null,
+        "notice": ""
+      }
+    },
+    {
+      "name": "precommit-stale",
+      "result": {
+        "outcome": "stale",
+        "acceptedCount": 0,
+        "commitRevision": null,
+        "placement": "none",
+        "playback": "unchanged",
+        "playbackKey": null,
+        "notice": "STALE_BINDING"
+      }
+    },
+    {
+      "name": "full-no-eviction",
+      "result": {
+        "outcome": "full",
+        "acceptedCount": 0,
+        "commitRevision": null,
+        "placement": "none",
+        "playback": "unchanged",
+        "playbackKey": null,
+        "notice": "PLAYBACK_LIMIT"
+      }
+    },
+    {
+      "name": "unsupported-receiver",
+      "result": {
+        "outcome": "unsupported",
+        "acceptedCount": 0,
+        "commitRevision": null,
+        "placement": "none",
+        "playback": "unchanged",
+        "playbackKey": null,
+        "notice": "UNSUPPORTED_RECEIVER"
+      }
+    }
+  ],
+  "semantics": [
+    {
+      "name": "low-empty-stays-low",
+      "queue": [],
+      "position": -1,
+      "high": [],
+      "origins": {},
+      "active": false,
+      "intent": "low",
+      "additions": [
+        "A1",
+        "A2"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A1",
+        "A2"
+      ],
+      "expectedHigh": [],
+      "expectedCurrent": "A1"
+    },
+    {
+      "name": "high-empty-origin-not-membership",
+      "queue": [],
+      "position": -1,
+      "high": [],
+      "origins": {},
+      "active": false,
+      "intent": "high",
+      "additions": [
+        "B1",
+        "B2"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "B1",
+        "B2"
+      ],
+      "expectedHigh": [
+        "B2"
+      ],
+      "expectedCurrent": "B1"
+    },
+    {
+      "name": "active-no-high-not-interrupted",
+      "queue": [
+        "A1",
+        "A2"
+      ],
+      "position": 0,
+      "high": [],
+      "origins": {},
+      "active": true,
+      "intent": "high",
+      "additions": [
+        "X"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A1",
+        "X",
+        "A2"
+      ],
+      "expectedHigh": [
+        "X"
+      ],
+      "expectedCurrent": "A1"
+    },
+    {
+      "name": "low-tail",
+      "queue": [
+        "A1",
+        "A2"
+      ],
+      "position": 0,
+      "high": [],
+      "origins": {},
+      "active": true,
+      "intent": "low",
+      "additions": [
+        "X"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A1",
+        "A2",
+        "X"
+      ],
+      "expectedHigh": [],
+      "expectedCurrent": "A1"
+    },
+    {
+      "name": "high-FIFO-batch",
+      "queue": [
+        "A1",
+        "B1",
+        "B2",
+        "X",
+        "A2"
+      ],
+      "position": 0,
+      "high": [
+        "B1",
+        "B2",
+        "X"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "high",
+      "additions": [
+        "C1",
+        "C2"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A1",
+        "B1",
+        "B2",
+        "X",
+        "C1",
+        "C2",
+        "A2"
+      ],
+      "expectedHigh": [
+        "B1",
+        "B2",
+        "X",
+        "C1",
+        "C2"
+      ],
+      "expectedCurrent": "A1"
+    },
+    {
+      "name": "next-explicit-immediate",
+      "queue": [
+        "A1",
+        "B1",
+        "B2",
+        "A2"
+      ],
+      "position": 0,
+      "high": [
+        "B1",
+        "B2"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "next",
+      "additions": [
+        "N"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A1",
+        "N",
+        "B1",
+        "B2",
+        "A2"
+      ],
+      "expectedHigh": [
+        "N",
+        "B1",
+        "B2"
+      ],
+      "expectedCurrent": "A1"
+    },
+    {
+      "name": "corrected-P1-paused-A-keeps-current",
+      "queue": [
+        "A",
+        "H1",
+        "C1",
+        "C2"
+      ],
+      "position": 0,
+      "high": [
+        "H1"
+      ],
+      "origins": {},
+      "active": false,
+      "intent": "low",
+      "additions": [
+        "B1",
+        "B2"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A",
+        "H1",
+        "C1",
+        "C2",
+        "B1",
+        "B2"
+      ],
+      "expectedHigh": [
+        "H1"
+      ],
+      "expectedCurrent": "A"
+    },
+    {
+      "name": "paused-new-high-follows-old-keeps-A",
+      "queue": [
+        "A",
+        "M1",
+        "M2",
+        "C1"
+      ],
+      "position": 0,
+      "high": [
+        "M1",
+        "M2"
+      ],
+      "origins": {},
+      "active": false,
+      "intent": "high",
+      "additions": [
+        "X"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A",
+        "M1",
+        "M2",
+        "X",
+        "C1"
+      ],
+      "expectedHigh": [
+        "M1",
+        "M2",
+        "X"
+      ],
+      "expectedCurrent": "A"
+    },
+    {
+      "name": "retired-interleaving-boundary",
+      "queue": [
+        "A",
+        "M1",
+        "M2",
+        "C1",
+        "C2"
+      ],
+      "position": 0,
+      "high": [
+        "M2"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "high",
+      "additions": [
+        "X"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "A",
+        "M1",
+        "M2",
+        "X",
+        "C1",
+        "C2"
+      ],
+      "expectedHigh": [
+        "M2",
+        "X"
+      ],
+      "expectedCurrent": "A"
+    },
+    {
+      "name": "keyed-promotion-same-occurrence",
+      "queue": [
+        "A",
+        "M1",
+        "C1",
+        "C2"
+      ],
+      "position": 0,
+      "high": [
+        "M1"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "high",
+      "additions": [],
+      "selectionKey": "C2",
+      "expectedQueue": [
+        "A",
+        "M1",
+        "C2",
+        "C1"
+      ],
+      "expectedHigh": [
+        "M1",
+        "C2"
+      ],
+      "expectedCurrent": "A"
+    },
+    {
+      "name": "keyed-next-not-generic-adoption",
+      "queue": [
+        "A",
+        "M1",
+        "C1",
+        "C2"
+      ],
+      "position": 0,
+      "high": [
+        "M1"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "next",
+      "additions": [],
+      "selectionKey": "C2",
+      "expectedQueue": [
+        "A",
+        "C2",
+        "M1",
+        "C1"
+      ],
+      "expectedHigh": [
+        "C2",
+        "M1"
+      ],
+      "expectedCurrent": "A"
+    },
+    {
+      "name": "keyed-low-demotes",
+      "queue": [
+        "A",
+        "M1",
+        "C1"
+      ],
+      "position": 0,
+      "high": [
+        "M1"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "low",
+      "additions": [],
+      "selectionKey": "M1",
+      "expectedQueue": [
+        "A",
+        "C1",
+        "M1"
+      ],
+      "expectedHigh": [],
+      "expectedCurrent": "A"
+    },
+    {
+      "name": "now-keyed-exact-jump",
+      "queue": [
+        "A",
+        "M1",
+        "C1",
+        "C2"
+      ],
+      "position": 0,
+      "high": [
+        "M1"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "now",
+      "additions": [],
+      "selectionKey": "C2",
+      "expectedQueue": [
+        "A",
+        "M1",
+        "C1",
+        "C2"
+      ],
+      "expectedHigh": [],
+      "expectedCurrent": "C2"
+    },
+    {
+      "name": "now-context-replacement",
+      "queue": [
+        "A",
+        "M1",
+        "C1"
+      ],
+      "position": 0,
+      "high": [
+        "M1"
+      ],
+      "origins": {},
+      "active": true,
+      "intent": "now",
+      "additions": [
+        "D1",
+        "D2"
+      ],
+      "selectionKey": null,
+      "expectedQueue": [
+        "D1",
+        "D2"
+      ],
+      "expectedHigh": [],
+      "expectedCurrent": "D1"
+    }
+  ],
+  "legacyViews": [
+    {
+      "name": "empty",
+      "raw": "{\"deviceId\":\"phone\",\"devices\":[{\"deviceId\":\"pc\",\"name\":\"PC\",\"available\":true},{\"deviceId\":\"phone\",\"name\":\"Phone\",\"available\":true}],\"activeDeviceId\":\"pc\",\"epoch\":7,\"leaseMs\":8000,\"quarantineMs\":0,\"state\":null,\"stateSeq\":0,\"stateAgeMs\":0,\"transfer\":null,\"directives\":[],\"commands\":[]}"
+    },
+    {
+      "name": "populated",
+      "raw": "{\"deviceId\":\"phone\",\"devices\":[{\"deviceId\":\"pc\",\"name\":\"PC\",\"available\":true},{\"deviceId\":\"phone\",\"name\":\"Phone\",\"available\":true}],\"activeDeviceId\":\"pc\",\"epoch\":7,\"leaseMs\":8000,\"quarantineMs\":0,\"state\":{\"version\":1,\"queue\":[{\"id\":\"A\",\"name\":\"A\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":101,\"order\":1},{\"id\":\"H1\",\"name\":\"H1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":102,\"order\":2},{\"id\":\"C1\",\"name\":\"C1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":103,\"order\":3},{\"id\":\"C2\",\"name\":\"C2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":104,\"order\":4},{\"id\":\"B1\",\"name\":\"B1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":105,\"order\":5},{\"id\":\"B2\",\"name\":\"B2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":106,\"order\":6}],\"position\":0,\"context\":null,\"shuffle\":false,\"repeat\":\"off\",\"elapsed\":42,\"duration\":120,\"playing\":false,\"waiting\":false,\"loading\":false,\"error\":\"\",\"truncated\":false,\"notice\":\"\",\"occurrence\":{\"key\":101,\"trackId\":\"A\",\"eventId\":\"history_A\",\"progress\":0,\"reported\":false}},\"stateSeq\":32,\"stateAgeMs\":0,\"transfer\":null,\"directives\":[],\"commands\":[]}"
+    },
+    {
+      "name": "transfer",
+      "raw": "{\"deviceId\":\"phone\",\"devices\":[{\"deviceId\":\"pc\",\"name\":\"PC\",\"available\":true},{\"deviceId\":\"phone\",\"name\":\"Phone\",\"available\":true}],\"activeDeviceId\":\"pc\",\"epoch\":7,\"leaseMs\":8000,\"quarantineMs\":0,\"state\":{\"version\":1,\"queue\":[{\"id\":\"A\",\"name\":\"A\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":101,\"order\":1},{\"id\":\"H1\",\"name\":\"H1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":102,\"order\":2},{\"id\":\"C1\",\"name\":\"C1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":103,\"order\":3},{\"id\":\"C2\",\"name\":\"C2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":104,\"order\":4},{\"id\":\"B1\",\"name\":\"B1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":105,\"order\":5},{\"id\":\"B2\",\"name\":\"B2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":106,\"order\":6}],\"position\":0,\"context\":null,\"shuffle\":false,\"repeat\":\"off\",\"elapsed\":42,\"duration\":120,\"playing\":false,\"waiting\":false,\"loading\":false,\"error\":\"\",\"truncated\":false,\"notice\":\"\",\"occurrence\":{\"key\":101,\"trackId\":\"A\",\"eventId\":\"history_A\",\"progress\":0,\"reported\":false}},\"stateSeq\":0,\"stateAgeMs\":0,\"transfer\":{\"commandId\":\"handoff\",\"sourceDeviceId\":\"pc\",\"targetDeviceId\":\"phone\",\"phase\":\"preparing\"},\"directives\":[{\"deliveryId\":\"prepare_phone\",\"epoch\":7,\"type\":\"prepare\",\"commandId\":\"handoff\",\"state\":{\"version\":1,\"queue\":[{\"id\":\"A\",\"name\":\"A\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":101,\"order\":1},{\"id\":\"H1\",\"name\":\"H1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":102,\"order\":2},{\"id\":\"C1\",\"name\":\"C1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":103,\"order\":3},{\"id\":\"C2\",\"name\":\"C2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":104,\"order\":4},{\"id\":\"B1\",\"name\":\"B1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":105,\"order\":5},{\"id\":\"B2\",\"name\":\"B2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":106,\"order\":6}],\"position\":0,\"context\":null,\"shuffle\":false,\"repeat\":\"off\",\"elapsed\":42,\"duration\":120,\"playing\":false,\"waiting\":false,\"loading\":false,\"error\":\"\",\"truncated\":false,\"notice\":\"\",\"occurrence\":{\"key\":101,\"trackId\":\"A\",\"eventId\":\"history_A\",\"progress\":0,\"reported\":false}}}],\"commands\":[]}"
+    },
+    {
+      "name": "command-outcomes",
+      "raw": "{\"deviceId\":\"phone\",\"devices\":[{\"deviceId\":\"pc\",\"name\":\"PC\",\"available\":true},{\"deviceId\":\"phone\",\"name\":\"Phone\",\"available\":true}],\"activeDeviceId\":\"pc\",\"epoch\":7,\"leaseMs\":8000,\"quarantineMs\":0,\"state\":{\"version\":1,\"queue\":[{\"id\":\"A\",\"name\":\"A\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":101,\"order\":1},{\"id\":\"H1\",\"name\":\"H1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":102,\"order\":2},{\"id\":\"C1\",\"name\":\"C1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":103,\"order\":3},{\"id\":\"C2\",\"name\":\"C2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":104,\"order\":4},{\"id\":\"B1\",\"name\":\"B1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":105,\"order\":5},{\"id\":\"B2\",\"name\":\"B2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":106,\"order\":6}],\"position\":0,\"context\":null,\"shuffle\":false,\"repeat\":\"off\",\"elapsed\":42,\"duration\":120,\"playing\":false,\"waiting\":false,\"loading\":false,\"error\":\"\",\"truncated\":false,\"notice\":\"\",\"occurrence\":{\"key\":101,\"trackId\":\"A\",\"eventId\":\"history_A\",\"progress\":0,\"reported\":false}},\"stateSeq\":0,\"stateAgeMs\":0,\"transfer\":null,\"directives\":[],\"commands\":[{\"commandId\":\"legacy_play\",\"status\":\"ok\"},{\"commandId\":\"legacy_enqueue\",\"status\":\"pending\"},{\"commandId\":\"legacy_failure\",\"status\":\"blocked\"}]}"
+    },
+    {
+      "name": "safe-409",
+      "raw": "{\"deviceId\":\"phone\",\"devices\":[{\"deviceId\":\"pc\",\"name\":\"PC\",\"available\":true},{\"deviceId\":\"phone\",\"name\":\"Phone\",\"available\":true}],\"activeDeviceId\":\"pc\",\"epoch\":7,\"leaseMs\":8000,\"quarantineMs\":0,\"state\":{\"version\":1,\"queue\":[{\"id\":\"A\",\"name\":\"A\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":101,\"order\":1},{\"id\":\"H1\",\"name\":\"H1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":102,\"order\":2},{\"id\":\"C1\",\"name\":\"C1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":103,\"order\":3},{\"id\":\"C2\",\"name\":\"C2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":104,\"order\":4},{\"id\":\"B1\",\"name\":\"B1\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":105,\"order\":5},{\"id\":\"B2\",\"name\":\"B2\",\"artists\":[],\"albumName\":\"\",\"albumId\":\"\",\"duration\":120,\"key\":106,\"order\":6}],\"position\":0,\"context\":null,\"shuffle\":false,\"repeat\":\"off\",\"elapsed\":42,\"duration\":120,\"playing\":false,\"waiting\":false,\"loading\":false,\"error\":\"\",\"truncated\":false,\"notice\":\"\",\"occurrence\":{\"key\":101,\"trackId\":\"A\",\"eventId\":\"history_A\",\"progress\":0,\"reported\":false}},\"stateSeq\":0,\"stateAgeMs\":0,\"transfer\":null,\"directives\":[],\"commands\":[],\"error\":\"stale epoch\"}"
+    }
+  ]
+}

@@ -7,6 +7,9 @@ import dev.spofify.mobile.core.ApiException
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.LibraryPage
 import dev.spofify.mobile.core.PlaybackQueue
+import dev.spofify.mobile.core.PlaybackContext
+import dev.spofify.mobile.core.QueueIntentSelection
+import dev.spofify.mobile.playback.queueIntentSelection
 import dev.spofify.mobile.core.PlaylistSummary
 import dev.spofify.mobile.core.ServerAddress
 import dev.spofify.mobile.core.Session
@@ -83,7 +86,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     val rememberedLogin: RememberedLogin? get() = remembered
     private var queueGeneration = 0
     private var actionFeedbackSerial = 0L
-    private class ListActionTicket(var key: PlaybackInteractionKey?) {
+    private class ListActionTicket(var key: PlaybackInteractionKey?,
+        var binding: dev.spofify.mobile.core.QueueIntentBinding? = null) {
         val serial = PlaybackListActionTickets.commit()
     }
     private val listActionTickets = mutableSetOf<ListActionTicket>()
@@ -439,6 +443,16 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     fun playPage(shuffle: Boolean = false) {
+        if (!shuffle) {
+            val item = when (val page = state.value.page) {
+                Page.Likes -> LibraryItem("likes", "likes", "Liked songs")
+                is Page.Playlist -> LibraryItem("playlist", page.playlist.id, page.playlist.name)
+                is Page.Detail -> page.item
+                else -> return
+            }
+            graph.client?.let { queueIntentFrom(it, item, PlaybackListAction.PLAY_NOW) }
+            return
+        }
         when (val page = state.value.page) {
             Page.Likes -> prepare(null, shuffle, context = LibraryItem("likes", "", "Liked songs")) { it.likedPlayback() }
             is Page.Playlist -> prepare(null, shuffle) { it.playlistPlayback(page.playlist.id) }
@@ -448,15 +462,45 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     fun playFrom(expectedClient: SpofifyClient, item: LibraryItem, shuffle: Boolean = false) {
-        if (graph.client === expectedClient && state.value.session != null) play(item, shuffle)
+        if (shuffle) { if (graph.client === expectedClient && state.value.session != null) play(item, true) }
+        else queueIntentFrom(expectedClient, item, PlaybackListAction.PLAY_NOW)
+    }
+
+    /** Source/Host captures the exact selection and binding before the admission lane awaits.
+     * Collections are resolved once by the receiver; row L/H/Next never fetch the context here. */
+    fun queueIntentFrom(expectedClient: SpofifyClient, item: LibraryItem, action: PlaybackListAction,
+        expectedKey: PlaybackInteractionKey? = playback.state.value.interactionKey,
+        callerIsCurrent: () -> Boolean = { true },
+        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = playback.state.value.queueIntentBinding) {
+        if (cleared || !callerIsCurrent() || graph.client !== expectedClient || state.value.session == null ||
+            !item.playable && item.kind !in setOf("likes", "playlist", "derived")) return
+        val source = state.value.page
+        val context = when {
+            source == Page.Likes && item.kind == "track" -> PlaybackContext("likes", "likes", "Liked songs")
+            source is Page.Playlist && item.kind == "track" -> PlaybackContext("playlist", source.playlist.id, source.playlist.name)
+            else -> null
+        }
+        queueIntentSelectionFrom(expectedClient, queueIntentSelection(item, context), action, expectedKey, callerIsCurrent, expectedBinding)
+    }
+
+    fun queueIntentSelectionFrom(expectedClient: SpofifyClient, selection: QueueIntentSelection,
+        action: PlaybackListAction, expectedKey: PlaybackInteractionKey? = playback.state.value.interactionKey,
+        callerIsCurrent: () -> Boolean = { true },
+        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = playback.state.value.queueIntentBinding) {
+        if (cleared || !callerIsCurrent() || graph.client !== expectedClient || state.value.session == null || state.value.busy) return
+        if (expectedKey != null && playback.state.value.interactionKey !== expectedKey) return
+        val binding = expectedBinding
+        if (action == PlaybackListAction.PLAY_NOW) {
+            ++queueGeneration; queueJob?.cancel(); queueJob = null; cancelListPreparations()
+            mutable.update { it.copy(playbackIntentGeneration = queueGeneration) }
+        }
+        prepareListAction(null, null, action, expectedKey, null, callerIsCurrent,
+            selection = selection, expectedBinding = binding) { PlaybackQueue(emptyList(), total = 0) }
     }
 
     fun enqueueFrom(expectedClient: SpofifyClient, item: LibraryItem, playNext: Boolean = false) {
         if (graph.client !== expectedClient || state.value.session == null || !item.playable) return
-        prepare(item.takeIf { it.kind == "track" }, false,
-            listAction = if (playNext) PlaybackListAction.PLAY_NEXT else PlaybackListAction.ADD_TO_QUEUE) { client ->
-            if (item.kind == "track") PlaybackQueue(listOf(item), total = 1) else client.playback(item)
-        }
+        queueIntentFrom(expectedClient, item, if (playNext) PlaybackListAction.PLAY_NEXT else PlaybackListAction.QUEUE_HIGH)
     }
 
     /** A held row supplies its original binding, never a later UI isPlaying decision. */
@@ -464,16 +508,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         callerIsCurrent: () -> Boolean = { true }) {
         if (!callerIsCurrent() || graph.client !== expectedClient || state.value.session == null || !item.playable ||
             playback.state.value.interactionKey != expectedKey) return
-        val source = state.value.page
-        val selected = item.takeIf { it.kind == "track" }
-        prepare(selected, false, listAction = PlaybackListAction.CONTEXTUAL, expectedKey = expectedKey,
-            callerIsCurrent = callerIsCurrent,
-            context = when {
-                source == Page.Likes -> LibraryItem("likes", "", "Liked songs")
-                item.kind != "track" -> item
-                !item.albumId.isNullOrBlank() -> LibraryItem("album", item.albumId!!, item.albumName ?: "Album")
-                else -> null
-            }) { playbackForSelection(it, source, item) }
+        queueIntentFrom(expectedClient, item, PlaybackListAction.QUEUE_HIGH, expectedKey, callerIsCurrent)
     }
 
     /** Signed/manual playlist selection stays prepared; no token or occurrence ID is repackaged. */
@@ -542,6 +577,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
      * exact additive receipt from their own predecessor, never an external edit or fresh sample. */
     private fun prepareListAction(startTrackId: String?, startEntryId: String?, action: PlaybackListAction,
         expectedKey: PlaybackInteractionKey?, context: LibraryItem?, callerIsCurrent: () -> Boolean,
+        selection: QueueIntentSelection? = null,
+        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
         fetch: suspend (SpofifyClient) -> PlaybackQueue) {
         val client = graph.client ?: return
         if (state.value.session == null || state.value.busy || !callerIsCurrent()) return
@@ -570,9 +607,9 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         val route = state.value.page
         val routeGeneration = generation
         val predecessor = listPreparationTail
-        val ticket = ListActionTicket(expectedKey)
+        val ticket = ListActionTicket(expectedKey, expectedBinding)
         listActionTickets.add(ticket)
-        fun isCurrent() = callerIsCurrent() && request == queueGeneration && playbackEpoch == PlaybackRequests.epoch &&
+        fun isCurrent() = !cleared && callerIsCurrent() && request == queueGeneration && playbackEpoch == PlaybackRequests.epoch &&
             graph.client === client && account != null && client.currentSession() === session &&
             state.value.session?.accountId == account && state.value.page == route && generation == routeGeneration
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
@@ -581,7 +618,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                 if (!isCurrent()) return@launch
                 val queue = fetch(client)
                 if (!isCurrent()) return@launch
-                if (queue.items.isEmpty()) {
+                if (selection == null && queue.items.isEmpty()) {
                     if (feedbackRequest == actionFeedbackSerial) mutable.update { it.copy(notice = "No audio is available in this collection.") }
                     return@launch
                 }
@@ -590,18 +627,24 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                     return@launch
                 }
                 val result = suspendCancellableCoroutine<PlaybackActionResult> { continuation ->
-                    playback.performPreparedAction(queue, client, action, ticket.key, startTrackId, startEntryId, context,
-                        isCurrent = { continuation.isActive && isCurrent() }) { accepted ->
+                    val complete: (PlaybackActionResult) -> Unit = { accepted ->
                         if (continuation.isActive) {
                             if (isCurrent()) accepted.additiveTransition?.let { receipt ->
                                 listActionTickets.forEach { pending ->
                                     if (pending !== ticket && pending.serial <= receipt.committedThrough &&
-                                        pending.key === receipt.before) pending.key = receipt.after
+                                        pending.key === receipt.before && pending.binding == receipt.beforeBinding) {
+                                        pending.key = receipt.after
+                                        pending.binding = receipt.afterBinding
+                                    }
                                 }
                             }
                             continuation.resume(accepted)
                         }
                     }
+                    val live = { continuation.isActive && isCurrent() }
+                    if (selection != null) playback.queueIntent(selection, client, action, ticket.key, ticket.binding, live, complete)
+                    else playback.performPreparedAction(queue, client, action, ticket.key, startTrackId, startEntryId, context,
+                        isCurrent = live, onResult = complete)
                 }
                 if (isCurrent() && feedbackRequest == actionFeedbackSerial) mutable.update { it.copy(notice = result.userMessage) }
             } catch (error: Exception) {
@@ -625,7 +668,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         expectedKey: PlaybackInteractionKey? = null, context: LibraryItem? = null,
         callerIsCurrent: () -> Boolean = { true }, fetch: suspend (SpofifyClient) -> PlaybackQueue) {
         if (listAction != null) {
-            prepareListAction(start?.id, start?.entryId, listAction, expectedKey, context, callerIsCurrent, fetch)
+            prepareListAction(start?.id, start?.entryId, listAction, expectedKey, context, callerIsCurrent, fetch = fetch)
             return
         }
         val client = graph.client ?: return

@@ -34,9 +34,10 @@ data class CatalogPlaybackFeedback(
     val interactionKey: dev.spofify.mobile.playback.PlaybackInteractionKey? = null,
     val playWhenReady: Boolean = false,
     val onContextual: ((LibraryItem, dev.spofify.mobile.playback.PlaybackInteractionKey, () -> Boolean) -> Unit)? = null,
+    val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
 ) {
     val activeIntent: Boolean get() = isPlaying || (buffering && playWhenReady)
-    val contextualLabel: String get() = if (activeIntent) "Add to queue" else "Play now"
+    val contextualLabel: String get() = "Queue High"
 }
 
 /** Like state belongs to the account's shared personal-action owner, not each row. */
@@ -96,7 +97,7 @@ fun MusicRow(
                     add(CustomAccessibilityAction("More actions") { onShowActions(item); true })
                     if (item.playable) {
                         add(CustomAccessibilityAction("Play now") { onPlayItem(item, false); true })
-                        if (contextualEnabled && playback.activeIntent) add(CustomAccessibilityAction(playback.contextualLabel) {
+                        if (contextualEnabled) add(CustomAccessibilityAction(playback.contextualLabel) {
                             if (isCurrent()) playback.onContextual?.invoke(item, playback.interactionKey!!, isCurrent); true
                         })
                     }

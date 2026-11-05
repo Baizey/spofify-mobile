@@ -69,35 +69,22 @@ class MusicActionsContentTest {
         compose.runOnIdle { assertEquals(2, toggles); assertEquals(1, retries) }
     }
 
-    @Test fun explicitAddAndSeparatelyNamedContextualActionNeverDispatchEachOthersIntent() {
-        val contextualLabel = mutableStateOf("Play now")
+    @Test fun fourPriorityActionsAreIndependentOfSampledTransportState() {
         val events = mutableListOf<String>()
         compose.setContent {
             MaterialTheme(typography = AppTypography) {
                 MusicActionsContent(LibraryItem("track", "song", "Song", hasAudio = true),
                     liked = false, likePending = false, likeFailed = false,
-                    onPlay = { events += "play-now" }, onPlayNext = { events += "play-next" },
-                    onEnqueue = { events += "enqueue" }, onToggleLike = {}, onRetryLike = {},
-                    onAddToPlaylist = {}, onOpenItem = {}, contextualLabel = contextualLabel.value,
-                    onContextual = { events += "contextual" })
+                    onPlay = { events += "now" }, onPlayNext = { events += "next" },
+                    onEnqueue = { error("High must use its explicit callback") }, onToggleLike = {}, onRetryLike = {},
+                    onAddToPlaylist = {}, onOpenItem = {}, onQueueLow = { events += "low" },
+                    onContextual = { events += "high" })
             }
         }
-        for (label in listOf("Play now", "Add to queue")) {
-            compose.runOnIdle { contextualLabel.value = label; events.clear() }
-            val swipeLabel = "$label (swipe action)"
-            // Exact labels keep explicit non-starting Add distinguishable in either output state.
-            compose.onAllNodesWithText("Add to queue").assertCountEquals(1)
-            compose.onAllNodesWithText("Play now").assertCountEquals(1)
-            compose.onAllNodesWithText(swipeLabel).assertCountEquals(1)
-            val otherLabel = if (label == "Play now") "Add to queue" else "Play now"
-            compose.onNodeWithText("$otherLabel (swipe action)").assertDoesNotExist()
-            compose.onNodeWithText("Add to queue").performScrollTo().assertIsDisplayed()
-                .assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
-            compose.runOnIdle { assertEquals(listOf("enqueue"), events) }
-            compose.onNodeWithText(swipeLabel).performScrollTo().assertIsDisplayed()
-                .assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
-            compose.runOnIdle { assertEquals(listOf("enqueue", "contextual"), events) }
+        for (label in listOf("Queue Low", "Queue High", "Play next", "Play now")) {
+            compose.onNodeWithText(label).performScrollTo().assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
         }
+        compose.runOnIdle { assertEquals(listOf("low", "high", "next", "now"), events) }
     }
 
     @OptIn(ExperimentalMaterial3Api::class)
@@ -114,7 +101,7 @@ class MusicActionsContentTest {
                         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
                         MusicActionsContent(item, liked = false, likePending = false, likeFailed = false,
                             onPlay = { events += "play" }, onPlayNext = { events += "next" },
-                            onEnqueue = { events += "queue" }, onToggleLike = { events += "like" },
+                            onEnqueue = { events += "queue" }, onQueueLow = { events += "low" }, onToggleLike = { events += "like" },
                             onRetryLike = { events += "retry" }, onAddToPlaylist = { events += "playlist" },
                             onOpenItem = { events += "${it.kind}:${it.id}" })
                     }
@@ -133,7 +120,7 @@ class MusicActionsContentTest {
             compose.runOnIdle { assertEquals(expected, events.last()) }
         }
         // Traverse back through the actual actions, not a duplicate test-only menu.
-        for (label in listOf("Open details", "Add to playlist", "Add to queue", "Play next", "Play now", "Like song")) {
+        for (label in listOf("Open details", "Add to playlist", "Queue Low", "Queue High", "Play next", "Play now", "Like song")) {
             val action = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
             val viewport = compose.onNodeWithTag("music-actions").getUnclippedBoundsInRoot()
             val target = action.getUnclippedBoundsInRoot()
@@ -144,7 +131,7 @@ class MusicActionsContentTest {
             action.performClick()
         }
         compose.runOnIdle {
-            assertEquals(listOf("album:album", "artist:artist-24", "track:song", "playlist", "queue", "next", "play", "like"), events)
+            assertEquals(listOf("album:album", "artist:artist-24", "track:song", "playlist", "low", "queue", "next", "play", "like"), events)
         }
     }
 }

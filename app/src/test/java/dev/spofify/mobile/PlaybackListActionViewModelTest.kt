@@ -10,20 +10,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.*
-import okhttp3.mockwebserver.Dispatcher
-import okhttp3.mockwebserver.MockResponse
-import okhttp3.mockwebserver.MockWebServer
-import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.*
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.serialization.json.jsonPrimitive
 
-/** Host-boundary regressions. The fake records dispatch, but only an explicit later completion
- * acknowledges it; queue/service mutation itself belongs to the service bridge tests. */
+/** Captured raw selection -> acknowledged control boundary; no HTTP preparation on controller.
+ * These JVM tests do not establish native rendering/audio or cross-endpoint acceptance. */
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -33,51 +33,44 @@ class PlaybackListActionViewModelTest {
         override fun read() = value
         override fun write(value: StoredSession?) { this.value = value }
     }
-
-    private class PendingAction(
-        val queue: PreparedQueue,
-        val client: SpofifyClient,
-        val action: PlaybackListAction,
-        val expectedKey: PlaybackInteractionKey?,
-        val startTrackId: String?,
-        val startEntryId: String?,
-        val context: LibraryItem?,
-        val isCurrent: () -> Boolean,
-        private var callback: ((PlaybackActionResult) -> Unit)?,
-    ) {
-        var dispatches = 0
-            private set
-        fun dispatchIfCurrent(): Boolean {
-            if (!isCurrent()) return false
-            dispatches++
-            return true
-        }
-        fun complete(result: PlaybackActionResult) {
-            val deliver = checkNotNull(callback) { "Action already completed" }
-            callback = null
-            deliver(result)
-        }
+    private data class Pending(val selection: QueueIntentSelection, val action: PlaybackListAction,
+        val key: PlaybackInteractionKey?, val binding: QueueIntentBinding?, val current: () -> Boolean,
+        val complete: (PlaybackActionResult) -> Unit)
+    private data class PreparedPending(val queue: PreparedQueue, val startTrackId: String?, val startEntryId: String?,
+        val key: PlaybackInteractionKey?, val current: () -> Boolean, val complete: (PlaybackActionResult) -> Unit)
+    private class FetchGate {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val responded = CountDownLatch(1)
     }
-
-    private class DelayedPlayback : PlaybackControls {
-        override val state = MutableStateFlow(PlaybackState(interactionKey = PlaybackInteractionKey()))
-        val actions = mutableListOf<PendingAction>()
+    private class Controls : PlaybackControls {
+        val key = PlaybackInteractionKey()
+        val binding = QueueIntentBinding("phone", "receiver", 5, 1, "event-A")
+        override val state = MutableStateFlow(PlaybackState(interactionKey = key, queueIntentBinding = binding, canQueueIntent = true))
+        val pending = mutableListOf<Pending>()
+        var prepared: PreparedQueue? = null
+        var selectedEntry: String? = null
+        var holdPrepared = false
         var replacementPlays = 0
-            private set
-        override fun performPreparedAction(queue: PreparedQueue, client: SpofifyClient,
-            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?,
-            startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean,
+        val preparedPending = mutableListOf<PreparedPending>()
+        override fun queueIntent(selection: QueueIntentSelection, client: SpofifyClient, action: PlaybackListAction,
+            expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?, isCurrent: () -> Boolean,
             onResult: (PlaybackActionResult) -> Unit) {
-            actions += PendingAction(queue, client, action, expectedKey, startTrackId, startEntryId, context, isCurrent, onResult)
+            pending += Pending(selection, action, expectedKey, expectedBinding, isCurrent, onResult)
         }
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?,
-            shuffle: Boolean, startEntryId: String?) {
+        override fun performPreparedAction(queue: PreparedQueue, client: SpofifyClient, action: PlaybackListAction,
+            expectedKey: PlaybackInteractionKey?, startTrackId: String?, startEntryId: String?, context: LibraryItem?,
+            isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            prepared = queue; selectedEntry = startEntryId
+            preparedPending += PreparedPending(queue, startTrackId, startEntryId, expectedKey, isCurrent, onResult)
+            if (!holdPrepared) onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+        }
+        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean,
+            startEntryId: String?) {
             replacementPlays++
-            throw AssertionError("List actions must use the acknowledged boundary, without a late replacement Play")
+            error("No sampled Play fallback")
         }
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) {
-            throw AssertionError("Legacy enqueue cannot acknowledge list acceptance")
-        }
+        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) = error("No legacy enqueue fallback")
         override fun connect() = Unit
         override fun release() = Unit
         override fun toggle() = Unit
@@ -89,507 +82,502 @@ class PlaybackListActionViewModelTest {
         override fun cycleRepeat() = Unit
         override fun stop() { PlaybackRequests.invalidate() }
     }
-
-    private class FetchGate {
-        val started = CountDownLatch(1)
-        val release = CountDownLatch(1)
-        val responded = CountDownLatch(1)
-    }
-
-    private class Fixture(
-        val model: LibraryViewModel,
-        val client: SpofifyClient,
-        val graph: AppGraph,
-        val playback: DelayedPlayback,
-    ) {
-        val selected = LibraryItem("track", "same-song", "Selected duplicate", hasAudio = true, entryId = "entry-2")
-        val queue = PreparedQueue(listOf(selected.copy(entryId = "entry-1"), selected), total = 2,
-            context = LibraryPlaybackContext("playlist", "manual", "Manual playlist"), revision = 7)
-        val key get() = requireNotNull(playback.state.value.interactionKey)
-        fun prepared(action: PlaybackListAction = PlaybackListAction.ADD_TO_QUEUE,
-            preparedQueue: PreparedQueue = queue, startEntryId: String? = selected.entryId) {
-            model.preparedListAction(client, client.currentSession()!!.accountId, preparedQueue,
-                selected.id, startEntryId, action, if (action == PlaybackListAction.CONTEXTUAL) key else null)
+    private data class Fixture(val model: LibraryViewModel, val client: SpofifyClient, val graph: AppGraph,
+        val controls: Controls, val playbackReads: AtomicInteger, val loginAccount: AtomicReference<String>) {
+        val row = LibraryItem("track", "same", "Duplicate", hasAudio = true, albumId = "album")
+        fun submit(action: PlaybackListAction = PlaybackListAction.QUEUE_HIGH, item: LibraryItem = row) =
+            model.queueIntentFrom(client, item, action)
+        val manualQueue get() = PreparedQueue(listOf(row.copy(entryId = "one"), row.copy(entryId = "two")), total = 2,
+            context = LibraryPlaybackContext("playlist", "manual", "Manual"), revision = 7)
+        fun prepare(queue: PreparedQueue = manualQueue, callerIsCurrent: () -> Boolean = { true }) {
+            controls.holdPrepared = true
+            model.preparedListAction(client, client.currentSession()!!.accountId, queue, row.id,
+                if (queue.context?.kind == "derived") null else "two", PlaybackListAction.ADD_TO_QUEUE, null,
+                callerIsCurrent = callerIsCurrent)
         }
     }
-
     private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
-    private fun loginResponse() = json("""{"accountId":"id","username":"listener","role":"user","csrfToken":"csrf"}""")
-        .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
-    private fun track(entry: String) = """{"kind":"track","id":"same-song","name":"Song","hasAudio":true,"entryId":"$entry"}"""
-    private fun queueResponse() = json("""{"items":[${track("entry-1")},${track("entry-2")}],"total":2,"context":{"kind":"playlist","id":"manual","name":"Manual playlist"},"revision":7}""")
-    private fun derivedResponse(): MockResponse {
-        fun occurrence(id: String) = """{"kind":"track","id":"same-song","name":"Song","hasAudio":true,"occurrenceId":"$id","selectionToken":"returned-$id"}"""
-        return json("""{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"fixture-fence"},"items":[${occurrence("occ-1")},${occurrence("occ-2")}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"fixture-fence","startOccurrenceId":"occ-2","notice":null}""")
-    }
-
     private fun TestScope.until(condition: () -> Boolean) {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
         while (!condition() && System.nanoTime() < deadline) { runCurrent(); Thread.sleep(5) }
-        runCurrent()
-        assertTrue("Timed out waiting for host action", condition())
+        runCurrent(); assertTrue("Timed out awaiting VM", condition())
     }
-
     private fun fixture(gate: FetchGate? = null, block: suspend TestScope.(Fixture) -> Unit) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val web = MockWebServer()
+        val reads = AtomicInteger()
+        val account = AtomicReference("id")
         web.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
-                "/api/auth/login" -> loginResponse()
-                "/api/auth/logout" -> MockResponse().setResponseCode(204)
-                "/api/library/albums/album/playback", "/api/me/playlists/manual/playback" -> {
-                    gate?.started?.countDown()
-                    gate?.release?.await(5, TimeUnit.SECONDS)
-                    queueResponse().also { gate?.responded?.countDown() }
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.requestUrl!!.encodedPath.endsWith("/playback")) reads.incrementAndGet()
+                return when (request.requestUrl!!.encodedPath) {
+                    "/api/auth/login" -> json("""{"accountId":"${account.get()}","username":"listener","role":"user","csrfToken":"csrf"}""")
+                        .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
+                    "/api/auth/logout" -> MockResponse().setResponseCode(204)
+                    "/api/library/albums/album/playback" -> {
+                        gate?.started?.countDown()
+                        if (gate != null) check(gate.release.await(5, TimeUnit.SECONDS)) { "Owned synthetic playback gate timed out" }
+                        json("""{"items":[{"kind":"track","id":"old-play","name":"Old Play","hasAudio":true}],"total":1}""")
+                            .also { gate?.responded?.countDown() }
+                    }
+                    "/api/me/playlists/rules/playback" -> json("""{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"fixture-fence"},"items":[{"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-1","selectionToken":"returned-1"},{"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-2","selectionToken":"returned-2"}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"fixture-fence","startOccurrenceId":"occ-2","notice":null}""")
+                    else -> json("""{"items":[],"total":0,"revision":1}""")
                 }
-                "/api/me/playlists/rules/playback" -> derivedResponse()
-                else -> MockResponse().setResponseCode(404)
             }
         }
         val app = ApplicationProvider.getApplicationContext<Application>()
         val graph = AppGraph(app, MemoryStore())
         val store = ViewModelStore()
         try {
-            web.start()
-            val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
-            client.login("listener", "password")
-            val playback = DelayedPlayback()
-            val model = LibraryViewModel(app, graph, playback)
+            web.start(); val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
+            client.login("listener", "synthetic")
+            val controls = Controls(); val model = LibraryViewModel(app, graph, controls)
             store.put("subject", model)
-            until { model.state.value.session != null && !model.state.value.busy }
-            block(Fixture(model, client, graph, playback))
-        } finally {
-            gate?.release?.countDown()
-            store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain()
-        }
+            until { model.state.value.session != null && !model.state.value.restoring }
+            block(Fixture(model, client, graph, controls, reads, account))
+        } finally { gate?.release?.countDown(); store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain() }
     }
-
-    @Test fun enqueueAndPlayNextPreserveManualEntryAndWaitForAcceptance() = fixture { f ->
-        for (playNext in listOf(false, true)) {
-            f.model.clearNotice()
-            val before = f.playback.actions.size
-            f.model.enqueueFrom(f.client, f.selected, playNext)
-            until { f.playback.actions.size == before + 1 }
-            assertTrue(f.model.state.value.preparing)
-            val pending = f.playback.actions.last()
-            assertEquals(if (playNext) PlaybackListAction.PLAY_NEXT else PlaybackListAction.ADD_TO_QUEUE, pending.action)
-            assertSame(f.client, pending.client)
-            assertSame(f.selected, pending.queue.items.single())
-            assertEquals("same-song", pending.startTrackId)
-            assertEquals("entry-2", pending.startEntryId)
-            assertNull(pending.expectedKey)
-            assertNull("Queued work is not acceptance", f.model.state.value.notice)
-            assertTrue(pending.dispatchIfCurrent())
-            assertEquals(1, pending.dispatches)
-            assertNull("Dispatch is not acceptance", f.model.state.value.notice)
-            pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
+    @Test fun fourRawIntentsPreserveOriginalBindingAndDoNotPrepareOnController() = fixture { f ->
+        for (action in listOf(PlaybackListAction.QUEUE_LOW, PlaybackListAction.QUEUE_HIGH,
+            PlaybackListAction.PLAY_NEXT, PlaybackListAction.PLAY_NOW)) {
+            f.model.clearNotice(); val count = f.controls.pending.size + 1
+            f.submit(action); until { f.controls.pending.size == count }
+            val pending = f.controls.pending.last()
+            assertEquals(action, pending.action); assertSame(f.controls.key, pending.key)
+            assertEquals(f.controls.binding, pending.binding)
+            assertTrue(pending.selection is QueueIntentSelection.Track)
+            assertTrue(f.model.state.value.preparing); assertNull(f.model.state.value.notice)
+            pending.complete(queueIntentActionResult(QueueIntentResult("queued", 1, 6, "high", "unchanged", null, ""), action))
             until { !f.model.state.value.preparing }
-            assertEquals("Added to queue", f.model.state.value.notice)
+            assertEquals(if (action == PlaybackListAction.PLAY_NOW) "Selection accepted." else "Queued", f.model.state.value.notice)
+        }
+        assertEquals(0, f.playbackReads.get())
+    }
+    @Test fun rowHighIsOneTrackButAlbumHighIsWholeBoundedContext() = fixture { f ->
+        f.submit(); runCurrent(); val row = f.controls.pending.single()
+        assertTrue(row.selection is QueueIntentSelection.Track)
+        row.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP)); runCurrent()
+        f.submit(item = LibraryItem("album", "album", "Album", coverage = Coverage(inLibrary = 20)))
+        runCurrent(); val collection = f.controls.pending.last().selection as QueueIntentSelection.Collection
+        assertEquals(PlaybackContext("album", "album", "Album"), collection.context)
+        assertEquals(0, f.playbackReads.get())
+    }
+    @Test fun committedRawLocalTicketsFollowOnlyExactPredecessorKeyAndBindingDespiteTransportChurn() = fixture { f ->
+        f.submit(); f.submit(item = f.row.copy(id = "Y")); runCurrent()
+        assertEquals(1, f.controls.pending.size)
+        val first = f.controls.pending.single()
+        val successorKey = PlaybackInteractionKey(); val successorBinding = f.controls.binding.copy(revision = 6)
+        f.controls.state.value = f.controls.state.value.copy(interactionKey = successorKey,
+            queueIntentBinding = successorBinding, transportInteractionKey = PlaybackInteractionKey())
+        first.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1,
+            PlaybackAdditiveTransition(f.controls.key, successorKey, PlaybackListActionTickets.committedThrough,
+                f.controls.binding, successorBinding)))
+        until { f.controls.pending.size == 2 }
+        val second = f.controls.pending.last()
+        assertSame(successorKey, second.key); assertEquals(successorBinding, second.binding)
+        assertTrue(second.current())
+        second.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+    }
+    @Test fun remoteTerminalDetailCannotRefreshAnotherAlreadyCommittedBinding() = fixture { f ->
+        f.submit(); f.submit(item = f.row.copy(id = "Y")); runCurrent()
+        val first = f.controls.pending.single()
+        f.controls.state.value = f.controls.state.value.copy(interactionKey = PlaybackInteractionKey(),
+            queueIntentBinding = f.controls.binding.copy(revision = 6))
+        first.complete(queueIntentActionResult(QueueIntentResult("queued", 1, 6, "high", "unchanged", null, ""), first.action))
+        until { f.controls.pending.size == 2 }
+        assertSame(f.controls.key, f.controls.pending.last().key)
+        assertEquals(f.controls.binding, f.controls.pending.last().binding)
+    }
+    @Test fun receiptWithDifferentBindingCannotUpgradeCommittedLocalTicket() = fixture { f ->
+        f.submit(); f.submit(item = f.row.copy(id = "Y")); runCurrent()
+        f.controls.pending.single().complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1,
+            PlaybackAdditiveTransition(f.controls.key, PlaybackInteractionKey(), PlaybackListActionTickets.committedThrough,
+                f.controls.binding.copy(revision = 4), f.controls.binding.copy(revision = 6))))
+        until { f.controls.pending.size == 2 }
+        assertSame(f.controls.key, f.controls.pending.last().key)
+        assertEquals(f.controls.binding, f.controls.pending.last().binding)
+    }
+    @Test fun pausedAH1LowBReceiptIsQueuedNotStartedOrPlaying() = fixture { f ->
+        f.submit(PlaybackListAction.QUEUE_LOW, LibraryItem("album", "B", "B", coverage = Coverage(inLibrary = 2)))
+        runCurrent(); val pending = f.controls.pending.single()
+        val result = QueueIntentResult("queued", 2, 6, "low", "unchanged", null, "")
+        pending.complete(queueIntentActionResult(result, pending.action)); runCurrent()
+        assertEquals("Queued 2 songs.", f.model.state.value.notice)
+        assertFalse(f.controls.state.value.isPlaying)
+        assertNull(result.playbackKey)
+    }
+    @Test fun acceptedBlockedMediaAndSupersededResultsAreRetainedWithoutReplay() = fixture { f ->
+        for (playback in listOf("blocked", "media", "superseded")) {
+            f.submit(PlaybackListAction.PLAY_NOW); runCurrent()
+            val pending = f.controls.pending.last()
+            val detail = QueueIntentResult(if (playback == "superseded") "queued" else playback, 2, 6,
+                "replace", playback, if (playback == "superseded") null else 4, "")
+            val result = queueIntentActionResult(detail, pending.action)
+            assertSame(detail, result.queueIntentResult); assertEquals(2, result.acceptedCount)
+            val count = f.controls.pending.size
+            pending.complete(result); runCurrent()
+            assertEquals(count, f.controls.pending.size)
+            assertTrue(f.model.state.value.notice!!.contains("accepted"))
+            assertFalse(f.model.state.value.notice!!.contains("Playback started"))
         }
     }
-
-    @Test fun twoManualAddsBeforePreparationRunsBothReachTheAcknowledgedBoundary() = fixture { f ->
-        val first = f.selected
-        val second = f.selected.copy(entryId = "entry-3")
-        f.model.enqueueFrom(f.client, first)
-        f.model.enqueueFrom(f.client, second)
-        assertTrue("Neither preparation coroutine has run yet", f.playback.actions.isEmpty())
-        runCurrent()
-        assertEquals("Only the first Add may dispatch before its acceptance", 1, f.playback.actions.size)
-        val firstPending = f.playback.actions.single()
-        assertEquals("entry-2", firstPending.startEntryId)
-        assertTrue(firstPending.dispatchIfCurrent())
-        assertTrue(f.model.state.value.preparing)
-        assertNull("Independent requests still wait for acceptance", f.model.state.value.notice)
-        firstPending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-        until { f.playback.actions.size == 2 }
-        assertEquals(listOf("entry-2", "entry-3"), f.playback.actions.map { it.startEntryId })
-        assertEquals(listOf(first, second), f.playback.actions.map { it.queue.items.single() })
-        assertTrue(f.playback.actions.all { it.action == PlaybackListAction.ADD_TO_QUEUE })
-        assertTrue("The second request is still awaiting acceptance", f.model.state.value.preparing)
-        assertNull("The older result must not replace the newer pending action's feedback", f.model.state.value.notice)
-        val secondPending = f.playback.actions.last()
-        assertTrue(secondPending.dispatchIfCurrent())
-        secondPending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-        until { !f.model.state.value.preparing }
-        assertEquals("Added to queue", f.model.state.value.notice)
+    @Test fun unknownControlsFailClosedInsteadOfLegacyFallback() = fixture { f ->
+        f.submit(); runCurrent()
+        f.controls.pending.single().complete(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED)); runCurrent()
+        assertTrue(f.model.state.value.notice!!.contains("Update"))
     }
+    @Test fun manualPreparedCompatibilityRetainsExactQueueAndDuplicateEntry() = fixture { f ->
+        val queue = PreparedQueue(listOf(f.row.copy(entryId = "one"), f.row.copy(entryId = "two")), total = 2,
+            context = LibraryPlaybackContext("playlist", "manual", "Manual"), revision = 7)
+        f.model.preparedListAction(f.client, "id", queue, "same", "two", PlaybackListAction.ADD_TO_QUEUE, null)
+        runCurrent(); assertSame(queue, f.controls.prepared); assertEquals("two", f.controls.selectedEntry)
+    }
+    @Test fun heldRawActionRetiresAcrossRouteABAOutputEpochAndSessionChanges() = fixture { f ->
+        f.submit(); runCurrent(); val pending = f.controls.pending.single()
+        assertTrue(pending.current())
+        f.model.switchTab(Tab.SEARCH); f.model.switchTab(Tab.HOME)
+        assertFalse(pending.current())
+        pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+        assertNull(f.model.state.value.notice)
+        f.submit(); runCurrent(); val afterRoute = f.controls.pending.last()
+        PlaybackRequests.invalidate(); assertFalse(afterRoute.current())
+        afterRoute.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+        assertNull(f.model.state.value.notice)
+        f.submit(); runCurrent(); val beforeOutputChange = f.controls.pending.last()
+        val capturedBinding = beforeOutputChange.binding
+        f.controls.state.value = f.controls.state.value.copy(interactionKey = PlaybackInteractionKey(),
+            queueIntentBinding = f.controls.binding.copy(outputDeviceId = "replacement", receiverId = "replacement_receiver"))
+        assertSame(f.controls.key, beforeOutputChange.key)
+        assertEquals("Output authority must be rejected downstream, never refreshed by VM", capturedBinding, beforeOutputChange.binding)
+        val stale = PlaybackActionResult(PlaybackActionStatus.STALE)
+        beforeOutputChange.complete(stale); runCurrent()
+        assertEquals(stale.userMessage, f.model.state.value.notice)
+        f.model.clearNotice()
+        f.submit(); runCurrent(); val beforeSessionChange = f.controls.pending.last()
+        val oldSession = f.client.currentSession()
+        f.client.login("listener", "synthetic")
+        assertEquals(oldSession, f.client.currentSession()); assertNotSame(oldSession, f.client.currentSession())
+        assertFalse(beforeSessionChange.current())
+        beforeSessionChange.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+        assertNull(f.model.state.value.notice)
+    }
+    private data class Held(val current: () -> Boolean, val complete: (PlaybackActionResult) -> Unit) {
+        var dispatches = 0
+        fun dispatchIfCurrent(): Boolean {
+            if (!current()) return false
+            dispatches++
+            return true
+        }
+    }
+    private fun TestScope.admit(f: Fixture, prepared: Boolean, caller: () -> Boolean = { true }): Held {
+        if (prepared) {
+            val count = f.controls.preparedPending.size + 1
+            f.prepare(callerIsCurrent = caller)
+            until { f.controls.preparedPending.size == count }
+            return f.controls.preparedPending.last().let { Held(it.current, it.complete) }
+        }
+        val count = f.controls.pending.size + 1
+        f.model.queueIntentFrom(f.client, f.row, PlaybackListAction.QUEUE_HIGH, callerIsCurrent = caller)
+        until { f.controls.pending.size == count }
+        return f.controls.pending.last().let { Held(it.current, it.complete) }
+    }
+    private enum class Invalidation { ROUTE, ROUTE_ABA, CLIENT, NEW_INTENT, REAUTH, SESSION, ACCOUNT, EPOCH, STOP, SIGN_OUT }
+    private fun staleCompletionMatrix(prepared: Boolean, invalidation: Invalidation) = fixture { f ->
+        val held = admit(f, prepared)
+        assertTrue(held.current()); assertTrue(f.model.state.value.preparing)
+        assertNull("Admission is not acceptance", f.model.state.value.notice)
+        when (invalidation) {
+            Invalidation.ROUTE -> f.model.switchTab(Tab.SEARCH)
+            Invalidation.ROUTE_ABA -> {
+                f.model.switchTab(Tab.SEARCH); f.model.switchTab(Tab.HOME)
+                assertEquals(Page.Home, f.model.state.value.page)
+            }
+            Invalidation.CLIENT -> {
+                val replacement = f.graph.configure(f.client.server)
+                replacement.login("listener", "synthetic")
+                assertNotSame(f.client, replacement)
+            }
+            Invalidation.NEW_INTENT -> f.submit(PlaybackListAction.PLAY_NOW, f.row.copy(id = "new-now"))
+            Invalidation.REAUTH -> {
+                val old = f.client.currentSession()
+                f.client.login("listener", "synthetic")
+                assertEquals("Equal values do not reuse session identity", old, f.client.currentSession())
+                assertNotSame(old, f.client.currentSession())
+            }
+            Invalidation.SESSION -> { f.client.clearSession(); assertNull(f.client.currentSession()) }
+            Invalidation.ACCOUNT -> {
+                f.loginAccount.set("other-account")
+                f.client.login("listener", "synthetic")
+                assertEquals("other-account", f.client.currentSession()!!.accountId)
+            }
+            Invalidation.EPOCH -> PlaybackRequests.invalidate()
+            Invalidation.STOP -> f.model.stopPlayback()
+            Invalidation.SIGN_OUT -> { f.model.logout(); until { f.model.state.value.session == null } }
+        }
+        runCurrent()
+        assertFalse("Old $prepared work must lose its $invalidation origin before mutation", held.current())
+        assertFalse(held.dispatchIfCurrent())
+        assertEquals(0, held.dispatches)
+        val noticeAfterInvalidation = f.model.state.value.notice
+        held.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
+        runCurrent()
+        assertEquals("Late accepted detail must not publish after $invalidation (prepared=$prepared)",
+            noticeAfterInvalidation, f.model.state.value.notice)
+        assertEquals(0, f.controls.replacementPlays)
+    }
+    @Test fun rawCompletionCannotPublishIntoAnotherRoute() = staleCompletionMatrix(false, Invalidation.ROUTE)
+    @Test fun preparedCompletionCannotPublishIntoAnotherRoute() = staleCompletionMatrix(true, Invalidation.ROUTE)
+    @Test fun rawCompletionCannotReviveAfterUnsampledRouteABA() = staleCompletionMatrix(false, Invalidation.ROUTE_ABA)
+    @Test fun preparedCompletionCannotReviveAfterUnsampledRouteABA() = staleCompletionMatrix(true, Invalidation.ROUTE_ABA)
+    @Test fun rawCompletionCannotPublishIntoReplacementClient() = staleCompletionMatrix(false, Invalidation.CLIENT)
+    @Test fun preparedCompletionCannotPublishIntoReplacementClient() = staleCompletionMatrix(true, Invalidation.CLIENT)
+    @Test fun rawCompletionCannotPublishAfterNewNowIntent() = staleCompletionMatrix(false, Invalidation.NEW_INTENT)
+    @Test fun preparedCompletionCannotPublishAfterNewNowIntent() = staleCompletionMatrix(true, Invalidation.NEW_INTENT)
+    @Test fun rawCompletionCannotPublishAfterEqualValuedReauthentication() = staleCompletionMatrix(false, Invalidation.REAUTH)
+    @Test fun preparedCompletionCannotPublishAfterEqualValuedReauthentication() = staleCompletionMatrix(true, Invalidation.REAUTH)
+    @Test fun rawCompletionCannotPublishAfterSessionClearing() = staleCompletionMatrix(false, Invalidation.SESSION)
+    @Test fun preparedCompletionCannotPublishAfterSessionClearing() = staleCompletionMatrix(true, Invalidation.SESSION)
+    @Test fun rawCompletionCannotPublishAfterAccountReplacement() = staleCompletionMatrix(false, Invalidation.ACCOUNT)
+    @Test fun preparedCompletionCannotPublishAfterAccountReplacement() = staleCompletionMatrix(true, Invalidation.ACCOUNT)
+    @Test fun rawCompletionCannotPublishAfterAuthorityEpochChanges() = staleCompletionMatrix(false, Invalidation.EPOCH)
+    @Test fun preparedCompletionCannotPublishAfterAuthorityEpochChanges() = staleCompletionMatrix(true, Invalidation.EPOCH)
+    @Test fun rawCompletionCannotPublishAfterStop() = staleCompletionMatrix(false, Invalidation.STOP)
+    @Test fun preparedCompletionCannotPublishAfterStop() = staleCompletionMatrix(true, Invalidation.STOP)
+    @Test fun rawCompletionCannotPublishAfterSignOut() = staleCompletionMatrix(false, Invalidation.SIGN_OUT)
+    @Test fun preparedCompletionCannotPublishAfterSignOut() = staleCompletionMatrix(true, Invalidation.SIGN_OUT)
 
-    @Test fun acceptedAddRetiresAnOlderHttpBlockedReplacementPlay() =
-        acceptedAddRetiresReplacement(prepared = false)
+    private fun callerGuardAtDispatchAndCompletion(prepared: Boolean) = fixture { f ->
+        var callerCurrent = true
+        if (prepared) f.prepare(callerIsCurrent = { callerCurrent })
+        else f.model.queueIntentFrom(f.client, f.row, PlaybackListAction.QUEUE_HIGH, callerIsCurrent = { callerCurrent })
+        callerCurrent = false // Before the preparation coroutine/dispatch can run.
+        runCurrent()
+        assertTrue(f.controls.pending.isEmpty()); assertTrue(f.controls.preparedPending.isEmpty())
+        assertFalse(f.model.state.value.preparing)
+        assertNull(f.model.state.value.notice)
+        callerCurrent = true
+        val held = admit(f, prepared) { callerCurrent }
+        assertTrue(held.current())
+        callerCurrent = false // After boundary admission, before serialized mutation/completion.
+        assertFalse(held.dispatchIfCurrent()); assertEquals(0, held.dispatches)
+        held.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1)); runCurrent()
+        assertFalse(f.model.state.value.preparing)
+        assertNull("An accepted late callback cannot borrow a fresh caller lifetime", f.model.state.value.notice)
+    }
+    @Test fun rawCallerGuardIsRecheckedBeforeDispatchAndAtLateCompletion() = callerGuardAtDispatchAndCompletion(false)
+    @Test fun preparedCallerGuardIsRecheckedBeforeDispatchAndAtLateCompletion() = callerGuardAtDispatchAndCompletion(true)
 
-    @Test fun acceptedPreparedAddRetiresAnOlderHttpBlockedReplacementPlay() =
-        acceptedAddRetiresReplacement(prepared = true)
+    private fun fifoAndNewestFeedback(prepared: Boolean) = fixture { f ->
+        val queue = f.manualQueue
+        if (prepared) { f.prepare(queue); f.prepare(queue) }
+        else { f.submit(); f.submit(item = f.row.copy(id = "Y")) }
+        assertTrue(f.controls.pending.isEmpty()); assertTrue(f.controls.preparedPending.isEmpty())
+        runCurrent()
+        val first = if (prepared) {
+            assertEquals(1, f.controls.preparedPending.size)
+            f.controls.preparedPending.single().let { assertSame(queue, it.queue); Held(it.current, it.complete) }
+        } else {
+            assertEquals(1, f.controls.pending.size)
+            f.controls.pending.single().let { Held(it.current, it.complete) }
+        }
+        assertTrue("A newer additive request cannot cancel its predecessor", first.dispatchIfCurrent())
+        assertEquals(1, first.dispatches)
+        first.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
+        until { if (prepared) f.controls.preparedPending.size == 2 else f.controls.pending.size == 2 }
+        assertNull("Older acceptance cannot replace the newer pending action's feedback", f.model.state.value.notice)
+        assertTrue(f.model.state.value.preparing)
+        val second = if (prepared) f.controls.preparedPending.last().let {
+            assertSame(queue, it.queue); assertEquals("two", it.startEntryId); Held(it.current, it.complete)
+        } else f.controls.pending.last().let {
+            assertEquals(listOf("same", "Y"), f.controls.pending.map { p ->
+                (p.selection as QueueIntentSelection.Track).track.getValue("id").jsonPrimitive.content
+            })
+            Held(it.current, it.complete)
+        }
+        assertTrue(second.dispatchIfCurrent())
+        val latest = PlaybackActionResult(PlaybackActionStatus.FULL)
+        second.complete(latest); until { !f.model.state.value.preparing }
+        assertEquals(latest.userMessage, f.model.state.value.notice)
+        assertEquals("Raw receiver preparation never fetches controller context", 0, f.playbackReads.get())
+    }
+    @Test fun rawHeldReceiverPreparationPreservesFifoAndOnlyNewestFeedbackPublishes() = fifoAndNewestFeedback(false)
+    @Test fun repeatedPreparedAddsPreserveFifoAndOnlyNewestFeedbackPublishes() = fifoAndNewestFeedback(true)
 
-    private fun acceptedAddRetiresReplacement(prepared: Boolean) {
+    private fun retireOlderHttpReplacement(prepared: Boolean) {
         val gate = FetchGate()
         fixture(gate) { f ->
-            val replacement = LibraryItem("album", "album", "Queue Q", coverage = Coverage(inLibrary = 1))
-            val addition = f.selected.copy(id = "song-y", name = "Song Y", entryId = "entry-y")
-            f.model.play(replacement)
-            runCurrent()
-            assertTrue("Replacement Q must be awaiting its HTTP response", gate.started.await(5, TimeUnit.SECONDS))
-            val replacementGeneration = f.model.state.value.playbackIntentGeneration
-            assertTrue(f.model.state.value.preparing)
-            assertEquals(0, f.playback.replacementPlays)
-
-            if (prepared) {
-                f.model.preparedListAction(f.client, f.client.currentSession()!!.accountId,
-                    PreparedQueue(listOf(addition), total = 1), addition.id, addition.entryId,
-                    PlaybackListAction.ADD_TO_QUEUE, null)
-            } else f.model.enqueueFrom(f.client, addition)
-            until { f.playback.actions.size == 1 }
-            assertTrue("A later explicit Add must retire the older replacement generation",
-                f.model.state.value.playbackIntentGeneration > replacementGeneration)
-            val pending = f.playback.actions.single()
-            assertEquals(PlaybackListAction.ADD_TO_QUEUE, pending.action)
-            assertEquals(addition, pending.queue.items.single())
-            assertEquals("song-y", pending.startTrackId)
-            assertEquals("entry-y", pending.startEntryId)
-            assertTrue(pending.dispatchIfCurrent())
-            assertNull(f.model.state.value.notice)
-            pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
+            f.model.play(LibraryItem("album", "album", "Old replacement", coverage = Coverage(inLibrary = 1)))
+            runCurrent(); assertTrue("Old replacement is held in actual HTTP", gate.started.await(5, TimeUnit.SECONDS))
+            val oldGeneration = f.model.state.value.playbackIntentGeneration
+            val addition = admit(f, prepared)
+            assertTrue(f.model.state.value.playbackIntentGeneration > oldGeneration)
+            assertTrue(addition.dispatchIfCurrent())
+            addition.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
             until { !f.model.state.value.preparing }
-            assertEquals("Added to queue", f.model.state.value.notice)
-
-            // Release Q only after Y has been accepted. Drain the HTTP call and main work so
-            // an old queue response cannot hide behind the newer action's completed busy flag.
+            val acceptedNotice = f.model.state.value.notice
+            assertEquals("Added to queue", acceptedNotice)
             gate.release.countDown()
             assertTrue(gate.responded.await(5, TimeUnit.SECONDS))
             until { f.client.httpClient.dispatcher.runningCallsCount() == 0 }
             runCurrent()
-            assertEquals("Late Q must never replace the accepted Add with Play", 0, f.playback.replacementPlays)
-            assertEquals("Only Y may reach the playback action boundary", 1, f.playback.actions.size)
+            assertEquals("Late old Play must not replace accepted additions", 0, f.controls.replacementPlays)
+            assertEquals(1, f.controls.pending.size + f.controls.preparedPending.size)
+            assertEquals(acceptedNotice, f.model.state.value.notice)
             assertFalse(f.model.state.value.preparing)
-            assertEquals("Added to queue", f.model.state.value.notice)
         }
     }
+    @Test fun admittedRawAddRetiresOlderReplacementPlayBlockedInHttp() = retireOlderHttpReplacement(false)
+    @Test fun admittedPreparedAddRetiresOlderReplacementPlayBlockedInHttp() = retireOlderHttpReplacement(true)
 
-    @Test fun contextualRequestBlockedInHttpIsNotDroppedOrOvertakenByTheNextGesture() {
-        val gate = FetchGate()
-        fixture(gate) { f ->
-            val first = f.selected.copy(entryId = null, albumId = "album", albumName = "Album")
-            val second = f.selected.copy(id = "second-song", entryId = null)
-            val key = f.key
-            f.model.contextualFrom(f.client, first, key)
-            runCurrent()
-            assertTrue("First selection must be awaiting the synthetic HTTP response",
-                gate.started.await(5, TimeUnit.SECONDS))
-            assertTrue(f.playback.actions.isEmpty())
-            f.model.contextualFrom(f.client, second, key)
-            runCurrent()
-            assertTrue("The second gesture must not overtake blocked HTTP preparation", f.playback.actions.isEmpty())
-            gate.release.countDown()
-            until { f.playback.actions.size == 1 }
-            val firstPending = f.playback.actions.single()
-            assertEquals(first.id, firstPending.startTrackId)
-            assertSame(key, firstPending.expectedKey)
-            assertTrue("A later gesture alone must not invalidate the earlier mutation", firstPending.dispatchIfCurrent())
-            runCurrent()
-            assertEquals("The next request waits for actual acceptance, not just HTTP preparation", 1, f.playback.actions.size)
-            firstPending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-            until { f.playback.actions.size == 2 }
-            assertEquals("Preparation latency must not reverse the user's FIFO requests",
-                listOf(first.id, second.id), f.playback.actions.map { it.startTrackId })
-            val secondPending = f.playback.actions.last()
-            assertTrue(f.playback.actions.all { it.action == PlaybackListAction.CONTEXTUAL })
-            assertSame(key, secondPending.expectedKey)
-            assertTrue(secondPending.dispatchIfCurrent())
-            assertTrue(f.model.state.value.preparing)
-            assertNull("The newest request has not been acknowledged", f.model.state.value.notice)
-            secondPending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-            until { !f.model.state.value.preparing }
-            assertEquals("Added to queue", f.model.state.value.notice)
-        }
-    }
-
-    @Test fun everyTypedResultPublishesOnlyAfterTheDelayedCallback() = fixture { f ->
-        for (status in PlaybackActionStatus.values()) {
-            f.model.clearNotice()
-            val before = f.playback.actions.size
-            f.model.enqueueFrom(f.client, f.selected)
-            until { f.playback.actions.size == before + 1 }
-            assertTrue(f.model.state.value.preparing)
-            assertTrue(f.playback.actions.last().dispatchIfCurrent())
-            assertNull("No optimistic Added/Playing for $status", f.model.state.value.notice)
-            val result = PlaybackActionResult(status, if (status == PlaybackActionStatus.LIMITED) 1 else 0)
-            f.playback.actions.last().complete(result)
-            until { !f.model.state.value.preparing }
-            assertEquals(result.userMessage, f.model.state.value.notice)
-            if (status !in listOf(PlaybackActionStatus.ADDED, PlaybackActionStatus.PLAYING, PlaybackActionStatus.LIMITED)) {
-                assertNotEquals("Added to queue", f.model.state.value.notice)
-                assertNotEquals("Playing", f.model.state.value.notice)
-            }
-        }
-    }
-
-    @Test fun contextualSelectionForwardsCapturedKeyAndExactManualOccurrence() = fixture { f ->
-        f.model.open(Page.Playlist(PlaylistSummary("manual", "Manual playlist")))
-        val key = f.key
-        f.model.contextualFrom(f.client, f.selected, key)
-        until { f.playback.actions.size == 1 }
-        assertTrue(f.model.state.value.preparing)
-        val pending = f.playback.actions.single()
-        assertEquals(PlaybackListAction.CONTEXTUAL, pending.action)
-        assertSame(key, pending.expectedKey)
-        assertEquals(listOf("entry-1", "entry-2"), pending.queue.items.map { it.entryId })
-        assertEquals("entry-2", pending.startEntryId)
-        assertEquals("same-song", pending.startTrackId)
-        assertEquals("manual", pending.queue.context?.id)
-        assertTrue(pending.dispatchIfCurrent())
-        assertNull(f.model.state.value.notice)
-        pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))
-        until { !f.model.state.value.preparing }
-        assertEquals("Playing", f.model.state.value.notice)
-    }
-
-    @Test fun contextualSelectionCarriesAlbumContextWithoutUsingUiPlayingFlag() = fixture { f ->
-        val item = f.selected.copy(entryId = null, albumId = "album", albumName = "Album")
-        val key = f.key
-        f.model.contextualFrom(f.client, item, key)
-        // A harmless progress/state publication does not replace the binding or select a host action.
-        f.playback.state.value = f.playback.state.value.copy(positionMs = 500, isBuffering = true, playWhenReady = true)
-        until { f.playback.actions.size == 1 }
-        val pending = f.playback.actions.single()
-        assertSame(key, pending.expectedKey)
-        assertEquals(PlaybackListAction.CONTEXTUAL, pending.action)
-        assertEquals(LibraryItem("album", "album", "Album"), pending.context)
-        assertNull(f.model.state.value.notice)
-    }
-
-    @Test fun contextualSelectionRejectsAnAlreadyReplacedBinding() = fixture { f ->
-        val old = f.key
-        f.playback.state.value = f.playback.state.value.copy(interactionKey = PlaybackInteractionKey())
-        f.model.contextualFrom(f.client, f.selected, old)
-        runCurrent()
-        assertTrue(f.playback.actions.isEmpty())
-        assertNull(f.model.state.value.notice)
-    }
-
-    @Test fun contextualSelectionKeepsOriginalBindingAfterOutputChangesDuringPreparation() {
-        val gate = FetchGate()
-        fixture(gate) { f ->
-            val capturedKey = f.key
-            f.model.contextualFrom(f.client, f.selected.copy(albumId = "album"), capturedKey)
-            runCurrent()
-            assertTrue(gate.started.await(5, TimeUnit.SECONDS))
-            f.playback.state.value = f.playback.state.value.copy(interactionKey = PlaybackInteractionKey())
-            gate.release.countDown()
-            until { f.playback.actions.size == 1 }
-            val pending = f.playback.actions.single()
-            assertSame("The service must receive the original key, never the replacement output's key",
-                capturedKey, pending.expectedKey)
-            assertNotSame(f.key, pending.expectedKey)
-            assertNull(f.model.state.value.notice)
-            // Actual key rejection belongs to the service boundary, whose bridge tests cover
-            // mutation. The host must preserve that binding and relay its typed stale result.
-            val result = PlaybackActionResult(PlaybackActionStatus.STALE)
-            pending.complete(result)
-            until { !f.model.state.value.preparing }
-            assertEquals(result.userMessage, f.model.state.value.notice)
-        }
-    }
-
-    @Test fun preparedManualQueueAndSelectedEntryAreForwardedWithoutFlattening() = fixture { f ->
-        f.prepared()
-        until { f.playback.actions.size == 1 }
-        assertTrue(f.model.state.value.preparing)
-        val pending = f.playback.actions.single()
-        assertSame(f.queue, pending.queue)
-        assertEquals(7L, pending.queue.revision)
-        assertEquals("manual", pending.queue.context?.id)
-        assertEquals("entry-2", pending.startEntryId)
-        assertNull(f.model.state.value.notice)
-        pending.complete(PlaybackActionResult(PlaybackActionStatus.LIMITED, 1))
-        until { !f.model.state.value.preparing }
-        assertEquals("Added 1 to queue; queue limited to 1,000 songs.", f.model.state.value.notice)
-    }
-
-    @Test fun preparedDerivedSelectionKeepsAuthorityAndNeverUsesOccurrenceAsManualEntryId() = fixture { f ->
+    @Test fun preparedDerivedSelectionRetainsAuthorityExactStartAndOriginalToken() = fixture { f ->
         val queue = DerivedPlaylistsApi(f.client).playback("rules", 5, "fixture-fence", "original-click-token").queue
-        val state = requireNotNull(queue.preparedState)
+        val snapshot = requireNotNull(queue.preparedState)
         val authority = requireNotNull(queue.selectionAuthority)
-        assertEquals("occ-2", state.queue[state.position].occurrenceId)
-        f.prepared(PlaybackListAction.CONTEXTUAL, queue, startEntryId = null)
-        until { f.playback.actions.size == 1 }
-        val pending = f.playback.actions.single()
-        assertEquals(PlaybackListAction.CONTEXTUAL, pending.action)
-        assertSame(f.key, pending.expectedKey)
-        assertSame(queue, pending.queue)
-        assertSame(state, pending.queue.preparedState)
-        assertSame(authority, pending.queue.selectionAuthority)
-        assertTrue(authority.isValidFor(f.client, state))
-        assertEquals("original-click-token", authority.selectionTokenFor(f.client, state))
-        assertEquals("same-song", pending.startTrackId)
-        assertNull(pending.startEntryId)
-        assertEquals(listOf("occ-1", "occ-2"), pending.queue.items.map { it.entryId })
-        assertTrue("Derived occurrence IDs must not enter the bounded wire manual-entry field",
-            state.queue.all { it.entryId.isEmpty() })
-        assertNull(f.model.state.value.notice)
+        f.prepare(queue); until { f.controls.preparedPending.size == 1 }
+        val held = f.controls.preparedPending.single()
+        assertSame(queue, held.queue); assertSame(snapshot, held.queue.preparedState)
+        assertSame(authority, held.queue.selectionAuthority)
+        assertEquals("occ-2", snapshot.queue[snapshot.position].occurrenceId)
+        assertTrue(snapshot.queue.all { it.entryId.isEmpty() })
+        assertEquals(listOf("occ-1", "occ-2"), queue.items.map { it.entryId })
+        assertNull(held.startEntryId)
+        assertEquals("original-click-token", authority.selectionTokenFor(f.client, snapshot))
+        assertTrue(authority.isValidFor(f.client, snapshot)); assertNull(f.model.state.value.notice)
     }
-
-    @Test fun derivedSelectionCannotBeReusedAfterEqualValuedReauthentication() = fixture { f ->
+    @Test fun preparedSignedDerivedSelectionCannotBeReusedAfterEqualValuedReauthentication() = fixture { f ->
         val queue = DerivedPlaylistsApi(f.client).playback("rules", 5, "fixture-fence", "original-click-token").queue
-        val original = f.client.currentSession()
-        f.client.login("listener", "password")
-        assertEquals(original, f.client.currentSession())
-        assertNotSame(original, f.client.currentSession())
-        f.prepared(preparedQueue = queue, startEntryId = null)
-        assertTrue(f.playback.actions.isEmpty())
+        val old = f.client.currentSession()
+        f.client.login("listener", "synthetic")
+        assertEquals(old, f.client.currentSession()); assertNotSame(old, f.client.currentSession())
+        f.prepare(queue); runCurrent()
+        assertTrue(f.controls.preparedPending.isEmpty())
         assertEquals("This prepared selection expired. Reload the collection and choose again.", f.model.state.value.notice)
     }
-
-    @Test fun callerRouteGuardIsRecheckedAtQueuedContextualDispatchAndCompletion() = fixture { f ->
-        var rowStillBound = true
-        f.model.contextualFrom(f.client, f.selected, f.key, callerIsCurrent = { rowStillBound })
-        until { f.playback.actions.size == 1 }
-        assertTrue(f.model.state.value.preparing)
-        val pending = f.playback.actions.single()
-        assertTrue(pending.isCurrent())
-        rowStillBound = false // The screen's nested route changed without changing the host Page.
-        assertFalse(pending.isCurrent())
-        assertFalse(pending.dispatchIfCurrent())
-        assertEquals(0, pending.dispatches)
-        pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))
-        runCurrent()
-        assertNull(f.model.state.value.notice)
+    @Test fun heldRawSignedDerivedSelectionCannotBorrowEqualValuedNewSessionAtDispatchOrCompletion() = fixture { f ->
+        val selection = queueIntentSelection(f.row, PlaybackContext("derived", "rules", "Rules", 5, "fence"), "exact-path", "opaque.signed")
+        f.model.queueIntentSelectionFrom(f.client, selection, PlaybackListAction.QUEUE_HIGH)
+        runCurrent(); val pending = f.controls.pending.single()
+        val old = f.client.currentSession()
+        f.client.login("listener", "synthetic")
+        assertEquals(old, f.client.currentSession()); assertNotSame(old, f.client.currentSession())
+        assertFalse(pending.current())
+        pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+        assertSame(selection, pending.selection); assertNull(f.model.state.value.notice)
+        assertEquals(0, f.playbackReads.get())
     }
-
-    @Test fun callerRouteGuardIsRecheckedAtQueuedPreparedDispatchAndCompletion() = fixture { f ->
-        var rowStillBound = true
-        f.model.preparedListAction(f.client, f.client.currentSession()!!.accountId, f.queue,
-            f.selected.id, f.selected.entryId, PlaybackListAction.ADD_TO_QUEUE, null,
-            callerIsCurrent = { rowStillBound })
-        until { f.playback.actions.size == 1 }
-        assertTrue(f.model.state.value.preparing)
-        val pending = f.playback.actions.single()
-        assertTrue(pending.isCurrent())
-        rowStillBound = false
-        assertFalse(pending.isCurrent())
-        assertFalse(pending.dispatchIfCurrent())
-        assertEquals(0, pending.dispatches)
-        pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-        runCurrent()
-        assertNull(f.model.state.value.notice)
-    }
-
-    @Test fun preparedActionRejectsWrongAccountOldIntentAndReplacedContextualKey() = fixture { f ->
+    @Test fun preparedAdmissionRejectsWrongAccountOldGenerationAndReplacedContextualKey() = fixture { f ->
+        val queue = f.manualQueue
         val generation = f.model.state.value.playbackIntentGeneration
-        f.model.preparedListAction(f.client, "another-account", f.queue, f.selected.id, f.selected.entryId,
-            PlaybackListAction.ADD_TO_QUEUE, null)
+        f.model.preparedListAction(f.client, "wrong-account", queue, "same", "two", PlaybackListAction.ADD_TO_QUEUE, null)
         f.model.stopPlayback()
-        f.model.preparedListAction(f.client, "id", f.queue, f.selected.id, f.selected.entryId,
-            PlaybackListAction.ADD_TO_QUEUE, null, expectedGeneration = generation)
-        val oldKey = f.key
-        f.playback.state.value = f.playback.state.value.copy(interactionKey = PlaybackInteractionKey())
-        f.model.preparedListAction(f.client, "id", f.queue, f.selected.id, f.selected.entryId,
-            PlaybackListAction.CONTEXTUAL, oldKey)
-        runCurrent()
-        assertTrue(f.playback.actions.isEmpty())
-        assertNull(f.model.state.value.notice)
+        f.model.preparedListAction(f.client, "id", queue, "same", "two", PlaybackListAction.ADD_TO_QUEUE, null,
+            expectedGeneration = generation)
+        val oldKey = f.controls.state.value.interactionKey!!
+        f.controls.state.value = f.controls.state.value.copy(interactionKey = PlaybackInteractionKey())
+        f.model.preparedListAction(f.client, "id", queue, "same", "two", PlaybackListAction.CONTEXTUAL, oldKey)
+        runCurrent(); assertTrue(f.controls.preparedPending.isEmpty()); assertNull(f.model.state.value.notice)
     }
-
-    private enum class Invalidation { ROUTE, ACCOUNT, CLIENT, INTENT, EPOCH, ROUTE_ROUND_TRIP }
-
-    private fun staleCompletion(prepared: Boolean, invalidation: Invalidation) = fixture { f ->
-        if (prepared) f.prepared() else f.model.enqueueFrom(f.client, f.selected)
-        until { f.playback.actions.size == 1 }
-        assertTrue(f.model.state.value.preparing)
-        val pending = f.playback.actions.single()
-        assertTrue("Fresh work must be dispatchable", pending.isCurrent())
-        assertNull(f.model.state.value.notice)
-        when (invalidation) {
-            Invalidation.ROUTE -> f.model.switchTab(Tab.SEARCH)
-            Invalidation.ROUTE_ROUND_TRIP -> {
-                f.model.switchTab(Tab.SEARCH)
-                f.model.switchTab(Tab.HOME)
-                assertEquals(Page.Home, f.model.state.value.page)
-            }
-            Invalidation.ACCOUNT -> {
-                // Same account and equal Session values are still a new authentication identity.
-                val old = f.client.currentSession()
-                f.client.login("listener", "password")
-                assertEquals(old, f.client.currentSession())
-                assertNotSame(old, f.client.currentSession())
-            }
-            Invalidation.CLIENT -> {
-                val replacement = f.graph.configure(f.client.server)
-                replacement.login("listener", "password")
-                assertNotSame(f.client, replacement)
-            }
-            Invalidation.INTENT -> f.model.stopPlayback()
-            Invalidation.EPOCH -> PlaybackRequests.invalidate()
+    @Test fun rawAdmissionRejectsReplacedKeyWithoutRefetchOrFallback() = fixture { f ->
+        val oldKey = f.controls.state.value.interactionKey!!
+        f.controls.state.value = f.controls.state.value.copy(interactionKey = PlaybackInteractionKey())
+        f.model.contextualFrom(f.client, f.row, oldKey)
+        runCurrent(); assertTrue(f.controls.pending.isEmpty()); assertNull(f.model.state.value.notice)
+        assertEquals(0, f.playbackReads.get())
+    }
+    @Test fun rawManualDuplicateSelectionForwardsOnlyExactEntryWithOriginalContextAndBinding() = fixture { f ->
+        f.model.open(Page.Playlist(PlaylistSummary("manual", "Manual")))
+        val selected = f.row.copy(entryId = "two")
+        f.model.contextualFrom(f.client, selected, f.controls.key)
+        until { f.controls.pending.size == 1 }
+        val held = f.controls.pending.single()
+        val selection = held.selection as QueueIntentSelection.Track
+        assertEquals("two", selection.track.getValue("entryId").jsonPrimitive.content)
+        assertEquals("same", selection.track.getValue("id").jsonPrimitive.content)
+        assertEquals(PlaybackContext("playlist", "manual", "Manual"), selection.context)
+        assertSame(f.controls.key, held.key); assertEquals(f.controls.binding, held.binding)
+        assertEquals(0, f.playbackReads.get()); assertNull(f.model.state.value.notice)
+    }
+    @Test fun rawDefaultManualQueueAndPlayNextKeepExactEntryAndWaitForAcceptance() = fixture { f ->
+        f.model.open(Page.Playlist(PlaylistSummary("manual", "Manual")))
+        for (next in listOf(false, true)) {
+            f.model.clearNotice()
+            val count = f.controls.pending.size + 1
+            f.model.enqueueFrom(f.client, f.row.copy(entryId = "two"), playNext = next)
+            until { f.controls.pending.size == count }
+            val held = f.controls.pending.last()
+            assertEquals(if (next) PlaybackListAction.PLAY_NEXT else PlaybackListAction.QUEUE_HIGH, held.action)
+            val selected = held.selection as QueueIntentSelection.Track
+            assertEquals("two", selected.track.getValue("entryId").jsonPrimitive.content)
+            assertEquals("manual", selected.context!!.id)
+            assertTrue(held.current()); assertTrue(f.model.state.value.preparing)
+            assertNull("Preparing/submitting a manual duplicate is not acceptance", f.model.state.value.notice)
+            held.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
+            until { !f.model.state.value.preparing }
+            assertEquals("Added to queue", f.model.state.value.notice)
         }
-        runCurrent()
-        assertFalse("Queued work must recheck $invalidation before mutation (prepared=$prepared)", pending.isCurrent())
-        assertFalse(pending.dispatchIfCurrent())
-        assertEquals("No old-route mutation may be dispatched", 0, pending.dispatches)
-        val notice = f.model.state.value.notice
-        // Also model a result already accepted before invalidation but delivered afterward.
-        pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-        runCurrent()
-        assertEquals("Old acceptance must not publish after $invalidation (prepared=$prepared)", notice, f.model.state.value.notice)
+        assertEquals(0, f.playbackReads.get())
     }
-
-    @Test fun enqueueCompletionCannotPublishIntoAnotherRoute() = staleCompletion(false, Invalidation.ROUTE)
-    @Test fun preparedCompletionCannotPublishIntoAnotherRoute() = staleCompletion(true, Invalidation.ROUTE)
-    @Test fun enqueueCompletionCannotPublishAfterReauthentication() = staleCompletion(false, Invalidation.ACCOUNT)
-    @Test fun preparedCompletionCannotPublishAfterReauthentication() = staleCompletion(true, Invalidation.ACCOUNT)
-    @Test fun enqueueCompletionCannotPublishIntoReplacementClient() = staleCompletion(false, Invalidation.CLIENT)
-    @Test fun preparedCompletionCannotPublishIntoReplacementClient() = staleCompletion(true, Invalidation.CLIENT)
-    @Test fun enqueueCompletionCannotPublishAfterNewIntent() = staleCompletion(false, Invalidation.INTENT)
-    @Test fun preparedCompletionCannotPublishAfterNewIntent() = staleCompletion(true, Invalidation.INTENT)
-    @Test fun enqueueCompletionCannotPublishAfterAuthorityEpochChanges() = staleCompletion(false, Invalidation.EPOCH)
-    @Test fun preparedCompletionCannotPublishAfterAuthorityEpochChanges() = staleCompletion(true, Invalidation.EPOCH)
-    @Test fun enqueueCompletionCannotReviveAfterRouteRoundTrip() = staleCompletion(false, Invalidation.ROUTE_ROUND_TRIP)
-    @Test fun preparedCompletionCannotReviveAfterRouteRoundTrip() = staleCompletion(true, Invalidation.ROUTE_ROUND_TRIP)
-
-    @Test fun olderEnqueueAcceptanceCannotPublishWhileANewerActionIsPending() = fixture { f ->
-        f.model.enqueueFrom(f.client, f.selected)
-        until { f.playback.actions.size == 1 }
-        val older = f.playback.actions.single()
-        f.model.enqueueFrom(f.client, f.selected.copy(entryId = "entry-3"))
-        runCurrent()
-        assertEquals("Second dispatch waits for the first callback", 1, f.playback.actions.size)
-        assertTrue("A newer Add supersedes feedback, not the older queued mutation", older.dispatchIfCurrent())
-        older.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-        until { f.playback.actions.size == 2 }
-        assertNull("Older acceptance must not publish into the pending newer action", f.model.state.value.notice)
-        assertTrue(f.model.state.value.preparing)
-        val newer = f.playback.actions.last()
-        assertTrue(newer.dispatchIfCurrent())
-        val newest = PlaybackActionResult(PlaybackActionStatus.FULL)
-        newer.complete(newest)
-        until { !f.model.state.value.preparing }
-        assertEquals(newest.userMessage, f.model.state.value.notice)
-    }
-
-    @Test fun repeatedPreparedAddsDispatchInFifoButOnlyNewestFeedbackPublishes() = fixture { f ->
-        f.prepared()
-        f.prepared()
-        assertTrue("Prepared requests also wait for their lane coroutines", f.playback.actions.isEmpty())
-        runCurrent()
-        assertEquals("The second prepared action must await first acceptance", 1, f.playback.actions.size)
-        val older = f.playback.actions.single()
-        assertSame(f.queue, older.queue)
-        assertEquals(PlaybackListAction.ADD_TO_QUEUE, older.action)
-        assertEquals("entry-2", older.startEntryId)
-        assertTrue("A repeated Add must not invalidate the earlier mutation", older.dispatchIfCurrent())
-        assertEquals(1, older.dispatches)
-        assertTrue(f.model.state.value.preparing)
+    @Test fun delayedPreparedManualCompatibilityRetainsCompleteQueueRevisionAndSelectedDuplicate() = fixture { f ->
+        val queue = f.manualQueue
+        f.prepare(queue); until { f.controls.preparedPending.size == 1 }
+        val held = f.controls.preparedPending.single()
+        assertSame(queue, held.queue); assertEquals(7L, held.queue.revision)
+        assertEquals("manual", held.queue.context!!.id)
+        assertEquals(listOf("one", "two"), held.queue.items.map { it.entryId })
+        assertEquals("same", held.startTrackId); assertEquals("two", held.startEntryId)
+        assertTrue(held.current()); assertTrue(f.model.state.value.preparing)
         assertNull(f.model.state.value.notice)
-        older.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-        until { f.playback.actions.size == 2 }
-        assertNull("An older result must not publish while newer acceptance is pending", f.model.state.value.notice)
-        assertTrue(f.model.state.value.preparing)
-        val newer = f.playback.actions.last()
-        assertSame(f.queue, newer.queue)
-        assertEquals(PlaybackListAction.ADD_TO_QUEUE, newer.action)
-        assertEquals("entry-2", newer.startEntryId)
-        assertTrue(newer.dispatchIfCurrent())
-        val newestResult = PlaybackActionResult(PlaybackActionStatus.FULL)
-        newer.complete(newestResult)
-        until { !f.model.state.value.preparing }
-        assertEquals(newestResult.userMessage, f.model.state.value.notice)
+        val accepted = PlaybackActionResult(PlaybackActionStatus.LIMITED, 1)
+        held.complete(accepted); until { !f.model.state.value.preparing }
+        assertEquals(accepted.userMessage, f.model.state.value.notice)
+    }
+    @Test fun rawHeldReceiverPreparationKeepsOriginalBindingAfterOutputReplacement() = fixture { f ->
+        f.submit(); f.submit(item = f.row.copy(id = "Y")); runCurrent()
+        assertEquals(1, f.controls.pending.size)
+        val first = f.controls.pending.single()
+        f.controls.state.value = f.controls.state.value.copy(interactionKey = PlaybackInteractionKey(),
+            queueIntentBinding = f.controls.binding.copy(outputDeviceId = "other", receiverId = "other_receiver", revision = 1))
+        first.complete(PlaybackActionResult(PlaybackActionStatus.STALE))
+        until { f.controls.pending.size == 2 }
+        val second = f.controls.pending.last()
+        assertSame(f.controls.key, first.key); assertSame(f.controls.key, second.key)
+        assertEquals(f.controls.binding, first.binding); assertEquals(f.controls.binding, second.binding)
+        assertNotEquals(f.controls.state.value.queueIntentBinding, second.binding)
+        assertNull("The second pending action has no acceptance yet", f.model.state.value.notice)
+        val rejected = PlaybackActionResult(PlaybackActionStatus.STALE)
+        second.complete(rejected); until { !f.model.state.value.preparing }
+        assertEquals(rejected.userMessage, f.model.state.value.notice)
+    }
+    @Test fun rawBenignTransportPublicationPreservesCapturedSelectionKeyAndBinding() = fixture { f ->
+        f.model.contextualFrom(f.client, f.row, f.controls.key)
+        f.controls.state.value = f.controls.state.value.copy(positionMs = 500, isBuffering = true, playWhenReady = true,
+            transportInteractionKey = PlaybackInteractionKey())
+        runCurrent(); val held = f.controls.pending.single()
+        assertSame(f.controls.key, held.key); assertEquals(f.controls.binding, held.binding)
+        assertEquals(PlaybackListAction.QUEUE_HIGH, held.action); assertTrue(held.current())
+        val selection = held.selection as QueueIntentSelection.Track
+        assertEquals("album", selection.track.getValue("albumId").jsonPrimitive.content)
+        assertNull("Receiver infers Now's album context; row High stays one raw row", selection.context)
+        assertNull(f.model.state.value.notice)
+    }
+    private fun allTypedResultsWaitForTerminalCallback(prepared: Boolean) = fixture { f ->
+        for (status in PlaybackActionStatus.entries) {
+            f.model.clearNotice()
+            val held = admit(f, prepared)
+            assertTrue(held.dispatchIfCurrent()); assertTrue(f.model.state.value.preparing)
+            assertNull("No optimistic acceptance for $status", f.model.state.value.notice)
+            val result = PlaybackActionResult(status, if (status == PlaybackActionStatus.LIMITED) 1 else 0)
+            held.complete(result); until { !f.model.state.value.preparing }
+            assertEquals(result.userMessage, f.model.state.value.notice)
+        }
+    }
+    @Test fun everyRawTypedResultWaitsForTerminalCallback() = allTypedResultsWaitForTerminalCallback(false)
+    @Test fun everyPreparedTypedResultWaitsForTerminalCallback() = allTypedResultsWaitForTerminalCallback(true)
+
+    @Test fun signedDerivedSelectionRemainsOpaqueAndNeverFallsBackToAlbum() = fixture { f ->
+        val selection = queueIntentSelection(f.row, PlaybackContext("derived", "rules", "Rules", 5, "fence"), "exact-path", "opaque.signed")
+        f.model.queueIntentSelectionFrom(f.client, selection, PlaybackListAction.QUEUE_LOW)
+        runCurrent(); assertSame(selection, f.controls.pending.single().selection)
+        assertEquals(0, f.playbackReads.get())
     }
 }

@@ -917,9 +917,11 @@ class NativePlayerTest {
             upcoming = listOf(QueueEntry("first", duplicate, 19), QueueEntry("second", duplicate, 3)))
         setNowPlaying(snapshot, controls)
         compose.onNodeWithContentDescription("Upcoming queue").assertIsDisplayed()
-        compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1]
-            .performScrollTo().performClick()
-        compose.onNodeWithText("Play next").performClick()
+        for (label in listOf("Queue Low", "Queue High", "Play next", "Play now")) {
+            compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1]
+                .performScrollTo().performClick()
+            compose.onNodeWithText(label).performClick()
+        }
         compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[0]
             .performScrollTo().performClick()
         compose.onNodeWithText("Move up").assertIsNotEnabled()
@@ -928,17 +930,20 @@ class NativePlayerTest {
             .performScrollTo().performClick()
         compose.onNodeWithText("Remove from queue").performClick()
         compose.onAllNodesWithContentDescription("Play queued song Duplicate song").assertCountEquals(0)
-        compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1]
-            .performScrollTo().performClick()
-        compose.onNodeWithText("Play now").performClick()
         compose.onNodeWithText("Undo").performClick()
         compose.onNodeWithContentDescription("Upcoming queue actions").performClick()
         compose.onNodeWithText("Clear upcoming").performClick()
         compose.runOnIdle {
             assertEquals(listOf("first" to 1), controls.moves)
-            assertEquals(listOf(interactionKey to "second"), controls.playNexts)
+            assertEquals(listOf(
+                dev.spofify.mobile.playback.PlaybackListAction.QUEUE_LOW,
+                dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
+                dev.spofify.mobile.playback.PlaybackListAction.PLAY_NEXT,
+                dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW,
+            ).map { Triple(interactionKey, "second", it) }, controls.queueIntents)
+            assertTrue("No legacy Play-next fallback", controls.playNexts.isEmpty())
             assertEquals(listOf("second"), controls.removed)
-            assertEquals(listOf("second"), controls.selected)
+            assertTrue("Now must address the guarded raw occurrence, not unguarded legacy select", controls.selected.isEmpty())
             assertEquals(1, controls.undos)
             assertEquals(1, controls.clears)
             assertEquals(0, controls.stops)
@@ -1387,6 +1392,7 @@ class NativePlayerTest {
         val moves = mutableListOf<Pair<String, Int>>()
         val guardedMoves = mutableListOf<Triple<PlaybackInteractionKey, String, Int>>()
         val playNexts = mutableListOf<Pair<PlaybackInteractionKey, String>>()
+        val queueIntents = mutableListOf<Triple<PlaybackInteractionKey, String, dev.spofify.mobile.playback.PlaybackListAction>>()
         val removed = mutableListOf<String>()
         val selected = mutableListOf<String>()
         val selectedIndices = mutableListOf<Int>()
@@ -1396,7 +1402,7 @@ class NativePlayerTest {
             assertEquals(0, seeks); assertEquals(0, shuffles); assertEquals(0, repeats)
             assertEquals(0, undos); assertEquals(0, clears)
             assertTrue(keyedAttempts.isEmpty()); assertTrue(moves.isEmpty()); assertTrue(guardedMoves.isEmpty())
-            assertTrue(playNexts.isEmpty()); assertTrue(removed.isEmpty()); assertTrue(selected.isEmpty())
+            assertTrue(queueIntents.isEmpty()); assertTrue(playNexts.isEmpty()); assertTrue(removed.isEmpty()); assertTrue(selected.isEmpty())
             assertTrue(selectedIndices.isEmpty())
         }
 
@@ -1428,6 +1434,13 @@ class NativePlayerTest {
         override fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int) {
             guardedMoves += Triple(expectedKey, occurrenceId, toIndex)
             moves += occurrenceId to toIndex
+        }
+        override fun queueIntentOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+            action: dev.spofify.mobile.playback.PlaybackListAction, isCurrent: () -> Boolean,
+            onResult: (PlaybackActionResult) -> Unit) {
+            org.junit.Assert.assertTrue("Raw queue intent retains the originating host guard", isCurrent())
+            queueIntents += Triple(expectedKey, occurrenceId, action)
+            onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP))
         }
         override fun playNextOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
             isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {

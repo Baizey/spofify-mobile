@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "name": "actual-player-pause-only-aligned-receipt",
+  "initialPoll": {
+    "action": "poll",
+    "deviceId": "pc",
+    "epoch": 7,
+    "stateSeq": 1,
+    "state": {
+      "version": 1,
+      "queue": [],
+      "position": -1,
+      "context": null,
+      "shuffle": false,
+      "repeat": "off",
+      "elapsed": 0,
+      "duration": 0,
+      "playing": false,
+      "waiting": false,
+      "loading": false,
+      "error": "",
+      "truncated": false,
+      "notice": "",
+      "occurrence": null
+    },
+    "queueIntentState": {
+      "receiverId": "receiver_01010101010101010101010101010101",
+      "revision": 1,
+      "provenance": "tracked",
+      "origins": [],
+      "highKeys": []
+    },
+    "acks": []
+  },
+  "commandRequest": {
+    "action": "command",
+    "deviceId": "controller",
+    "epoch": 7,
+    "commandId": "pause_only",
+    "command": {
+      "type": "queueIntent",
+      "intent": "high",
+      "expected": {
+        "outputDeviceId": "pc",
+        "receiverId": "receiver_01010101010101010101010101010101",
+        "revision": 1,
+        "currentKey": null,
+        "currentEventId": null
+      },
+      "selection": {
+        "kind": "track",
+        "track": {
+          "id": "X",
+          "name": "X",
+          "artists": [],
+          "albumName": "",
+          "albumId": "",
+          "duration": 120
+        },
+        "context": null
+      }
+    }
+  },
+  "terminalPoll": {
+    "action": "poll",
+    "deviceId": "pc",
+    "epoch": 7,
+    "stateSeq": 2,
+    "state": {
+      "version": 1,
+      "queue": [
+        {
+          "id": "X",
+          "name": "X",
+          "artists": [],
+          "albumName": "",
+          "albumId": "",
+          "duration": 120,
+          "key": 1,
+          "order": 1
+        }
+      ],
+      "position": 0,
+      "context": null,
+      "shuffle": false,
+      "repeat": "off",
+      "elapsed": 0,
+      "duration": 0,
+      "playing": false,
+      "waiting": false,
+      "loading": false,
+      "error": "",
+      "truncated": false,
+      "notice": "",
+      "occurrence": {
+        "key": 1,
+        "trackId": "X",
+        "eventId": "02020202020202020202020202020202",
+        "progress": 0,
+        "reported": false
+      }
+    },
+    "queueIntentState": {
+      "receiverId": "receiver_01010101010101010101010101010101",
+      "revision": 2,
+      "provenance": "tracked",
+      "origins": [
+        {
+          "key": 1,
+          "intent": "high"
+        }
+      ],
+      "highKeys": []
+    },
+    "acks": [
+      {
+        "deliveryId": "delivery_pause_only",
+        "epoch": 7,
+        "status": "ok",
+        "queueIntentResult": {
+          "outcome": "queued",
+          "acceptedCount": 1,
+          "commitRevision": 2,
+          "placement": "high",
+          "playback": "superseded",
+          "playbackKey": null,
+          "notice": ""
+        }
+      }
+    ]
+  }
+}

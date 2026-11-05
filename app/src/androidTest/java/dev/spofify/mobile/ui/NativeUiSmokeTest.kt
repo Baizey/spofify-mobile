@@ -774,7 +774,7 @@ class NativeUiSmokeTest {
         compose.onNodeWithContentDescription(more).performClick()
         waitFor(hasTestTag("music-actions"))
         screenshot("15-list-more")
-        compose.onNodeWithText("Add to queue").performScrollTo().assertHeightIsAtLeast(48.dp).performClick()
+        compose.onNodeWithText("Queue High").performScrollTo().assertHeightIsAtLeast(48.dp).performClick()
         waitUntilAbsent(hasTestTag("music-actions"))
         compose.waitUntil(15_000) { readPlaybackState().upcoming.size == initialFuture.size + 3 }
         val added = readPlaybackState()
@@ -814,25 +814,31 @@ class NativeUiSmokeTest {
         collapsePlayer()
         waitUntilAbsent(playerSheet)
 
-        // Explicit Add remains nonstarting when paused; the subsequent physical-right
-        // selection is deliberate Play now, not a resume of the previously audible song.
+        // Low and physical-right High preserve the exact paused current, even with High
+        // pending. Only the separate deliberate Now below changes selection and starts.
         compose.onNode(playingButton()).performClick()
         waitFor(pausedButton())
         val paused = readPlaybackState()
         scrollToCatalogItem(additions.last())
         compose.onNodeWithContentDescription(more).performClick()
         waitFor(hasTestTag("music-actions"))
-        compose.onNodeWithText("Add to queue").performScrollTo().performClick()
+        compose.onNodeWithText("Queue Low").performScrollTo().performClick()
         waitUntilAbsent(hasTestTag("music-actions"))
         compose.waitUntil(15_000) { readPlaybackState().upcoming.size == paused.upcoming.size + 1 }
         assertFalse(readPlaybackState().playWhenReady)
         assertEquals(paused.currentEntryId, readPlaybackState().currentEntryId)
+        val beforeHigh = readPlaybackState()
         swipeCatalogRowRight(additions.first())
-        compose.waitUntil(20_000) {
-            val state = readPlaybackState()
-            state.item?.name == additions.first() && state.isPlaying
-        }
-        screenshot("17-paused-swipe-starts-selected")
+        compose.waitUntil(15_000) { readPlaybackState().upcoming.size == beforeHigh.upcoming.size + 1 }
+        assertEquals(paused.currentEntryId, readPlaybackState().currentEntryId)
+        assertFalse(readPlaybackState().playWhenReady)
+        assertTrue(kotlin.math.abs(paused.positionMs - readPlaybackState().positionMs) < 250)
+        screenshot("17-paused-low-and-high-preserve-current")
+        scrollToCatalogItem(additions.first())
+        compose.onNodeWithContentDescription("More actions for ${additions.first()}").performClick()
+        compose.onNodeWithText("Play now").performScrollTo().performClick()
+        compose.waitUntil(20_000) { readPlaybackState().item?.name == additions.first() && readPlaybackState().isPlaying }
+        screenshot("17a-explicit-now-changes-selection")
     }
 
     private fun assertContextualListFont2() {
@@ -843,7 +849,7 @@ class NativeUiSmokeTest {
         scrollToCatalogItem(name)
         compose.onNodeWithContentDescription("More actions for $name").performClick()
         waitFor(hasTestTag("music-actions"))
-        compose.onNodeWithText("Add to queue").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("Queue High").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         screenshot("18a-font2-list-more")
         pressBack()
         waitUntilAbsent(hasTestTag("music-actions"))
@@ -1345,9 +1351,8 @@ class NativeUiSmokeTest {
         assertTrue("Every song has an accessible More action", "More actions" in custom)
         assertEquals("Deliberate Play now matches audio availability", playable, "Play now" in custom)
         val playback = readPlaybackState()
-        val activeIntent = playback.isPlaying || (playback.isBuffering && playback.playWhenReady)
-        assertEquals("Contextual Add is available only with active playback and a current binding",
-            playable && activeIntent && playback.interactionKey != null, "Add to queue" in custom)
+        assertEquals("Queue High requires a current binding, independent of play/pause state",
+            playable && playback.interactionKey != null, "Queue High" in custom)
         return SongRowSlots(bounds.width, bounds.height, art, more, text, buttons, custom,
             row.config.getOrNull(SemanticsActions.OnLongClick)?.label, row.config.getOrNull(SemanticsProperties.StateDescription))
     }
@@ -1365,7 +1370,7 @@ class NativeUiSmokeTest {
             fun checkMenu() {
                 waitFor(menu)
                 compose.onNode(hasText(name) and inMenu).assertExists()
-                listOf("Play now", "Play next", "Add to queue").forEach { action ->
+                listOf("Play now", "Play next", "Queue Low", "Queue High").forEach { action ->
                     val control = compose.onNode(hasText(action) and hasClickAction() and inMenu)
                     if (index == 4) control.assertIsNotEnabled() else control.assertIsEnabled()
                 }

@@ -12,20 +12,13 @@ import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.test.core.app.ApplicationProvider
-import dev.spofify.mobile.core.LibraryItem
-import dev.spofify.mobile.core.PlaybackQueue
-import dev.spofify.mobile.core.ServerAddress
-import dev.spofify.mobile.core.SessionStore
-import dev.spofify.mobile.core.SpofifyClient
-import dev.spofify.mobile.core.StoredSession
+import dev.spofify.mobile.core.*
 import dev.spofify.mobile.playback.*
 import dev.spofify.mobile.ui.theme.AppTypography
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
-import okhttp3.mockwebserver.Dispatcher
-import okhttp3.mockwebserver.MockResponse
-import okhttp3.mockwebserver.MockWebServer
-import okhttp3.mockwebserver.RecordedRequest
+import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.mockwebserver.*
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -34,20 +27,17 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
-/** Exercises the production host/sheet wiring, not just MusicActionsContent callbacks.
- * Delayed controls model acknowledged dispatch; native rendering/service policy remain separate gates. */
+/** Actual Source -> host -> More -> VM boundary. Robolectric is not native acceptance. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], qualifiers = "w320dp-h640dp-xhdpi")
 class CatalogMoreHostTest {
     @get:Rule val compose = createComposeRule()
-
     private class MemoryStore : SessionStore {
-        private var session: StoredSession? = null
-        override fun read() = session
-        override fun write(value: StoredSession?) { session = value }
+        private var value: StoredSession? = null
+        override fun read() = value
+        override fun write(value: StoredSession?) { this.value = value }
     }
     private class MemoryLoginStore : LoginStore {
         override fun read(): RememberedLogin? = null
@@ -57,29 +47,21 @@ class CatalogMoreHostTest {
         val registry = LifecycleRegistry(this)
         override val lifecycle: Lifecycle get() = registry
     }
-    private data class PendingAction(
-        val queue: PlaybackQueue,
-        val action: PlaybackListAction,
-        val key: PlaybackInteractionKey?,
-        val startTrackId: String?,
-        val isCurrent: () -> Boolean,
-        val complete: (PlaybackActionResult) -> Unit,
-    )
-    private class DelayedPlayback : PlaybackControls {
-        override val state = MutableStateFlow(PlaybackState(interactionKey = PlaybackInteractionKey()))
-        val pending = mutableListOf<PendingAction>()
-        var replacements = 0
-        override fun performPreparedAction(queue: PlaybackQueue, client: SpofifyClient,
-            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?,
-            startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean,
+    private data class Pending(val selection: QueueIntentSelection, val action: PlaybackListAction,
+        val key: PlaybackInteractionKey?, val binding: QueueIntentBinding?, val current: () -> Boolean,
+        val complete: (PlaybackActionResult) -> Unit)
+    private class Controls : PlaybackControls {
+        override val state = MutableStateFlow(PlaybackState(interactionKey = PlaybackInteractionKey(),
+            queueIntentBinding = QueueIntentBinding("pc", "receiver", 7, 1, "history-A"), canQueueIntent = true))
+        val pending = mutableListOf<Pending>()
+        override fun queueIntent(selection: QueueIntentSelection, client: SpofifyClient, action: PlaybackListAction,
+            expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?, isCurrent: () -> Boolean,
             onResult: (PlaybackActionResult) -> Unit) {
-            pending += PendingAction(queue, action, expectedKey, startTrackId, isCurrent, onResult)
+            pending += Pending(selection, action, expectedKey, expectedBinding, isCurrent, onResult)
         }
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?,
-            shuffle: Boolean, startEntryId: String?) { replacements++ }
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) {
-            error("More must use the acknowledged list-action boundary")
-        }
+        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean,
+            startEntryId: String?) = error("More must not use legacy replacement")
+        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) = error("No legacy fallback")
         override fun connect() = Unit
         override fun release() = Unit
         override fun toggle() = Unit
@@ -91,40 +73,35 @@ class CatalogMoreHostTest {
         override fun cycleRepeat() = Unit
         override fun stop() { PlaybackRequests.invalidate() }
     }
-
     private val web = MockWebServer()
     private val store = ViewModelStore()
     private val owner = Owner()
-    private val playback = DelayedPlayback()
+    private val controls = Controls()
     private val shown = mutableStateOf(true)
-    private val fetchStarted = CountDownLatch(1)
-    private val releaseFetch = CountDownLatch(1)
-    @Volatile private var holdFetch = false
+    private val playbackReads = AtomicInteger()
     private lateinit var graph: AppGraph
     private lateinit var model: LibraryViewModel
-    private var mounted = false
     private val trackJson = """{"kind":"track","id":"song","name":"Synthetic song","albumId":"album","hasAudio":true}"""
-
     private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
-
     @Before fun setUp() {
         web.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl?.encodedPath) {
-                "/api/auth/login" -> json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"csrf"}""")
-                    .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
-                "/api/auth/logout" -> MockResponse().setResponseCode(204)
-                "/api/library/revision" -> json("""{"revision":1}""")
-                "/api/library/tracks/song" -> json("""{"item":$trackJson,"revision":1}""")
-                "/api/me/recent" -> json("""{"items":[{"track":$trackJson}],"total":1,"offset":0,"limit":40}""")
-                "/api/me/likes/status" -> json("""{"items":[{"trackId":"song","liked":false}]}""")
-                "/api/library/albums/album/playback" -> {
-                    if (holdFetch) {
-                        fetchStarted.countDown()
-                        check(releaseFetch.await(5, TimeUnit.SECONDS)) { "Synthetic playback gate timed out" }
-                    }
-                    json("""{"items":[$trackJson],"total":1}""")
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.requestUrl!!.encodedPath
+                if (path.endsWith("/playback")) playbackReads.incrementAndGet()
+                return when (path) {
+                    "/api/auth/login" -> json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"csrf"}""")
+                        .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
+                    "/api/auth/logout" -> MockResponse().setResponseCode(204)
+                    "/api/library/revision" -> json("""{"revision":1}""")
+                    "/api/library/tracks/song" -> json("""{"item":$trackJson,"revision":1}""")
+                    "/api/me/recent" -> json("""{"items":[{"track":$trackJson}],"total":1,"offset":0,"limit":40}""")
+                    "/api/me/likes/status" -> json("""{"items":[{"trackId":"song","liked":false}]}""")
+                    "/api/library" -> if (request.requestUrl!!.queryParameter("kind") == "tracks")
+                        json("""{"items":[$trackJson],"total":1,"offset":0,"limit":40,"revision":1}""")
+                    else json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
+                    "/api/library/albums/album" -> json("""{"item":{"kind":"album","id":"album","name":"Synthetic album","coverage":{"inLibrary":2}},"revision":1}""")
+                    else -> json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
                 }
-                else -> json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
             }
         }
         web.start()
@@ -134,11 +111,9 @@ class CatalogMoreHostTest {
         runBlocking { client.login("listener", "synthetic-password") }
         compose.runOnIdle {
             owner.registry.currentState = Lifecycle.State.RESUMED
-            model = LibraryViewModel(app, graph, playback)
-            store.put("subject", model)
+            model = LibraryViewModel(app, graph, controls); store.put("subject", model)
         }
-        awaitHost { !model.state.value.restoring && model.state.value.session != null }
-        mounted = true
+        await { !model.state.value.restoring && model.state.value.session != null }
         compose.setContent {
             CompositionLocalProvider(LocalLifecycleOwner provides owner) {
                 MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
@@ -146,228 +121,214 @@ class CatalogMoreHostTest {
                 }
             }
         }
-        awaitHost { model.homeHolder()?.state?.value?.recent?.value?.isNotEmpty() == true }
+        await { model.homeHolder()?.state?.value?.recent?.value?.isNotEmpty() == true }
     }
-
     @After fun tearDown() {
-        releaseFetch.countDown()
         try {
-            if (mounted) {
-                compose.runOnIdle { shown.value = false }
-                compose.waitForIdle()
-            }
+            compose.runOnIdle { shown.value = false }; compose.waitForIdle()
             compose.runOnIdle { store.clear(); if (::graph.isInitialized) graph.clear() }
-        } finally {
-            web.shutdown()
-        }
+        } finally { web.shutdown() }
     }
-
+    private fun await(condition: () -> Boolean) = compose.waitUntil(5_000) { compose.runOnIdle(condition) }
     private fun openMore() {
         compose.onNodeWithContentDescription("More actions for Synthetic song").performClick()
         compose.onNodeWithTag("music-actions").assertExists()
     }
-    private fun choose(label: String) {
+    private fun choose(label: String): Pending {
+        val count = controls.pending.size + 1
         compose.onNodeWithText(label).performScrollTo().performClick()
         compose.onNodeWithTag("music-actions").assertDoesNotExist()
+        await { controls.pending.size == count }
+        return compose.runOnIdle { controls.pending.last() }
     }
-    private fun awaitHost(condition: () -> Boolean) {
-        // Network completion resumes viewModelScope on Android's main queue, not the
-        // Compose frame clock. Drain that queue on every poll, and inspect lazy holders
-        // and the playback fake on their owning thread rather than racing UI callbacks.
-        compose.waitUntil(5_000) { compose.runOnIdle(condition) }
-    }
-    private fun awaitAction(count: Int = 1): PendingAction {
-        awaitHost { playback.pending.size == count }
-        return compose.runOnIdle { playback.pending.last() }
-    }
-
-    @Test fun actualRecentlyPlayedRowsKeepMoreWithoutInlinePlayOrAutoplay() {
+    @Test fun homeMoreHasFourIndependentIntentsAndNoInlinePlayOrCompositionSubmission() {
         compose.onNodeWithText("Recently played").assertIsDisplayed()
-        compose.onNodeWithText("Synthetic song").assertIsDisplayed()
-        compose.onNodeWithContentDescription("More actions for Synthetic song").assertIsEnabled()
         compose.onNodeWithContentDescription("Play Synthetic song").assertDoesNotExist()
         openMore()
-        compose.onNodeWithText("Play now").assertIsEnabled()
-        compose.runOnIdle {
-            assertTrue("Opening Recently played More must not submit playback", playback.pending.isEmpty())
-            assertEquals(0, playback.replacements)
-        }
+        for (label in listOf("Queue Low", "Queue High", "Play next", "Play now"))
+            compose.onNodeWithText(label).assertIsEnabled()
+        compose.runOnIdle { assertTrue(controls.pending.isEmpty()); assertEquals(0, playbackReads.get()) }
     }
-
-    @Test fun idleContextualIntentSurvivesSheetDismissalAndProgressUntilAcknowledged() {
-        val captured = playback.state.value.interactionKey
-        openMore()
-        compose.onNodeWithText("Play now (swipe action)").assertIsEnabled()
-        compose.onNodeWithText("Add to queue (swipe action)").assertDoesNotExist()
-        choose("Play now (swipe action)")
-        val pending = awaitAction()
-        compose.runOnIdle {
-            assertEquals(PlaybackListAction.CONTEXTUAL, pending.action)
-            assertSame(captured, pending.key)
-            assertEquals("song", pending.startTrackId)
-            assertEquals("song", pending.queue.items.single().id)
-            assertTrue("Dismissing the accepting sheet must not retire the intent", pending.isCurrent())
-            assertNull("No optimistic Playing/Added feedback", model.state.value.notice)
-            assertEquals(0, playback.replacements)
-            playback.state.value = playback.state.value.copy(positionMs = 5_000)
-        }
-        compose.runOnIdle {
-            assertTrue("Benign progress must not retire an accepted intent", pending.isCurrent())
-            pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING))
-        }
-        compose.onNodeWithText("Playing").assertExists()
-    }
-
-    @Test fun activeAndBufferingMoreKeepContextualExplicitAddPlayNextAndPlayNowDistinct() {
-        for (buffering in listOf(false, true)) {
-            compose.runOnIdle {
-                playback.state.value = playback.state.value.copy(isPlaying = !buffering,
-                    isBuffering = buffering, playWhenReady = true)
-            }
-            for ((label, action) in listOf("Add to queue" to PlaybackListAction.ADD_TO_QUEUE,
-                "Play next" to PlaybackListAction.PLAY_NEXT,
-                "Add to queue (swipe action)" to PlaybackListAction.CONTEXTUAL)) {
-                openMore()
-                compose.onAllNodesWithText("Add to queue").assertCountEquals(1)
-                compose.onAllNodesWithText("Play now").assertCountEquals(1)
-                compose.onNodeWithText("Play now (swipe action)").assertDoesNotExist()
-                val count = playback.pending.size + 1
-                choose(label)
-                val pending = awaitAction(count)
+    @Test fun pausedAndPlayingAndBufferingHomeRowsSendExactlyOneRawRowIntent() {
+        for (mode in 0..2) {
+            compose.runOnIdle { controls.state.value = controls.state.value.copy(isPlaying = mode == 1,
+                isBuffering = mode == 2, playWhenReady = mode == 2) }
+            for ((label, action) in listOf("Queue Low" to PlaybackListAction.QUEUE_LOW,
+                "Queue High" to PlaybackListAction.QUEUE_HIGH, "Play next" to PlaybackListAction.PLAY_NEXT,
+                "Play now" to PlaybackListAction.PLAY_NOW)) {
+                openMore(); val pending = choose(label)
                 compose.runOnIdle {
                     assertEquals(action, pending.action)
-                    assertTrue(pending.isCurrent())
-                    if (action == PlaybackListAction.CONTEXTUAL) assertSame(playback.state.value.interactionKey, pending.key)
-                    else assertNull("Explicit Add/Play next must not become contextual starts", pending.key)
+                    assertSame(controls.state.value.interactionKey, pending.key)
+                    assertEquals(controls.state.value.queueIntentBinding, pending.binding)
+                    val row = pending.selection as QueueIntentSelection.Track
+                    assertEquals("song", row.track.getValue("id").jsonPrimitive.content)
+                    assertNull(row.context)
+                    assertTrue(pending.current())
                     pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
                 }
             }
-            openMore()
-            val plays = playback.replacements
-            choose("Play now")
-            awaitHost { playback.replacements == plays + 1 }
         }
+        assertEquals("Receiver, not controller, resolves all contexts", 0, playbackReads.get())
     }
-
-    @Test fun routeAwayAndBackRetiresAcceptedIntentEvenThoughItsSheetAlreadyDismissed() {
-        openMore()
-        choose("Play now (swipe action)")
-        val pending = awaitAction()
-        compose.runOnIdle { model.switchTab(Tab.SEARCH) }
-        compose.runOnIdle { model.switchTab(Tab.HOME) }
+    @Test fun detailMoreRetainsOpeningBindingAndInnerRouteLifetime() {
+        compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song", "Synthetic song", hasAudio = true))) }
+        openMore(); val pending = choose("Queue High")
+        val page = model.state.value.page as Page.Detail
+        val catalog = checkNotNull(model.catalogHolder(page.item, page.navigationId))
         compose.runOnIdle {
-            assertFalse("A→B→A must not revive the old route lifetime", pending.isCurrent())
+            assertTrue(pending.current())
+            catalog.open(LibraryItem("album", "other", "Other")); assertTrue(catalog.back())
+            assertFalse("Unsampled route ABA cannot revive More", pending.current())
             pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-            assertNull(model.state.value.notice)
+        }
+        await { !model.state.value.preparing }
+        compose.runOnIdle { assertNull("Late callback was drained, not merely queued", model.state.value.notice) }
+    }
+    @Test fun searchAndCollectionDetailsUseActualHostMoreWithoutControllerPlaybackReads() {
+        compose.runOnIdle { model.switchTab(Tab.SEARCH); model.catalogHolder()?.commitQuery("Synthetic", immediate = true) }
+        compose.waitUntil(5_000) { compose.runOnIdle {
+            model.catalogHolder()?.state?.value?.current?.sections?.get("tracks")?.items?.isNotEmpty() == true
+        } }
+        openMore(); val search = choose("Queue High")
+        compose.runOnIdle {
+            assertTrue(search.selection is QueueIntentSelection.Track)
+            search.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+            model.open(Page.Detail(LibraryItem("album", "album", "Synthetic album", coverage = Coverage(inLibrary = 2))))
+        }
+        compose.onNodeWithContentDescription("More actions for Synthetic album").performClick()
+        val collection = choose("Queue Low")
+        compose.runOnIdle {
+            assertEquals(QueueIntentSelection.Collection(PlaybackContext("album", "album", "Synthetic album")), collection.selection)
+            assertEquals(0, playbackReads.get())
+            collection.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
         }
     }
-
-    @Test fun innerCatalogNavigationAwayAndBackAlsoRetiresAcceptedIntent() {
-        compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song", "Synthetic song", albumId = "album", hasAudio = true))) }
+    @Test fun openMoreDoesNotRetargetReplacementOutput() {
         openMore()
-        choose("Play now (swipe action)")
-        val pending = awaitAction()
-        val page = model.state.value.page as Page.Detail
-        val catalog = checkNotNull(model.catalogHolder(page.item, page.navigationId))
-        compose.runOnIdle { catalog.open(LibraryItem("album", "other", "Other album")) }
-        compose.runOnIdle { assertFalse("Inner navigation does not change LibraryState.page", pending.isCurrent()) }
-        compose.runOnIdle { assertTrue(catalog.back()) }
+        compose.runOnIdle { controls.state.value = controls.state.value.copy(interactionKey = PlaybackInteractionKey(),
+            queueIntentBinding = QueueIntentBinding("new", "newReceiver", 1, null, null)) }
+        compose.onNodeWithText("Queue Low").performScrollTo().performClick()
+        compose.runOnIdle { assertTrue(controls.pending.isEmpty()) }
+    }
+    @Test fun acceptedQueueWithUnchangedPausedCurrentNeverClaimsPlaying() {
+        openMore(); val pending = choose("Queue Low")
         compose.runOnIdle {
-            assertFalse("Returning to the same inner screen must not revive its retired lifetime", pending.isCurrent())
-            pending.complete(PlaybackActionResult(PlaybackActionStatus.STALE))
-            assertNull(model.state.value.notice)
+            pending.complete(queueIntentActionResult(QueueIntentResult("queued", 2, 8, "low", "unchanged", null, ""), pending.action))
+        }
+        compose.onNodeWithText("Queued 2 songs.").assertExists()
+        compose.runOnIdle { assertFalse(controls.state.value.isPlaying) }
+    }
+    @Test fun blockedAndMediaAndSupersededReceiptsKeepPositiveAcceptance() {
+        for (playback in listOf("blocked", "media", "superseded")) {
+            openMore(); val pending = choose("Play now")
+            val receipt = QueueIntentResult(if (playback == "superseded") "queued" else playback, 2, 8,
+                "replace", playback, if (playback == "superseded") null else 22, "")
+            compose.runOnIdle { pending.complete(queueIntentActionResult(receipt, pending.action)) }
+            await { model.state.value.notice?.contains("accepted") == true }
+            compose.runOnIdle {
+                assertFalse(model.state.value.notice!!.contains("Playing"))
+                assertFalse(model.state.value.notice!!.contains("Playback started"))
+            }
         }
     }
-
-    @Test fun unsampledInnerNavigationRoundTripCannotReviveAcceptedIntent() {
-        compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song", "Synthetic song", albumId = "album", hasAudio = true))) }
+    @Test fun unsampledInnerRouteABAWhileMoreIsStillOpenCannotDispatchOrRebind() {
+        compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song", "Synthetic song", hasAudio = true))) }
         openMore()
-        choose("Play now (swipe action)")
-        val pending = awaitAction()
         val page = model.state.value.page as Page.Detail
         val catalog = checkNotNull(model.catalogHolder(page.item, page.navigationId))
         compose.runOnIdle {
-            val screen = catalog.state.value.current
-            catalog.rememberScroll(screen.key, 1, 12)
-            assertTrue("Harmless same-route publication must preserve the intent", pending.isCurrent())
-            // No recomposition/collector sample between navigation and return.
             catalog.open(LibraryItem("album", "other", "Other album"))
-            assertTrue(catalog.back())
-            assertFalse("Event-time A→B→A must retire the original intent", pending.isCurrent())
-            pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-            assertNull("An old completion cannot publish after an unsampled round-trip", model.state.value.notice)
+            assertTrue(catalog.back()) // No Compose/collector sample between the two events.
+        }
+        compose.onNodeWithText("Queue High").performScrollTo().performClick()
+        compose.onNodeWithTag("music-actions").assertDoesNotExist()
+        compose.runOnIdle {
+            assertTrue("An old open More cannot acquire the returned route incarnation", controls.pending.isEmpty())
+            assertNull(model.state.value.notice)
+            assertEquals(0, playbackReads.get())
         }
     }
-
-    @Test fun unsampledInnerNavigationRoundTripWhileMoreIsOpenCannotDispatch() {
-        compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song", "Synthetic song", albumId = "album", hasAudio = true))) }
-        openMore()
+    @Test fun acceptedIntentSurvivesSheetDismissalAndBenignProgressUntilTerminalReceipt() {
+        val key = controls.state.value.interactionKey
+        val binding = controls.state.value.queueIntentBinding
+        openMore(); val pending = choose("Queue High")
+        compose.onNodeWithTag("music-actions").assertDoesNotExist()
+        compose.runOnIdle {
+            assertTrue("Dismissing accepted More is presentation, not cancellation", pending.current())
+            assertNull("Dispatch is not acceptance", model.state.value.notice)
+            controls.state.value = controls.state.value.copy(positionMs = 5_000, isBuffering = true, playWhenReady = true,
+                transportInteractionKey = PlaybackInteractionKey())
+        }
+        compose.runOnIdle {
+            assertTrue("Progress/buffering/transport-only key churn cannot retire a held list action", pending.current())
+            assertSame(key, pending.key); assertEquals(binding, pending.binding)
+            assertNull(model.state.value.notice)
+            pending.complete(queueIntentActionResult(QueueIntentResult("queued", 1, 8, "high", "unchanged", null, ""), pending.action))
+        }
+        compose.onNodeWithText("Queued").assertExists()
+        compose.runOnIdle { assertEquals(1, controls.pending.size); assertEquals(0, playbackReads.get()) }
+    }
+    @Test fun innerRouteNavigationAfterAcceptedDismissalRetiresWorkEvenAfterReturn() {
+        compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song", "Synthetic song", hasAudio = true))) }
+        openMore(); val pending = choose("Queue Low")
         val page = model.state.value.page as Page.Detail
         val catalog = checkNotNull(model.catalogHolder(page.item, page.navigationId))
+        compose.runOnIdle { assertTrue(pending.current()); catalog.open(LibraryItem("album", "other", "Other album")) }
+        compose.runOnIdle { assertFalse(pending.current()); assertTrue(catalog.back()) }
         compose.runOnIdle {
-            catalog.open(LibraryItem("album", "other", "Other album"))
-            assertTrue(catalog.back())
+            assertFalse("Returning to the same nested route cannot revive accepted work", pending.current())
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))
         }
-        choose("Play now (swipe action)")
-        compose.runOnIdle {
-            assertTrue("More cannot retarget a new event-time route incarnation", playback.pending.isEmpty())
-            assertEquals(0, playback.replacements)
-        }
+        await { !model.state.value.preparing }
+        compose.runOnIdle { assertNull("Late Playing receipt cannot publish after inner navigation", model.state.value.notice) }
     }
-
-    @Test fun outputBindingChangeWhileMoreIsOpenCannotRetargetItsCapturedSelection() {
-        openMore()
+    @Test fun outputLossDuringHeldReceiverPreparationCancelsWithoutReplayOrLatePlayingFeedback() {
+        openMore(); val pending = choose("Queue High")
         compose.runOnIdle {
-            playback.state.value = playback.state.value.copy(interactionKey = PlaybackInteractionKey())
-        }
-        choose("Play now (swipe action)")
-        compose.runOnIdle {
-            assertTrue("The old captured key must be rejected, not replaced by the current key", playback.pending.isEmpty())
-            assertEquals(0, playback.replacements)
-        }
-    }
-
-    @Test fun unavailableBindingDoesNotOfferAnExecutableContextualAction() {
-        compose.runOnIdle { playback.state.value = playback.state.value.copy(interactionKey = null) }
-        openMore()
-        compose.onNodeWithText("Play now (swipe action)").assertDoesNotExist()
-        compose.onNodeWithText("Add to queue (swipe action)").assertDoesNotExist()
-        compose.onNodeWithText("Play now").assertIsEnabled()
-        compose.onNodeWithText("Play next").assertIsEnabled()
-        compose.onNodeWithText("Add to queue").assertIsEnabled()
-    }
-
-    @Test fun outputLossDuringPreparationCancelsRatherThanStartingAfterSheetDismissal() {
-        holdFetch = true
-        openMore()
-        choose("Play now (swipe action)")
-        // Keep pumping main while waiting for preparation to reach the server gate.
-        // Blocking the test thread on the latch can strand a queued main continuation.
-        awaitHost { fetchStarted.count == 0L }
-        compose.runOnIdle {
-            assertTrue("Playback preparation must still be in flight at the synthetic gate", model.state.value.preparing)
+            assertTrue(model.state.value.preparing); assertTrue(pending.current())
+            // Preparation now belongs to the receiver, so hold its terminal callback rather
+            // than inventing a controller playback GET. Output revocation uses the shared fence.
             PlaybackRequests.invalidate()
-            playback.state.value = playback.state.value.copy(interactionKey = null)
+            controls.state.value = controls.state.value.copy(interactionKey = null, queueIntentBinding = null, canQueueIntent = false)
+            assertFalse(pending.current())
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))
         }
-        releaseFetch.countDown()
-        awaitHost { !model.state.value.preparing }
+        await { !model.state.value.preparing }
         compose.runOnIdle {
-            assertTrue(playback.pending.isEmpty())
-            assertEquals(0, playback.replacements)
+            assertEquals("No deferred replay or retargeting", 1, controls.pending.size)
             assertNull(model.state.value.notice)
+            assertFalse(controls.state.value.isPlaying)
+            assertEquals(0, playbackReads.get())
         }
     }
-
-    @Test fun signOutRetiresAcceptedIntentAndCannotPublishItsLateSuccess() {
-        openMore()
-        choose("Play now (swipe action)")
-        val pending = awaitAction()
-        compose.runOnIdle { model.logout() }
-        awaitHost { model.state.value.session == null }
+    @Test fun signOutAfterAcceptedDismissalSuppressesLateSuccessInActualHost() {
+        openMore(); val pending = choose("Queue Low")
+        compose.runOnIdle { assertTrue(pending.current()); model.logout() }
+        await { model.state.value.session == null }
+        val signedOutNotice = compose.runOnIdle { model.state.value.notice }
         compose.runOnIdle {
-            assertFalse(pending.isCurrent())
+            assertFalse(pending.current())
             pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
-            assertNotEquals("Added to queue", model.state.value.notice)
         }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            assertEquals(signedOutNotice, model.state.value.notice)
+            assertNotEquals("Added to queue", model.state.value.notice)
+            assertEquals(1, controls.pending.size)
+        }
+    }
+    @Test fun routeRoundTripAndSignOutRetireAcceptedWorkWithoutLateFeedback() {
+        openMore(); val pending = choose("Queue High")
+        compose.runOnIdle {
+            model.switchTab(Tab.SEARCH); model.switchTab(Tab.HOME)
+            assertFalse(pending.current())
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
+            assertNull(model.state.value.notice)
+        }
+        openMore(); val second = choose("Queue Low")
+        compose.runOnIdle { model.logout() }
+        await { model.state.value.session == null }
+        compose.runOnIdle { assertFalse(second.current()); second.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)) }
     }
 }

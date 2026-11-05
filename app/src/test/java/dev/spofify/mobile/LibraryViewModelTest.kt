@@ -39,6 +39,12 @@ class LibraryViewModelTest {
         val contexts = mutableListOf<LibraryItem?>()
         val listActions = mutableListOf<PlaybackListAction>()
         val actionResults = ArrayDeque<(PlaybackActionResult) -> Unit>()
+        val actionCurrents = ArrayDeque<() -> Boolean>()
+        override fun queueIntent(selection: QueueIntentSelection, client: SpofifyClient, action: PlaybackListAction,
+            expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?, isCurrent: () -> Boolean,
+            onResult: (PlaybackActionResult) -> Unit) {
+            listActions += action; actionResults.addLast(onResult); actionCurrents.addLast(isCurrent)
+        }
         override fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
             action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?,
             startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean,
@@ -111,7 +117,8 @@ class LibraryViewModelTest {
             val intent = model.state.value.playbackIntentGeneration
             if (invalidateBeforeLaunch) PlaybackRequests.invalidate()
             runCurrent()
-            assertTrue(queueStarted.await(5, TimeUnit.SECONDS))
+            if (!enqueue) assertTrue(queueStarted.await(5, TimeUnit.SECONDS))
+            else assertEquals("Raw selected receiver owns preparation", 1, playback.listActions.size)
             assertTrue(model.state.value.preparing)
             if (retireThroughProfile) {
                 val playing = playback.state.value
@@ -123,8 +130,13 @@ class LibraryViewModelTest {
                 assertEquals(Page.Home, model.state.value.page)
                 assertEquals(playing, playback.state.value)
             } else if (!invalidateBeforeLaunch) PlaybackRequests.invalidate()
+            if (enqueue) {
+                assertFalse("Held receiver work must observe route/epoch cancellation", playback.actionCurrents.removeFirst().invoke())
+                playback.actionResults.removeFirst().invoke(PlaybackActionResult(PlaybackActionStatus.STALE))
+                playback.listActions.clear()
+            }
             releaseQueue.countDown()
-            // Unlike cancellation through stopPlayback(), only the completing fetch clears this.
+            // The completing fetch or terminal callback clears preparation, not an optimistic enqueue.
             until { !model.state.value.preparing }
             assertEquals(intent, model.state.value.playbackIntentGeneration)
             assertEquals(0, playback.plays)

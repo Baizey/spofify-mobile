@@ -36,6 +36,7 @@ internal fun MusicActionsContent(
     modifier: Modifier = Modifier,
     contextualLabel: String = "Play now",
     onContextual: (() -> Unit)? = null,
+    onQueueLow: (() -> Unit)? = null,
 ) {
     // Keep a finite scroll viewport even if a sheet measures its body with loose constraints.
     // The sheet's own smaller constraints (safe areas, drag handle, IME) still take precedence.
@@ -48,12 +49,8 @@ internal fun MusicActionsContent(
         Text(item.name, style = MaterialTheme.typography.titleLarge)
         MusicAction("Play now", enabled = item.playable, onClick = onPlay)
         MusicAction("Play next", enabled = item.playable, onClick = onPlayNext)
-        // Explicit Add is always non-starting. The contextual intent can start if the
-        // authoritative output becomes idle while preparation is pending, so keep it distinct.
-        MusicAction("Add to queue", enabled = item.playable, onClick = onEnqueue)
-        onContextual?.let { action ->
-            MusicAction("$contextualLabel (swipe action)", enabled = item.playable, onClick = action)
-        }
+        MusicAction("Queue High", enabled = item.playable, onClick = onContextual ?: onEnqueue)
+        onQueueLow?.let { action -> MusicAction("Queue Low", enabled = item.playable, onClick = action) }
         if (item.kind == "track") {
             val likeLabel = when {
                 likePending -> "Saving like"

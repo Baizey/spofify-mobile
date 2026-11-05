@@ -172,15 +172,35 @@ class PlaybackListActionServiceTest {
 
     private fun installOwner(scope: CoroutineScope, remote: Boolean = false): PlaybackCoordinator {
         graph.playbackCoordinator!!.close()
+        var published = endpoint.exportSnapshot()
+        var publishedMetadata = requireNotNull(endpoint.exportQueueIntentState())
+        var publishedSequence = 0L
         fun deviceView() = PlaybackDevicesView("phone", listOf(PlaybackDevice("phone", "Phone", true), PlaybackDevice("pc", "PC", true)),
-            if (remote) "pc" else "phone", remoteEpoch, 8000, state = if (remote) remoteState ?: contextQueue() else null,
-            stateSeq = 0, stateAgeMs = 0, transfer = null, directives = emptyList(),
-            commands = remoteCommandId?.let { listOf(PlaybackOutcome(it, remoteOutcome)) } ?: emptyList())
+            if (remote) "pc" else "phone", remoteEpoch, 8000, state = if (remote) remoteState ?: contextQueue() else published,
+            stateSeq = publishedSequence, stateAgeMs = 0, transfer = null, directives = emptyList(),
+            commands = remoteCommandId?.let { listOf(PlaybackOutcome(it, remoteOutcome)) } ?: emptyList(),
+            queueIntents = if (remote) null else QueueIntentsView(1, listOf(QueueIntentReceiver("phone", 1)),
+                QueueIntentBinding("phone", publishedMetadata.receiverId, publishedMetadata.revision,
+                    published.queue.getOrNull(published.position)?.key, published.occurrence?.eventId),
+                publishedMetadata, emptyList(), emptyList()))
         val protocol = object : PlaybackDevicesProtocol {
             override suspend fun register(name: String) = deviceView()
+            override suspend fun register(name: String, queueIntentsVersion: Int?) = deviceView().also {
+                assertEquals(if (remote) null else 1, queueIntentsVersion)
+            }
+            override suspend fun probeQueueIntents() = deviceView()
             override suspend fun view() = deviceView()
             override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView {
                 pollGate?.await(); return deviceView()
+            }
+            override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?,
+                acks: List<PlaybackAck>, queueIntentState: QueueIntentState?): PlaybackDevicesView {
+                pollGate?.await()
+                if (state != null) {
+                    PlaybackPublication.validatePoll(deviceId, epoch, stateSeq, state, acks, queueIntentState)
+                    published = state; publishedMetadata = requireNotNull(queueIntentState); publishedSequence = requireNotNull(stateSeq)
+                }
+                return deviceView()
             }
             override suspend fun rename(deviceId: String, name: String) = deviceView()
             override suspend fun command(deviceId: String, epoch: Long, commandId: String, request: PlaybackDeviceCommand): PlaybackDevicesView {
@@ -346,14 +366,11 @@ class PlaybackListActionServiceTest {
             store.put("fifo", model)
             until { model.state.value.session != null && !model.state.value.busy }
             val key = requireNotNull(controls.state.value.interactionKey)
-            expectedRequests++
-            model.contextualFrom(client, LibraryItem("track", "X", "X", hasAudio = true, albumId = "delayed"), key)
-            until { preparationStarted.count == 0L }
-            // Y is committed while X is still in authenticated HTTP preparation, not after a
-            // refreshed key. The real service will change this key when X is inserted.
-            model.contextualFrom(client, LibraryItem("track", "Y", "Y", hasAudio = true), key)
             pollGate = publication
-            preparationRelease.countDown()
+            // Raw High rows need no album fetch. Commit both tickets before dispatch; X's
+            // mutation then waits at exact publication while Y retains the original binding.
+            model.contextualFrom(client, LibraryItem("track", "X", "X", hasAudio = true, albumId = "delayed"), key)
+            model.contextualFrom(client, LibraryItem("track", "Y", "Y", hasAudio = true), key)
             until { endpoint.exportSnapshot().queue.any { it.id == "X" } }
             assertNotSame(key, PlaybackService.interactionKey())
             assertEquals(listOf("played", "A", "X", "C1", "C2"), endpoint.exportSnapshot().queue.map { it.id })
@@ -386,7 +403,7 @@ class PlaybackListActionServiceTest {
             assertEquals(when (interruption) {
                 "queue" -> PlaybackActionResult(PlaybackActionStatus.STALE).userMessage
                 "route", "auth" -> null
-                else -> "Added to queue"
+                else -> queueIntentMessage(QueueIntentResult("queued", 1, 1, "high", "unchanged", null, ""), PlaybackListAction.QUEUE_HIGH)
             }, model.state.value.notice)
             // A separately held gesture is NOT a committed ticket and never inherits X's
             // receipt. Even after successful FIFO completion it must reject the original key.
@@ -441,6 +458,7 @@ class PlaybackListActionServiceTest {
     @Test fun committedInitialStartFifoCannotReviveAfterExternalEditAndEqualQueueReturn() = delayedInitialStartFifo("round-trip")
     @Test fun committedInitialStartFifoCannotFollowNavigationDuringStartup() = delayedInitialStartFifo("route")
     @Test fun committedInitialStartFifoCannotFollowReauthenticationDuringStartup() = delayedInitialStartFifo("auth")
+    @Test fun committedInitialStartFifoSurvivesTransportCapabilityOnlyChurn() = delayedInitialStartFifo("transport")
 
     private fun delayedInitialStartFifo(interruption: String? = null) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
@@ -462,11 +480,10 @@ class PlaybackListActionServiceTest {
             store.put("initial-fifo", model)
             until { model.state.value.session != null && !model.state.value.busy }
             val key = requireNotNull(controls.state.value.interactionKey)
-            expectedRequests++
+            // Raw High row preparation is receiver-owned and adds that row only: no album
+            // fetch. Commit both local tickets before allowing X's synchronous installation.
             model.contextualFrom(client, LibraryItem("track", "X", "X", hasAudio = true, albumId = "delayed"), key)
-            until { preparationStarted.count == 0L }
             model.contextualFrom(client, LibraryItem("track", "Y", "Y", hasAudio = true), key)
-            preparationRelease.countDown()
             until { startup.state == Player.STATE_BUFFERING && endpoint.exportSnapshot().queue.map { it.id } == listOf("X") }
             val installedKey = requireNotNull(PlaybackService.interactionKey())
             val installedPermit = PlaybackService::class.java.getDeclaredField("authority").let {
@@ -486,6 +503,12 @@ class PlaybackListActionServiceTest {
                         installedPermit)
                     assertNotSame(installedKey, PlaybackService.interactionKey())
                 }
+                "transport" -> {
+                    PlaybackService::class.java.getDeclaredField("transportCapabilityRevision").apply {
+                        isAccessible = true; setLong(service.get(), getLong(service.get()) + 1)
+                    }
+                    releaseDispatch(); runCurrent()
+                }
                 "route" -> model.search("changed route")
                 "auth" -> {
                     expectedRequests++
@@ -497,15 +520,15 @@ class PlaybackListActionServiceTest {
             until { !model.state.value.preparing }
             val after = endpoint.exportSnapshot()
             assertEquals(when (interruption) {
-                null -> listOf("X", "Y")
+                null, "transport" -> listOf("X", "Y")
                 "edit" -> listOf("X", "external")
                 else -> listOf("X")
             }, after.queue.map { it.id })
             assertEquals("X", after.queue[after.position].id)
             assertEquals(1, startup.prepares)
-            assertEquals(if (interruption in listOf("route", "auth")) 0 else 1, startup.plays)
+            assertEquals(if (interruption == null || interruption == "transport") 1 else 0, startup.plays)
             assertEquals(when (interruption) {
-                null -> "Added to queue"
+                null, "transport" -> queueIntentMessage(QueueIntentResult("queued", 1, 1, "high", "unchanged", null, ""), PlaybackListAction.QUEUE_HIGH)
                 "route", "auth" -> null
                 else -> PlaybackActionResult(PlaybackActionStatus.STALE).userMessage
             }, model.state.value.notice)
@@ -569,7 +592,7 @@ class PlaybackListActionServiceTest {
         assertTrue("Callback-chained FIFO additions must not interrupt transport", outputCalls.isEmpty())
     }
 
-    @Test fun initialAuthoritativeEmptyKeySurvivesBootstrapAndIdleStartsExactPreparedSelectionHonestly() = runTest {
+    @Test fun initialAuthoritativeEmptyKeySurvivesBootstrapAndHighStartsOnlyExactDuplicateRowHonestly() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
         val controls = connect()
@@ -589,9 +612,11 @@ class PlaybackListActionServiceTest {
         assertEquals(listOf(PlaybackActionStatus.BLOCKED), results.map { it.status })
         assertFalse(results.single().userMessage.startsWith("Playing"))
         val after = endpoint.exportSnapshot()
-        assertEquals(listOf("first", "second", "tail"), after.queue.map { it.entryId })
+        assertEquals(listOf("second"), after.queue.map { it.entryId })
         assertEquals("second", after.queue[after.position].entryId)
-        assertEquals("saved", after.context?.id)
+        assertEquals("saved", after.queue.single().playbackContext?.id)
+        assertEquals(1, results.single().acceptedCount)
+        assertEquals(after.queue.single().key, results.single().queueIntentResult!!.playbackKey)
         assertFalse(after.playing)
         assertFalse(actualPlayer.playWhenReady)
     }
@@ -678,13 +703,15 @@ class PlaybackListActionServiceTest {
         }
         controls.contextualOccurrence(key, controls.state.value.upcoming.last().occurrenceId, onResult = results::add)
         releaseDispatch(); runCurrent()
-        assertEquals(List(3) { PlaybackActionStatus.UNSUPPORTED_REMOTE }, results.map { it.status })
+        assertEquals(listOf(PlaybackActionStatus.UNSUPPORTED_REMOTE, PlaybackActionStatus.UNSUPPORTED_REMOTE,
+            PlaybackActionStatus.UNSUPPORTED), results.map { it.status })
+        assertTrue(results.all { it.userMessage == "Update the selected playback device and server to use queue priorities." })
         assertTrue(commands.isEmpty())
         assertEquals(0, actualPlayer.mediaItemCount)
         assertFalse(actualPlayer.playWhenReady)
     }
 
-    @Test fun capacityLimitedAndFullAdmissionNeverRetiresPlayedHistoryToMakeRoom() = runTest {
+    @Test fun capacityPrunesOnlyRequiredPlayedPrefixAndProtectsExactCurrentFutureHistoryAndOrigins() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
         val initial = contextQueue(size = 999, position = 500)
@@ -694,28 +721,75 @@ class PlaybackListActionServiceTest {
         controls.performPreparedAction(prepared("X", "Y", "Z"), client, PlaybackListAction.ADD_TO_QUEUE,
             requireNotNull(PlaybackService.interactionKey()), onResult = results::add)
         releaseDispatch(); runCurrent()
-        assertEquals(listOf(PlaybackActionStatus.LIMITED), results.map { it.status })
-        assertEquals(1, results.single().acceptedCount)
+        assertEquals(listOf(PlaybackActionStatus.ADDED), results.map { it.status })
+        assertEquals(3, results.single().acceptedCount)
         val after = endpoint.exportSnapshot()
         assertEquals(1000, after.queue.size)
-        assertEquals(initial.queue.take(501), after.queue.take(501))
+        val originalKeys = initial.queue.map { it.key }.toSet()
+        assertEquals(initial.queue.drop(2), after.queue.filter { it.key in originalKeys })
+        assertEquals(initial.queue[initial.position], after.queue[after.position])
+        assertEquals(initial.queue.drop(initial.position + 1), after.queue.drop(after.position + 1).filter { it.key in originalKeys })
         assertEquals(initial.occurrence, after.occurrence)
-        controls.performPreparedAction(prepared("Q"), client, PlaybackListAction.ADD_TO_QUEUE,
-            requireNotNull(PlaybackService.interactionKey()), startTrackId = "Q", onResult = results::add)
-        releaseDispatch(); runCurrent()
-        assertEquals(PlaybackActionStatus.FULL, results.last().status)
-        assertEquals(after, endpoint.exportSnapshot())
+        assertEquals(initial.elapsed, after.elapsed, 0.0)
+        assertEquals(listOf("X", "Y", "Z"), after.queue.filter { it.key !in originalKeys }.map { it.id })
+        val metadata = endpoint.exportQueueIntentState()!!
+        assertEquals(after.queue.map { it.key }, metadata.origins.map { it.key })
+        assertEquals(listOf(1000L, 1001L, 1002L), metadata.highKeys)
+        assertTrue(metadata.origins.filter { it.key in originalKeys }.all { it.intent == "legacy" })
+        assertTrue(metadata.origins.filter { it.key !in originalKeys }.all { it.intent == "high" })
         assertFalse(actualPlayer.playWhenReady)
     }
 
-    @Test fun explicitAddOnTrulyEmptyOutputIsNonstartingAndPlayNextRemainsDistinctFromFifo() = runTest {
+    @Test fun capacityWithNoPlayedPrefixReportsOnlyActualPartialAcceptance() = runTest {
+        val coordinator = installOwner(backgroundScope)
+        runCurrent()
+        val initial = contextQueue(size = 999, position = 0)
+        coordinator.localAction { endpoint.activate(initial, it) }; runCurrent()
+        val controls = connect()
+        val results = mutableListOf<PlaybackActionResult>()
+        controls.performPreparedAction(prepared("X", "Y", "Z"), client, PlaybackListAction.ADD_TO_QUEUE,
+            requireNotNull(PlaybackService.interactionKey()), onResult = results::add)
+        releaseDispatch(); runCurrent()
+        assertEquals(listOf(PlaybackActionStatus.LIMITED), results.map { it.status })
+        assertEquals(1, results.single().acceptedCount)
+        assertEquals("PLAYBACK_LIMIT", results.single().queueIntentResult!!.notice)
+        val after = endpoint.exportSnapshot()
+        assertEquals(1000, after.queue.size)
+        assertEquals(initial.queue, after.queue.filter { it.key != 1000L })
+        assertEquals("X", after.queue.single { it.key == 1000L }.id)
+        assertEquals(initial.occurrence, after.occurrence)
+        assertEquals(initial.elapsed, after.elapsed, 0.0)
+        assertEquals(listOf(1000L), endpoint.exportQueueIntentState()!!.highKeys)
+        assertFalse(actualPlayer.playWhenReady)
+    }
+
+    @Test fun trulyFullCurrentAndFutureRejectWithoutPruningOrChangingQueueHistoryOrMetadata() = runTest {
+        val coordinator = installOwner(backgroundScope)
+        runCurrent()
+        val initial = contextQueue(size = 1000, position = 0)
+        coordinator.localAction { endpoint.activate(initial, it) }; runCurrent()
+        val controls = connect()
+        val metadata = endpoint.exportQueueIntentState()!!
+        val results = mutableListOf<PlaybackActionResult>()
+        controls.performPreparedAction(prepared("Q"), client, PlaybackListAction.ADD_TO_QUEUE,
+            requireNotNull(PlaybackService.interactionKey()), startTrackId = "Q", onResult = results::add)
+        releaseDispatch(); runCurrent()
+        assertEquals(listOf(PlaybackActionStatus.FULL), results.map { it.status })
+        assertEquals(0, results.single().acceptedCount)
+        assertEquals(initial, endpoint.exportSnapshot())
+        assertEquals(metadata, endpoint.exportQueueIntentState())
+        assertFalse(actualPlayer.playWhenReady)
+    }
+
+    @Test fun highOnTrulyEmptyOutputAttemptsInitialSelectionOnceAndPlayNextRemainsDistinctFromFifo() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
         val controls = connect()
         val results = mutableListOf<PlaybackActionResult>()
+        shadowOf(service.get()).setThrowInStartForeground(android.app.ForegroundServiceStartNotAllowedException("Synthetic block"))
         controls.performPreparedAction(prepared("A", "C"), client, PlaybackListAction.ADD_TO_QUEUE, null, onResult = results::add)
         releaseDispatch(); runCurrent()
-        assertEquals(listOf(PlaybackActionStatus.ADDED), results.map { it.status })
+        assertEquals(listOf(PlaybackActionStatus.BLOCKED), results.map { it.status })
         assertEquals(2, results.single().acceptedCount)
         assertEquals(listOf("A", "C"), endpoint.exportSnapshot().queue.map { it.id })
         assertFalse(actualPlayer.playWhenReady)
@@ -733,7 +807,7 @@ class PlaybackListActionServiceTest {
         assertNotNull(coordinator.currentAuthority())
     }
 
-    @Test fun pausedEndedIdleAndMediaErrorAllChooseNormalSelectedPreparedPlayNotEnqueueOrResumeOther() = runTest {
+    @Test fun pausedEndedIdleAndMediaErrorHighPreservesExactCurrentStateWithoutPrepareResumeOrAdvance() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
         val controls = connect()
@@ -757,24 +831,29 @@ class PlaybackListActionServiceTest {
             setActiveReadState(state, playWhenReady, error)
             assertSame("The old-item media error is present at the contextual decision", error,
                 (playerField.get(service.get()) as ExoPlayer).playerError)
+            val beforeAction = endpoint.exportSnapshot()
+            outputCalls.clear()
             controls.performPreparedAction(prepared("selected", "selected-context-tail"), client, PlaybackListAction.CONTEXTUAL,
                 requireNotNull(PlaybackService.interactionKey()), startTrackId = "selected", onResult = results::add)
             releaseDispatch(); runCurrent()
-            assertEquals("State=$state playWhenReady=$playWhenReady error=$error", PlaybackActionStatus.BLOCKED, results.last().status)
-            assertEquals(0, results.last().acceptedCount)
-            assertNull("A blocked initial start cannot carry committed FIFO successors", results.last().additiveTransition)
+            assertEquals("State=$state playWhenReady=$playWhenReady error=$error", PlaybackActionStatus.ADDED, results.last().status)
+            assertEquals(1, results.last().acceptedCount)
+            assertEquals("unchanged", results.last().queueIntentResult!!.playback)
+            assertNull(results.last().queueIntentResult!!.playbackKey)
             val after = endpoint.exportSnapshot()
-            assertEquals("The exported display and terminal ACK must agree on the new start failure", "blocked", after.error)
-            assertFalse(after.playing)
-            assertTrue("A retained old media error must not turn an honest blocked result into an owner fence", coordinator.state.value.connected)
-            assertEquals(listOf("selected", "selected-context-tail"), after.queue.map { it.id })
-            assertEquals("selected", after.queue[after.position].id)
-            assertFalse(actualPlayer.playWhenReady)
+            assertEquals(beforeAction.error, after.error)
+            assertEquals(beforeAction.playing, after.playing)
+            assertTrue(coordinator.state.value.connected)
+            assertEquals(listOf("played", "A", "selected", "C1", "C2"), after.queue.map { it.id })
+            assertEquals(beforeAction.queue[beforeAction.position], after.queue[after.position])
+            assertEquals(beforeAction.occurrence, after.occurrence)
+            assertEquals(beforeAction.elapsed, after.elapsed, 0.0)
+            assertTrue("Unchanged-current High never prepares/plays/pauses/stops/seeks", outputCalls.isEmpty())
         }
         assertEquals(states.size, results.size)
     }
 
-    @Test fun idleUpcomingSelectionStartsExactExistingOccurrenceWithoutDuplicatingQueue() = runTest {
+    @Test fun idleUpcomingHighPromotesExactOccurrenceWithoutSelectingStartingOrDuplicatingIt() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
         val initial = contextQueue()
@@ -785,10 +864,11 @@ class PlaybackListActionServiceTest {
         controls.contextualOccurrence(requireNotNull(PlaybackService.interactionKey()), "wire-4", onResult = results::add)
         releaseDispatch(); runCurrent()
         val after = endpoint.exportSnapshot()
-        assertEquals(listOf(PlaybackActionStatus.BLOCKED), results.map { it.status })
-        assertEquals(initial.queue, after.queue)
-        assertEquals(4L, after.queue[after.position].key)
-        assertEquals(0.0, after.elapsed, 0.0)
+        assertEquals(listOf(PlaybackActionStatus.ADDED), results.map { it.status })
+        assertEquals(listOf(1L, 2L, 4L, 3L), after.queue.map { it.key })
+        assertEquals(initial.queue[initial.position], after.queue[after.position])
+        assertEquals(initial.occurrence, after.occurrence)
+        assertEquals(initial.elapsed, after.elapsed, 0.0)
         assertFalse(after.playing)
         assertFalse(actualPlayer.playWhenReady)
     }
@@ -895,9 +975,15 @@ class PlaybackListActionServiceTest {
         assertFalse(unshuffled.shuffle)
         assertEquals(listOf("played", "A", "M1", "M2", "C1", "C2"), unshuffled.queue.map { it.id })
         val removed = unshuffled.queue.single { it.id == "M1" }
+        val beforeRemovalMetadata = requireNotNull(endpoint.exportQueueIntentState())
         endpoint.execute(PlaybackDeviceCommand.queue("remove", removed.key), permit)
         PlaybackService.undoQueuedRemoval(); runCurrent()
         assertEquals(unshuffled.queue, endpoint.exportSnapshot().queue)
+        assertTrue("Undo's exact snapshot+metadata publication must not fence a capable owner", coordinator.state.value.connected)
+        val restoredMetadata = requireNotNull(endpoint.exportQueueIntentState())
+        assertEquals(beforeRemovalMetadata.origins, restoredMetadata.origins)
+        assertEquals(beforeRemovalMetadata.highKeys, restoredMetadata.highKeys)
+        assertTrue(restoredMetadata.revision > beforeRemovalMetadata.revision)
         controls.performPreparedAction(prepared("M3"), client, PlaybackListAction.ADD_TO_QUEUE,
             requireNotNull(PlaybackService.interactionKey()), startTrackId = "M3", onResult = results::add)
         releaseDispatch(); runCurrent()

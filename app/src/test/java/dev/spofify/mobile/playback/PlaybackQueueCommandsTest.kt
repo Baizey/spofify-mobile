@@ -36,6 +36,9 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 
 /** Queue-specific service/connection commands extracted from the recovery media fixture.
  * No media-key dispatch, trust shadow or remote session projection is required here.
@@ -113,18 +116,60 @@ class PlaybackQueueCommandsTest {
         occurrence = PlaybackOccurrence(7, "duplicate-track", "retained-history", 3.25, false),
     ).validated()
 
-    private fun TestScope.remoteOwner(output: String = "speaker", initial: PlaybackSnapshot? = null): PlaybackCoordinator {
+    private fun TestScope.remoteOwner(output: String = "speaker", initial: PlaybackSnapshot? = null,
+        capable: Boolean = false): PlaybackCoordinator {
         graph.playbackCoordinator!!.close()
-        fun view(outcome: PlaybackOutcome? = latestCommand?.let { PlaybackOutcome(it, remoteOutcome) }) = PlaybackDevicesView("phone",
-            listOf(PlaybackDevice("phone", "Phone", true), PlaybackDevice("speaker", "Speaker", true)),
-            output, 1, 8000, state = initial ?: prepared().copy(playing = remotePlaying, elapsed = remoteElapsed, duration = remoteDuration),
-            stateSeq = 1, stateAgeMs = 0, transfer = null, directives = emptyList(), commands = listOfNotNull(outcome))
+        var capableState = initial ?: prepared().copy(playing = remotePlaying, elapsed = remoteElapsed, duration = remoteDuration)
+        var receipt: QueueIntentResult? = null
+        var promotedKey: Long? = null
+        fun view(outcome: PlaybackOutcome? = latestCommand?.let { PlaybackOutcome(it, remoteOutcome) }): PlaybackDevicesView {
+            // A synthetic receiver completes the one queue-intent transaction only on terminal
+            // acknowledgement. Legacy test variants deliberately keep their old DTO shapes.
+            if (capable && remoteOutcome == "ok" && receipt == null && requests.lastOrNull()?.type == "queueIntent") {
+                val command = requests.last()
+                val before = capableState
+                val key = command.json.getValue("selection").jsonObject.getValue("key").jsonPrimitive.long
+                val selected = before.queue.single { it.key == key }
+                check(before.queue.indexOf(selected) > before.position)
+                val moved = before.queue.toMutableList().apply { remove(selected); add(before.position + 1, selected) }
+                capableState = before.copy(queue = moved)
+                promotedKey = key
+                receipt = QueueIntentResult("queued", 1, 2, "next", "unchanged", null, "")
+            }
+            val snapshot = if (capable) capableState else initial ?: prepared().copy(
+                playing = remotePlaying, elapsed = remoteElapsed, duration = remoteDuration)
+            val metadata = QueueIntentState("remote_receiver", if (receipt == null) 1 else 2, "legacy-reset",
+                snapshot.queue.map { QueueIntentOrigin(it.key, if (it.key == promotedKey) "next" else "legacy") },
+                listOfNotNull(promotedKey))
+            val extension = if (!capable) null else QueueIntentsView(1,
+                listOf(QueueIntentReceiver("speaker", 1), QueueIntentReceiver("phone", 1)),
+                QueueIntentBinding(output, metadata.receiverId, metadata.revision,
+                    snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId),
+                metadata, emptyList(), receipt?.let { detail ->
+                    listOf(QueueIntentCommandResult(requireNotNull(latestCommand), detail))
+                } ?: emptyList())
+            return PlaybackDevicesView("phone",
+                listOf(PlaybackDevice("phone", "Phone", true), PlaybackDevice("speaker", "Speaker", true)),
+                output, 1, 8000, state = snapshot, stateSeq = if (receipt == null) 1 else 2,
+                stateAgeMs = 0, transfer = null, directives = emptyList(), commands = listOfNotNull(outcome),
+                queueIntents = extension)
+        }
         val protocol = object : PlaybackDevicesProtocol {
+            override suspend fun probeQueueIntents() = view()
             override suspend fun register(name: String) = view()
+            override suspend fun register(name: String, queueIntentsVersion: Int?): PlaybackDevicesView {
+                check(queueIntentsVersion == if (capable) 1 else null)
+                return view()
+            }
             override suspend fun view() = view()
             override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView {
                 state?.let(published::add)
                 return view()
+            }
+            override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?,
+                acks: List<PlaybackAck>, queueIntentState: QueueIntentState?): PlaybackDevicesView {
+                check(capable || queueIntentState == null)
+                return poll(deviceId, epoch, stateSeq, state, acks)
             }
             override suspend fun rename(deviceId: String, name: String) = view()
             override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView {
@@ -289,22 +334,50 @@ class PlaybackQueueCommandsTest {
         } finally { connection.release() }
     }
 
-    @Test fun actualConnectionPromotesAnExactRemoteOccurrenceWithOneAcknowledgedMove() = runTest {
+    @Test fun actualConnectionPromotesAnExactRemoteOccurrenceWithOneNegotiatedIntentAndTerminalReceipt() = runTest {
         val base = prepared()
-        remoteOwner(initial = base.copy(queue = base.queue + base.queue.last().copy(key = 45, order = 3)))
+        remoteOutcome = "pending"
+        val owner = remoteOwner(initial = base.copy(queue = base.queue + base.queue.last().copy(key = 45, order = 3)), capable = true)
         val connection = connectedUi()
         try {
             val key = PlaybackConnection::class.java.getDeclaredMethod("currentRemoteInteractionKey").let {
                 it.isAccessible = true; it.invoke(connection) as PlaybackInteractionKey
             }
-            val state = requireNotNull(graph.playbackCoordinator!!.state.value.view?.state)
+            val state = requireNotNull(owner.state.value.view?.state)
+            val capturedBinding = requireNotNull(owner.state.value.queueIntentBinding)
+            val localBefore = endpoint.exportSnapshot()
             val selected = state.queue.last()
             val results = mutableListOf<PlaybackActionResult>()
             connection.playNextOccurrence(key, PlaybackSnapshotCodec.occurrenceId(selected), onResult = { results += it })
             shadowOf(Looper.getMainLooper()).idleFor(10, TimeUnit.MILLISECONDS); runCurrent()
-            assertEquals(listOf(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)), results)
+            assertTrue("POST/pending is not terminal queue acceptance", results.isEmpty())
             assertEquals(1, requests.size)
-            assertEquals(PlaybackDeviceCommand.queue("move", selected.key, "next").json, requests.single().json)
+            val submitted = requests.single()
+            assertEquals(PlaybackDeviceCommand.queueIntent(QueueIntentIntent.NEXT, capturedBinding,
+                QueueIntentSelection.Occurrence(selected.key)).json, submitted.json)
+            assertEquals(capturedBinding, QueueIntentBinding.fromJson(submitted.json.getValue("expected").jsonObject))
+            assertEquals("queueIntent", submitted.type)
+            remoteOutcome = "ok"
+            advanceTimeBy(1_000); runCurrent()
+            val receipt = QueueIntentResult("queued", 1, 2, "next", "unchanged", null, "")
+            assertEquals(listOf(queueIntentActionResult(receipt, PlaybackListAction.PLAY_NEXT)), results)
+            val accepted = requireNotNull(owner.state.value.view?.state)
+            assertEquals(selected.key, accepted.queue[accepted.position + 1].key)
+            assertEquals(state.queue.map { it.key }.toSet(), accepted.queue.map { it.key }.toSet())
+            assertEquals(state.queue[state.position].key, accepted.queue[accepted.position].key)
+            assertEquals(state.elapsed, accepted.elapsed, 0.0)
+            assertEquals(state.occurrence, accepted.occurrence)
+            assertFalse("Unchanged paused current stays paused", accepted.playing)
+            assertNull(results.single().queueIntentResult!!.playbackKey)
+            assertEquals(localBefore, endpoint.exportSnapshot())
+            assertFalse("Remote queue intent never starts local output", output.playWhenReady)
+            advanceTimeBy(9_000); runCurrent()
+            assertEquals("Terminal callback is once-only", 1, results.size)
+            assertEquals("No replay or legacy move fallback", 1, requests.size)
+            connection.playNextOccurrence(key, PlaybackSnapshotCodec.occurrenceId(selected), onResult = { results += it })
+            shadowOf(Looper.getMainLooper()).idleFor(10, TimeUnit.MILLISECONDS); runCurrent()
+            assertEquals("Old captured binding is stale, never refreshed", PlaybackActionStatus.STALE, results.last().status)
+            assertEquals(1, requests.size)
         } finally { connection.release() }
     }
 

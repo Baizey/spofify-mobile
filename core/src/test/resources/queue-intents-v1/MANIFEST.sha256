@@ -1,0 +1,4 @@
+# Source: spofify-go b6eb54ffdc91e07e2ce7824b8be5f90afa8b05eb internal/web/testdata/
+# Raw bytes are normative; never normalize duplicate/case/unknown-field negatives.
+621f5e5eea8632ea732c7369ae03bc442db53ec82e3d0edd7a9052a24547f44b  queue-intents-v1.json
+dd614300d5f33e4ac06103fea5f118420e7bd92a4bcb130b3770509a5d07adfc  queue-intents-pause-receipt-v1.json

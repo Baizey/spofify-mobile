@@ -57,9 +57,21 @@ import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.playback.PlaybackControls
 import dev.spofify.mobile.playback.PlaybackState
+import dev.spofify.mobile.playback.PlaybackListAction
 import dev.spofify.mobile.playback.QueueEntry
 import dev.spofify.mobile.ui.ContextualSwipeRow
 import dev.spofify.mobile.ui.RowActionLifetime
+
+/** The four intentional actions always address the exact retained upcoming occurrence. */
+private fun upcomingIntentActions(entry: QueueEntry, state: PlaybackState, controls: PlaybackControls,
+    rowIsCurrent: () -> Boolean, hostIsCurrent: () -> Boolean): List<Pair<String, () -> Unit>> {
+    val key = state.interactionKey
+    return listOf("Queue Low" to PlaybackListAction.QUEUE_LOW, "Queue High" to PlaybackListAction.QUEUE_HIGH,
+        "Play next" to PlaybackListAction.PLAY_NEXT, "Play now" to PlaybackListAction.PLAY_NOW).map { (label, action) ->
+        label to { if (key != null && entry.item.playable && rowIsCurrent() && hostIsCurrent())
+            controls.queueIntentOccurrence(key, entry.occurrenceId, action, hostIsCurrent) {} }
+    }
+}
 
 /**
  * Remember in the queue/sheet host, never in a lazy row/header. A committed action may remove its
@@ -203,7 +215,7 @@ private fun CompactUpcomingRow(
     // An open action menu belongs to the rendered queue binding, not a later publication.
     // Progress keeps the key; queue/output/session replacement disposes the old menu.
     var menuOpen by remember(entry.occurrenceId, state.interactionKey) { mutableStateOf(false) }
-    val label = if (state.isPlaying || (state.isBuffering && state.playWhenReady)) "Add to queue" else "Play now"
+    val label = "Queue High"
     ContextualSwipeRow(entry, state.interactionKey, entry.item.playable && state.interactionKey != null, label,
         onCommit = { key, rowIsCurrent ->
             if (rowIsCurrent() && actionIsCurrent())
@@ -214,13 +226,11 @@ private fun CompactUpcomingRow(
             controls.playNextOccurrence(expectedKey, entry.occurrenceId, actionIsCurrent) {}
         }
     }
+    val intents = upcomingIntentActions(entry, state, controls, isCurrent, actionIsCurrent)
     Row(swipeModifier.fillMaxWidth().heightIn(min = 72.dp).background(MaterialTheme.colorScheme.surface).semantics {
         customActions = buildList {
-            if (entry.item.playable) add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
-            if (entry.item.playable && label == "Add to queue" && state.interactionKey != null) add(CustomAccessibilityAction(label) {
-                if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}; true
-            })
-            if (entry.item.playable && state.interactionKey != null) add(CustomAccessibilityAction("Play next") { playNext(); true })
+            if (entry.item.playable && state.interactionKey != null)
+                intents.forEach { (label, action) -> add(CustomAccessibilityAction(label) { action(); true }) }
             if (index > 0) add(CustomAccessibilityAction("Move up") { controls.moveUpcoming(entry.occurrenceId, index - 1); true })
             if (index < count - 1) add(CustomAccessibilityAction("Move down") { controls.moveUpcoming(entry.occurrenceId, index + 1); true })
             add(CustomAccessibilityAction("Remove from queue") { controls.removeUpcoming(entry.occurrenceId); true })
@@ -239,14 +249,10 @@ private fun CompactUpcomingRow(
                     Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    DropdownMenuItem(text = { Text("Play now") }, enabled = entry.item.playable,
-                        onClick = { menuOpen = false; controls.selectOccurrence(entry.occurrenceId) })
-                    if (label == "Add to queue" && state.interactionKey != null) DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable,
-                        onClick = { menuOpen = false
-                            if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}
-                        })
-                    DropdownMenuItem(text = { Text("Play next") }, enabled = entry.item.playable && state.interactionKey != null,
-                        onClick = { menuOpen = false; playNext() })
+                    intents.forEach { (label, action) ->
+                        DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable && state.interactionKey != null,
+                            onClick = { menuOpen = false; action() })
+                    }
                     DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
                         onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index - 1) })
                     DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,
@@ -282,7 +288,7 @@ private fun UpcomingRow(
     val moveUp = { controls.moveUpcoming(entry.occurrenceId, (index - 1).coerceAtLeast(0)) }
     val moveDown = { controls.moveUpcoming(entry.occurrenceId, (index + 1).coerceAtMost(count - 1)) }
     val remove = { controls.removeUpcoming(entry.occurrenceId) }
-    val label = if (state.isPlaying || (state.isBuffering && state.playWhenReady)) "Add to queue" else "Play now"
+    val label = "Queue High"
     ContextualSwipeRow(entry, state.interactionKey, entry.item.playable && state.interactionKey != null, label,
         onCommit = { key, rowIsCurrent ->
             if (rowIsCurrent() && actionIsCurrent())
@@ -294,16 +300,14 @@ private fun UpcomingRow(
             controls.playNextOccurrence(expectedKey, entry.occurrenceId, actionIsCurrent) {}
         }
     }
+    val intents = upcomingIntentActions(entry, state, controls, isCurrent, actionIsCurrent)
     Row(
         swipeModifier.fillMaxWidth().heightIn(min = 80.dp).background(MaterialTheme.colorScheme.surface).onSizeChanged { rowHeight = it.height }
             .playerSwipe(PlayerSwipeArea.UPCOMING) { remove() }
             .semantics {
                 customActions = buildList {
-                    if (entry.item.playable) add(CustomAccessibilityAction("Play now") { controls.selectOccurrence(entry.occurrenceId); true })
-                    if (entry.item.playable && label == "Add to queue" && state.interactionKey != null) add(CustomAccessibilityAction(label) {
-                        if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}; true
-                    })
-                    if (entry.item.playable && state.interactionKey != null) add(CustomAccessibilityAction("Play next") { playNext(); true })
+                    if (entry.item.playable && state.interactionKey != null)
+                        intents.forEach { (label, action) -> add(CustomAccessibilityAction(label) { action(); true }) }
                     if (index > 0) add(CustomAccessibilityAction("Move up") { moveUp(); true })
                     if (index < count - 1) add(CustomAccessibilityAction("Move down") { moveDown(); true })
                     add(CustomAccessibilityAction("Remove from queue") { remove(); true })
@@ -352,14 +356,10 @@ private fun UpcomingRow(
                 Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(text = { Text("Play now") }, enabled = entry.item.playable,
-                    onClick = { menuOpen = false; controls.selectOccurrence(entry.occurrenceId) })
-                if (label == "Add to queue" && state.interactionKey != null) DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable,
-                    onClick = { menuOpen = false
-                        if (isCurrent() && actionIsCurrent()) controls.contextualOccurrence(state.interactionKey, entry.occurrenceId, actionIsCurrent) {}
-                    })
-                DropdownMenuItem(text = { Text("Play next") }, enabled = entry.item.playable && state.interactionKey != null,
-                    onClick = { menuOpen = false; playNext() })
+                intents.forEach { (label, action) ->
+                    DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable && state.interactionKey != null,
+                        onClick = { menuOpen = false; action() })
+                }
                 DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
                     onClick = { menuOpen = false; moveUp() })
                 DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,

@@ -37,6 +37,20 @@ interface PlaybackControls {
         onResult: (PlaybackActionResult) -> Unit) {
         onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
     }
+    /** One receiver-authoritative transaction. Binding/key are captured before any await;
+     * unknown controls fail closed, never downgrade to legacy Play/enqueue commands. */
+    fun queueIntent(selection: dev.spofify.mobile.core.QueueIntentSelection, client: SpofifyClient,
+        action: PlaybackListAction, expectedKey: PlaybackInteractionKey?,
+        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding?,
+        isCurrent: () -> Boolean = { true }, onResult: (PlaybackActionResult) -> Unit) {
+        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+    }
+    /** Exact upcoming key selection. No duplicate, context refetch or positional jump. */
+    fun queueIntentOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+        action: PlaybackListAction, isCurrent: () -> Boolean = { true },
+        onResult: (PlaybackActionResult) -> Unit = {}) {
+        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+    }
     /** Contextual selection of one existing upcoming occurrence; never a catalog duplicate. */
     fun contextualOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
         isCurrent: () -> Boolean = { true }, onResult: (PlaybackActionResult) -> Unit = {}) {

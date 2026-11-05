@@ -290,7 +290,7 @@ class SharedSongListRowsTest {
                 val custom = row(song).fetchSemanticsNode().config[SemanticsActions.CustomActions]
                 compose.runOnIdle {
                     assertTrue(custom.single { it.label == "More actions" }.action())
-                    assertTrue(custom.single { it.label == "Add to queue" }.action())
+                    assertTrue(custom.single { it.label == "Queue High" }.action())
                     assertTrue(custom.single { it.label == "Unlike song" }.action())
                     assertEquals(listOf("open", "more", "more", "more", "queue", "like"), events.map { it.second })
                     events.forEach { assertEquals(owner, it.first); assertSame(song, it.third) }
@@ -334,7 +334,7 @@ class SharedSongListRowsTest {
                 assertFalse(row(songs[1]).fetchSemanticsNode().config[SemanticsActions.CustomActions].any { it.label.contains("Like") })
                 scrollTo(songs[2])
                 val unavailable = row(songs[2]).fetchSemanticsNode().config[SemanticsActions.CustomActions]
-                assertFalse(unavailable.any { it.label == "Add to queue" })
+                assertFalse(unavailable.any { it.label == "Queue High" })
                 more(songs[2]).performClick()
                 compose.runOnIdle { assertEquals(listOf(Triple(owner, "more", songs[2])), events) }
             }

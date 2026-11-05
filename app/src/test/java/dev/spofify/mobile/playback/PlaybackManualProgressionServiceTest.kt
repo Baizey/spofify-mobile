@@ -8,6 +8,14 @@ import dev.spofify.mobile.AppGraph
 import dev.spofify.mobile.LoginStore
 import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
+import dev.spofify.mobile.core.QueueIntentBinding
+import dev.spofify.mobile.core.QueueIntentIntent
+import dev.spofify.mobile.core.QueueIntentSelection
+import dev.spofify.mobile.core.PlaybackDevice
+import dev.spofify.mobile.core.PlaybackDevicesView
+import dev.spofify.mobile.feature.devices.PlaybackDevicesState
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.serialization.json.JsonObject
 import dev.spofify.mobile.core.PlaybackContext
 import dev.spofify.mobile.core.PlaybackDeviceCommand
 import dev.spofify.mobile.core.PlaybackSnapshot
@@ -82,6 +90,15 @@ class PlaybackManualProgressionServiceTest {
         client.login("listener", "synthetic-password")
         assertEquals("/api/auth/login", web.takeRequest(1, TimeUnit.SECONDS)?.path)
         controller = Robolectric.buildService(PlaybackService::class.java).create()
+        // Leased service fixture only; production graph tests own HTTP negotiation.
+        val owner = requireNotNull(graph.playbackCoordinator)
+        @Suppress("UNCHECKED_CAST")
+        val state = owner.javaClass.getDeclaredField("mutableState").let {
+            it.isAccessible = true; it.get(owner) as MutableStateFlow<PlaybackDevicesState>
+        }
+        state.value = PlaybackDevicesState(deviceId = "phone", connected = true, view = PlaybackDevicesView(
+            "phone", listOf(PlaybackDevice("phone", "Phone", true)), "phone", 23, 8000, state = null,
+            stateSeq = 0, stateAgeMs = 0, transfer = null, directives = emptyList(), commands = emptyList()))
         val baseline = PlaybackSnapshot(
             queue = listOf(track("A", 1), track("C1", 2), track("C2", 3)), position = 0,
             context = PlaybackContext("album", "album", "Album"),
@@ -116,8 +133,12 @@ class PlaybackManualProgressionServiceTest {
 
     private suspend fun enqueue(name: String): PlaybackSnapshot {
         val wire = PlaybackSnapshot(queue = listOf(track(name)), position = 0).toJson()
-        val result = endpoint.execute(PlaybackDeviceCommand.musical("enqueue",
-            track = wire.getValue("queue").jsonArray.single().jsonObject, first = false), permit)
+        val before = endpoint.exportSnapshot()
+        val metadata = requireNotNull(endpoint.exportQueueIntentState())
+        val selected = JsonObject(wire.getValue("queue").jsonArray.single().jsonObject.filterKeys { it != "key" && it != "order" })
+        val result = endpoint.execute(PlaybackDeviceCommand.queueIntent(QueueIntentIntent.HIGH,
+            QueueIntentBinding("phone", metadata.receiverId, metadata.revision, before.queue.getOrNull(before.position)?.key,
+                before.occurrence?.eventId), QueueIntentSelection.Track(selected, null)), permit)
         assertEquals("ok", result.status)
         assertFalse(output.playWhenReady)
         assertFalse(output.isPlaying)

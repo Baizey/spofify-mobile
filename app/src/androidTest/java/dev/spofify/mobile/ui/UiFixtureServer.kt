@@ -5,8 +5,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.Log
-import android.util.JsonReader
-import android.util.JsonToken
 import android.os.SystemClock
 import dev.spofify.mobile.core.*
 import kotlinx.serialization.json.*
@@ -20,7 +18,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
-import java.io.StringReader
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -329,9 +326,18 @@ class UiFixtureServer : AutoCloseable {
      * No fake speaker, hidden audio engine, automatic ACK, or off-device connection is installed.
      */
     private inner class SyntheticPlayerRoom {
-        private inner class Device(val id: String, var name: String, var seen: Long, var selectionSeq: Long = 0)
-        private inner class Delivery(val deviceId: String, val value: PlaybackDirective, val deadline: Long, var delivered: Boolean = false)
-        private inner class Outcome(val deviceId: String, val request: JsonObject, var status: String, val expires: Long)
+        private inner class Device(val id: String, var name: String, var seen: Long, val capable: Boolean, var selectionSeq: Long = 0) {
+            var metadata: QueueIntentState? = null
+            var snapshot: PlaybackSnapshot? = null
+        }
+        private inner class Delivery(val deviceId: String, val value: PlaybackDirective, val deadline: Long,
+            val metadata: QueueIntentState?, val base: PlaybackSnapshot?, val baseMetadata: QueueIntentState?, var delivered: Boolean = false)
+        private inner class Outcome(val deviceId: String, val request: JsonObject, var status: String, val expires: Long) {
+            var detail: QueueIntentResult? = null
+            var deliveryId = ""
+            var ackEpoch = 0L
+            var ackOwner = ""
+        }
         private val devices = linkedMapOf<String, Device>()
         private val deliveries = mutableListOf<Delivery>()
         private val outcomes = linkedMapOf<String, Outcome>()
@@ -343,6 +349,10 @@ class UiFixtureServer : AutoCloseable {
         private var leaseUntil = 0L
         private var quarantineUntil = 0L
         private var state: PlaybackSnapshot? = null
+        private var queueState: QueueIntentState? = null
+        // route() executes under the enclosing fixture monitor; response projection is
+        // request-local even when legacy and negotiated clients share this synthetic room.
+        private var opted = false
         private var stateSeq = 0L
         private var stateAccepted = 0L
         private var transfer: PlaybackTransfer? = null
@@ -355,6 +365,8 @@ class UiFixtureServer : AutoCloseable {
         fun loseNextAckResponse() { check(!loseAckResponse); loseAckResponse = true }
 
         fun route(request: RecordedRequest): MockResponse {
+            val headers = request.headers.values("X-Spofify-Playback-Extensions")
+            opted = headers.size == 1 && headers.single() == "queue-intents-v1"
             if (request.requestUrl?.query != null) return invalid()
             if (request.method == "GET") {
                 prune()
@@ -365,16 +377,9 @@ class UiFixtureServer : AutoCloseable {
                 return json(JSONObject().put("error", "Content-Type must be application/json"), 415)
             if (request.body.size > 2 * 1024 * 1024) return json(JSONObject().put("error", "JSON body is too large"), 413)
             val q = try {
-                val raw = request.body.readUtf8()
-                // JsonObject parsing alone overwrites duplicate names. Reject ambiguous envelopes
-                // before validating the guard, just as Go's strict decoder does.
-                JsonReader(StringReader(raw)).use { reader ->
-                    val names = mutableSetOf<String>()
-                    reader.beginObject()
-                    while (reader.hasNext()) { require(names.add(reader.nextName())); reader.skipValue() }
-                    reader.endObject(); require(reader.peek() == JsonToken.END_DOCUMENT)
-                }
-                Json.parseToJsonElement(raw).jsonObject.also(::validate)
+                // The original bytes hit the SAME bounded recursive decoder as core's
+                // frozen raw corpus. Never parse through JSONObject/normalize negatives first.
+                PlaybackRequestContract.fromRawJson(request.body.readUtf8()).also(::validate)
             } catch (_: RuntimeException) { return invalid() } catch (_: IOException) { return invalid() }
             playerCalls.add(q.string("action"))
             // Conditional denials and exact retained retries are observational, even when
@@ -386,7 +391,7 @@ class UiFixtureServer : AutoCloseable {
             if (action == "register") {
                 if (devices.size >= 16) return response(status = 429, error = "device limit reached")
                 val id = "synthetic-player-${++nextDevice}"
-                devices[id] = Device(id, q.string("name"), now())
+                devices[id] = Device(id, q.string("name"), now(), q["queueIntentsVersion"] == JsonPrimitive(1))
                 if (!registered && epoch == 1L && now() >= quarantineUntil) { active = id; leaseUntil = now() + 8000 }
                 registered = true
                 return response(id, deliver = true)
@@ -471,12 +476,16 @@ class UiFixtureServer : AutoCloseable {
                 else -> throw IllegalArgumentException("Unknown action")
             }
             val optional = when (q.string("action")) {
-                "poll" -> setOf("state", "stateSeq", "acks")
+                "register" -> setOf("queueIntentsVersion")
+                "poll" -> setOf("state", "stateSeq", "acks", "queueIntentState")
                 "transfer" -> setOf("selectionSeq", "requireUnselected")
                 else -> emptySet()
             }
             require(q.keys.containsAll(required) && q.keys.all { it in required || it in optional })
             if (q.containsKey("requireUnselected")) require(q.getValue("requireUnselected") == JsonPrimitive(true))
+            if (q.containsKey("queueIntentsVersion")) require(opted && q.getValue("queueIntentsVersion") == JsonPrimitive(1))
+            if (q.containsKey("queueIntentState")) require(opted && q.getValue("queueIntentState") is JsonObject)
+            if (q["command"]?.jsonObject?.get("type") == JsonPrimitive("queueIntent")) require(opted)
             listOf("deviceId", "commandId", "targetDeviceId").forEach { if (q.containsKey(it)) require(validPlaybackProtocolId(q.string(it))) }
             if (q.containsKey("name")) require(validPlaybackDeviceName(q.string("name")))
             listOf("epoch", "stateSeq", "selectionSeq").forEach { if (q.containsKey(it)) q.number(it) }
@@ -489,18 +498,25 @@ class UiFixtureServer : AutoCloseable {
             require(acks.size <= 16 && acks.map { it.jsonObject.string("deliveryId") }.distinct().size == acks.size)
             acks.forEach {
                 val a = it.jsonObject
-                require(a.keys == setOf("deliveryId", "epoch", "status") && validPlaybackProtocolId(a.string("deliveryId")))
+                require(a.keys.containsAll(setOf("deliveryId", "epoch", "status")) && a.keys.all { key -> key in setOf("deliveryId", "epoch", "status", "queueIntentResult") } && validPlaybackProtocolId(a.string("deliveryId")))
                 a.number("epoch"); require(a.string("status") in setOf("ok", "blocked", "media", "rejected"))
+                if (a.containsKey("queueIntentResult")) require(opted && a.getValue("queueIntentResult") is JsonObject)
             }
         }
         private fun response(id: String = "", status: Int = 200, error: String = "", deliver: Boolean = false): MockResponse {
             val directives = if (deliver) deliveries.filter { it.deviceId == id && !it.delivered }.map { it.delivered = true; it.value } else emptyList()
+            val extension = if (!opted) null else QueueIntentsView(1,
+                devices.values.filter { it.capable }.map { QueueIntentReceiver(it.id, 1) }, binding(), queueState,
+                directives.filter { it.type in setOf("prepare", "activate") && devices[id]?.capable == true }.map { d ->
+                    QueueIntentDirective(d.deliveryId, deliveries.single { it.value.deliveryId == d.deliveryId }.metadata)
+                }, outcomes.mapNotNull { (commandId, outcome) -> outcome.detail?.let { QueueIntentCommandResult(commandId, it) } })
             val view = PlaybackDevicesView(id, devices.values.map { PlaybackDevice(it.id, it.name, now() - it.seen <= 5000) },
                 active, epoch, if (active.isEmpty()) 0 else (leaseUntil - now()).coerceAtLeast(0),
                 (quarantineUntil - now()).coerceIn(0, 8000), state, stateSeq,
                 if (state == null) 0 else (now() - stateAccepted).coerceAtLeast(0), transfer, directives,
-                outcomes.map { PlaybackOutcome(it.key, it.value.status) }, error)
+                outcomes.map { PlaybackOutcome(it.key, it.value.status) }, error, extension)
             return json(JSONObject(view.toJson().toString()), status).setHeader("Cache-Control", "no-store")
+                .setHeader("Vary", "X-Spofify-Playback-Extensions")
         }
         private fun finish(commandId: String, status: String) { outcomes[commandId]?.let { if (it.status == "pending") it.status = status } }
         private fun cancelTransfer(status: String) {
@@ -546,8 +562,19 @@ class UiFixtureServer : AutoCloseable {
             if (deliveries.any { now() >= it.deadline && it.value.type == "prepare" }) cancelTransfer("timeout")
             outcomes.entries.removeAll { it.value.status != "pending" && now() >= it.value.expires }
         }
+        private fun binding(): QueueIntentBinding? {
+            val device = devices[active] ?: return null
+            val metadata = queueState ?: return null
+            val snapshot = state ?: return null
+            if (!device.capable || device.metadata?.receiverId != metadata.receiverId || device.metadata?.revision != metadata.revision ||
+                transfer != null || now() < quarantineUntil || now() >= leaseUntil || now() - device.seen > 5000) return null
+            return QueueIntentBinding(active, metadata.receiverId, metadata.revision, snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId)
+        }
         private fun addDelivery(device: String, type: String, commandId: String, command: JsonObject? = null, snapshot: PlaybackSnapshot? = null) {
-            deliveries += Delivery(device, PlaybackDirective("synthetic-delivery-${++nextDelivery}", epoch, type, commandId, command, snapshot), now() + 8000)
+            val metadata = if (type in setOf("prepare", "activate") && devices[device]?.capable == true) queueState else null
+            metadata?.validated(checkNotNull(snapshot))
+            deliveries += Delivery(device, PlaybackDirective("synthetic-delivery-${++nextDelivery}", epoch, type, commandId, command, snapshot), now() + 8000,
+                metadata, state, queueState)
         }
         private fun makeOutcome(device: Device, q: JsonObject): Boolean {
             if (outcomes.size >= 128) {
@@ -560,6 +587,13 @@ class UiFixtureServer : AutoCloseable {
         private fun command(device: Device, q: JsonObject): String {
             if (transfer != null) return "transfer in progress"
             if (active.isEmpty()) return "no active device"
+            val command = PlaybackDeviceCommand.fromJson(q.getValue("command").jsonObject)
+            if (command.type == "queueIntent") {
+                if (!opted || devices[active]?.capable != true) return "unsupported receiver"
+                if (command.expected != binding()) return "stale queue intent binding"
+                val key = (command.selection as? QueueIntentSelection.Occurrence)?.key
+                if (key != null && state!!.queue.drop(state!!.position + 1).none { it.key == key }) return "stale queue occurrence"
+            }
             if (deliveries.isNotEmpty()) {
                 if (q.getValue("command").jsonObject.string("type") !in setOf("pause", "close")) return "command in progress"
                 deliveries.forEach { finish(it.value.commandId, "cancelled") }; deliveries.clear()
@@ -599,29 +633,76 @@ class UiFixtureServer : AutoCloseable {
             addDelivery(active, "activate", t.commandId, snapshot = state)
         }
         private fun poll(device: Device, q: JsonObject): String {
-            val snapshot = q["state"]?.takeUnless { it == JsonNull }?.let { PlaybackSnapshot.fromJson(it.jsonObject) }
+            val snapshot = q["state"]?.let { PlaybackSnapshot.fromJson(it.jsonObject) }
+            val metadata = q["queueIntentState"]?.let { QueueIntentState.fromJson(it.jsonObject, checkNotNull(snapshot)) }
+            if (device.capable && !opted) return "capable receiver requires negotiated poll"
+            if (metadata != null && (!opted || !device.capable || snapshot == null || active != device.id)) return "invalid queue intent state publisher"
             if (snapshot != null) {
                 if (active != device.id) return "only the active device may publish state"
                 if (q.number("stateSeq") <= stateSeq) return "stale state sequence"
+                if (device.capable && metadata == null) return "capable publication requires queue intent state"
             }
-            val acknowledged = mutableListOf<Pair<Delivery, String>>()
+            if (metadata != null) {
+                if (devices.values.any { it.id != device.id && it.metadata?.receiverId == metadata.receiverId }) return "receiver incarnation already registered"
+                device.metadata?.let { previous ->
+                    if (metadata.receiverId != previous.receiverId) return "receiver incarnation requires registration"
+                    if (metadata.revision < previous.revision || metadata.revision == previous.revision &&
+                        !QueueIntentReceipt.sameSemantics(checkNotNull(device.snapshot), previous, checkNotNull(snapshot), metadata)) return "stale semantic revision"
+                }
+            }
+            // Validate EVERY publication and ACK before touching heartbeat, lease, state or
+            // retained outcomes. The fixture does not execute music or fabricate native ACKs.
+            val acknowledged = mutableListOf<Triple<Delivery, String, QueueIntentResult?>>()
             for (element in q["acks"]?.jsonArray.orEmpty()) {
                 val ack = element.jsonObject
-                val found = deliveries.firstOrNull { it.value.deliveryId == ack.string("deliveryId") } ?: continue
+                val detail = ack["queueIntentResult"]?.let { QueueIntentResult.fromJson(it.jsonObject) }
+                val found = deliveries.firstOrNull { it.value.deliveryId == ack.string("deliveryId") }
+                if (found == null) {
+                    if (detail != null && outcomes.values.none { it.deliveryId == ack.string("deliveryId") && it.ackEpoch == ack.number("epoch") &&
+                            it.ackOwner == device.id && it.status == ack.string("status") && it.detail == detail }) return "unknown queue intent acknowledgement"
+                    continue
+                }
                 if (found.deviceId != device.id || found.value.epoch != ack.number("epoch") || !found.delivered) return "invalid acknowledgement"
                 if (found.value.type in setOf("release", "activate", "command") && snapshot == null) return "acknowledgement requires state"
                 val status = ack.string("status")
                 if (found.value.type == "activate" && status == "ok" && snapshot?.error != "") return "activation outcome does not match state"
                 if (status in setOf("blocked", "media") && snapshot != null && (snapshot.playing || snapshot.error != status)) return "outcome does not match state"
-                acknowledged += found to status
+                val command = found.value.command?.let(PlaybackDeviceCommand::fromJson)
+                if (found.value.type == "command" && command?.type == "queueIntent") {
+                    if (!opted || !device.capable || detail == null || snapshot == null || metadata == null || active != device.id) return "queue intent acknowledgement requires state and detail"
+                    try {
+                        QueueIntentReceipt.validate(command, detail, status, snapshot, metadata, checkNotNull(found.base), checkNotNull(found.baseMetadata))
+                    } catch (_: RuntimeException) { return "invalid queue intent receipt" }
+                } else if (detail != null) return "unexpected queue intent result"
+                if (found.value.type == "activate" && status != "rejected" && device.capable) {
+                    if (snapshot == null || metadata == null) return "capable activation requires metadata"
+                    // First explicit app Play is allowed to stage blank/paused replacement
+                    // state, never retained old audio. Its raw handoff was already admitted
+                    // when constructing prepare/activate; this is NOT a normal queue reset.
+                    val guardedBlank = outcomes[found.value.commandId]?.request?.get("requireUnselected") == JsonPrimitive(true) && snapshot == PlaybackSnapshot()
+                    if (!guardedBlank) {
+                        if (found.metadata != null) {
+                            if (!QueueIntentReceipt.sameSemantics(checkNotNull(found.value.state), found.metadata, snapshot, metadata)) return "handoff metadata does not match prepared state"
+                        } else if (metadata.provenance != "legacy-reset" || metadata.highKeys.isNotEmpty() || metadata.origins.any { it.intent != "legacy" }) return "legacy handoff requires provenance reset"
+                    }
+                }
+                acknowledged += Triple(found, status, detail)
             }
             device.seen = now()
             if (active == device.id) leaseUntil = now() + 8000
-            if (snapshot != null) { state = snapshot; stateSeq = q.number("stateSeq"); stateAccepted = now() }
-            for ((delivery, status) in acknowledged) {
+            if (snapshot != null) {
+                state = snapshot; queueState = metadata; stateSeq = q.number("stateSeq"); stateAccepted = now()
+                device.snapshot = snapshot; device.metadata = metadata
+            }
+            for ((delivery, status, detail) in acknowledged) {
                 deliveries.remove(delivery)
                 when (delivery.value.type) {
-                    "command" -> finish(delivery.value.commandId, status)
+                    "command" -> {
+                        finish(delivery.value.commandId, status)
+                        if (detail != null) outcomes[delivery.value.commandId]?.let {
+                            it.detail = detail; it.deliveryId = delivery.value.deliveryId; it.ackEpoch = delivery.value.epoch; it.ackOwner = device.id
+                        }
+                    }
                     "prepare" -> if (status != "ok") cancelTransfer(status) else {
                         val t = checkNotNull(transfer)
                         if (t.sourceDeviceId.isEmpty()) activate() else {

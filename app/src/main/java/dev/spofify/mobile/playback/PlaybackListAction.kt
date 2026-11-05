@@ -1,7 +1,7 @@
 package dev.spofify.mobile.playback
 
-/** Explicit list intent. Add never starts; Play next is not contextual FIFO. */
-enum class PlaybackListAction { CONTEXTUAL, ADD_TO_QUEUE, PLAY_NEXT }
+/** Queue placement is separate from playback: only a changed exact current may start. */
+enum class PlaybackListAction { CONTEXTUAL, ADD_TO_QUEUE, PLAY_NEXT, QUEUE_LOW, QUEUE_HIGH, PLAY_NOW }
 
 enum class PlaybackActionStatus {
     PLAYING, ADDED, LIMITED, FULL, NO_OP, UNAVAILABLE, BLOCKED, STALE, UNSUPPORTED_REMOTE, UNSUPPORTED,
@@ -15,6 +15,8 @@ class PlaybackAdditiveTransition internal constructor(
     internal val before: PlaybackInteractionKey,
     internal val after: PlaybackInteractionKey,
     internal val committedThrough: Long,
+    val beforeBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
+    val afterBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
 )
 
 /** Process-local ordering only; never persisted or used as output/server authority. */
@@ -29,8 +31,12 @@ data class PlaybackActionResult(
     val status: PlaybackActionStatus,
     val acceptedCount: Int = 0,
     val additiveTransition: PlaybackAdditiveTransition? = null,
+    val queueIntentResult: dev.spofify.mobile.core.QueueIntentResult? = null,
+    val requestedAction: PlaybackListAction? = null,
 ) {
-    val userMessage: String get() = when (status) {
+    val userMessage: String get() {
+        queueIntentResult?.let { return queueIntentMessage(it, requestedAction) }
+        return when (status) {
         PlaybackActionStatus.PLAYING -> "Playing"
         PlaybackActionStatus.ADDED -> "Added to queue"
         PlaybackActionStatus.LIMITED -> "Added $acceptedCount to queue; queue limited to 1,000 songs."
@@ -39,20 +45,39 @@ data class PlaybackActionResult(
         PlaybackActionStatus.UNAVAILABLE -> "This selection or playback output is unavailable."
         PlaybackActionStatus.BLOCKED -> "Playback needs a tap on this device."
         PlaybackActionStatus.STALE -> "Playback action cancelled after the selection or output changed."
-        PlaybackActionStatus.UNSUPPORTED_REMOTE -> "Contextual queue actions are unavailable on this remote output. Use its explicit controls."
-        PlaybackActionStatus.UNSUPPORTED -> "This playback action is unavailable."
+        PlaybackActionStatus.UNSUPPORTED_REMOTE, PlaybackActionStatus.UNSUPPORTED -> "Update the selected playback device and server to use queue priorities."
+        }
     }
 }
 
 /** Transient local provenance only. Imports cannot reconstruct a manual tier from v1 wire data. */
 internal class PlaybackManualTier {
     private val occurrences = mutableSetOf<String>()
+    private val origins = mutableMapOf<String, String>()
+    var provenance: String = "tracked"
+        private set
 
-    fun reset() = occurrences.clear()
-    fun prune(order: List<String>, current: String?) { occurrences.retainAll(PlaybackQueue.upcoming(order, current).toSet()) }
+    fun reset() { occurrences.clear(); origins.clear(); provenance = "tracked" }
+    /** Retirement affects membership only. Requested origins survive Previous/repeat. */
+    fun prune(order: List<String>, current: String?) {
+        occurrences.retainAll(PlaybackQueue.upcoming(order, current).toSet())
+        origins.keys.retainAll(order.toSet())
+        order.forEach { origins.putIfAbsent(it, "legacy") }
+    }
     fun contains(id: String): Boolean = id in occurrences
-    fun add(ids: Collection<String>) { occurrences.addAll(ids) }
-    fun remove(id: String) { occurrences.remove(id) }
+    fun origin(id: String): String = origins[id] ?: "legacy"
+    fun add(ids: Collection<String>) { occurrences.addAll(ids); ids.forEach { origins.putIfAbsent(it, "legacy") } }
+    fun tag(ids: Collection<String>, intent: String, high: Boolean) {
+        require(intent in setOf("low", "high", "next", "now", "legacy"))
+        ids.forEach { origins[it] = intent; if (high) occurrences.add(it) else occurrences.remove(it) }
+    }
+    fun restore(order: List<String>, requestedOrigins: Map<String, String>?, high: Collection<String> = emptyList(),
+        provenance: String = if (requestedOrigins == null) "legacy-reset" else "tracked") {
+        reset(); this.provenance = provenance
+        order.forEach { origins[it] = requestedOrigins?.get(it) ?: "legacy" }
+        occurrences.addAll(high)
+    }
+    fun remove(id: String) { occurrences.remove(id); origins.remove(id) }
 
     fun insertionIndex(order: List<String>, current: String?): Int {
         prune(order, current)
@@ -77,7 +102,7 @@ internal class PlaybackManualTier {
     /** Explicit arbitrary reorder adopts the displayed future as manual, preserving user order.
      * A later FIFO request follows that entire order; shuffle never undoes the explicit order. */
     fun adoptReorder(order: List<String>, current: String?) {
-        reset(); add(PlaybackQueue.upcoming(order, current))
+        occurrences.clear(); add(PlaybackQueue.upcoming(order, current))
     }
 
     fun partitionFuture(order: List<String>, current: String?): Pair<List<String>, List<String>> {

@@ -188,7 +188,7 @@ class PlaybackCoordinatorTest {
             assertTrue(c.state.value.verifyingConnection); assertFalse(c.state.value.retryAvailable)
             api.pollGate!!.complete(Unit); runCurrent()
             if (status == 409) {
-                assertEquals(1, api.views)
+                assertEquals(2, api.views) // Read-only extension probe precedes registration.
                 assertTrue(c.state.value.verifyingConnection); assertFalse(c.state.value.retryAvailable)
                 api.viewGate!!.complete(Unit); runCurrent()
                 assertTrue(c.state.value.message.contains("not replayed"))

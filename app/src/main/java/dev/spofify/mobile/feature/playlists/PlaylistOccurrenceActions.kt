@@ -41,13 +41,12 @@ internal fun PlaylistOccurrenceActions(
         Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = onPlayNow, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Play now") }
             onContextual?.let { action ->
-                TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("$contextualLabel (swipe action)") }
+                TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Queue High") }
             }
             onPlayNext?.let { action -> TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Play next") } }
-            // Explicit Add remains non-starting even if playback ends during preparation.
-            // The separately named swipe action carries contextual start-or-queue intent.
+            // Priority is explicit and independent of the output's play/pause state.
             onEnqueue?.let { action ->
-                TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Add to queue") }
+                TextButton(onClick = action, enabled = playbackEnabled && !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Queue Low") }
             }
             TextButton(onClick = onOpen, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Open track details") }
             TextButton(onClick = onAdd, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Add to playlist") }

@@ -3,6 +3,7 @@ package dev.spofify.mobile.playback
 import android.os.Looper
 import dev.spofify.mobile.core.PlaybackDeviceCommand
 import dev.spofify.mobile.core.PlaybackSnapshot
+import dev.spofify.mobile.core.QueueIntentState
 import dev.spofify.mobile.feature.devices.NativePlaybackEndpoint
 import dev.spofify.mobile.feature.devices.PlaybackAuthority
 import dev.spofify.mobile.feature.devices.PlaybackEndpointResult
@@ -10,11 +11,22 @@ import dev.spofify.mobile.feature.devices.PlaybackEndpointResult
 /** Same-process bridge to the single service output. Preparation is a pure exact-import plan. */
 class Media3PlaybackEndpoint : NativePlaybackEndpoint {
     override val supportsExactHandoff: Boolean = true
+    override val supportsQueueIntents: Boolean = true
+
+    override fun exportQueueIntentState(): QueueIntentState? {
+        checkMain()
+        return PlaybackService.exportLocalQueueIntentState()
+    }
 
     override fun suspendOutput() {
         checkMain()
         PlaybackRequests.invalidate()
         PlaybackService.suspendLocalOutput()
+    }
+
+    override fun interruptQueueIntentStart(): Boolean {
+        checkMain()
+        return PlaybackService.interruptLocalQueueIntentStart()
     }
 
     override fun exportSnapshot(): PlaybackSnapshot {
@@ -28,24 +40,48 @@ class Media3PlaybackEndpoint : NativePlaybackEndpoint {
         return runCatching { PlaybackSnapshotCodec.plan(snapshot); true }.getOrDefault(false)
     }
 
+    override suspend fun prepare(snapshot: PlaybackSnapshot, queueIntentState: QueueIntentState?): Boolean {
+        checkMain()
+        return runCatching {
+            PlaybackSnapshotCodec.plan(snapshot, queueIntentState)
+            true
+        }.getOrDefault(false)
+    }
+
+    override suspend fun activate(snapshot: PlaybackSnapshot, queueIntentState: QueueIntentState?, authority: PlaybackAuthority): PlaybackEndpointResult {
+        checkMain()
+        if (!prepare(snapshot, queueIntentState) || !authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())
+        return withMetadata(PlaybackService.activateSnapshot(snapshot, queueIntentState, authority))
+    }
+
+    private fun withMetadata(result: PlaybackEndpointResult): PlaybackEndpointResult =
+        if (result.queueIntentState != null) result else result.copy(queueIntentState = exportQueueIntentState())
+
     override suspend fun activate(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult {
         checkMain()
         snapshot.validated()
         if (!authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())
-        return PlaybackService.activateSnapshot(snapshot, authority)
+        return withMetadata(PlaybackService.activateSnapshot(snapshot, authority))
     }
 
     override suspend fun activatePreparedResume(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult {
         checkMain()
         snapshot.validated()
         if (!authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())
-        return PlaybackService.activatePreparedResumeSnapshot(snapshot, authority)
+        return withMetadata(PlaybackService.activatePreparedResumeSnapshot(snapshot, authority))
     }
 
     override suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority): PlaybackEndpointResult {
         checkMain()
         if (!authority.isValid()) return PlaybackEndpointResult("rejected", exportSnapshot())
-        return PlaybackService.executeCommand(command, authority)
+        return withMetadata(PlaybackService.executeCommand(command, authority))
+    }
+
+    override suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority,
+        isCurrent: () -> Boolean): PlaybackEndpointResult {
+        checkMain()
+        if (!authority.isValid() || !isCurrent()) return PlaybackEndpointResult("rejected", exportSnapshot())
+        return withMetadata(PlaybackService.executeCommand(command, authority, isCurrent))
     }
 
     private fun checkMain() = check(Looper.myLooper() == Looper.getMainLooper()) {

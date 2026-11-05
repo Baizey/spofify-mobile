@@ -70,8 +70,18 @@ class AppGraphPlaybackParticipationTest {
         occurrence = PlaybackOccurrence(71, "same-song", "original-history-event", 17.875, false),
     ).validated()
 
-    private inner class Fixture : Dispatcher() {
+    private inner class Fixture(private val negotiated: Boolean = false) : Dispatcher() {
         val registrations = AtomicInteger()
+        val probes = AtomicInteger()
+        val capableRegisters = AtomicInteger()
+        val collectionReads = AtomicInteger()
+        var additions: List<String> = emptyList()
+        private var publishedMetadata = false
+        private var metadata: QueueIntentState? = if (negotiated) QueueIntentState("fixture-source", 1, "tracked",
+            seed.queue.map { QueueIntentOrigin(it.key, "low") }, emptyList()) else null
+        private val outcomes = linkedMapOf<String, String>()
+        private val details = linkedMapOf<String, QueueIntentResult>()
+        val registrationsSeen = CopyOnWriteArrayList<JsonObject>()
         val unexpected = CopyOnWriteArrayList<String>()
         val polls = CopyOnWriteArrayList<JsonObject>()
         val pending = AtomicReference<PlaybackDirective?>()
@@ -81,12 +91,31 @@ class AppGraphPlaybackParticipationTest {
         private fun view(directives: List<PlaybackDirective> = emptyList()) = PlaybackDevicesView(
             deviceId, if (deviceId.isEmpty()) emptyList() else listOf(PlaybackDevice(deviceId, "Synthetic phone", true)),
             deviceId, 1, if (deviceId.isEmpty()) 0 else 8000, state = snapshot, stateSeq = sequence,
-            stateAgeMs = 0, transfer = null, directives = directives, commands = emptyList(),
+            stateAgeMs = 0, transfer = null, directives = directives,
+            commands = outcomes.map { PlaybackOutcome(it.key, it.value) },
+            queueIntents = if (!negotiated) null else QueueIntentsView(1,
+                if (deviceId.isEmpty()) emptyList() else listOf(QueueIntentReceiver(deviceId, 1)),
+                if (!publishedMetadata || deviceId.isEmpty()) null else metadata?.let {
+                    QueueIntentBinding(deviceId, it.receiverId, it.revision,
+                        snapshot?.queue?.getOrNull(snapshot?.position ?: -1)?.key, snapshot?.occurrence?.eventId)
+                }, metadata, emptyList(), details.map { QueueIntentCommandResult(it.key, it.value) }),
         )
         @Synchronized override fun dispatch(request: RecordedRequest): MockResponse {
             if (request.method == "POST" && request.path == "/api/auth/login") return response(
                 """{"accountId":"fixture-participant","username":"listener","role":"user","csrfToken":"fixture-csrf"}""",
             ).setHeader("Set-Cookie", "spofify_session=fixture-session; Path=/; HttpOnly; Max-Age=3600")
+            if (negotiated && request.method == "GET" && request.path == "/api/library/albums/album_B/playback") {
+                assertTrue(request.getHeader("Cookie")?.contains("spofify_session=fixture-session") == true)
+                collectionReads.incrementAndGet()
+                return response(buildJsonObject {
+                    put("context", buildJsonObject { put("kind", "album"); put("id", "album_B"); put("name", "Album B") })
+                    put("items", JsonArray(additions.map { id -> buildJsonObject {
+                        put("kind", "track"); put("id", id); put("name", id); put("artists", JsonArray(emptyList()))
+                        put("durationMs", 120000); put("hasAudio", true)
+                    } }))
+                    put("total", additions.size); put("limit", 1000); put("truncated", false); put("revision", 7)
+                }.toString())
+            }
             if (request.path != "/api/me/player") {
                 unexpected += "${request.method} ${request.path}"
                 return MockResponse().setResponseCode(500)
@@ -96,10 +125,20 @@ class AppGraphPlaybackParticipationTest {
                 unexpected += "Unauthenticated player request"
                 return MockResponse().setResponseCode(401)
             }
-            if (request.method == "GET") return response(view().toJson().toString())
+            if (request.method == "GET") {
+                if (request.getHeader("X-Spofify-Playback-Extensions") == "queue-intents-v1") probes.incrementAndGet()
+                return response(view().toJson().toString())
+            }
+            if (negotiated) assertEquals("queue-intents-v1", request.getHeader("X-Spofify-Playback-Extensions"))
             val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
             return when (body.getValue("action").jsonPrimitive.content) {
                 "register" -> {
+                    registrationsSeen += body
+                    if (negotiated) {
+                        assertTrue("Read-only probe must precede extended registration", probes.get() > 0)
+                        assertEquals(JsonPrimitive(1), body["queueIntentsVersion"])
+                        capableRegisters.incrementAndGet()
+                    }
                     deviceId = "phone-${registrations.incrementAndGet()}"
                     snapshot = seed; sequence = 0
                     response(view().toJson().toString())
@@ -107,9 +146,28 @@ class AppGraphPlaybackParticipationTest {
                 "poll" -> {
                     polls += body
                     assertEquals(deviceId, body.getValue("deviceId").jsonPrimitive.content)
-                    body["state"]?.let { snapshot = PlaybackSnapshot.fromJson(it.jsonObject) }
+                    body["state"]?.let {
+                        snapshot = PlaybackSnapshot.fromJson(it.jsonObject)
+                        if (negotiated) {
+                            metadata = QueueIntentState.fromJson(body.getValue("queueIntentState").jsonObject, snapshot!!)
+                            publishedMetadata = true
+                        }
+                    }
                     body["stateSeq"]?.let { sequence = it.jsonPrimitive.long }
-                    response(view(listOfNotNull(pending.getAndSet(null))).toJson().toString())
+                    if (negotiated) body.getValue("acks").jsonArray.forEach { raw ->
+                        val ack = raw.jsonObject
+                        ack["queueIntentResult"]?.let { detail ->
+                            val result = QueueIntentResult.fromJson(detail.jsonObject)
+                            result.validated(requireNotNull(snapshot), requireNotNull(metadata), ack.getValue("status").jsonPrimitive.content)
+                            outcomes["priority-command"] = ack.getValue("status").jsonPrimitive.content
+                            details["priority-command"] = result
+                        }
+                    }
+                    val delivered = pending.getAndSet(null)
+                    if (negotiated && delivered?.command?.get("type")?.jsonPrimitive?.content == "queueIntent") {
+                        outcomes[delivered.commandId] = "pending"
+                    }
+                    response(view(listOfNotNull(delivered)).toJson().toString())
                 }
                 "leave" -> response(view().copy(deviceId = "", devices = emptyList(), activeDeviceId = "", leaseMs = 0).toJson().toString())
                 else -> {
@@ -330,7 +388,7 @@ class AppGraphPlaybackParticipationTest {
         }
     }
 
-    private fun TestScope.await(description: String, condition: () -> Boolean) {
+    private fun TestScope.await(description: String, diagnostics: () -> String = { "" }, condition: () -> Boolean) {
         val deadline = System.nanoTime() + 5_000_000_000L
         while (!condition() && System.nanoTime() < deadline) {
             runCurrent()
@@ -338,7 +396,7 @@ class AppGraphPlaybackParticipationTest {
             Thread.sleep(5)
         }
         runCurrent()
-        assertTrue(description, condition())
+        assertTrue(description + diagnostics(), condition())
     }
 
     private fun longDerived(length: Int): PlaybackSnapshot {
@@ -387,6 +445,108 @@ class AppGraphPlaybackParticipationTest {
             assertEquals(supported, fixture.states().last())
             assertTrue(fixture.polls.all { it.toString().toByteArray().size <= 2 * 1024 * 1024 })
             assertTrue("No audio/history/refetch: ${fixture.unexpected}", fixture.unexpected.isEmpty())
+        } finally {
+            graph.clear(); service?.destroy(); runCurrent(); web.shutdown(); Dispatchers.resetMain()
+        }
+    }
+
+    @Test fun negotiatedProductionReceiverConsumesFrozenPausedVectorAndPublishesAtomicDetailedAck() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val corpusPath = listOf(java.io.File("core/src/test/resources/queue-intents-v1/queue-intents-v1.json"),
+            java.io.File("../core/src/test/resources/queue-intents-v1/queue-intents-v1.json")).first { it.isFile }
+        val bytes = corpusPath.readBytes()
+        assertEquals("621f5e5eea8632ea732c7369ae03bc442db53ec82e3d0edd7a9052a24547f44b",
+            java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) })
+        val vector = Json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject.getValue("semantics").jsonArray
+            .map { it.jsonObject }.single { it.getValue("name").jsonPrimitive.content == "corrected-P1-paused-A-keeps-current" }
+        fun labels(name: String) = vector.getValue(name).jsonArray.map { it.jsonPrimitive.content }
+        val initial = PlaybackSnapshot(queue = labels("queue").mapIndexed { index, id ->
+            PlaybackTrack(id, id, emptyList(), "", "", 120.0, key = index + 101L, order = index.toLong())
+        }, position = vector.getValue("position").jsonPrimitive.int, elapsed = 42.0, duration = 120.0,
+            occurrence = PlaybackOccurrence(101, "A", "frozen-vector-history", 12.25, false)).validated()
+        val imported = QueueIntentState("source-receiver", 31, "tracked", initial.queue.map {
+            QueueIntentOrigin(it.key, if (it.id in labels("high")) "high" else "low")
+        }, initial.queue.filter { it.id in labels("high") }.map { it.key }).validated(initial)
+        val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
+        app.graph.clear()
+        val graph = AppGraph(app, Sessions(), Logins())
+        SpofifyApplication::class.java.getDeclaredField("graph").apply { isAccessible = true; set(app, graph) }
+        val fixture = Fixture(negotiated = true).apply { additions = labels("additions") }
+        val web = MockWebServer().apply { dispatcher = fixture; start(InetAddress.getByName("127.0.0.1"), 0) }
+        var service: ServiceController<PlaybackService>? = null
+        try {
+            graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}")).login("listener", "synthetic-password")
+            val owner = requireNotNull(graph.playbackCoordinator)
+            service = Robolectric.buildService(PlaybackService::class.java).create()
+            await("Complete native receiver must negotiate before capable registration") { owner.state.value.connected }
+            assertEquals(1, fixture.capableRegisters.get())
+            assertTrue(Media3PlaybackEndpoint().supportsQueueIntents)
+            val endpoint = Media3PlaybackEndpoint()
+            owner.localAction { permit -> endpoint.activate(initial, imported, permit) }
+            await("Imported exact state and native incarnation must be published") {
+                owner.state.value.canQueueIntent && fixture.states().lastOrNull()?.queue?.map { it.id } == labels("queue")
+            }
+            val before = endpoint.exportSnapshot()
+            val binding = requireNotNull(owner.state.value.queueIntentBinding)
+            assertNotEquals("Incoming handoff must not adopt the source incarnation", imported.receiverId, binding.receiverId)
+            fixture.pending.set(PlaybackDirective("priority-delivery", owner.state.value.view!!.epoch, "command", "priority-command",
+                PlaybackDeviceCommand.queueIntent(QueueIntentIntent.fromWire(vector.getValue("intent").jsonPrimitive.content), binding,
+                    QueueIntentSelection.Collection(PlaybackContext("album", "album_B", "Album B"))).json))
+            owner.retry()
+            await("One native resolver must prepare the bounded album") { fixture.collectionReads.get() == 1 }
+            await("Receiver installs the accepted queue before terminal publication") { endpoint.exportSnapshot().queue.size == 6 }
+            owner.retry()
+            await("Queue acceptance must publish its detailed terminal ACK") { fixture.ackStatus("priority-delivery") == "ok" }
+            val after = endpoint.exportSnapshot()
+            assertEquals(labels("expectedQueue"), after.queue.map { it.id })
+            assertEquals(vector.getValue("expectedCurrent").jsonPrimitive.content, after.queue[after.position].id)
+            assertEquals(before.occurrence, after.occurrence)
+            assertEquals(42.0, after.elapsed, 0.0)
+            assertFalse(after.playing); assertEquals(before.error, after.error)
+            val metadata = requireNotNull(endpoint.exportQueueIntentState()).validated(after)
+            assertEquals(labels("expectedHigh"), metadata.highKeys.map { key -> after.queue.single { it.key == key }.id })
+            assertEquals(listOf("low", "low"), metadata.origins.takeLast(2).map { it.intent })
+            val ackPoll = fixture.polls.single { body -> body.getValue("acks").jsonArray.any {
+                it.jsonObject.getValue("deliveryId").jsonPrimitive.content == "priority-delivery"
+            } }
+            val detail = QueueIntentResult.fromJson(ackPoll.getValue("acks").jsonArray.single().jsonObject.getValue("queueIntentResult").jsonObject)
+            assertEquals("queued", detail.outcome); assertEquals(2, detail.acceptedCount)
+            assertEquals("low", detail.placement); assertEquals("unchanged", detail.playback); assertNull(detail.playbackKey)
+            detail.validated(PlaybackSnapshot.fromJson(ackPoll.getValue("state").jsonObject),
+                QueueIntentState.fromJson(ackPoll.getValue("queueIntentState").jsonObject), "ok")
+            val raw = PlaybackService::class.java.getDeclaredField("player").let { it.isAccessible = true; it.get(service.get()) as ExoPlayer }
+            assertFalse(raw.playWhenReady)
+            assertEquals(Player.STATE_IDLE, raw.playbackState)
+            assertEquals(1, fixture.collectionReads.get())
+            // A locally originated raw queue transaction must retain its pure output lease
+            // after its OWN publication changes the captured semantic Binding. Never store
+            // an authority predicate tied forever to the obsolete predecessor binding.
+            await("The controller consumes the preceding terminal publication before a new explicit action") {
+                owner.state.value.queueIntentBinding?.revision == metadata.revision
+            }
+            val localDetail = AtomicReference<List<QueueIntentResult?>>(emptyList())
+            owner.queueIntent(QueueIntentIntent.HIGH, owner.state.value.queueIntentBinding,
+                QueueIntentSelection.Track(buildJsonObject {
+                    put("id", "local-X"); put("name", "Local X"); put("artists", JsonArray(emptyList()))
+                    put("albumName", ""); put("albumId", ""); put("duration", 120)
+                }, null), isCurrent = { true }, onResult = { localDetail.set(listOf(it)) })
+            await("Locally originated queue action waits for its exact publication", diagnostics = {
+                " connected=${owner.state.value.connected} capable=${owner.state.value.canQueueIntent}" +
+                    " projectedRevision=${owner.state.value.queueIntentBinding?.revision}" +
+                    " nativeRevision=${endpoint.exportQueueIntentState()?.revision}" +
+                    " nativeCount=${endpoint.exportSnapshot().queue.size} polls=${fixture.polls.size}" +
+                    " lastSeq=${fixture.polls.lastOrNull()?.get("stateSeq")}" +
+                    " unexpectedRoutes=${fixture.unexpected.takeLast(3)}"
+            }) { localDetail.get().isNotEmpty() }
+            val localReceipt = requireNotNull(localDetail.get().single())
+            assertEquals("queued", localReceipt.outcome)
+            assertEquals(1, localReceipt.acceptedCount)
+            val retainedAuthority = PlaybackService::class.java.getDeclaredField("authority").let {
+                it.isAccessible = true; it.get(service.get()) as dev.spofify.mobile.feature.devices.PlaybackAuthority
+            }
+            assertTrue("Own successor publication must not revoke the native output's lease", retainedAuthority.isValid())
+            assertFalse(endpoint.exportSnapshot().playing)
+            assertTrue("Only authenticated synthetic player and one album resolver route", fixture.unexpected.isEmpty())
         } finally {
             graph.clear(); service?.destroy(); runCurrent(); web.shutdown(); Dispatchers.resetMain()
         }

@@ -75,6 +75,34 @@ internal object PlaybackCommandResolver {
             (entry == null || current.entryId == entry) && fields.text("occurrenceId") == null && fields.text("selectionToken") == null
     }
 
+    /** One receiver-authoritative normalization. Queue rows never expand into their album. */
+    suspend fun resolveQueueIntent(command: PlaybackDeviceCommand, client: SpofifyClient): ResolvedPlaybackCommand? {
+        require(command.type == "queueIntent")
+        val fields = PlaybackDeviceCommand.fromJson(command.json).json
+        val intent = fields.getValue("intent").jsonPrimitive.content
+        val selection = fields.getValue("selection").jsonObject
+        return when (selection.getValue("kind").jsonPrimitive.content) {
+            "occurrence" -> null // Exact live upcoming validation is serialized in the service.
+            "collection" -> resolve(PlaybackDeviceCommand.musical("playCollection",
+                context = json.decodeFromJsonElement<PlaybackContext>(selection.getValue("context"))), client)
+            "track" -> {
+                val raw = selection.getValue("track").jsonObject
+                val track = decodeTrack(raw)
+                val context = selection["context"]?.takeUnless { it is kotlinx.serialization.json.JsonNull }
+                    ?.let { json.decodeFromJsonElement<PlaybackContext>(it) }
+                require(track.playbackContext == null || context == track.playbackContext) { "Contradictory context" }
+                if (intent == "now" || context?.kind in setOf("derived", "playlist")) {
+                    val prepared = requireNotNull(resolve(PlaybackDeviceCommand.musical("play", track = raw, context = context), client))
+                    if (intent == "now") prepared else prepared.copy(tracks = listOf(prepared.tracks[prepared.startIndex]), startIndex = 0)
+                } else {
+                    require(!hasDerivedIdentity(track)) { "Missing signed derived context" }
+                    result(listOf(track.copy(playbackContext = context)), context, 0, pinStart = true)
+                }
+            }
+            else -> throw IllegalArgumentException("Invalid queue selection")
+        }
+    }
+
     suspend fun resolve(command: PlaybackDeviceCommand, client: SpofifyClient): ResolvedPlaybackCommand? {
         currentCoroutineContext().ensureActive()
         if (command.type !in setOf("play", "playCollection", "enqueue", "enqueueContext")) return null
@@ -152,6 +180,7 @@ internal object PlaybackCommandResolver {
             "playlist" -> {
                 val response = PersonalCollectionsApi(client).playback(context.id)
                 require(response.context.kind == "playlist" && response.context.id == context.id) { "Mismatched playback context" }
+                require(context.revision == 0L || response.revision == context.revision) { "Stale playlist revision" }
                 OrdinaryQueue(response.items, response.total, response.limit, response.truncated,
                     PlaybackContext("playlist", response.context.id, response.context.name,
                         response.revision.takeIf { it > 0 } ?: response.context.revision ?: context.revision))

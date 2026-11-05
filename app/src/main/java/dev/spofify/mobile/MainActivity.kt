@@ -63,6 +63,7 @@ private data class CatalogMoreSelection(
     val item: LibraryItem,
     val interactionKey: PlaybackInteractionKey?,
     val lifetime: RowActionLifetime,
+    val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding?,
 )
 
 internal fun listeningColorScheme() = darkColorScheme(
@@ -148,7 +149,8 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         val feedback = CatalogPlaybackFeedback(player.item?.id, player.isPlaying, player.isBuffering, model.playback::toggle,
             interactionKey = player.interactionKey,
             playWhenReady = player.playWhenReady,
-            onContextual = { item, binding, isCurrent -> model.contextualFrom(client, item, binding, isCurrent) })
+            onContextual = { item, binding, isCurrent -> model.contextualFrom(client, item, binding, isCurrent) },
+            queueIntentBinding = player.queueIntentBinding)
         val likeStates = state.likes.mapValues { (id, liked) ->
             CatalogLikeState(liked, id in state.pendingLikes, id in state.failedLikeStatus)
         } + state.failedLikeStatus.filterNot { it in state.likes }.associateWith { CatalogLikeState(failed = true) }
@@ -165,7 +167,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         // Inner catalog navigation/query changes also retire the old route (including A→B→A).
         val actionLifetime = remember(state.page, catalog, catalogRoute) { RowActionLifetime() }
         DisposableEffect(actionLifetime) { onDispose { actionLifetime.invalidate() } }
-        val showMore: (LibraryItem) -> Unit = { more = CatalogMoreSelection(it, player.interactionKey, actionLifetime) }
+        val showMore: (LibraryItem) -> Unit = { more = CatalogMoreSelection(it, player.interactionKey, actionLifetime, player.queueIntentBinding) }
         val openExternal: (LibraryItem) -> Unit = { item ->
             expanded = false
             when (item.kind) {
@@ -235,6 +237,9 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                             onOpenTrack = openExternal,
                             onPlayQueue = { prepared, trackId, entryId -> model.playPrepared(client, accountId, prepared, trackId, entryId, preparedGeneration) },
                             onShowTrackActions = showMore, modifier = contentModifier, playback = feedback,
+                            onQueueIntent = { selection, action, binding, expectedBinding, isCurrent ->
+                                model.queueIntentSelectionFrom(client, selection, action, binding, isCurrent, expectedBinding)
+                            },
                             playbackEntryId = player.item?.entryId, playbackContext = player.context,
                             onPreparedAction = { prepared, trackId, entryId, action, binding, isCurrent ->
                                 model.preparedListAction(client, accountId, prepared, trackId, entryId, action, binding, preparedGeneration, isCurrent)
@@ -283,13 +288,15 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             LaunchedEffect(item.id) { if (item.kind == "track") model.checkLike(item) }
             ModalBottomSheet(onDismissRequest = { more = null }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
                 MusicActionsContent(item, state.likes[item.id], item.id in state.pendingLikes, item.id in state.failedLikeStatus,
-                    onPlay = { more = null; play(item, false) },
-                    onPlayNext = { more = null; model.enqueueFrom(client, item, playNext = true) },
-                    onEnqueue = { more = null; queue(item) },
+                    onPlay = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW, binding, isCurrent, selection.queueIntentBinding) },
+                    onPlayNext = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NEXT, binding, isCurrent, selection.queueIntentBinding) },
+                    onEnqueue = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, binding, isCurrent, selection.queueIntentBinding) },
+                    onQueueLow = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_LOW, binding, isCurrent, selection.queueIntentBinding) },
                     contextualLabel = feedback.contextualLabel,
                     onContextual = binding?.let { capturedKey -> {
                         more = null
-                        model.contextualFrom(client, item, capturedKey, isCurrent)
+                        model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
+                            capturedKey, isCurrent, selection.queueIntentBinding)
                     } },
                     onToggleLike = { model.likeAction(item) }, onRetryLike = { model.checkLike(item) },
                     onAddToPlaylist = { more = null; addToPlaylist = item },

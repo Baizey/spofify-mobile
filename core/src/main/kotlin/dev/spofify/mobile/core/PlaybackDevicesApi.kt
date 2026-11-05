@@ -9,7 +9,7 @@ internal const val MAX_PLAYBACK_BODY_BYTES = 2 * 1024 * 1024
 // Maximum escaped context/history growth + poll identity/sequence and 16 maximum ACKs.
 // PlaybackPublicationTest proves this reserve; exact API body-size enforcement remains below.
 internal const val PLAYBACK_PUBLICATION_RESERVE_BYTES = 16 * 1024
-private val playbackJson = Json { ignoreUnknownKeys = false; encodeDefaults = true; explicitNulls = true }
+internal val playbackJson = Json { ignoreUnknownKeys = false; encodeDefaults = true; explicitNulls = true }
 
 @Serializable data class PlaybackArtist(val id: String = "", val name: String)
 @Serializable data class PlaybackContext(val kind: String, val id: String, val name: String, val revision: Long = 0, val fence: String = "")
@@ -71,19 +71,22 @@ private fun requireSnapshotShape(value: JsonObject) {
     require(value.keys.containsAll(setOf("version", "queue", "position", "context", "shuffle", "repeat", "elapsed", "duration", "playing", "waiting", "error", "truncated", "notice", "occurrence")))
     value.getValue("queue").jsonArray.forEach { require(it.jsonObject.keys.containsAll(setOf("id", "name", "artists", "albumName", "albumId", "duration", "key", "order"))) }
 }
-private fun libraryId(s: String) = s.isNotEmpty() && s.trim() == s && text(s, 512)
+internal fun libraryId(s: String) = s.isNotEmpty() && s.trim() == s && text(s, 512)
 private fun optionalId(s: String) = s.isEmpty() || libraryId(s)
-private val wireNumbers = setOf("version", "position", "elapsed", "duration", "key", "order", "revision", "progress", "epoch", "leaseMs", "quarantineMs", "stateSeq", "stateAgeMs", "value")
+private val wireNumbers = setOf("version", "position", "elapsed", "duration", "key", "order", "revision", "progress", "epoch", "leaseMs", "quarantineMs", "stateSeq", "stateAgeMs", "value", "acceptedCount", "currentKey", "commitRevision", "playbackKey", "queueIntentsVersion")
 private val wireBooleans = setOf("shuffle", "playing", "waiting", "loading", "truncated", "reported", "available", "first")
-private val wireStrings = setOf("id", "name", "albumName", "albumId", "entryId", "targetId", "occurrenceId", "selectionToken", "kind", "fence", "repeat", "error", "notice", "trackId", "eventId", "deviceId", "activeDeviceId", "commandId", "sourceDeviceId", "targetDeviceId", "phase", "deliveryId", "type", "status", "direction")
-private fun requireWireTypes(value: JsonElement, depth: Int = 0) {
+private val wireStrings = setOf("id", "name", "albumName", "albumId", "entryId", "targetId", "occurrenceId", "selectionToken", "kind", "fence", "repeat", "error", "notice", "trackId", "eventId", "deviceId", "activeDeviceId", "commandId", "sourceDeviceId", "targetDeviceId", "phase", "deliveryId", "type", "status", "direction", "receiverId", "outputDeviceId", "currentEventId", "intent", "provenance", "outcome", "placement", "playback")
+internal fun requireWireTypes(value: JsonElement, depth: Int = 0) {
     require(depth <= 16)
     when (value) {
         is JsonObject -> value.forEach { (key, child) ->
             when (key) {
-                in wireNumbers -> require(child is JsonPrimitive && !child.isString && child.doubleOrNull?.isFinite() == true)
+                in wireNumbers -> if (child != JsonNull || key !in setOf("currentKey", "commitRevision", "playbackKey")) {
+                    require(child is JsonPrimitive && !child.isString && child.doubleOrNull?.isFinite() == true)
+                    if (key !in setOf("elapsed", "duration", "progress", "value")) require(child.content.matches(Regex("-?(0|[1-9][0-9]*)")) && child.longOrNull?.let { it in -MAX_SAFE..MAX_SAFE } == true)
+                }
                 in wireBooleans -> require(child is JsonPrimitive && !child.isString && child.booleanOrNull != null)
-                in wireStrings -> require(child is JsonPrimitive && child.isString)
+                in wireStrings -> if (key != "currentEventId" || child != JsonNull) require(child is JsonPrimitive && child.isString)
             }
             if (child is JsonObject || child is JsonArray) requireWireTypes(child, depth + 1)
         }
@@ -93,11 +96,11 @@ private fun requireWireTypes(value: JsonElement, depth: Int = 0) {
 }
 fun validPlaybackProtocolId(s: String) = s.matches(Regex("[A-Za-z0-9_-]{1,128}"))
 fun validPlaybackDeviceName(s: String) = s.isNotBlank() && s.codePointCount(0, s.length) <= 64 && text(s, 256)
-private fun PlaybackContext.validate() {
+internal fun PlaybackContext.validate() {
     require(kind in setOf("album", "artist", "playlist", "likes", "derived") && libraryId(id) && text(name, 512) && revision in 0..MAX_SAFE && text(fence, 4096))
     if (kind == "derived") require(validPlaybackProtocolId(id) && revision > 0 && fence.isNotEmpty() && fence.all { it.code in 33..126 })
 }
-private fun PlaybackTrack.validate() {
+internal fun PlaybackTrack.validate() {
     require(libraryId(id) && text(name, 512) && text(albumName, 512) && optionalId(albumId) && number(duration))
     require(artists.size <= 64 && artists.all { optionalId(it.id) && text(it.name, 512) })
     require(optionalId(entryId) && optionalId(targetId) && text(occurrenceId, 4096) && key in 1..MAX_SAFE && order in 0..MAX_SAFE)
@@ -108,6 +111,9 @@ private fun PlaybackTrack.validate() {
 @ConsistentCopyVisibility
 data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
     val type: String get() = json.getValue("type").jsonPrimitive.content
+    val intent: String? get() = json["intent"]?.jsonPrimitive?.content
+    val expected: QueueIntentBinding? get() = json["expected"]?.jsonObject?.let(QueueIntentBinding::fromJson)
+    val selection: QueueIntentSelection? get() = json["selection"]?.jsonObject?.let(QueueIntentSelection::fromJson)
     // Musical commands may carry ephemeral signed selection authority. Serialize only via
     // the intentional wire json boundary, never via a generated diagnostic data-class string.
     override fun toString(): String = "PlaybackDeviceCommand(type=$type, payload=<redacted>)"
@@ -150,6 +156,13 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
                 occurrenceId?.let { put("occurrenceId", it) }; selectionToken?.let { put("selectionToken", it) }
             })
         }
+        fun queueIntent(intent: QueueIntentIntent, expected: QueueIntentBinding, selection: QueueIntentSelection): PlaybackDeviceCommand =
+            PlaybackDeviceCommand(buildJsonObject {
+                put("type", "queueIntent"); put("intent", intent.wire); put("expected", expected.toJson()); put("selection", selection.toJson())
+            })
+        fun queueIntent(intent: String, expected: QueueIntentBinding, selection: QueueIntentSelection): PlaybackDeviceCommand =
+            queueIntent(QueueIntentIntent.fromWire(intent), expected, selection)
+        fun fromRawJson(raw: String): PlaybackDeviceCommand = fromJson(PlaybackRawJson.parse(raw))
         fun fromJson(value: JsonObject): PlaybackDeviceCommand {
             requireWireTypes(value)
             val type = value["type"]?.jsonPrimitive?.content ?: error("Missing command type")
@@ -157,6 +170,8 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
                 // Shipped web clients still send toggle. It is incoming-only: transport("toggle")
                 // stays forbidden so native controls never toggle against a stale remote display.
                 "toggle" -> PlaybackDeviceCommand(buildJsonObject { put("type", "toggle") })
+                "queueIntent" -> queueIntent(QueueIntentIntent.fromWire(value.getValue("intent").jsonPrimitive.content),
+                    QueueIntentBinding.fromJson(value.getValue("expected").jsonObject), QueueIntentSelection.fromJson(value.getValue("selection").jsonObject))
                 "seek" -> seek(value.getValue("value").jsonPrimitive.double)
                 "jump", "remove", "move" -> queue(type, value.getValue("key").jsonPrimitive.long, value["direction"]?.jsonPrimitive?.content)
                 "play", "playCollection", "enqueue", "enqueueContext" -> musical(type, value["track"]?.jsonObject,
@@ -177,14 +192,14 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
 @Serializable data class PlaybackTransfer(val commandId: String, val sourceDeviceId: String, val targetDeviceId: String, val phase: String)
 @Serializable data class PlaybackOutcome(val commandId: String, val status: String)
 @Serializable data class PlaybackDirective(val deliveryId: String, val epoch: Long, val type: String, val commandId: String = "", val command: JsonObject? = null, val state: PlaybackSnapshot? = null)
-@Serializable data class PlaybackAck(val deliveryId: String, val epoch: Long, val status: String)
+@Serializable data class PlaybackAck(val deliveryId: String, val epoch: Long, val status: String, val queueIntentResult: QueueIntentResult? = null)
 @Serializable data class PlaybackDevicesView(
     val deviceId: String = "", val devices: List<PlaybackDevice>, val activeDeviceId: String, val epoch: Long,
     val leaseMs: Long, val quarantineMs: Long = 0, val state: PlaybackSnapshot?, val stateSeq: Long,
-    val stateAgeMs: Long, val transfer: PlaybackTransfer?, val directives: List<PlaybackDirective>, val commands: List<PlaybackOutcome>, val error: String = "",
+    val stateAgeMs: Long, val transfer: PlaybackTransfer?, val directives: List<PlaybackDirective>, val commands: List<PlaybackOutcome>, val error: String = "", val queueIntents: QueueIntentsView? = null,
 ) {
     fun validated() = apply {
-        require(epoch in 1..MAX_SAFE && stateSeq in 0..MAX_SAFE && leaseMs in 0..8000 && quarantineMs in 0..8000 && stateAgeMs >= 0)
+        require(epoch in 1..MAX_SAFE && stateSeq in 0..MAX_SAFE && leaseMs in 0..8000 && quarantineMs in 0..8000 && stateAgeMs in 0..MAX_SAFE)
         require(deviceId.isEmpty() || validPlaybackProtocolId(deviceId))
         require(devices.size <= 16 && devices.map { it.deviceId }.distinct().size == devices.size)
         require(devices.all { validPlaybackProtocolId(it.deviceId) && validPlaybackDeviceName(it.name) })
@@ -193,10 +208,16 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
         transfer?.let { require(validPlaybackProtocolId(it.commandId) && validPlaybackProtocolId(it.targetDeviceId) && (it.sourceDeviceId.isEmpty() || validPlaybackProtocolId(it.sourceDeviceId)) && it.phase in setOf("waiting", "preparing", "releasing", "activating")) }
         directives.forEach { require(validPlaybackProtocolId(it.deliveryId) && it.epoch == epoch && it.type in setOf("prepare", "release", "activate", "command")); it.state?.validated(); it.command?.let(PlaybackDeviceCommand::fromJson) }
         commands.forEach { require(validPlaybackProtocolId(it.commandId) && it.status in setOf("pending", "ok", "blocked", "media", "rejected", "timeout", "cancelled")) }
+        queueIntents?.validated(this)
+        if (queueIntents == null) require(directives.none { it.command?.get("type")?.jsonPrimitive?.content == "queueIntent" })
     }
-    fun toJson(): JsonObject = playbackJson.encodeToJsonElement(serializer(), validated()).jsonObject
+    fun toJson(): JsonObject = JsonObject(playbackJson.encodeToJsonElement(serializer(), validated()).jsonObject.filterKeys { it != "queueIntents" || queueIntents != null })
     companion object {
-        fun fromJson(value: JsonObject): PlaybackDevicesView {
+        fun fromRawJson(raw: String, allowQueueIntents: Boolean = false): PlaybackDevicesView = fromJson(PlaybackRawJson.parse(raw), allowQueueIntents)
+        fun fromJson(value: JsonObject): PlaybackDevicesView = fromJson(value, allowQueueIntents = true)
+        fun fromJson(value: JsonObject, allowQueueIntents: Boolean): PlaybackDevicesView {
+            require(allowQueueIntents || "queueIntents" !in value)
+            require("queueIntents" !in value || value["queueIntents"] is JsonObject)
             requireWireTypes(value)
             value["state"]?.takeUnless { it is JsonNull }?.jsonObject?.let(::requireSnapshotShape)
             value["directives"]?.jsonArray?.forEach { directive ->
@@ -211,7 +232,16 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
 interface PlaybackDevicesProtocol {
     suspend fun view(): PlaybackDevicesView
     suspend fun register(name: String): PlaybackDevicesView
+    suspend fun probeQueueIntents(): PlaybackDevicesView = view()
+    suspend fun register(name: String, queueIntentsVersion: Int?): PlaybackDevicesView {
+        if (queueIntentsVersion != null) throw UnsupportedOperationException("Queue intents receiver is unavailable")
+        return register(name)
+    }
     suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long? = null, state: PlaybackSnapshot? = null, acks: List<PlaybackAck> = emptyList()): PlaybackDevicesView
+    suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>, queueIntentState: QueueIntentState?): PlaybackDevicesView {
+        if (queueIntentState != null || acks.any { it.queueIntentResult != null }) throw UnsupportedOperationException("Queue intents publication is unavailable")
+        return poll(deviceId, epoch, stateSeq, state, acks)
+    }
     suspend fun rename(deviceId: String, name: String): PlaybackDevicesView
     suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView
     suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView
@@ -224,21 +254,47 @@ interface PlaybackDevicesProtocol {
 class PlaybackDevicesApi(client: SpofifyClient) : PlaybackDevicesProtocol {
     private val transport = ApiTransport(client)
     private val path = listOf("api", "me", "player")
+    @Volatile private var extensions = false
+    @Volatile private var probed = false
+    @Volatile private var receiverCapable = false
+    override suspend fun probeQueueIntents(): PlaybackDevicesView = withTimeout(4000) {
+        val view = PlaybackDevicesView.fromJson(transport.send("GET", path, playbackExtensions = true)!!, true)
+        extensions = view.queueIntents != null; probed = true
+        view
+    }
+    private suspend fun requireExtensions() {
+        if (!probed) probeQueueIntents()
+        check(extensions) { "Queue intents are unsupported by this server" }
+    }
     private suspend fun post(action: String, fields: JsonObjectBuilder.() -> Unit): PlaybackDevicesView = withTimeout(4000) {
         val body = buildJsonObject { put("action", action); fields() }
         require(body.toString().toByteArray(Charsets.UTF_8).size <= MAX_PLAYBACK_BODY_BYTES) { "Queue is too large to share" }
-        PlaybackDevicesView.fromJson(requireNotNull(transport.send("POST", path, body)))
+        PlaybackRequestContract.fromRawJson(body.toString())
+        decodeView(requireNotNull(transport.send("POST", path, body, playbackExtensions = extensions)))
     }
-    override suspend fun view() = withTimeout(4000) { PlaybackDevicesView.fromJson(transport.get(path)) }
-    override suspend fun register(name: String): PlaybackDevicesView { require(validPlaybackDeviceName(name)); return post("register") { put("name", name) } }
-    override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView {
-        require((state == null) == (stateSeq == null) && acks.size <= 16)
-        require(stateSeq == null || stateSeq in 1..MAX_SAFE)
-        acks.forEach { require(validPlaybackProtocolId(it.deliveryId) && it.epoch in 1..MAX_SAFE && it.status in setOf("ok", "blocked", "media", "rejected")) }
-        return post("poll") { identity(deviceId, epoch); state?.let { put("state", it.toJson()); put("stateSeq", stateSeq!!) }; put("acks", playbackJson.encodeToJsonElement(acks)) }
+    private fun decodeView(json: JsonObject): PlaybackDevicesView = PlaybackDevicesView.fromJson(json, extensions).also {
+        require(!extensions || it.queueIntents != null) { "Negotiated queue metadata is missing" }
+    }
+    override suspend fun view() = withTimeout(4000) { decodeView(transport.send("GET", path, playbackExtensions = extensions)!!) }
+    override suspend fun register(name: String): PlaybackDevicesView = register(name, null)
+    override suspend fun register(name: String, queueIntentsVersion: Int?): PlaybackDevicesView {
+        require(validPlaybackDeviceName(name) && (queueIntentsVersion == null || queueIntentsVersion == 1))
+        if (queueIntentsVersion != null) requireExtensions()
+        val view = post("register") { put("name", name); queueIntentsVersion?.let { put("queueIntentsVersion", it) } }
+        require(queueIntentsVersion == null || view.queueIntents?.receivers?.any { it.deviceId == view.deviceId && it.version == 1 } == true)
+        receiverCapable = queueIntentsVersion == 1
+        return view
+    }
+    override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView =
+        poll(deviceId, epoch, stateSeq, state, acks, null)
+    override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>, queueIntentState: QueueIntentState?): PlaybackDevicesView {
+        if (queueIntentState != null || acks.any { it.queueIntentResult != null }) { requireExtensions(); check(receiverCapable) }
+        require(!receiverCapable || state == null || queueIntentState != null)
+        val body = PlaybackPublication.pollBody(deviceId, epoch, stateSeq, state, acks, queueIntentState)
+        return post("poll") { body.forEach { (key, value) -> if (key != "action") put(key, value) } }
     }
     override suspend fun rename(deviceId: String, name: String): PlaybackDevicesView { require(validPlaybackProtocolId(deviceId) && validPlaybackDeviceName(name)); return post("rename") { put("deviceId", deviceId); put("name", name) } }
-    override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView { require(validPlaybackProtocolId(commandId)); return post("command") { identity(deviceId, epoch); put("commandId", commandId); put("command", command.json) } }
+    override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView { require(validPlaybackProtocolId(commandId)); if (command.type == "queueIntent") requireExtensions(); return post("command") { identity(deviceId, epoch); put("commandId", commandId); put("command", command.json) } }
     override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView {
         require(validPlaybackProtocolId(commandId) && validPlaybackProtocolId(targetDeviceId) && selectionSeq in 1..MAX_SAFE)
         return post("transfer") { identity(deviceId, epoch); put("commandId", commandId); put("targetDeviceId", targetDeviceId); put("selectionSeq", selectionSeq) }

@@ -6,6 +6,7 @@ import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.PlaybackArtist
 import dev.spofify.mobile.core.PlaybackContext
 import dev.spofify.mobile.core.PlaybackSnapshot
+import dev.spofify.mobile.core.QueueIntentState
 import dev.spofify.mobile.core.PlaybackTrack
 import dev.spofify.mobile.core.SpofifyClient
 import kotlin.math.roundToLong
@@ -28,6 +29,8 @@ internal object PlaybackSnapshotCodec {
         val currentIndex: Int,
         /** Media3 millisecond precision; the exact wire seconds remain in snapshot.elapsed. */
         val positionMs: Long,
+        /** Validated source provenance only; importing must retain the native incarnation. */
+        val queueIntentState: QueueIntentState? = null,
     ) {
         /** Only derive URLs from the authenticated client's origin, never from wire metadata. */
         fun mediaItems(client: SpofifyClient): List<MediaItem> {
@@ -37,8 +40,11 @@ internal object PlaybackSnapshotCodec {
     }
 
     /** Validates the entire snapshot without a client, player, audio, or network access. */
-    fun plan(snapshot: PlaybackSnapshot): ImportPlan {
+    fun plan(snapshot: PlaybackSnapshot, queueIntentState: QueueIntentState? = null): ImportPlan {
         snapshot.publicationValidated()
+        val metadata = queueIntentState?.also { it.validated(snapshot) }?.let(PlaybackQueueIntents::metadata)
+            ?: PlaybackQueueIntents.Metadata(snapshot.queue.associate { it.key to "legacy" }, emptySet(), "legacy-reset")
+        PlaybackQueueIntents.publication(snapshot, PlaybackQueueIntents.state("native_prepared", 1, snapshot, metadata))
         // The wire permits opaque IDs; native audio paths additionally reject dot segments.
         require(snapshot.queue.none { it.id == "." || it.id == ".." }) { "Invalid playback track" }
         // Own list containers so later changes to a caller's mutable lists cannot alter the plan.
@@ -47,7 +53,8 @@ internal object PlaybackSnapshotCodec {
         val indexByKey = physical.mapIndexed { index, track -> track.key to index }.toMap()
         val traversal = retained.queue.map { indexByKey.getValue(it.key) }
         return ImportPlan(retained, physical, traversal,
-            traversal.getOrElse(retained.position) { -1 }, secondsToMs(retained.elapsed))
+            traversal.getOrElse(retained.position) { -1 }, secondsToMs(retained.elapsed), queueIntentState?.copy(
+                origins = queueIntentState.origins.toList(), highKeys = queueIntentState.highKeys.toList()))
     }
 
     /** New explicit queue intent, not handoff/restoration. Never reconstruct a derived envelope

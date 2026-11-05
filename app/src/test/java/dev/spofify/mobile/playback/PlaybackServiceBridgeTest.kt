@@ -1313,11 +1313,16 @@ class PlaybackServiceBridgeTest {
         val track = PlaybackSnapshot(queue = listOf(ordinary), position = 0).toJson().getValue("queue") as kotlinx.serialization.json.JsonArray
         val added = endpoint.execute(PlaybackDeviceCommand.musical("enqueue", track = track.single() as kotlinx.serialization.json.JsonObject, first = false), permit)
         assertEquals("ok", added.status)
-        // Imported future has unknown/manual-free provenance. A fresh manual Add belongs
-        // immediately after current, ahead of that contextual tail—not at the total tail.
-        assertEquals(501L, added.snapshot.queue[1].key) // Rejected speculative allocation consumed NO live keys.
+        // Legacy enqueue(false) is deliberately absolute, nonstarting append, not new High.
+        // The rejected speculative collection must have consumed NO live keys.
+        assertEquals(501, added.snapshot.queue.size)
+        assertEquals(501L, added.snapshot.queue.last().key)
+        assertEquals(original.queue, added.snapshot.queue.dropLast(1))
         assertEquals(original.occurrence, added.snapshot.occurrence)
         assertEquals(original.queue, added.snapshot.queue.filterNot { it.key == 501L })
+        val metadata = requireNotNull(added.queueIntentState)
+        assertEquals("legacy", metadata.origins.last().intent)
+        assertEquals(listOf(501L), metadata.highKeys)
         assertSilent()
     }
 
@@ -1776,6 +1781,10 @@ class PlaybackServiceBridgeTest {
                 assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
                 assertEquals(Player.STATE_IDLE, player.playbackState)
                 assertFalse(player.playWhenReady); assertFalse(player.isLoading)
+                shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+                assertSame("pure availability ABA must retain the musical interaction key", rawKey, connection.state.value.interactionKey)
+                assertNotSame("availability loss/regain retires the held transport key", key, requireNotNull(connection.state.value.transportInteractionKey))
+                assertTrue(connection.state.value.canSkipNext); assertTrue(connection.state.value.canSkipPrevious)
             }
         } finally { connection.release(); owner.close() }
         assertSilent()
@@ -1835,7 +1844,52 @@ class PlaybackServiceBridgeTest {
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    @Test fun localNextCapabilityUsesRepeatWrappingAndInvalidatesLossRegainBeforeDispatch() = runTest {
+    @Test fun localLoadingAndReadyPresentationKeepSemanticAndTransportKeysWhenCapabilitiesDoNotChange() = runTest {
+        val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
+        runCurrent()
+        owner.localAction { endpoint.activate(snapshot().paused(), it) }; runCurrent()
+        val connection = connectedPlayback()
+        val service = requireNotNull(controller).get()
+        val outputField = PlaybackService::class.java.getDeclaredField("player").apply { isAccessible = true }
+        val real = player
+        var state = Player.STATE_IDLE
+        var loading = false
+        // Only output presentation is controlled; real queue/timeline/commands remain intact.
+        val output = java.lang.reflect.Proxy.newProxyInstance(ExoPlayer::class.java.classLoader,
+            arrayOf(ExoPlayer::class.java)) { _, method, args ->
+            when (method.name) {
+                "getPlaybackState" -> state
+                "isLoading" -> loading
+                else -> try { method.invoke(real, *(args ?: emptyArray())) }
+                    catch (failure: java.lang.reflect.InvocationTargetException) { throw failure.targetException }
+            }
+        } as ExoPlayer
+        try {
+            connection.connect()
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            val generic = requireNotNull(connection.state.value.interactionKey)
+            val transport = requireNotNull(connection.state.value.transportInteractionKey)
+            val before = endpoint.exportSnapshot()
+            val revision = requireNotNull(endpoint.exportQueueIntentState()).revision
+            outputField.set(service, output)
+            for (next in listOf(Player.STATE_BUFFERING, Player.STATE_READY, Player.STATE_BUFFERING, Player.STATE_READY, Player.STATE_IDLE)) {
+                state = next; loading = next == Player.STATE_BUFFERING
+                assertEquals(next, player.playbackState); assertEquals(loading, player.isLoading)
+                assertEquals(loading, endpoint.exportSnapshot().waiting)
+                assertSame("loading/ready churn is not a semantic edit", generic, PlaybackService.interactionKey())
+                assertEquals(revision, endpoint.exportQueueIntentState()!!.revision)
+                assertFalse(player.playWhenReady)
+            }
+            assertEquals(before, endpoint.exportSnapshot())
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            assertSame(generic, connection.state.value.interactionKey)
+            assertSame("presentation alone does not change directional capability", transport, connection.state.value.transportInteractionKey)
+        } finally { outputField.set(service, real); connection.release(); owner.close() }
+        assertSilent()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun localNextCapabilityUsesRepeatWrappingAndSemanticRepeatAbaInvalidatesBothKeysBeforeDispatch() = runTest {
         val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone")
         runCurrent()
         val connection = connectedPlayback()
@@ -1856,18 +1910,33 @@ class PlaybackServiceBridgeTest {
             }
             val held = requireNotNull(connection.state.value.transportInteractionKey)
             val rawKey = requireNotNull(connection.state.value.interactionKey)
+            val before = endpoint.exportSnapshot()
+            val revision = requireNotNull(endpoint.exportQueueIntentState()).revision
+            val queueEpoch = PlaybackRequests.queueEpoch
             assertTrue(connection.next(held)) // Waiting for serialized coordinator dispatch.
             val permit = requireNotNull(owner.currentAuthority())
-            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // all -> one: capability lost
-            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // one -> off
-            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // off -> all: regained
+            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // all -> one: semantic edit AND capability lost
+            val oneKey = requireNotNull(PlaybackService.interactionKey())
+            assertNotSame(rawKey, oneKey)
+            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // one -> off: another semantic edit
+            val offKey = requireNotNull(PlaybackService.interactionKey())
+            assertNotSame(oneKey, offKey)
+            endpoint.execute(PlaybackDeviceCommand.transport("repeat"), permit) // off -> all: equal state, newer semantic identity
+            assertNotSame(offKey, PlaybackService.interactionKey())
+            assertEquals(revision + 3, endpoint.exportQueueIntentState()!!.revision)
+            assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
             // Deliver service events but no UI publication is needed to invalidate held work.
             shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
             val after = endpoint.exportSnapshot()
             runCurrent()
             assertEquals(after, endpoint.exportSnapshot())
-            assertSame("capability changes do not invalidate generic receipts", rawKey, PlaybackService.interactionKey())
+            assertEquals("Repeat ABA restores the exact musical state, not its captured identity", before, after)
+            assertNotSame("Repeat is semantic: a held musical intent must not borrow the new binding", rawKey, PlaybackService.interactionKey())
             assertFalse(connection.next(held))
+            shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
+            assertNotSame(held, requireNotNull(connection.state.value.transportInteractionKey))
+            assertNotSame(rawKey, requireNotNull(connection.state.value.interactionKey))
+            assertTrue(connection.state.value.canSkipNext) // Repeat-all wrapping was genuinely regained.
         } finally { connection.release(); owner.close() }
         assertSilent()
     }
