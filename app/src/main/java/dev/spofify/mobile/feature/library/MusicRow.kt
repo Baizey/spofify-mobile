@@ -45,6 +45,15 @@ data class CatalogPlaybackFeedback(
 /** Like state belongs to the account's shared personal-action owner, not each row. */
 data class CatalogLikeState(val liked: Boolean? = null, val pending: Boolean = false, val failed: Boolean = false)
 
+/** Uncommitted UI captures also fence output ABA; admitted work keeps only source lifetime.
+ * The playback owner, not this guard, validates bindings and exact additive successor receipts. */
+internal class MusicRowActionGuard(val sourceCurrent: () -> Boolean, private val admissionCurrent: () -> Boolean) : () -> Boolean {
+    override fun invoke(): Boolean = sourceCurrent() && admissionCurrent()
+}
+
+internal fun sourceCurrent(action: () -> Boolean): () -> Boolean =
+    (action as? MusicRowActionGuard)?.sourceCurrent ?: action
+
 /**
  * Shared compact identity row. Opening only navigates; Play is always a separate action.
  * [like] and [onToggleLike] supply the optional, pending-guarded Like/Unlike accessibility
@@ -101,16 +110,26 @@ fun MusicRow(
     val contextualEnabled = canPlay && (playback.interactionKey != null && playback.onContextual != null ||
         playback.unselectedQueueOrigin != null && playback.onUnselectedHigh != null)
     fun contextual(captured: Any, current: () -> Boolean) {
+        if (!current()) return
+        val admittedSource = sourceCurrent(current)
         when (captured) {
-            is dev.spofify.mobile.playback.PlaybackInteractionKey -> playback.onContextual?.invoke(item, captured, current)
-            is dev.spofify.mobile.playback.PlaybackQueueOrigin -> playback.onUnselectedHigh?.invoke(item, captured, current)
+            is dev.spofify.mobile.playback.PlaybackInteractionKey -> playback.onContextual?.invoke(item, captured, admittedSource)
+            is dev.spofify.mobile.playback.PlaybackQueueOrigin -> playback.onUnselectedHigh?.invoke(item, captured, admittedSource)
         }
     }
+    // Separate output admission from source lifetime so an admitted action can follow its
+    // owner's exact additive receipt. Progress alone changes neither lifetime.
+    val outputLifetime = remember(rowIdentity, capture) { dev.spofify.mobile.ui.RowActionLifetime() }
+    DisposableEffect(outputLifetime) { onDispose { outputLifetime.invalidate() } }
+    fun guard(source: () -> Boolean) = MusicRowActionGuard(source) {
+        outputLifetime.isCurrent() && latestCapture === capture
+    }
     dev.spofify.mobile.ui.ContextualSwipeRow(rowIdentity, capture, contextualEnabled,
-        playback.contextualLabel, onCommit = { captured, current -> contextual(captured, current) }, modifier = modifier) { swipeModifier, isCurrent ->
+        playback.contextualLabel, onCommit = { captured, current -> contextual(captured, guard(current)) }, modifier = modifier) { swipeModifier, isCurrent ->
+        val actionCurrent = guard(isCurrent)
         fun more() {
-            if (isCurrent() && latestActionsEnabled && latestCapture === capture) {
-                if (onShowScopedActions != null) onShowScopedActions(item, isCurrent) else onShowActions(item)
+            if (actionCurrent() && latestActionsEnabled && latestCapture === capture) {
+                if (onShowScopedActions != null) onShowScopedActions(item, actionCurrent) else onShowActions(item)
             }
         }
         Row(swipeModifier.fillMaxWidth().background(
@@ -124,13 +143,13 @@ fun MusicRow(
                     if (actionsEnabled) add(CustomAccessibilityAction("More actions") { more(); true })
                     if (canPlay) {
                         add(CustomAccessibilityAction("Play now") {
-                            if (isCurrent() && latestCanPlay && latestCapture === capture) {
-                                if (onPlayScoped != null) onPlayScoped(item, isCurrent) else onPlayItem(item, false)
+                            if (actionCurrent() && latestCanPlay && latestCapture === capture) {
+                                if (onPlayScoped != null) onPlayScoped(item, actionCurrent) else onPlayItem(item, false)
                             }
                             true
                         })
                         if (contextualEnabled) add(CustomAccessibilityAction(playback.contextualLabel) {
-                            if (isCurrent() && latestCanPlay && latestCapture === capture) capture?.let { contextual(it, isCurrent) }; true
+                            if (actionCurrent() && latestCanPlay && latestCapture === capture) capture?.let { contextual(it, actionCurrent) }; true
                         })
                     }
                     if (item.kind == "track" && onToggleLike != null && like?.pending != true) {

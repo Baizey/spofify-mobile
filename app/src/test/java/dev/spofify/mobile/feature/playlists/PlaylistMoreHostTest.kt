@@ -40,8 +40,10 @@ class PlaylistMoreHostTest {
     @Test fun derivedMorePreservesSignedExactOccurrenceAndFenceForAllFourIntentsWithoutPreparation() = check(derived = true)
     @Test fun manualCollectionMoreSendsWholeBoundedContextForAllFourIntents() = check(derived = false, collection = true)
     @Test fun derivedCollectionMorePreservesEvaluatedRevisionAndFence() = check(derived = true, collection = true)
-    @Test fun manualOpenMoreCannotRebindAfterOutputReplacement() = check(derived = false, stale = true)
-    @Test fun derivedOpenMoreCannotRebindAfterOutputReplacement() = check(derived = true, stale = true)
+    @Test fun manualOpenMoreCannotReviveAfterOutputReplacementABA() = check(derived = false, stale = true)
+    @Test fun derivedOpenMoreCannotReviveAfterOutputReplacementABA() = check(derived = true, stale = true)
+    @Test fun manualCollectionMoreCannotReviveAfterOutputReplacementABA() = check(derived = false, collection = true, stale = true)
+    @Test fun derivedCollectionMoreCannotReviveAfterOutputReplacementABA() = check(derived = true, collection = true, stale = true)
     private fun check(derived: Boolean, collection: Boolean = false, stale: Boolean = false) {
         val preparations = AtomicInteger()
         val kind = if (derived) "derived" else "manual"
@@ -74,6 +76,7 @@ class PlaylistMoreHostTest {
             val feedback = mutableStateOf(CatalogPlaybackFeedback(interactionKey = key, queueIntentBinding = binding))
             val shown = mutableStateOf(true)
             val accepted = mutableListOf<Pair<QueueIntentSelection, PlaybackListAction>>()
+            val admittedSources = mutableListOf<() -> Boolean>()
             try {
                 runBlocking { client.login("listener", "synthetic") }
                 compose.setContent {
@@ -83,6 +86,7 @@ class PlaylistMoreHostTest {
                             onQueueIntent = { selection, action, capturedKey, capturedBinding, current ->
                                 assertSame(key, capturedKey); assertEquals(binding, capturedBinding); assertTrue(current())
                                 accepted += selection to action
+                                admittedSources += current
                             })
                     }
                 }
@@ -93,6 +97,7 @@ class PlaylistMoreHostTest {
                 val labels = listOf("Queue Low" to PlaybackListAction.QUEUE_LOW, "Queue High" to PlaybackListAction.QUEUE_HIGH,
                     "Play next" to PlaybackListAction.PLAY_NEXT, "Play now" to PlaybackListAction.PLAY_NOW)
                 for ((label, expectedAction) in if (stale) labels.take(1) else labels) {
+                    compose.runOnIdle { feedback.value = feedback.value.copy(interactionKey = key, queueIntentBinding = binding) }
                     compose.onNodeWithContentDescription(if (collection) "More actions for Playlist fixture" else "More actions for Fixture song").performClick()
                     if (!collection) compose.waitUntil(5_000) {
                         compose.waitForIdle(); compose.onAllNodesWithText("Like song").fetchSemanticsNodes().size == 1
@@ -101,8 +106,20 @@ class PlaylistMoreHostTest {
                     compose.runOnIdle { feedback.value = feedback.value.copy(buffering = true, playWhenReady = true,
                         interactionKey = if (stale) PlaybackInteractionKey() else key,
                         queueIntentBinding = if (stale) binding.copy(revision = 8) else binding) }
+                    if (stale) {
+                        compose.onNodeWithText(label).performScrollTo().assertIsNotEnabled()
+                        compose.runOnIdle { feedback.value = feedback.value.copy(interactionKey = key, queueIntentBinding = binding) }
+                        compose.onNodeWithText(label).assertIsNotEnabled()
+                    }
                     compose.onNodeWithText(label).performScrollTo().performClick()
                     compose.waitForIdle()
+                    if (!stale) {
+                        // Once submitted, source guards must not veto the playback owner's own
+                        // additive successor receipt. Binding/receipt validation stays in that owner.
+                        compose.runOnIdle { feedback.value = feedback.value.copy(interactionKey = PlaybackInteractionKey(),
+                            queueIntentBinding = binding.copy(revision = 8)) }
+                        compose.runOnIdle { assertTrue("Admitted source survives output publication", admittedSources.all { it() }) }
+                    }
                     compose.runOnIdle {
                         if (stale) assertTrue("Open More must never refresh a binding", accepted.isEmpty())
                         else {

@@ -426,14 +426,22 @@ class MusicRowTest {
             enabled.value = true; feedback.value = feedback.value.copy(interactionKey = PlaybackInteractionKey())
         }
         compose.runOnIdle {
-            retained.single { it.label == "Queue High" }.action()
-            assertEquals("Old accessibility High cannot upgrade its output binding", 1, high)
-            identity.value = "entry-B"
+            assertFalse("Output replacement retires open More", current!!.invoke())
+            retained.forEach { it.action() }
+            assertEquals(1, more); assertEquals(0, play); assertEquals(1, high)
+            feedback.value = feedback.value.copy(interactionKey = key)
         }
+        compose.runOnIdle {
+            assertFalse("Returning to output A cannot revive old More", current!!.invoke())
+            retained.forEach { it.action() }
+            assertEquals(1, more); assertEquals(0, play); assertEquals(1, high)
+        }
+        compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
+        compose.runOnIdle { assertTrue(current!!.invoke()); identity.value = "entry-B" }
         compose.runOnIdle {
             assertFalse("Replacing a duplicate entry retires open More", current!!.invoke())
             retained.forEach { it.action() }
-            assertEquals(1, more); assertEquals(0, play); assertEquals(1, high)
+            assertEquals(2, more); assertEquals(0, play); assertEquals(1, high)
         }
         compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
         compose.runOnIdle { assertTrue(current!!.invoke()); shown.value = false }

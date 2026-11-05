@@ -21,6 +21,8 @@ import androidx.compose.material.icons.filled.MusicNote
 import dev.spofify.mobile.feature.library.CatalogPlaybackFeedback
 import dev.spofify.mobile.feature.library.MusicListLayout
 import dev.spofify.mobile.feature.library.MusicRow
+import dev.spofify.mobile.feature.library.MusicRowActionGuard
+import dev.spofify.mobile.feature.library.sourceCurrent as sourceLifetime
 import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.playback.PlaybackListAction
 import dev.spofify.mobile.core.*
@@ -197,6 +199,12 @@ private fun PlaylistDetail(
     var collectionActions by remember(id) { mutableStateOf<PlaylistCollectionSelection?>(null) }
     val actionLifetime = remember(id, client) { dev.spofify.mobile.ui.RowActionLifetime() }
     DisposableEffect(actionLifetime) { onDispose { actionLifetime.invalidate() } }
+    // Only uncommitted captures fence output ABA. Submitted work retains its source guard
+    // and the playback owner handles its exact binding/additive successor receipt.
+    val outputCapture = playback.interactionKey ?: playback.unselectedQueueOrigin
+    val latestOutputCapture by rememberUpdatedState(outputCapture)
+    val outputLifetime = remember(id, client, outputCapture) { dev.spofify.mobile.ui.RowActionLifetime() }
+    DisposableEffect(outputLifetime) { onDispose { outputLifetime.invalidate() } }
     val latestInteractionKey by rememberUpdatedState(playback.interactionKey)
     var addingTrack by remember(id) { mutableStateOf<LibraryItem?>(null) }
     var editing by remember(id) { mutableStateOf(false) }
@@ -243,7 +251,10 @@ private fun PlaylistDetail(
     val saved = summary
     fun captureCurrent(rowCurrent: () -> Boolean = { true }): () -> Boolean {
         val ticket = generation.ticket()
-        return { rowCurrent() && actionLifetime.isCurrent() && generation.accepts(ticket) }
+        val rowSource = sourceLifetime(rowCurrent)
+        return MusicRowActionGuard(
+            { rowSource() && actionLifetime.isCurrent() && generation.accepts(ticket) },
+            { rowCurrent() && outputLifetime.isCurrent() && latestOutputCapture === outputCapture })
     }
     fun exactSelection(track: LibraryItem? = null, occurrenceId: String? = null,
         token: String? = null, entryId: String? = null): QueueIntentSelection? {
@@ -262,8 +273,9 @@ private fun PlaylistDetail(
         val epoch = PlaybackRequests.epoch
         val revision = saved?.revision
         val sourceTicket = generation.ticket()
+        val admittedSource = sourceLifetime(current)
         val live = {
-            current() && actionLifetime.isCurrent() && generation.accepts(sourceTicket) &&
+            admittedSource() && actionLifetime.isCurrent() && generation.accepts(sourceTicket) &&
                 epoch == PlaybackRequests.epoch && !stale && summary?.revision == revision
         }
         if (action == PlaybackListAction.QUEUE_HIGH && origin != null) onUnselectedHigh?.invoke(selection, origin, live)
@@ -333,7 +345,7 @@ private fun PlaylistDetail(
         if (action != null && (onPreparedAction == null || expectedKey == null || latestInteractionKey !== expectedKey)) return
         val result = evaluation
         val sourceTicket = generation.ticket()
-        val sourceCurrent = captureCurrent(isCurrent)
+        val sourceCurrent = sourceLifetime(captureCurrent(isCurrent))
         val request = PlaylistPlaybackRequest(preparationGeneration); busy = true
         scope.launch {
             try {
