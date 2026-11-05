@@ -459,7 +459,12 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             if (devices.activeDeviceId.isNotEmpty() && !devices.canQueueIntent &&
                 !((operation == QueueIntentIntent.NOW || origin != null || operation == QueueIntentIntent.HIGH && expectedKey != null) &&
                     expectedBinding == null && devices.activeDeviceId == devices.deviceId)) {
-                complete(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED)); return@dispatch
+                // Readiness/authority loss on a negotiated receiver is not missing support.
+                val capable = devices.view?.queueIntents?.receivers?.any {
+                    it.deviceId == devices.activeDeviceId && it.version == 1
+                } == true
+                complete(PlaybackActionResult(if (capable) PlaybackActionStatus.UNAVAILABLE else PlaybackActionStatus.UNSUPPORTED))
+                return@dispatch
             }
             var transition: PlaybackAdditiveTransition? = null
             owner.queueIntent(operation, expectedBinding, selection, ::current, onResult = { detail ->

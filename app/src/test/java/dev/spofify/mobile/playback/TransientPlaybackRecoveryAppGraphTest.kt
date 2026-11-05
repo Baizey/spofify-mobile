@@ -69,7 +69,13 @@ class TransientPlaybackRecoveryAppGraphTest {
     @Test fun acceptedOrdinaryPlayingHeartbeatDropThenFreshActualMoreHighStaysPausedBeforeMiniPlay() =
         journey(queueHighFirst = true)
 
-    private fun journey(queueHighFirst: Boolean) {
+    @Test fun shortHeldOrdinaryHeartbeatContinuesOnlyOriginalPlayingPermission() =
+        journey(queueHighFirst = false, shortHold = true)
+
+    @Test fun moreOpenedBeforeHeartbeatLossCannotBorrowRecoveredBinding() =
+        journey(queueHighFirst = false, heldMore = true)
+
+    private fun journey(queueHighFirst: Boolean, shortHold: Boolean = false, heldMore: Boolean = false) {
         val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
         val models = ViewModelStore()
         val shown = mutableStateOf<LibraryViewModel?>(null)
@@ -243,7 +249,7 @@ class TransientPlaybackRecoveryAppGraphTest {
             initialAction("C2", "Queue Low")
             // Resolve the row before injecting the fault, but open NO menu/capture NO held key.
             // The recovery More action below is a genuinely fresh host capture.
-            if (queueHighFirst) search("B1")
+            if (queueHighFirst || heldMore) search("B1")
             await("SETUP: full playing queue and terminal metadata publication settle", details = diagnostic) {
                 val snapshot = PlaybackService.exportLocalSnapshot()
                 val view = owner.state.value.view
@@ -275,7 +281,10 @@ class TransientPlaybackRecoveryAppGraphTest {
             // No musical command follows arm; read-only settled barriers plus actual request
             // witness distinguish this from lost queue/activation/command ACK responses.
             assertTrue("SETUP: no unresolved action at fault arm", settled(owner))
-            runBlocking { broker.armQueueAdmissionResponse("queue-start", "drop") }
+            if (heldMore) compose.onNodeWithContentDescription("More actions for B1").performClick()
+            val renderersBeforeFault = renderers()
+            val armedAt = System.nanoTime()
+            runBlocking { broker.armQueueAdmissionResponse("queue-start", if (shortHold) "hold" else "drop") }
             await("SETUP: proxy fully received real Go HTTP 200 before dropping it") {
                 runBlocking { broker.pauseResponseStatus() }?.get("accepted")?.jsonPrimitive?.boolean == true
             }
@@ -289,7 +298,7 @@ class TransientPlaybackRecoveryAppGraphTest {
             assertEquals(epoch, witness.getValue("requestEpoch").jsonPrimitive.long)
             assertEquals(epoch, witness.getValue("responseEpoch").jsonPrimitive.long)
             val acceptedSequence = witness.getValue("stateSeq").jsonPrimitive.long
-            record("ordinary-playing-poll-accepted200-seq=$acceptedSequence-no-command-no-ack-dropped")
+            record("ordinary-playing-poll-accepted200-seq=$acceptedSequence-no-command-no-ack-${if (shortHold) "held" else "dropped"}")
             val independentAccepted = runBlocking { api.view() }
             assertTrue("Real observer confirms accepted publication sequence", independentAccepted.stateSeq >= acceptedSequence)
             assertTrue("Real observer confirms unchanged owner/epoch", independentAccepted.activeDeviceId == deviceId && independentAccepted.epoch == epoch)
@@ -297,6 +306,23 @@ class TransientPlaybackRecoveryAppGraphTest {
                 independentAccepted.queueIntents?.state == metadata)
             assertTrue("No command uncertainty can excuse this ordinary heartbeat case",
                 independentAccepted.commands.none { it.status == "pending" } && independentAccepted.transfer == null)
+
+            if (shortHold) {
+                // Bound the entire arm-to-release interval below the production 4s request
+                // deadline, not merely below the fixture's much longer emergency hold limit.
+                assertTrue("Short hold released before request deadline", System.nanoTime() - armedAt < TimeUnit.SECONDS.toNanos(3))
+                runBlocking { broker.releasePauseResponse() }
+                await("Real held response consumed while original playback continues") {
+                    (owner.state.value.view?.stateSeq ?: 0) >= acceptedSequence &&
+                        raw.isPlaying && PreparedTransportMedia.samples.get() > samplesAtFault && settled(owner)
+                }
+                assertEquals("Short response delay does not create a new start", renderersBeforeFault, renderers())
+                assertIdentity(before, PlaybackService.exportLocalSnapshot())
+                assertTrue(PlaybackService.exportLocalQueueIntentState() == metadata)
+                assertNoRecoveryWrites(attempts, runBlocking { broker.metrics() })
+                record("short-hold-original-output-continues-no-new-start")
+                return
+            }
 
             await("Dropped response conservatively fences local output") {
                 !raw.isPlaying && !connected.state.value.isPlaying && !connected.state.value.playWhenReady &&
@@ -350,6 +376,21 @@ class TransientPlaybackRecoveryAppGraphTest {
             assertTrue("Accepted semantic binding is unchanged by reconnection", owner.state.value.view?.queueIntents?.binding == binding)
             assertNoRecoveryWrites(attempts, runBlocking { broker.metrics() })
             record("two-healthy-heartbeats-flat-pcm-position")
+
+            if (heldMore) {
+                // A menu may close when its captured lifetime retires. If retained visually,
+                // dispatch its ORIGINAL action once; never reopen/refresh its captured binding.
+                if (compose.onAllNodesWithText("Queue High").fetchSemanticsNodes().isNotEmpty())
+                    compose.onNodeWithText("Queue High").performScrollTo().performClick()
+                val observedAt = System.nanoTime()
+                await("Old More dispatch settles without adopting fresh readiness") {
+                    silent()
+                    System.nanoTime() - observedAt >= TimeUnit.SECONDS.toNanos(1) && settled(owner) && !model.state.value.preparing
+                }
+                assertNoRecoveryWrites(attempts, runBlocking { broker.metrics() })
+                record("old-more-remains-retired-after-healthy-polls")
+                return
+            }
 
             var resumeSnapshot = frozen
             var resumeMetadata = metadata

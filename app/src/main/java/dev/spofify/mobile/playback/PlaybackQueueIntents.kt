@@ -10,6 +10,12 @@ internal object PlaybackQueueIntents {
     data class Plan(val snapshot: PlaybackSnapshot, val metadata: Metadata, val count: Int,
         val placement: String, val limited: Boolean, val newTracks: List<PlaybackTrack>)
 
+    /** Same semantic projection for revision tracking and fresh retained-output admission.
+     * Comparison only: never import this stripped snapshot or discard live progress/error. */
+    fun semanticSnapshot(snapshot: PlaybackSnapshot): PlaybackSnapshot = snapshot.copy(
+        elapsed = 0.0, duration = 0.0, playing = false, waiting = false, loading = false, error = "",
+        occurrence = snapshot.occurrence?.copy(progress = 0.0, reported = false))
+
     fun metadata(state: QueueIntentState): Metadata = Metadata(state.origins.associate { it.key to it.intent },
         state.highKeys.toSet(), state.provenance)
 
@@ -126,8 +132,7 @@ internal class PlaybackQueueIntentRevision(val receiverId: String = java.util.UU
     var revision: Long = 1; private set
     private var last: Pair<PlaybackSnapshot, PlaybackQueueIntents.Metadata>? = null
     fun observe(snapshot: PlaybackSnapshot, metadata: PlaybackQueueIntents.Metadata): Long {
-        val semantic = snapshot.copy(elapsed = 0.0, duration = 0.0, playing = false, waiting = false,
-            loading = false, error = "", occurrence = snapshot.occurrence?.copy(progress = 0.0, reported = false)) to metadata
+        val semantic = PlaybackQueueIntents.semanticSnapshot(snapshot) to metadata
         if (last != null && last != semantic) {
             check(revision < PlaybackQueueIntents.MAX_SAFE) { "Queue receiver revision exhausted" }
             revision++
