@@ -191,6 +191,10 @@ internal class SongCacheDataSource(
                 completed = true
             }
         }
+        // Storage append/commit/close can block after the upstream guard. Recheck at the byte
+        // handoff itself: runtime auth/lease may be revoked while retirement waits on storage.
+        // This failure is authorization, not a cache miss, and must never trigger fallback.
+        guard()
         return count
     }
 

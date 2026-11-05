@@ -68,7 +68,7 @@ class SongCachePlaybackTest {
      * production receiver. No directives/activation/start ACK or cache result are invented.
      */
     private class Room(private val remote: Boolean = false, private val sampleRate: Int = 8000,
-        private val longCurrent: Boolean = false) : Dispatcher() {
+        private val longCurrent: Boolean = false, private val longFutureB: Boolean = false) : Dispatcher() {
         /** Bytes scheduled at dispatch, not bytes written to a socket or read by a client.
          * A delayed/cancelled response can schedule its full body but transmit less or nothing.
          */
@@ -162,14 +162,15 @@ class SongCachePlaybackTest {
                 return json(view().toJson().toString())
             }
         }
-        fun durationMillis(id: String) = if (longCurrent && id == "A") 120_000L else 12_000L
+        fun durationMillis(id: String) = if (longCurrent && id == "A" || longFutureB && id == "B") 120_000L else 12_000L
         fun fetched() = audio.filter { it.method == "GET" }.map { it.id }.toSet()
         fun scheduledBodies(id: String) = audio.filter { it.id == id && it.method == "GET" }
             .sumOf { it.scheduledBodyBytes.toLong() }
         companion object {
             private const val SESSION = """{"accountId":"cache-account","username":"listener","role":"user","csrfToken":"cache-csrf"}"""
-            // Normally 192,044 bytes/track; the two worker/window tests use a 120s current A
-            // to cross the progressive loading checkpoint before EOF and keep buffering inside A. Generated on demand;
+            // Normally 192,044 bytes/track; selected worker/FIFO tests use 120s A (and the
+            // rebuffer variant also 120s B), crossing the progressive checkpoint before EOF.
+            // Generated on demand;
             // no binary assets or whole-song cache helper.
             // All A..Z markers are distinct. Each bounded captured slice checks identical
             // 16-bit samples; this is sampled PCM identity, not a whole-stream hash.
@@ -187,9 +188,9 @@ class SongCachePlaybackTest {
     }
 
     private inner class Journey(remote: Boolean = false, private val limits: SongCache.Limits = SongCache.Limits(),
-        sampleRate: Int = 8000, longCurrent: Boolean = false) : AutoCloseable {
+        sampleRate: Int = 8000, longCurrent: Boolean = false, longFutureB: Boolean = false) : AutoCloseable {
         val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        val room = Room(remote, sampleRate, longCurrent)
+        val room = Room(remote, sampleRate, longCurrent, longFutureB)
         val web = MockWebServer().apply { dispatcher = room; start(InetAddress.getByName("127.0.0.1"), 0) }
         val server = ServerAddress.parse("http://127.0.0.1:${web.port}")
         val sessions = Sessions()
@@ -292,6 +293,72 @@ class SongCachePlaybackTest {
             controller!!.pause()
             await("actual paused output") { !controller!!.isPlaying && !PlaybackService.exportLocalSnapshot().playing }
             awaitLocalPublication("Pause")
+        }
+        fun preparePaused(id: String) {
+            awaitLocalPublication("before paused $id replacement")
+            val item = track(id, "$id-paused-probe").copy(durationMs = room.durationMillis(id))
+            assertNull(PlaybackService.replacePrepared(listOf(PlaybackMedia.create(item, client)), client,
+                0, false, false))
+            await("new exact $id source is installed paused") {
+                val snapshot = PlaybackService.exportLocalSnapshot()
+                snapshot.queue.map { it.id } == listOf(id) && !snapshot.playing &&
+                    controller!!.currentMediaItem?.mediaId == id && !controller!!.playWhenReady
+            }
+            awaitLocalPublication("paused $id replacement")
+        }
+        fun resume() {
+            awaitLocalPublication("before deliberate Resume")
+            val id = requireNotNull(controller!!.currentMediaItem).mediaId
+            val pcm = consumed(id)
+            val position = controller!!.currentPosition
+            controller!!.play()
+            await("deliberate Resume really starts exact $id and consumes new PCM") {
+                controller!!.isPlaying && controller!!.currentPosition > position + 50 && consumed(id) > pcm
+            }
+            awaitLocalPublication("deliberate Resume")
+            assertNull(controller!!.playerError)
+        }
+        fun setFocusResponse(response: Int) {
+            shadowOf(requireNotNull(service).get().getSystemService(AudioManager::class.java))
+                .setNextFocusRequestResponse(response)
+        }
+        fun awaitUnpinnedComplete(count: Int) {
+            await("$count complete cache entries with all reader/writer pins released") {
+                assertBounded().let { it.entries == count && it.complete == count && it.pinned == 0 }
+            }
+        }
+        fun admitEToFullCache() {
+            awaitUnpinnedComplete(3)
+            // Hold the body, not an ACK: observe the real writer's reservation/eviction before
+            // completion. This avoids mistaking the old three-complete inventory for E's ACK.
+            room.delayedTrack = "E"
+            action(PlaybackListAction.QUEUE_HIGH, "E")
+            awaitFetched("E")
+            await("E has evicted one whole entry and owns its incomplete reservation") {
+                assertBounded().let { it.entries == 3 && it.complete == 2 && it.pinned == 1 }
+            }
+            awaitUnpinnedComplete(3)
+            room.delayedTrack = null
+            assertEquals(0L, consumed("E"))
+            assertFalse(controller!!.isPlaying)
+        }
+        fun assertFreshCacheHit(id: String) {
+            val before = room.audio.filter { it.id == id }
+            assertTrue("$id must first have had a real authenticated upstream GET", before.any { it.method == "GET" })
+            val pcm = consumed(id)
+            preparePaused(id) // play=false forces a new source rather than positive-current reuse.
+            resume()
+            assertTrue(consumed(id) > pcm)
+            assertEquals("Fresh $id source must use retained exact PCM without GET/HEAD", before, room.audio.filter { it.id == id })
+        }
+        fun assertFreshCacheMiss(id: String) {
+            val gets = room.audio.count { it.id == id && it.method == "GET" }
+            val pcm = consumed(id)
+            preparePaused(id)
+            resume()
+            assertTrue(consumed(id) > pcm)
+            assertEquals("Evicted $id must perform one new authenticated GET for actual output", gets + 1,
+                room.audio.count { it.id == id && it.method == "GET" })
         }
         fun repeat(mode: Int, wire: String) {
             awaitLocalPublication("before repeat $wire")
@@ -680,6 +747,173 @@ class SongCachePlaybackTest {
             assertEquals(0, j.assertBounded().complete)
             assertTrue(j.room.scheduledBodies("B") > limits.maxBytes)
             assertTrue(j.controller!!.isCommandAvailable(Player.COMMAND_PLAY_PAUSE))
+            j.assertHealthy()
+        }
+    }
+
+    @Test fun successfulNewCurrentPromotesItsRetainedTrackBeforeTheNextFifoEviction() {
+        Journey(limits = SongCache.Limits(maxTracks = 3, maxBytes = 700_000), longCurrent = true).use { j ->
+            j.startService()
+            // A cannot fit and streams uncached. Only sequential speculative B/C/D are admitted,
+            // establishing FIFO B,C,D without a current-reader pin masking the victim choice.
+            j.play("A", "B", "C", "D")
+            j.awaitFetched("B", "C", "D")
+            j.awaitUnpinnedComplete(3)
+            assertEquals(setOf("A", "B", "C", "D"), j.room.fetched())
+            assertEquals(0L, consumed("B") + consumed("C") + consumed("D"))
+            val bRequests = j.room.audio.filter { it.id == "B" }
+            j.play("B")
+            assertEquals("Actual new current B uses retained audio", bRequests, j.room.audio.filter { it.id == "B" })
+            assertTrue(consumed("B") > 0)
+            j.pause()
+            j.awaitUnpinnedComplete(3)
+            // Successful B must have moved behind C,D. With every pin released, E must
+            // evict C, not protect an old B merely because it is still an active reader.
+            j.admitEToFullCache()
+            j.assertFreshCacheHit("B")
+            j.pause()
+            j.assertFreshCacheMiss("C")
+            j.assertHealthy()
+        }
+    }
+
+    @Test fun actualResumePromotesWithoutANewHistoryEventBeforeTheNextFifoEviction() {
+        Journey(limits = SongCache.Limits(maxTracks = 3, maxBytes = 700_000), longCurrent = true).use { j ->
+            j.startService()
+            j.play("A", "B")
+            j.awaitFetched("B")
+            j.awaitUnpinnedComplete(1)
+            j.play("B")
+            j.pause()
+            // These admissions happen AFTER the initial B start: FIFO is now B,C,D, so
+            // only the upcoming successful Resume (not the first start) can save B from E.
+            j.action(PlaybackListAction.QUEUE_HIGH, "C")
+            j.awaitFetched("C")
+            j.awaitUnpinnedComplete(2)
+            j.action(PlaybackListAction.QUEUE_LOW, "D")
+            j.awaitFetched("D")
+            j.awaitUnpinnedComplete(3)
+            val event = requireNotNull(PlaybackService.exportLocalSnapshot().occurrence).eventId
+            val bRequests = j.room.audio.filter { it.id == "B" }
+            val pcm = consumed("B")
+            j.resume()
+            assertTrue(consumed("B") > pcm)
+            assertEquals("Resume does not require another body or freshness HEAD", bRequests, j.room.audio.filter { it.id == "B" })
+            assertEquals("Promotion is independent of a newly minted/qualified history event", event,
+                PlaybackService.exportLocalSnapshot().occurrence?.eventId)
+            j.pause()
+            j.awaitUnpinnedComplete(3)
+            assertEquals(event, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
+            j.admitEToFullCache()
+            j.assertFreshCacheHit("B")
+            j.pause()
+            j.assertFreshCacheMiss("C")
+            j.assertHealthy()
+        }
+    }
+
+    @Test fun focusDeniedPreparedStartNeverPromotesOrProtectsTheOldestRetainedTrack() {
+        Journey(limits = SongCache.Limits(maxTracks = 3, maxBytes = 700_000), longCurrent = true).use { j ->
+            j.startService()
+            j.play("A", "B", "C", "D")
+            j.awaitFetched("B", "C", "D")
+            j.awaitUnpinnedComplete(3) // FIFO B,C,D; none has ever reached local output.
+            j.pause()
+            val starts = SongCachePlaybackMedia.starts.get()
+            val pcm = consumed("B")
+            val bRequests = j.room.audio.filter { it.id == "B" }
+            j.preparePaused("B")
+            j.setFocusResponse(AudioManager.AUDIOFOCUS_REQUEST_FAILED)
+            j.controller!!.play()
+            await("real explicit B start is blocked by denied audio focus") {
+                PlaybackService.exportLocalSnapshot().error == "blocked" && !j.controller!!.isPlaying
+            }
+            j.awaitLocalPublication("focus-denied B start")
+            assertEquals(starts, SongCachePlaybackMedia.starts.get())
+            assertEquals(pcm, consumed("B"))
+            assertEquals(bRequests, j.room.audio.filter { it.id == "B" })
+            assertNull("A failed start cannot earn an observed occurrence", PlaybackService.exportLocalSnapshot().occurrence)
+            j.assertForegroundStopped()
+            j.awaitUnpinnedComplete(3)
+            // A failed B start cannot promote B or leave a successful-play protection pin.
+            // Therefore E evicts B, while C remains a whole retained object.
+            j.admitEToFullCache()
+            j.setFocusResponse(AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+            j.assertFreshCacheHit("C")
+            j.pause()
+            j.assertFreshCacheMiss("B")
+            j.assertHealthy()
+        }
+    }
+
+    @Test fun actualSeekRebufferingAndReturningPlayingCallbacksDoNotPromoteTheCurrentAgain() {
+        Journey(limits = SongCache.Limits(maxTracks = 3, maxBytes = 4 * 1024 * 1024L),
+            longCurrent = true, longFutureB = true).use { j ->
+            j.startService()
+            j.play("A", "B")
+            j.awaitFetched("B")
+            await("long B is whole while long A remains a legitimate partial current") {
+                j.assertBounded().let { it.entries == 2 && it.complete == 1 }
+            }
+            val bRequests = j.room.audio.filter { it.id == "B" }
+            j.play("B")
+            await("replacing A discards only its abandoned partial and plays whole cached B") {
+                j.assertBounded().let { it.entries == 1 && it.complete == 1 }
+            }
+            assertEquals(bRequests, j.room.audio.filter { it.id == "B" })
+            // C and D are admitted after B's last successful positive start. Thus FIFO is
+            // B,C,D: only an erroneous promotion from a seek/rebuffer callback could save B.
+            j.action(PlaybackListAction.QUEUE_HIGH, "C")
+            j.awaitFetched("C")
+            await("C retained after the successful B start") { j.assertBounded().let { it.entries == 2 && it.complete == 2 } }
+            j.action(PlaybackListAction.QUEUE_LOW, "D")
+            j.awaitFetched("D")
+            await("B,C,D are whole before real seek/rebuffer cycles") { j.assertBounded().let { it.entries == 3 && it.complete == 3 } }
+            val event = requireNotNull(PlaybackService.exportLocalSnapshot().occurrence).eventId
+            val focus = j.focusRequest()
+            val buffering = AtomicInteger()
+            val returningPlaying = AtomicInteger()
+            val listener = object : Player.Listener {
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (playbackState == Player.STATE_BUFFERING) buffering.incrementAndGet()
+                }
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    if (isPlaying) returningPlaying.incrementAndGet()
+                }
+            }
+            // Observe genuine callbacks from the public production session player. Never
+            // invoke listeners, fake readiness, or issue Resume/start commands between seeks.
+            j.session.player.addListener(listener)
+            try {
+                fun seekOnce(target: Long) {
+                    j.awaitLocalPublication("before real seek to $target")
+                    val beforeBuffering = buffering.get()
+                    val beforePlaying = returningPlaying.get()
+                    val pcm = consumed("B")
+                    j.controller!!.seekTo(target) // One submission only; no retry on refusal.
+                    await("real seek to $target buffers, returns READY/isPlaying and consumes B PCM") {
+                        buffering.get() > beforeBuffering && returningPlaying.get() > beforePlaying &&
+                            j.session.player.playbackState == Player.STATE_READY && j.session.player.isPlaying &&
+                            j.controller!!.isPlaying && j.controller!!.currentPosition > target + 50 && consumed("B") > pcm
+                    }
+                    j.awaitLocalPublication("real seek to $target")
+                    assertEquals(event, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
+                    assertEquals("Seeking cannot perform another explicit focus/start request", focus, j.focusRequest())
+                    assertEquals("Both seeks read the retained B object, not another body/HEAD", bRequests,
+                        j.room.audio.filter { it.id == "B" })
+                }
+                seekOnce(90_000) // Outside the first forward buffer of the 120-second period.
+                seekOnce(5_000) // Back outside the now-loaded suffix.
+                assertTrue("Both genuine seek operations must enter BUFFERING", buffering.get() >= 2)
+                assertTrue("Both genuine seek operations must return to actual playing", returningPlaying.get() >= 2)
+            } finally { j.session.player.removeListener(listener) }
+            j.pause()
+            j.awaitUnpinnedComplete(3)
+            assertEquals(event, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
+            j.admitEToFullCache()
+            j.assertFreshCacheHit("C") // Probe kept C before a B miss can change the FIFO again.
+            j.pause()
+            j.assertFreshCacheMiss("B")
             j.assertHealthy()
         }
     }

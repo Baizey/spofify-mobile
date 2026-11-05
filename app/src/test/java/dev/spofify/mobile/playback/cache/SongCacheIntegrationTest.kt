@@ -490,6 +490,120 @@ class SongCacheIntegrationTest {
         assertNull(requests["future"])
     }
 
+    @Test fun logoutDuringHeldWriteCannotReturnAnAuthorizedChunk() =
+        assertHeldStorageRevocation(holdClose = false, revocation = HeldRevocation.LOGOUT)
+
+    @Test fun logoutDuringHeldCompletionCloseCannotReturnAnAuthorizedChunk() =
+        assertHeldStorageRevocation(holdClose = true, revocation = HeldRevocation.LOGOUT)
+
+    @Test fun shared401DuringHeldWriteCannotReturnAnAuthorizedChunk() =
+        assertHeldStorageRevocation(holdClose = false, revocation = HeldRevocation.SHARED_401)
+
+    @Test fun shared401DuringHeldCompletionCloseCannotReturnAnAuthorizedChunk() =
+        assertHeldStorageRevocation(holdClose = true, revocation = HeldRevocation.SHARED_401)
+
+    @Test fun authorityLossDuringHeldWriteCannotReturnAnAuthorizedChunk() =
+        assertHeldStorageRevocation(holdClose = false, revocation = HeldRevocation.AUTHORITY)
+
+    @Test fun authorityLossDuringHeldCompletionCloseCannotReturnAnAuthorizedChunk() =
+        assertHeldStorageRevocation(holdClose = true, revocation = HeldRevocation.AUTHORITY)
+
+    private enum class HeldRevocation { LOGOUT, SHARED_401, AUTHORITY }
+
+    private fun assertHeldStorageRevocation(holdClose: Boolean, revocation: HeldRevocation) {
+        cache.close()
+        val enteredStorage = CountDownLatch(1)
+        val releaseStorage = CountDownLatch(1)
+        val authCleared = CountDownLatch(1)
+        val allowRetirement = CountDownLatch(1)
+        fun holdStorage() {
+            enteredStorage.countDown()
+            if (!releaseStorage.await(5, TimeUnit.SECONDS)) throw IOException("Synthetic held storage timed out")
+        }
+        cache = SongCache(directory, SongCache.Limits(chunkBytes = 512), openWrite = { file ->
+            val output = FileOutputStream(file)
+            object : OutputStream() {
+                override fun write(value: Int) = write(byteArrayOf(value.toByte()), 0, 1)
+                override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                    if (!holdClose) holdStorage()
+                    output.write(buffer, offset, length)
+                }
+                override fun close() {
+                    if (holdClose) holdStorage()
+                    output.close()
+                }
+            }
+        })
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        bytes("held", if (holdClose) 512 else 4096)
+        val demand = source()
+        val workers = Executors.newFixedThreadPool(3)
+        var invalidation: java.util.concurrent.Future<*>? = null
+        try {
+            demand.open(spec("held"))
+            val reading = workers.submit<Int> {
+                val buffer = ByteArray(512)
+                var delivered = 0
+                do {
+                    val count = demand.read(buffer, 0, buffer.size)
+                    if (count == C.RESULT_END_OF_INPUT) break
+                    delivered += count
+                } while (holdClose && delivered < 512)
+                delivered
+            }
+            assertTrue("Writer holds the storage lock", enteredStorage.await(3, TimeUnit.SECONDS))
+            if (revocation == HeldRevocation.AUTHORITY) {
+                authorized = false // The caller's independently changing lease/local-owner guard.
+                assertNotNull(client.currentSession())
+            } else {
+                // The real client clears runtime auth BEFORE notifying outside its auth lock.
+                // Hold retirement until read finishes to deterministically prevent a faster
+                // SessionCache fence from masking the missing final per-read auth check.
+                client.onAuthenticationChanged = { change ->
+                    if (change.identity == null) {
+                        authCleared.countDown()
+                        check(allowRetirement.await(5, TimeUnit.SECONDS))
+                        cache.retire()
+                    }
+                }
+                invalidation = workers.submit {
+                    if (revocation == HeldRevocation.LOGOUT) client.clearSession()
+                    else {
+                        responses["denied"] = { MockResponse().setResponseCode(401).setBody("synthetic-denial") }
+                        val request = okhttp3.Request.Builder()
+                            .url(client.audioUrl(LibraryItem("track", "denied", "synthetic"))).build()
+                        client.httpClient.newCall(request).execute().use { assertEquals(401, it.code) }
+                    }
+                }
+                assertTrue(authCleared.await(3, TimeUnit.SECONDS))
+                // This observer must finish while the retirement callback is still blocked.
+                // Using onUnauthorized under the client's auth lock would make this deadlock.
+                val observed = workers.submit<Boolean> { client.currentSession() == null }
+                assertTrue(observed.get(2, TimeUnit.SECONDS))
+                assertFalse(invalidation.isDone)
+            }
+            releaseStorage.countDown()
+            val failure = try {
+                reading.get(3, TimeUnit.SECONDS)
+                null // A positive read result is the regression, even though its HTTP read was valid.
+            } catch (error: java.util.concurrent.ExecutionException) { error.cause }
+            assertTrue("Revoked chunk must throw, not return its byte count", failure is IOException)
+            assertEquals(1, requests["held"])
+            allowRetirement.countDown()
+            invalidation?.get(3, TimeUnit.SECONDS)
+        } finally {
+            releaseStorage.countDown()
+            allowRetirement.countDown()
+            workers.shutdownNow()
+            try { assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS)) }
+            finally {
+                client.onAuthenticationChanged = null
+                demand.close()
+            }
+        }
+        if (revocation != HeldRevocation.AUTHORITY) assertEquals(0L, cache.inventory().ownedBytes)
+    }
+
     @Test fun osUnlinkedCompletedInodeRemainsOwnedThroughInvalidationUntilReaderCloses() {
         cache.close(); startCache(SongCache.Limits(maxTracks = 3, maxBytes = 24_000, chunkBytes = 512))
         bytes("A", 9_000); fetch("A")
