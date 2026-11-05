@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -37,6 +38,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -49,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -61,6 +64,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.media3.common.Player
@@ -77,8 +81,24 @@ fun NativeMiniPlayer(
     onExpand: () -> Unit,
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
     modifier: Modifier = Modifier,
+    onPlaybackDevices: (() -> Unit)? = null,
 ) {
-    val item = state.item ?: return
+    val item = state.item
+    if (item == null) {
+        Surface(modifier = modifier.fillMaxWidth(), shape = RectangleShape) {
+            Row(Modifier.fillMaxWidth().heightIn(min = 64.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("No song selected", Modifier.weight(1f).padding(8.dp),
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        PlaybackDevicesButton(onPlaybackDevices)
+                        PlayPauseButton(PlaybackState(), {}, enabled = false)
+                    }
+                }
+            }
+        }
+        return
+    }
     val key = state.transportInteractionKey
     // A new token on any observed identity/capability/controller transition also fences A→B→A
     // recompositions. Progress, artwork and buffering alone leave a held gesture intact.
@@ -141,7 +161,12 @@ fun NativeMiniPlayer(
                             style = MaterialTheme.typography.bodySmall)
                     }
                 }
-                PlayPauseButton(state, controls::toggle)
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        PlaybackDevicesButton(onPlaybackDevices)
+                        PlayPauseButton(state, controls::toggle)
+                    }
+                }
             }
             LinearProgressIndicator(
                 progress = { if (state.durationMs > 0)
@@ -196,6 +221,7 @@ fun NativeNowPlaying(
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
     modifier: Modifier = Modifier,
     presentation: NowPlayingPresentationState = remember { NowPlayingPresentationState() },
+    onPlaybackDevices: (() -> Unit)? = null,
 ) {
     val item = state.item ?: return
     BoxWithConstraints(modifier.fillMaxSize().testTag("now-playing")
@@ -225,14 +251,18 @@ fun NativeNowPlaying(
             }
         }
         val transport: @Composable () -> Unit = {
-            Row(Modifier.then(if (cramped) Modifier.fillMaxWidth() else Modifier).testTag("now-playing-controls"), verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceEvenly) {
-                IconButton(onClick = controls::previous, modifier = Modifier.size(48.dp)) {
-                    Icon(Icons.Default.SkipPrevious, "Previous song")
-                }
-                PlayPauseButton(state, controls::toggle, large = !short)
-                IconButton(onClick = controls::next, modifier = Modifier.size(48.dp)) {
-                    Icon(Icons.Default.SkipNext, "Next song")
+            // Musical direction and the requested physical-left Devices placement do not mirror.
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                Row(Modifier.then(if (cramped) Modifier.fillMaxWidth() else Modifier).testTag("now-playing-controls"),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceEvenly) {
+                    IconButton(onClick = controls::previous, modifier = Modifier.size(48.dp)) {
+                        Icon(Icons.Default.SkipPrevious, "Previous song")
+                    }
+                    PlaybackDevicesButton(onPlaybackDevices)
+                    PlayPauseButton(state, controls::toggle, large = !short)
+                    IconButton(onClick = controls::next, modifier = Modifier.size(48.dp)) {
+                        Icon(Icons.Default.SkipNext, "Next song")
+                    }
                 }
             }
         }
@@ -250,16 +280,10 @@ fun NativeNowPlaying(
                     }) { artwork(item, Modifier.matchParentSize()) }
                 }
             }
-            if (short && !landscape) {
-                // A short narrow window spends height on the queue, not decorative cover/chrome.
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f).padding(end = 4.dp)) { PlaybackSeekBar(state, controls) }
-                    transport()
-                }
-            } else {
-                PlaybackSeekBar(state, controls)
-                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { transport() }
-            }
+            // Seek gets its own full-width line: four independent transport targets must not
+            // squeeze it out in short/narrow or landscape panes.
+            PlaybackSeekBar(state, controls)
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { transport() }
         }
         if (cramped) {
             if (presentation.queueOpen) {
@@ -353,7 +377,14 @@ private fun PlayerMore(
 }
 
 @Composable
-private fun PlayPauseButton(state: PlaybackState, onClick: () -> Unit, large: Boolean = false) {
+private fun PlaybackDevicesButton(onClick: (() -> Unit)?) {
+    if (onClick != null) IconButton(onClick = onClick, modifier = Modifier.size(48.dp)) {
+        Icon(Icons.Default.Devices, "Playback devices")
+    }
+}
+
+@Composable
+private fun PlayPauseButton(state: PlaybackState, onClick: () -> Unit, large: Boolean = false, enabled: Boolean = true) {
     // Buffering may temporarily make isPlaying false while playback intent still calls for Pause.
     val showPause = state.isPlaying || state.playWhenReady
     val modifier = Modifier.size(if (large) 64.dp else 48.dp).semantics {
@@ -369,8 +400,8 @@ private fun PlayPauseButton(state: PlaybackState, onClick: () -> Unit, large: Bo
         if (state.isBuffering) CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
         else Icon(if (showPause) Icons.Default.Pause else Icons.Default.PlayArrow, null)
     }
-    if (large) FilledIconButton(onClick = onClick, modifier = modifier) { content() }
-    else IconButton(onClick = onClick, modifier = modifier) { content() }
+    if (large) FilledIconButton(onClick = onClick, modifier = modifier, enabled = enabled) { content() }
+    else IconButton(onClick = onClick, modifier = modifier, enabled = enabled) { content() }
 }
 
 @Composable

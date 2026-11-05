@@ -57,6 +57,8 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.LibraryItem
+import dev.spofify.mobile.core.PlaybackSnapshot
+import dev.spofify.mobile.core.PlaybackTrack
 import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.playback.PlaybackControls
 import dev.spofify.mobile.playback.PlaybackInteractionKey
@@ -64,6 +66,7 @@ import dev.spofify.mobile.playback.PlaybackActionResult
 import dev.spofify.mobile.playback.PlaybackActionStatus
 import dev.spofify.mobile.playback.PlaybackState
 import dev.spofify.mobile.playback.QueueEntry
+import dev.spofify.mobile.playback.remotePlaybackState
 import dev.spofify.mobile.ui.theme.AppTypography
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlin.math.ceil
@@ -604,13 +607,209 @@ class NativePlayerTest {
         fixture.assertPresentationOnly()
     }
 
-    @Test fun absentCurrentItemHasNoMiniIdentityProgressOrTransport() {
-        val fixture = setMini(miniSnapshot().copy(item = null))
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Test fun absentCurrentItemKeepsDevicesAndDisabledPlayWithoutMusicalIdentityOrProgress() {
+        val fixture = setMini(PlaybackState(), withPlaybackDevices = true)
         miniIdentity().assertDoesNotExist()
+        compose.onNodeWithTag("mini-art", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithContentDescription("Playback progress").assertDoesNotExist()
-        compose.onNodeWithContentDescription("Play").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Playback position").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Next song").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Previous song").assertDoesNotExist()
+        compose.onNodeWithTag("now-playing").assertDoesNotExist()
+        compose.onAllNodesWithContentDescription("Playback devices").assertCountEquals(1)
+        compose.onNodeWithText("No song selected").assertIsDisplayed().performTouchInput {
+            click()
+            swipe(center, center + Offset(0f, -px(100)))
+            swipe(center, center + Offset(-px(100), 0f))
+        }
+        val devices = compose.onNodeWithContentDescription("Playback devices")
+            .assertIsDisplayed().assertIsEnabled().assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
+        val play = compose.onNodeWithContentDescription("Play")
+            .assertIsDisplayed().assertIsNotEnabled().assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
+        val devicesBounds = devices.fetchSemanticsNode().boundsInRoot
+        val playBounds = play.fetchSemanticsNode().boundsInRoot
+        val emptyBounds = compose.onNodeWithText("No song selected").fetchSemanticsNode().boundsInRoot
+        assertTrue(emptyBounds.right <= devicesBounds.left)
+        assertEquals(devicesBounds.right, playBounds.left, .5f)
+        assertEquals(devicesBounds.center.y, playBounds.center.y, .5f)
+        play.performTouchInput { click() }
+        devices.performTouchInput { click() }
+        compose.runOnIdle {
+            assertEquals(1, fixture.deviceOpens)
+            fixture.controls.assertNoCommands()
+        }
         fixture.assertCancelled()
         fixture.assertPresentationOnly()
+    }
+
+    @Test fun missingDeviceCallbackOmitsDevicesTruthfullyButKeepsEmptyDock() {
+        val fixture = setMini()
+        compose.onNodeWithContentDescription("Playback devices").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Play").assertIsEnabled()
+        fixture.update { fixture.snapshot.value = PlaybackState() }
+        compose.onNodeWithText("No song selected").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Playback devices").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Play").assertIsNotEnabled().performTouchInput { click() }
+        miniIdentity().assertDoesNotExist()
+        compose.onNodeWithContentDescription("Playback progress").assertDoesNotExist()
+        compose.runOnIdle { fixture.controls.assertNoCommands(); assertEquals(0, fixture.deviceOpens) }
+        fixture.assertCancelled()
+    }
+
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Test fun narrowFont2MiniKeepsDevicesBetweenLongUnicodeIdentityAndPlayThroughPublications() {
+        val controls = RecordingControls()
+        val snapshot = mutableStateOf(miniSnapshot().copy(item = track.copy(
+            name = "Long Unicode title 音楽 🎵 that must yield width to transport",
+            artists = listOf(ArtistCredit("artist", "Long Unicode credit 演奏者 and another performer")),
+        )))
+        var deviceOpens = 0
+        var expands = 0
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, 2f)) {
+                MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
+                    Box(Modifier.width(320.dp).testTag("mini-host")) {
+                        NativeMiniPlayer(snapshot.value, controls, { expands++ },
+                            artwork = { _, modifier -> Box(modifier) },
+                            modifier = Modifier.testTag("mini-bar"), onPlaybackDevices = { deviceOpens++ })
+                    }
+                }
+            }
+        }
+        compose.onNodeWithTag("mini-bar").assertWidthIsEqualTo(320.dp)
+        compose.onAllNodesWithContentDescription("Playback devices").assertCountEquals(1)
+        val identity = miniIdentity().fetchSemanticsNode().boundsInRoot
+        val devices = compose.onNodeWithContentDescription("Playback devices")
+            .assertIsDisplayed().assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
+            .fetchSemanticsNode().boundsInRoot
+        val play = compose.onNodeWithContentDescription("Play")
+            .assertIsDisplayed().assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
+            .fetchSemanticsNode().boundsInRoot
+        assertTrue("Identity cannot own the device target", identity.right <= devices.left)
+        assertEquals("Devices immediately precedes Play", devices.right, play.left, .5f)
+        assertEquals(devices.center.y, play.center.y, .5f)
+        val bar = compose.onNodeWithTag("mini-bar").fetchSemanticsNode().boundsInRoot
+        for (bounds in listOf(identity, devices, play)) {
+            assertTrue("Each sibling fits in the dock", bounds.top >= bar.top && bounds.bottom <= bar.bottom)
+        }
+        for (text in listOf(snapshot.value.item!!.name, snapshot.value.item!!.subtitle)) {
+            val bounds = compose.onNodeWithText(text, useUnmergedTree = true).assertIsDisplayed()
+                .fetchSemanticsNode().boundsInRoot
+            assertTrue("Long identity yields width to Devices", bounds.right <= devices.left)
+        }
+        repeat(20) { frame ->
+            compose.runOnIdle { snapshot.value = snapshot.value.copy(positionMs = frame * 1_000L) }
+            assertEquals(identity, miniIdentity().fetchSemanticsNode().boundsInRoot)
+            assertEquals(devices, compose.onNodeWithContentDescription("Playback devices").fetchSemanticsNode().boundsInRoot)
+            assertEquals(play, compose.onNodeWithContentDescription("Play").fetchSemanticsNode().boundsInRoot)
+        }
+        compose.onNodeWithContentDescription("Playback devices").performTouchInput { click() }
+        compose.runOnIdle { assertEquals(1, deviceOpens); assertEquals(0, expands); controls.assertNoCommands() }
+        // Empty rendering must not borrow stale musical intent or progress from a publication.
+        compose.runOnIdle {
+            snapshot.value = snapshot.value.copy(item = null, isPlaying = true, playWhenReady = true, isBuffering = true)
+        }
+        miniIdentity().assertDoesNotExist()
+        compose.onNodeWithContentDescription("Playback progress").assertDoesNotExist()
+        compose.onNodeWithText("No song selected").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Pause").assertDoesNotExist()
+        val emptyPlay = compose.onNodeWithContentDescription("Play").assertIsNotEnabled()
+            .assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp).fetchSemanticsNode().boundsInRoot
+        val emptyDevices = compose.onNodeWithContentDescription("Playback devices").assertIsEnabled()
+            .assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp)
+        assertEquals(emptyDevices.fetchSemanticsNode().boundsInRoot.right, emptyPlay.left, .5f)
+        emptyDevices.performTouchInput { click() }
+        compose.runOnIdle { assertEquals(2, deviceOpens); assertEquals(0, expands); controls.assertNoCommands() }
+    }
+
+    @Test fun devicesTouchAndCrossingDragsNeverAcquireMiniIdentityTransportInEitherLayoutDirection() {
+        val fixture = setMini(withPlaybackDevices = true)
+        val remote = remotePlaybackState(PlaybackSnapshot(position = 0, queue = listOf(
+            PlaybackTrack("remote-song", "Remote song", emptyList(), "Remote album", "remote-album",
+                100.0, key = 1, order = 0),
+        ))).copy(transportInteractionKey = PlaybackInteractionKey(), canSkipNext = true, canSkipPrevious = true)
+        var expectedOpens = 0
+        for (direction in listOf(LayoutDirection.Ltr, LayoutDirection.Rtl)) {
+            fixture.update { fixture.layoutDirection.value = direction }
+            for (snapshot in listOf(miniSnapshot(), remote, miniSnapshot().copy(
+                isBuffering = true, playWhenReady = true), miniSnapshot().copy(
+                transportInteractionKey = null, canSkipNext = false, canSkipPrevious = false))) {
+                fixture.update { fixture.snapshot.value = snapshot }
+                val devices = compose.onNodeWithContentDescription("Playback devices").assertIsEnabled()
+                devices.performTouchInput { click() }
+                expectedOpens++
+                val deviceBounds = devices.fetchSemanticsNode().boundsInRoot
+                val playLabel = if (snapshot.isPlaying || snapshot.playWhenReady) "Pause" else "Play"
+                val playBounds = compose.onNodeWithContentDescription(playLabel).fetchSemanticsNode().boundsInRoot
+                val identityBounds = miniIdentity().fetchSemanticsNode().boundsInRoot
+                assertEquals("Devices stays physically left of Play even in $direction", deviceBounds.right, playBounds.left, .5f)
+                assertFalse("Devices is not inside identity in $direction", deviceBounds.overlaps(identityBounds))
+                assertFalse("Play is not inside identity in $direction", playBounds.overlaps(identityBounds))
+                val intoIdentity = identityBounds.center - deviceBounds.center
+                // Release inside identity after crossing its boundary, then repeat with an
+                // upward continuation. Hit ownership belongs to the pointer-down sibling.
+                devices.performTouchInput { swipe(center, center + intoIdentity) }
+                devices.performTouchInput {
+                    down(center)
+                    moveBy(intoIdentity)
+                    moveBy(Offset(0f, -px(100)))
+                    up()
+                }
+                devices.performTouchInput { down(center); moveBy(intoIdentity); cancel() }
+                compose.runOnIdle {
+                    assertEquals("Only the deliberate device tap opens the picker", expectedOpens, fixture.deviceOpens)
+                    fixture.controls.assertNoCommands()
+                }
+                fixture.assertCancelled()
+            }
+        }
+        // Device gestures do not poison subsequent identity tap or guarded music gestures.
+        fixture.update {
+            fixture.layoutDirection.value = LayoutDirection.Ltr
+            fixture.snapshot.value = miniSnapshot()
+        }
+        miniIdentity().performTouchInput { click() }
+        miniIdentity().performTouchInput { swipe(center, center + Offset(-px(100), 0f)) }
+        compose.runOnIdle {
+            assertEquals(1, fixture.expands)
+            assertEquals(1, fixture.controls.keyedNext.size)
+            assertEquals(expectedOpens, fixture.deviceOpens)
+        }
+        fixture.assertPresentationOnly()
+    }
+
+    @Test fun expandedDevicesTapIsPresentationOnlyDuringBufferingAndMissingCallbackOmitsIt() {
+        val controls = RecordingControls()
+        val available = mutableStateOf(true)
+        var deviceOpens = 0
+        compose.setContent {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                MaterialTheme {
+                    NativeNowPlaying(PlaybackState(item = track, playWhenReady = true, isBuffering = true),
+                        controls, false, false, false, {}, {}, {}, {},
+                        artwork = { _, modifier -> Box(modifier) },
+                        onPlaybackDevices = if (available.value) ({ deviceOpens++ }) else null)
+                }
+            }
+        }
+        compose.onAllNodesWithContentDescription("Playback devices").assertCountEquals(1)
+        compose.onNodeWithContentDescription("Pause").assertIsEnabled()
+        listOf("Previous song", "Playback devices", "Pause", "Next song").map {
+            compose.onNodeWithContentDescription(it).fetchSemanticsNode().boundsInRoot
+        }.zipWithNext().forEach { (left, right) ->
+            assertTrue("Expanded transport retains physical order in RTL", left.right <= right.left)
+        }
+        val devices = compose.onNodeWithContentDescription("Playback devices").assertIsEnabled()
+        devices.performTouchInput { click() }
+        devices.performTouchInput { swipe(center, center + Offset(-px(120), 0f)) }
+        compose.runOnIdle { assertEquals(1, deviceOpens); controls.assertNoCommands(); available.value = false }
+        compose.onNodeWithContentDescription("Playback devices").assertDoesNotExist()
+        for (label in listOf("Previous song", "Pause", "Next song")) {
+            compose.onNodeWithContentDescription(label).assertIsDisplayed()
+        }
+        compose.runOnIdle { controls.assertNoCommands() }
     }
 
     @Test fun expandedBufferingPlaybackIntentKeepsPauseActionAvailable() {
@@ -787,6 +986,9 @@ class NativePlayerTest {
     @Config(sdk = [35], qualifiers = "w800dp-h1000dp-mdpi")
     @Test fun pinnedControlsAndReleasedQueueBottomStayStableAcrossProgressArtworkAndViewportChanges() {
         val controls = RecordingControls()
+        var deviceOpens = 0
+        var expectedDeviceOpens = 0
+        val transportLabels = listOf("Previous song", "Playback devices", "Play", "Next song")
         val viewport = mutableStateOf(Triple(360, 800, 1f))
         val snapshot = mutableStateOf(PlaybackState(item = track.copy(
             name = "A long Unicode song title 音楽 with several credited performers",
@@ -809,7 +1011,7 @@ class NativePlayerTest {
                                     Box(modifier.testTag("fixture-art").background(MaterialTheme.colorScheme.primaryContainer)) {
                                         if (loaded.value) androidx.compose.material3.Text("♪", style = MaterialTheme.typography.displayLarge)
                                     }
-                                })
+                                }, onPlaybackDevices = { deviceOpens++ })
                         }
                     }
                 }
@@ -822,14 +1024,25 @@ class NativePlayerTest {
             val host = compose.onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
             val player = compose.onNodeWithTag("now-playing").fetchSemanticsNode().boundsInRoot
             assertEquals("Player fills $case", host, player)
-            val primaryControls = listOf("Play", "Previous song", "Next song").map { label ->
+            compose.onAllNodesWithContentDescription("Playback devices").assertCountEquals(1)
+            val primaryControls = transportLabels.map { label ->
                 val node = compose.onNodeWithContentDescription(label).assertIsDisplayed()
                 val bounds = node.fetchSemanticsNode().boundsInRoot
                 org.junit.Assert.assertTrue("48dp target $label at $case", bounds.width >= 48f && bounds.height >= 48f)
                 org.junit.Assert.assertTrue("Visible $label at $case: $bounds in $host", host.contains(bounds.topLeft) && host.contains(bounds.bottomRight - Offset(.1f, .1f)))
                 bounds
             }
+            primaryControls.zipWithNext().forEach { (left, right) ->
+                assertTrue("Transport stays Previous / Devices / Play / Next without overlap at $case", left.right <= right.left)
+                assertEquals("Transport shares a baseline at $case", left.center.y, right.center.y, .5f)
+            }
+            compose.onNodeWithContentDescription("Playback devices")
+                .assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp).performTouchInput { click() }
+            expectedDeviceOpens++
             val seekBounds = compose.onNodeWithContentDescription("Playback position").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+            primaryControls.forEach { bounds ->
+                assertFalse("Seek and transport are disjoint at $case", seekBounds.overlaps(bounds))
+            }
             for (text in listOf(snapshot.value.item!!.name, snapshot.value.item!!.subtitle)) {
                 val node = compose.onNodeWithText(text, useUnmergedTree = true)
                 val layouts = mutableListOf<TextLayoutResult>()
@@ -860,13 +1073,21 @@ class NativePlayerTest {
                 compose.onNodeWithTag("now-playing-show-queue").performClick()
                 compose.onNodeWithTag("now-playing-queue-view").assertIsDisplayed()
                 compose.onNodeWithContentDescription("Playback position").assertDoesNotExist()
+                compose.onAllNodesWithContentDescription("Playback devices").assertCountEquals(1)
+                compose.onNodeWithContentDescription("Playback devices")
+                    .assertWidthIsEqualTo(48.dp).assertHeightIsEqualTo(48.dp).performTouchInput { click() }
+                expectedDeviceOpens++
                 assertSingleLineFits("Up next · 30")
             }
-            val controlsBefore = listOf("Play", "Previous song", "Next song").map { label ->
+            val controlsBefore = transportLabels.map { label ->
                 val bounds = compose.onNodeWithContentDescription(label).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
                 org.junit.Assert.assertTrue("Disclosed-view 48dp target $label at $case", bounds.width >= 48f && bounds.height >= 48f)
                 org.junit.Assert.assertTrue("Disclosed-view control fits $case", host.contains(bounds.topLeft) && host.contains(bounds.bottomRight - Offset(.1f, .1f)))
                 bounds
+            }
+            controlsBefore.zipWithNext().forEach { (left, right) ->
+                assertTrue("Disclosed transport keeps Devices immediately before Play at $case", left.right <= right.left)
+                assertEquals(left.center.y, right.center.y, .5f)
             }
             val queue = compose.onNodeWithTag("now-playing-queue").assertIsDisplayed()
             val queueBounds = queue.fetchSemanticsNode().boundsInRoot
@@ -900,7 +1121,7 @@ class NativePlayerTest {
                 assertEquals("Queue bounds stable at $case frame $frame", queueBounds, queue.fetchSemanticsNode().boundsInRoot)
                 assertEquals("Last occurrence stable at $case frame $frame", initialLast,
                     compose.onNodeWithContentDescription("Queue actions for Queued song 30").fetchSemanticsNode().positionInRoot)
-                listOf("Play", "Previous song", "Next song").forEachIndexed { index, label ->
+                transportLabels.forEachIndexed { index, label ->
                     assertEquals("Pinned $label at $case frame $frame", controlsBefore[index],
                         compose.onNodeWithContentDescription(label).fetchSemanticsNode().boundsInRoot)
                 }
@@ -918,16 +1139,15 @@ class NativePlayerTest {
                 compose.onNodeWithContentDescription("Close upcoming queue").performClick()
                 compose.onNodeWithTag("now-playing-main-view").assertIsDisplayed()
                 compose.onNodeWithTag("now-playing-queue").assertDoesNotExist()
-                listOf("Play", "Previous song", "Next song").forEachIndexed { index, label ->
+                transportLabels.forEachIndexed { index, label ->
                     assertEquals("Explicit queue close restores full-width primary layout", primaryControls[index],
                         compose.onNodeWithContentDescription(label).fetchSemanticsNode().boundsInRoot)
                 }
             } else if (case == cases.first()) captureComponent(case)
         }
         compose.runOnIdle {
-            assertEquals(0, controls.prepares); assertEquals(0, controls.connects); assertEquals(0, controls.stops)
-            assertEquals(0, controls.toggles); assertEquals(0, controls.nexts); assertEquals(0, controls.previouses)
-            assertEquals(0, controls.seeks); assertEquals(0, controls.shuffles); assertEquals(0, controls.repeats)
+            assertEquals("One callback per intentional device tap in every presentation", expectedDeviceOpens, deviceOpens)
+            controls.assertNoCommands()
         }
     }
 
@@ -1041,7 +1261,7 @@ class NativePlayerTest {
     private fun miniCustomActions(): List<CustomAccessibilityAction> =
         miniIdentity().fetchSemanticsNode().config.getOrNull(SemanticsActions.CustomActions).orEmpty()
 
-    private fun setMini(initial: PlaybackState = miniSnapshot()): MiniFixture {
+    private fun setMini(initial: PlaybackState = miniSnapshot(), withPlaybackDevices: Boolean = false): MiniFixture {
         val fixture = MiniFixture(initial)
         compose.setContent {
             CompositionLocalProvider(LocalLayoutDirection provides fixture.layoutDirection.value,
@@ -1053,7 +1273,7 @@ class NativePlayerTest {
                                 Box(modifier.testTag("mini-art")) {
                                     if (fixture.artworkLoaded.value) androidx.compose.material3.Text("♪")
                                 }
-                            })
+                            }, onPlaybackDevices = if (withPlaybackDevices) ({ fixture.deviceOpens++ }) else null)
                     }
                 }
             }
@@ -1069,6 +1289,7 @@ class NativePlayerTest {
         val controls = RecordingControls().apply { state.value = initial }
         val boundControls = mutableStateOf(controls)
         var expands = 0
+        var deviceOpens = 0
         val feedback = mutableListOf<HapticFeedbackType>()
         val haptics = object : HapticFeedback {
             override fun performHapticFeedback(hapticFeedbackType: HapticFeedbackType) { feedback += hapticFeedbackType }
@@ -1168,6 +1389,17 @@ class NativePlayerTest {
         val playNexts = mutableListOf<Pair<PlaybackInteractionKey, String>>()
         val removed = mutableListOf<String>()
         val selected = mutableListOf<String>()
+        val selectedIndices = mutableListOf<Int>()
+        fun assertNoCommands() {
+            assertEquals(0, prepares); assertEquals(0, connects); assertEquals(0, stops)
+            assertEquals(0, toggles); assertEquals(0, nexts); assertEquals(0, previouses)
+            assertEquals(0, seeks); assertEquals(0, shuffles); assertEquals(0, repeats)
+            assertEquals(0, undos); assertEquals(0, clears)
+            assertTrue(keyedAttempts.isEmpty()); assertTrue(moves.isEmpty()); assertTrue(guardedMoves.isEmpty())
+            assertTrue(playNexts.isEmpty()); assertTrue(removed.isEmpty()); assertTrue(selected.isEmpty())
+            assertTrue(selectedIndices.isEmpty())
+        }
+
         override fun connect() { connects++ }
         override fun release() = Unit
         override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?,
@@ -1187,7 +1419,7 @@ class NativePlayerTest {
             keyedPrevious += expectedKey
             return true
         }
-        override fun select(index: Int) = Unit
+        override fun select(index: Int) { selectedIndices += index }
         override fun seekTo(positionMs: Long) { seeks++ }
         override fun toggleShuffle() { shuffles++ }
         override fun cycleRepeat() { repeats++ }

@@ -15,7 +15,7 @@ These are this app's requirements, not claims that every Android app must use th
 ### Listening destinations, not a catalog dump
 
 - Main navigation is **Home / Search / Playlists / Profile**.
-- Profile is a normal destination for authenticated username/server origin, Credits, Playback devices and Sign out—not an account popup or saved-login settings inventory. Credits nests under Profile and opens the complete bundled font notice locally.
+- Profile is a normal destination for authenticated username/server origin, Credits and Sign out—not an account popup or saved-login settings inventory. Credits nests under Profile and opens the complete bundled font notice locally. Playback devices belongs immediately left of Play/Pause in the mini-player and expanded transport, not Profile.
 - Home contains bounded recently played, a Liked Songs shortcut/count and a small selection of personal playlists. Shelves recover independently.
 - Do not present all artists, albums or tracks as a top-level Library to browse. The server catalog is too large for that to be a useful starting point.
 - Empty Search is a useful prompt and issues no match-all catalog request. Entering a query yields artists, albums and songs.
@@ -66,7 +66,7 @@ The live Go repository is **read-only**. Its [AGENTS shared UI standards](../../
 
 - Use a common compact **two-line** media-row primitive for comparable list presentations: aligned square art (native artist avatars may be circular), title, **one inline credit/metadata line**, and trailing More. Track rows have no inline Play/Pause or reserved playback spacer; their titles use that reclaimed width. Intentional collection Play and player transport remain. Do not stack one button/line per artist, add an extra type line, or enlarge padding/font on each iteration to imply hierarchy.
 - Reserve More geometry and bounded copy slots regardless of artist cardinality, missing artwork/audio or background refresh; never reserve the removed track playback slot. A large font scale may change the shared row pitch; it must change consistently, not only for multi-artist items. Long secondary credits can ellipsize, with complete names and all ID-backed actions available intentionally in details/More and accessibility.
-- The mini-player is a **full-width flat dock**, not a floating rounded card with outer gutters/shadow. It shares the shell's inset budget and never obscures the last result.
+- The mini-player is a **full-width flat dock**, not a floating rounded card with outer gutters/shadow. It shares the shell's inset budget and never obscures the last result. Devices and Play/Pause are independent 48dp targets outside the identity gesture surface. Before any track, retain a compact noninteractive “No song selected” identity, Devices (when a coordinator exists) and disabled Play; no fabricated artwork/progress/expansion. Opening Devices is presentation only and never connects, registers, selects or starts playback.
 - Improve information hierarchy before growing fonts, padding or chrome. Compact visuals must still retain **48dp** hit targets and readable text, not tiny buttons.
 
 ### Expanded Now Playing sheet

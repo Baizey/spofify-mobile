@@ -41,7 +41,6 @@ class ProfileLayoutTest {
                     Box(Modifier.requiredSize(320.dp, 640.dp)) {
                         ProfileScreen(username, origin, busy = false,
                             onCredits = { actions += "credits" },
-                            onPlaybackDevices = { actions += "devices" },
                             onSignOut = { actions += "sign-out" })
                     }
                 }
@@ -59,11 +58,12 @@ class ProfileLayoutTest {
             assertFalse("Essential identity cannot overflow its text bounds", layout.hasVisualOverflow)
             assertTrue("Essential identity must remain complete", (0 until layout.lineCount).none(layout::isLineEllipsized))
         }
-        listOf("Playback devices", "Credits", "Sign out").forEach { label ->
+        compose.onNodeWithText("Playback devices").assertDoesNotExist()
+        listOf("Credits", "Sign out").forEach { label ->
             scrollTo(label).assertIsDisplayed().assertIsEnabled()
                 .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
         }
-        assertEquals(listOf("devices", "credits", "sign-out"), actions)
+        assertEquals(listOf("credits", "sign-out"), actions)
         scrollTo("Username").assertIsDisplayed() // The long content also remains reachable again.
     }
 

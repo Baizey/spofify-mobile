@@ -20,7 +20,6 @@ internal fun ProfileScreen(
     origin: String,
     busy: Boolean,
     onCredits: () -> Unit,
-    onPlaybackDevices: (() -> Unit)?,
     onSignOut: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -35,9 +34,6 @@ internal fun ProfileScreen(
         item {
             Text("Server", style = MaterialTheme.typography.labelMedium)
             Text(origin, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.fillMaxWidth())
-        }
-        onPlaybackDevices?.let { openDevices ->
-            item { ProfileAction("Playback devices", onClick = openDevices) }
         }
         item { ProfileAction("Credits", onClick = onCredits) }
         item { ProfileAction("Sign out", enabled = !busy, onClick = onSignOut) }

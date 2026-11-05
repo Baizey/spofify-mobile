@@ -361,11 +361,12 @@ class NativeUiSmokeTest {
                 compose.waitUntil(15_000) { fixture.playlistWrites.get() == 1 }
                 screenshot("08b-playlist-edited")
 
-                // The picker remains discoverable from the normal Profile destination,
-                // not an account/connection toolbar or popup. Returning retains playlist detail.
-                compose.onNodeWithTag("nav-profile").performClick()
-                waitFor(hasTestTag("profile-screen"))
-                compose.onNodeWithText("Playback devices").performScrollTo().performClick()
+                // Before any track, the honest flat dock exposes Devices beside disabled Play.
+                // Opening is presentation only and returning retains the playlist detail.
+                compose.onNodeWithText("No song selected").assertIsDisplayed()
+                compose.onNodeWithContentDescription("Play").assertIsNotEnabled()
+                compose.onNodeWithContentDescription("Playback devices").assertIsDisplayed()
+                    .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
                 waitFor(hasText("Studio speaker"))
                 // Commands may be hidden rather than disabled. Never require unsupported actions.
                 compose.onAllNodes(hasText("Close") or hasText("Play from here")).assertCountEquals(0)
@@ -378,7 +379,11 @@ class NativeUiSmokeTest {
                     }
                 screenshot("08c-playback-devices-read-only")
                 pressBack()
+                waitFor(hasText("Night walk · edited"))
+                assertNoAutoplayOnBrowse(fixture)
+                compose.onNodeWithTag("nav-profile").performClick()
                 waitFor(hasTestTag("profile-screen"))
+                compose.onNodeWithText("Playback devices").assertDoesNotExist()
                 assertProfileAttribution(fixture, "08d-profile", playing = false)
                 compose.onNodeWithTag("nav-playlists").performClick()
                 waitFor(hasText("Night walk · edited"))
@@ -398,6 +403,14 @@ class NativeUiSmokeTest {
                 screenshot("09-now-playing")
                 compose.onNode(sheetTransport("Pause")).assertIsDisplayed()
                 screenshot("09b-now-playing-controls")
+                val beforePicker = capturePlaying(fixture)
+                compose.onNode(sheetTransport("Playback devices")).performClick()
+                waitFor(hasText("Studio speaker"))
+                screenshot("09c-now-playing-device-picker")
+                pressBack()
+                waitUntilAbsent(hasText("Playback devices"))
+                compose.onNode(playerSheet).assertIsDisplayed()
+                assertPlayingTransition(beforePicker, fixture, "device picker dismissal")
                 compose.onNode(sheetTransport("Pause")).performClick()
                 waitFor(pausedButton() and inPlayerSheet())
                 compose.onNode(sheetTransport("Play")).assertIsDisplayed().performClick()
@@ -1541,7 +1554,7 @@ class NativeUiSmokeTest {
         if (exists(playerPosition)) compose.onNode(playerPosition).assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         else compose.onNode(hasContentDescription("Queue playback progress") and inPlayerSheet()).assertIsDisplayed()
         val bounds = viewport.boundsInRoot
-        listOf("Previous song", if (exists(playingButton() and inPlayerSheet())) "Pause" else "Play", "Next song").forEach { label ->
+        listOf("Previous song", "Playback devices", if (exists(playingButton() and inPlayerSheet())) "Pause" else "Play", "Next song").forEach { label ->
             val control = compose.onNode(sheetTransport(label)).assertIsDisplayed()
                 .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).fetchSemanticsNode().boundsInRoot
             assertTrue("Pinned $label must fit within the safe player viewport: $control in $bounds",

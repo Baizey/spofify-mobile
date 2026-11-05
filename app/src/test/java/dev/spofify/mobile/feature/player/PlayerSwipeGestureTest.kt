@@ -114,6 +114,37 @@ class PlayerSwipeGestureTest {
         assertEquals(PlayerSwipeAction.NEXT, gesture(PlayerSwipeArea.MINI).run { move(-80f, 0f); finish() })
     }
 
+    @Test fun miniIdentityNarrowedByTwoSiblingTargetsKeepsPhysicalDirectionsAndReleaseThreshold() {
+        // A 320dp dock reserves separate 48dp Devices and Play targets. Only the
+        // remaining identity owns this recognizer; sibling hit-testing is covered by
+        // NativePlayerTest's actual pointer-down/crossing drags in LTR and RTL.
+        val identityWidth = 320f - 48f - 48f
+        for ((dx, expected) in listOf(-100f to PlayerSwipeAction.NEXT, 100f to PlayerSwipeAction.PREVIOUS)) {
+            val swipe = PlayerSwipeGesture(PlayerSwipeArea.MINI, 8f, 64f,
+                identityWidth / 2f, identityWidth, 24f)
+            assertTrue(swipe.move(dx, 0f))
+            assertEquals(expected, swipe.finish())
+            assertNull("Narrow identity never duplicates a commit", swipe.finish())
+        }
+        val short = PlayerSwipeGesture(PlayerSwipeArea.MINI, 8f, 64f,
+            identityWidth / 2f, identityWidth, 24f)
+        assertTrue(short.move(-63f, 0f))
+        assertNull("Reserving Devices must not lower the music-gesture threshold", short.finish())
+    }
+
+    @Test fun miniCrossingIntoSiblingRegionDoesNotReinterpretAnAlreadyLockedIdentityGesture() {
+        val identityWidth = 224f
+        val fromIdentity = PlayerSwipeGesture(PlayerSwipeArea.MINI, 8f, 64f,
+            identityWidth - 30f, identityWidth, 24f)
+        assertTrue(fromIdentity.move(90f, 0f)) // pointer is now outside identity, over sibling controls
+        assertEquals(PlayerSwipeAction.PREVIOUS, fromIdentity.finish())
+        assertNull(fromIdentity.finish())
+        val edgeStart = PlayerSwipeGesture(PlayerSwipeArea.MINI, 8f, 64f,
+            identityWidth - 2f, identityWidth, 24f)
+        assertFalse(edgeStart.move(-100f, 0f))
+        assertNull("An edge-start cannot become transport by crossing back into identity", edgeStart.finish())
+    }
+
     @Test fun miniEdgeStillAllowsUpAndHonorsAsymmetricSystemInsets() {
         for (start in listOf(0f, 300f)) {
             gesture(PlayerSwipeArea.MINI, start).also {

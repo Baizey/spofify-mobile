@@ -130,7 +130,14 @@ internal fun SpofifyApp(model: LibraryViewModel) {
     }
     key(client, state.session?.accountId) {
         val pages = rememberSaveableStateHolder()
-        var devices by remember { mutableStateOf(false) }
+        val deviceCoordinator = model.graph.playbackCoordinator
+        var devices by remember(deviceCoordinator) { mutableStateOf(false) }
+        val openDevices: (() -> Unit)? = deviceCoordinator?.let { { devices = true } }
+        val deviceSheet: @Composable () -> Unit = {
+            if (devices) deviceCoordinator?.let { coordinator ->
+                PlaybackDevicesSheet(coordinator, onDismiss = { devices = false })
+            }
+        }
         var creditsLicense by remember(state.page) { mutableStateOf(false) }
         var more by remember { mutableStateOf<CatalogMoreSelection?>(null) }
         var addToPlaylist by remember { mutableStateOf<LibraryItem?>(null) }
@@ -176,7 +183,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                     model.cancelSearchActivation(client, accountId)
                     focus.clearFocus(); keyboard?.hide()
                     expanded = true
-                }, art, Modifier.fillMaxWidth())
+                }, art, Modifier.fillMaxWidth(), onPlaybackDevices = openDevices)
             },
             navigation = {
                 CompactNavigation(modifier = Modifier.testTag("primary-navigation")) {
@@ -238,7 +245,6 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                         Page.Profile -> ProfileScreen(
                             username = state.session?.username.orEmpty(), origin = client.server.origin,
                             busy = state.busy, onCredits = { model.open(Page.Credits) },
-                            onPlaybackDevices = if (model.graph.playbackCoordinator != null) ({ devices = true }) else null,
                             onSignOut = model::logout, modifier = contentModifier)
                         Page.Credits -> CreditsScreen(onFontLicense = { creditsLicense = true }, modifier = contentModifier)
                     }
@@ -259,7 +265,10 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                         item.id in state.failedLikeStatus, { model.toggleLike(item) }, { model.checkLike(item) },
                         onAddToPlaylist = { expanded = false; addToPlaylist = it }, onOpenItem = openExternal,
                         artwork = art, modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
-                        presentation = presentation)
+                        presentation = presentation, onPlaybackDevices = openDevices)
+                    // Compose the single picker in the current player window, above its Dialog.
+                    // The underlying player and its queue/list state remain mounted on dismissal.
+                    deviceSheet()
                 }
             }
         }
@@ -290,9 +299,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         addToPlaylist?.let { item -> AddToPlaylistSheet(client, item, onDismiss = {
             addToPlaylist = null
         }) }
-        if (devices) model.graph.playbackCoordinator?.let { coordinator ->
-            PlaybackDevicesSheet(coordinator, onDismiss = { devices = false })
-        }
+        if (!expanded || player.item == null) deviceSheet()
     }
 }
 

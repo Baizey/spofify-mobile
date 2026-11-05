@@ -175,6 +175,7 @@ class ProfileHostTest {
                         .setHeader("Set-Cookie", "spofify_session=private-cookie; Path=/; HttpOnly; Max-Age=3600")
                     "/api/auth/logout" -> MockResponse().setResponseCode(204)
                     "/api/library/revision" -> json("""{"revision":1}""")
+                    "/api/me/player" -> json("""{"devices":[],"activeDeviceId":"","epoch":1,"leaseMs":0,"state":null,"stateSeq":0,"stateAgeMs":0,"transfer":null,"directives":[],"commands":[]}""")
                     "/api/library" -> {
                         val items = if (request.requestUrl?.queryParameter("kind") == "tracks") (0 until 30).joinToString(",") {
                             """{"kind":"track","id":"result-$it","name":"Search result $it","hasAudio":false}"""
@@ -226,7 +227,9 @@ class ProfileHostTest {
         compose.onNodeWithText(username).assertIsDisplayed()
         profileAction("Server").assertIsDisplayed()
         compose.onNodeWithText(client.server.origin).assertIsDisplayed()
-        listOf("Playback devices", "Credits", "Sign out").forEach { profileAction(it).assertHasClickAction() }
+        listOf("Credits", "Sign out").forEach { profileAction(it).assertHasClickAction() }
+        compose.onNodeWithText("Playback devices").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Playback devices").assertIsDisplayed()
         listOf("Your connection", "Font license", "View full font license", "Use saved login", "Forget saved login",
             "Remember sign-in on this device", "saved-user", "saved-secret", "private-csrf", "private-cookie", "profile-account")
             .forEach { compose.onNodeWithText(it, substring = true).assertDoesNotExist() }
@@ -365,7 +368,7 @@ class ProfileHostTest {
                     textBounds.top >= target.top && textBounds.bottom <= target.bottom)
             assertTrue("Navigation labels must not ellipsize: $label", (0 until layout.lineCount).none(layout::isLineEllipsized))
         }
-        listOf(username, client.server.origin, "Playback devices", "Credits", "Sign out").forEach {
+        listOf(username, client.server.origin, "Credits", "Sign out").forEach {
             profileAction(it).assertIsDisplayed()
         }
         openCredits()
@@ -376,6 +379,52 @@ class ProfileHostTest {
         back()
         profileAction("Sign out").assertIsDisplayed()
         assertTrue(playback.commands.isEmpty())
+    }
+
+    @Test fun emptyDockPickerIsPresentationOnlyAndBackReturnsToSameRoot() {
+        compose.runOnIdle { playback.state.value = PlaybackState() }
+        val before = playback.state.value
+        mount()
+        compose.onNodeWithText("No song selected").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Play").assertIsNotEnabled()
+        compose.onNodeWithTag("mini-player-identity").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Playback devices").performClick()
+        compose.onNodeWithText("Playback devices").assertIsDisplayed()
+        compose.onNodeWithText("View only", substring = true).assertExists()
+        dismissDialogWithBack()
+        compose.onNodeWithText("Playback devices").assertDoesNotExist()
+        compose.onNodeWithText("No song selected").assertIsDisplayed()
+        assertEquals(Page.Home, model.state.value.page)
+        assertPlaybackUnchanged(before)
+        assertTrue("Opening cannot register or select an output", requests.none {
+            it.method == "POST" && it.requestUrl?.encodedPath == "/api/me/player"
+        })
+    }
+
+    @Test fun miniAndExpandedPickerBackPreserveActualPlayerWindowAndPreparedState() {
+        val before = playback.state.value
+        mount()
+        compose.onNodeWithContentDescription("Playback devices").performClick()
+        compose.onNodeWithText("Playback devices").assertIsDisplayed()
+        dismissDialogWithBack()
+        compose.onNodeWithTag("mini-player-identity").performClick()
+        compose.onNodeWithTag("now-playing").assertIsDisplayed()
+        val playerDialog = compose.runOnIdle { org.robolectric.shadows.ShadowDialog.getLatestDialog() }
+        compose.onNode(hasContentDescription("Playback devices") and hasAnyAncestor(hasTestTag("now-playing"))).performClick()
+        compose.onNodeWithText("Playback devices").assertIsDisplayed()
+        val pickerDialog = compose.runOnIdle { org.robolectric.shadows.ShadowDialog.getLatestDialog() }
+        assertNotSame("Picker must have its own modal window", playerDialog, pickerDialog)
+        assertTrue("Opening must keep the underlying player window mounted", playerDialog.isShowing)
+        dismissDialogWithBack()
+        compose.onNodeWithText("Playback devices").assertDoesNotExist()
+        compose.onNodeWithTag("now-playing").assertIsDisplayed()
+        assertTrue(playerDialog.isShowing)
+        compose.runOnIdle { (playerDialog as androidx.activity.ComponentDialog).onBackPressedDispatcher.onBackPressed() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("now-playing").assertDoesNotExist()
+        compose.onNodeWithTag("mini-player-identity").assertIsDisplayed()
+        assertPlaybackUnchanged(before)
+        assertTrue(requests.none { it.method == "POST" && it.requestUrl?.encodedPath == "/api/me/player" })
     }
 
     @Test fun logoutWhileNoticeIsOpenCannotLeakPrivateProfileRouteIntoReplacementSession() {
