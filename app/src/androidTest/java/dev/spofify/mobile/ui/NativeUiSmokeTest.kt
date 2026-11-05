@@ -307,7 +307,7 @@ class NativeUiSmokeTest {
                     compose.onNode(devices).performClick()
                     waitFor(hasText("Studio speaker"))
                     // Commands may be hidden rather than disabled. Never require unsupported actions.
-                    val deviceCommand = hasText("Play on ", substring = true) or hasText("Rename") or
+                    val deviceCommand = hasText("Play from here") or hasText("Rename") or
                         hasText("Continue playback here") or hasText("Save")
                     compose.onAllNodes(deviceCommand and hasClickAction())
                         .fetchSemanticsNodes().forEach { node ->

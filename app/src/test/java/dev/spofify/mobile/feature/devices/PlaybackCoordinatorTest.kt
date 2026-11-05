@@ -49,7 +49,10 @@ class PlaybackCoordinatorTest {
         }
     }
     private class Protocol(var current: PlaybackDevicesView) : PlaybackDevicesProtocol {
-        var registers = 0; var polls = 0; var leaves = 0
+        var registers = 0; var polls = 0; var leaves = 0; var views = 0; var renames = 0
+        var viewGate: CompletableDeferred<Unit>? = null
+        var viewFailure: Exception? = null
+        var renameFailure: Exception? = null
         var lastState: PlaybackSnapshot? = null
         val sentAcks = mutableListOf<PlaybackAck>()
         val ackStates = mutableListOf<Pair<List<PlaybackAck>, PlaybackSnapshot?>>()
@@ -63,7 +66,10 @@ class PlaybackCoordinatorTest {
         var pollFailure: Exception? = null
         val commands = mutableListOf<Pair<Long, String>>()
         var echoPendingCommand = false
-        override suspend fun view() = current.copy(directives = emptyList())
+        override suspend fun view(): PlaybackDevicesView {
+            views++; viewGate?.await(); viewFailure?.let { throw it }
+            return current.copy(directives = emptyList())
+        }
         override suspend fun register(name: String): PlaybackDevicesView {
             registers++; registerGate?.await(); if (failRegister) error("synthetic unknown registration")
             return current
@@ -79,7 +85,9 @@ class PlaybackCoordinatorTest {
             val result = current; current = current.copy(directives = emptyList()); return result
         }
         override suspend fun rename(deviceId: String, name: String): PlaybackDevicesView {
+            renames++
             lateRenameFailure?.let { gate -> withContext(NonCancellable) { gate.await(); error("synthetic late failure") } }
+            renameFailure?.let { throw it }
             return current
         }
         override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView {
@@ -98,7 +106,134 @@ class PlaybackCoordinatorTest {
         runCurrent(); assertEquals(0, api.registers)
         endpoint.supportsExactHandoff = false; c.setServiceActive(true); runCurrent()
         assertEquals(0, api.registers); assertFalse(c.state.value.exclusiveOwner)
+        assertEquals(PlaybackConnectionRecovery.UNSUPPORTED, c.state.value.recovery)
+        assertFalse(c.state.value.retryAvailable)
+        c.retry(); runCurrent()
+        assertTrue(c.state.value.connected); assertFalse(c.state.value.retryAvailable)
         c.close()
+        assertEquals(PlaybackConnectionRecovery.OWNER_ENDED, c.state.value.recovery)
+    }
+
+    @Test fun readVerificationTracksInitialRetainedFailureAndRecoveryWithoutRegistration() = runTest {
+        for (retained in listOf(false, true)) for (status in listOf(500, 401)) {
+            val api = Protocol(view(owner = "pc", snapshot = prepared))
+            val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            assertFalse(c.state.value.retryAvailable)
+            if (retained) { c.retry(); runCurrent(); assertTrue(c.state.value.connected) }
+            api.viewGate = CompletableDeferred(); api.viewFailure = ApiException(status, "synthetic read failure")
+            c.retry(); runCurrent()
+            assertTrue(c.state.value.verifyingConnection); assertFalse(c.state.value.retryAvailable)
+            api.viewGate!!.complete(Unit); runCurrent()
+            assertFalse(c.state.value.verifyingConnection)
+            assertEquals(retained, c.state.value.connected) // Cached health is not verification success.
+            assertEquals(retained, c.state.value.view != null)
+            assertEquals(status != 401, c.state.value.retryAvailable)
+            assertEquals(if (status == 401) PlaybackConnectionRecovery.AUTH_REQUIRED else PlaybackConnectionRecovery.VERIFICATION_NEEDED,
+                c.state.value.recovery)
+            if (status == 401) {
+                api.viewFailure = ApiException(500, "still unverified")
+                c.retry(); runCurrent()
+                assertEquals(PlaybackConnectionRecovery.AUTH_REQUIRED, c.state.value.recovery)
+                assertFalse(c.state.value.retryAvailable)
+            }
+            api.viewFailure = null
+            c.retry(); runCurrent()
+            assertTrue(c.state.value.connected); assertFalse(c.state.value.retryAvailable)
+            assertFalse(c.state.value.verifyingConnection)
+            assertEquals("The picker already labels view-only capability", "", c.state.value.message)
+            assertEquals(0, api.registers); assertEquals(0, api.polls)
+            assertEquals(0, endpoint.stops); assertTrue(endpoint.starts.isEmpty())
+            c.close()
+        }
+    }
+
+    @Test fun queuedReadVerificationsClearOnLifecycleCancellation() = runTest {
+        for (end in listOf("stop", "auth", "close", "scope")) {
+            val parent = SupervisorJob()
+            val ownedScope = CoroutineScope(StandardTestDispatcher(testScheduler) + parent)
+            val api = Protocol(view()).apply { viewGate = CompletableDeferred() }
+            val c = PlaybackCoordinator(api, Endpoint(), ownedScope, clockMs = { testScheduler.currentTime })
+            c.retry(); c.retry(); runCurrent()
+            assertEquals(1, api.views); assertTrue(c.state.value.verifyingConnection)
+            when (end) {
+                "stop" -> { c.setServiceActive(true); c.setServiceActive(false) }
+                "auth" -> c.authLost()
+                "close" -> c.close()
+                else -> parent.cancel()
+            }
+            runCurrent()
+            assertFalse(c.state.value.verifyingConnection)
+            assertEquals(end == "stop", c.state.value.retryAvailable)
+            api.viewGate!!.complete(Unit); runCurrent()
+            assertNull(c.state.value.view); assertFalse(c.state.value.verifyingConnection)
+            c.close(); parent.cancel(); runCurrent()
+        }
+    }
+
+    @Test fun pollFailuresExposeRecoveryOnlyAfterVerificationIncludingConflictRead() = runTest {
+        for (status in listOf(500, 404, 409, 401)) {
+            val api = Protocol(view(owner = "pc", snapshot = prepared))
+            val endpoint = Endpoint()
+            val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
+            c.setServiceActive(true); runCurrent()
+            api.pollGate = CompletableDeferred(); api.pollFailure = ApiException(status, "synthetic poll failure")
+            api.viewGate = CompletableDeferred()
+            c.retry(); runCurrent()
+            assertTrue(c.state.value.verifyingConnection); assertFalse(c.state.value.retryAvailable)
+            api.pollGate!!.complete(Unit); runCurrent()
+            if (status == 409) {
+                assertEquals(1, api.views)
+                assertTrue(c.state.value.verifyingConnection); assertFalse(c.state.value.retryAvailable)
+                api.viewGate!!.complete(Unit); runCurrent()
+                assertTrue(c.state.value.message.contains("not replayed"))
+            }
+            assertFalse(c.state.value.connected); assertFalse(c.state.value.verifyingConnection)
+            assertEquals(status != 401, c.state.value.retryAvailable)
+            assertTrue(endpoint.starts.isEmpty()); assertNull(c.currentAuthority())
+            c.close()
+        }
+    }
+
+    @Test fun healthyConnectionGuidanceIsNotConnectionRecovery() = runTest {
+        for (healthy in listOf(
+            view(owner = ""), view(owner = "").copy(devices = emptyList()),
+            view(owner = "pc", snapshot = prepared.paused().copy(error = "blocked")),
+            view(owner = "pc", snapshot = prepared.paused().copy(error = "media")),
+            view(owner = "", quarantine = 2000),
+            view(transfer = PlaybackTransfer("switch", "phone", "pc", "preparing")),
+        )) {
+            val api = Protocol(healthy)
+            val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+            if (healthy.devices.isEmpty()) c.retry() else c.setServiceActive(true)
+            runCurrent()
+            assertTrue(c.state.value.connected); assertFalse(c.state.value.retryAvailable)
+            assertFalse(c.state.value.verifyingConnection)
+            if (healthy.quarantineMs > 0 || healthy.transfer != null) assertTrue(c.state.value.message.isNotEmpty())
+            else assertEquals("", c.state.value.message)
+            c.rename("phone", " "); runCurrent()
+            assertTrue(c.state.value.message.contains("1–64")); assertFalse(c.state.value.retryAvailable)
+            assertEquals(0, api.renames)
+            c.close()
+        }
+    }
+
+    @Test fun readOnlyRenameUncertaintyNeedsVerificationNotBlindWriteReplay() = runTest {
+        for (status in listOf(500, 401)) {
+            val api = Protocol(view(owner = "pc"))
+            val c = PlaybackCoordinator(api, Endpoint(), backgroundScope, clockMs = { testScheduler.currentTime })
+            c.retry(); runCurrent()
+            api.renameFailure = ApiException(status, "synthetic unknown rename")
+            c.rename("pc", "New name"); runCurrent()
+            assertTrue(c.state.value.connected); assertFalse(c.state.value.verifyingConnection)
+            assertEquals(status != 401, c.state.value.retryAvailable)
+            assertTrue(c.state.value.message.isNotEmpty())
+            c.retry(); runCurrent()
+            assertFalse(c.state.value.retryAvailable); assertEquals(1, api.renames)
+            assertEquals("PC", c.state.value.devices.first { it.deviceId == "pc" }.name)
+            assertEquals(0, api.registers); assertEquals(0, api.polls)
+            c.close()
+        }
     }
 
     @Test fun firstRegistrationPreservesTheGenuinePreBindPlaybackGeneration() = runTest {
@@ -201,6 +336,7 @@ class PlaybackCoordinatorTest {
             assertEquals(next, endpoint.executed.last())
             assertEquals("", endpoint.snapshot.error)
             assertTrue(c.state.value.connected)
+            assertFalse(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
             c.close()
         }
     }
@@ -240,6 +376,10 @@ class PlaybackCoordinatorTest {
         advanceTimeBy(500); runCurrent() // conservative 1500ms lease deadline
         assertFalse(endpoint.snapshot.playing); assertNull(c.currentAuthority())
         assertTrue(endpoint.stops > stops)
+        assertEquals(PlaybackConnectionRecovery.VERIFICATION_NEEDED, c.state.value.recovery)
+        assertTrue(c.state.value.verifyingConnection); assertFalse(c.state.value.retryAvailable)
+        advanceTimeBy(3500); runCurrent() // Existing bounded poll times out, without a new attempt yet.
+        assertFalse(c.state.value.verifyingConnection); assertTrue(c.state.value.retryAvailable)
         c.close()
     }
 
@@ -360,6 +500,8 @@ class PlaybackCoordinatorTest {
         val held = endpoint.authority!!; assertTrue(held.isValid()); assertTrue(endpoint.snapshot.playing)
         parent.cancel(); assertFalse(held.isValid()); runCurrent()
         assertFalse(endpoint.snapshot.playing); assertFalse(c.state.value.exclusiveOwner)
+        assertEquals(PlaybackConnectionRecovery.OWNER_ENDED, c.state.value.recovery)
+        assertFalse(c.state.value.verifyingConnection); assertFalse(c.state.value.retryAvailable)
         c.close()
     }
 
@@ -386,7 +528,11 @@ class PlaybackCoordinatorTest {
         c.setServiceActive(true)
         assertEquals("Binding must not invalidate a pre-bind user request", 0, endpoint.stops)
         runCurrent(); assertEquals("", c.state.value.deviceId)
+        assertTrue(c.state.value.connecting); assertTrue(c.state.value.verifyingConnection)
+        assertFalse(c.state.value.retryAvailable)
         c.setServiceActive(false)
+        assertFalse(c.state.value.connecting); assertFalse(c.state.value.verifyingConnection)
+        assertTrue(c.state.value.retryAvailable)
         assertTrue(endpoint.stops > 0)
         assertNull(c.currentAuthority())
         c.close()
@@ -422,7 +568,10 @@ class PlaybackCoordinatorTest {
         val api = Protocol(view()).apply { failRegister = true }; val endpoint = Endpoint()
         val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime })
         c.setServiceActive(true); runCurrent(); assertEquals(1, api.registers)
+        assertTrue(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
+        assertFalse(c.state.value.connecting)
         repeat(10) { c.retry(); runCurrent() }
+        assertTrue(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
         advanceTimeBy(7999); runCurrent(); assertEquals(1, api.registers)
         advanceTimeBy(1); runCurrent(); assertEquals(2, api.registers)
         advanceTimeBy(15999); runCurrent(); assertEquals(2, api.registers)
@@ -431,6 +580,7 @@ class PlaybackCoordinatorTest {
         advanceTimeBy(29999); runCurrent(); assertEquals(3, api.registers)
         advanceTimeBy(1); runCurrent(); assertEquals(4, api.registers)
         assertEquals("phone", c.state.value.deviceId)
+        assertFalse(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
         assertTrue(endpoint.starts.isEmpty())
         c.close()
     }
@@ -441,6 +591,7 @@ class PlaybackCoordinatorTest {
         c.setServiceActive(true); runCurrent()
         api.pollFailure = ApiException(404, "gone")
         c.retry(); runCurrent(); assertEquals("", c.state.value.deviceId)
+        assertTrue(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
         api.pollFailure = null
         advanceTimeBy(1000); runCurrent()
         assertEquals(2, api.registers); assertEquals("phone", c.state.value.deviceId)
@@ -631,13 +782,17 @@ class PlaybackCoordinatorTest {
         api.pollFailure = ApiException(409, "conflict")
         c.retry(); runCurrent()
         assertFalse(held.isValid()); assertNull(c.currentAuthority()); assertFalse(c.state.value.connected)
+        assertTrue(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
+        assertTrue(c.state.value.message.contains("not replayed"))
         c.rename("phone", "Renamed after conflict"); runCurrent()
         assertFalse("A rename response is not a fresh owner poll", c.state.value.connected)
+        assertTrue(c.state.value.retryAvailable); assertTrue(c.state.value.message.contains("not replayed"))
         c.localAction { fail("Conflict display must not grant authority"); PlaybackEndpointResult("ok", prepared) }
         runCurrent(); assertFalse(endpoint.snapshot.playing)
         api.pollFailure = null
         c.retry(); runCurrent()
         assertFalse(endpoint.snapshot.playing)
+        assertFalse(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
         c.remoteCommand(PlaybackDeviceCommand.transport("resume")); runCurrent()
         assertTrue(endpoint.snapshot.playing)
         c.close()
@@ -667,6 +822,8 @@ class PlaybackCoordinatorTest {
         c.authLost()
         assertFalse(old.isValid()); assertFalse(endpoint.snapshot.playing)
         assertFalse(c.state.value.exclusiveOwner)
+        assertEquals(PlaybackConnectionRecovery.AUTH_REQUIRED, c.state.value.recovery)
+        assertFalse(c.state.value.retryAvailable); assertFalse(c.state.value.verifyingConnection)
         c.close()
     }
 }

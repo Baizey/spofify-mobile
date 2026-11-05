@@ -11,6 +11,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
+/** Presentation only: never grants playback authority or schedules a retry. */
+enum class PlaybackConnectionRecovery { NONE, VERIFICATION_NEEDED, AUTH_REQUIRED, OWNER_ENDED, UNSUPPORTED }
+
 /** Remote display is NOT a local audible traversal and must never feed local history. */
 data class PlaybackDevicesState(
     val deviceId: String = "", val view: PlaybackDevicesView? = null,
@@ -18,7 +21,10 @@ data class PlaybackDevicesState(
     val connected: Boolean = false, val connecting: Boolean = false,
     val exclusiveOwner: Boolean = false, val needsTap: Boolean = false,
     val message: String = "Connect the playback service to use this phone as an output.",
+    val recovery: PlaybackConnectionRecovery = PlaybackConnectionRecovery.NONE,
+    val verifyingConnection: Boolean = false,
 ) {
+    val retryAvailable: Boolean get() = recovery == PlaybackConnectionRecovery.VERIFICATION_NEEDED && !verifyingConnection
     val activeDeviceId: String get() = view?.activeDeviceId.orEmpty()
     val devices: List<PlaybackDevice> get() = view?.devices.orEmpty()
     val quarantineMs: Long get() = view?.quarantineMs ?: 0
@@ -48,6 +54,27 @@ class PlaybackCoordinator(
     private var managedOutput = false
     private var closed = false
     private var lifecycle = 0L
+    private var connectionChecks = 0
+    private var connectionCheckVersion = 0L
+
+    // Counts queued/active verification separately from registration and playback work.
+    // Lifecycle resets invalidate old finally blocks, including NonCancellable completions.
+    private fun clearConnectionChecks() {
+        connectionCheckVersion++; connectionChecks = 0
+        mutableState.value = state.value.copy(verifyingConnection = false, connecting = false)
+    }
+    private suspend fun <T> verifyConnection(block: suspend () -> T): T {
+        val version = connectionCheckVersion
+        connectionChecks++
+        mutableState.value = state.value.copy(verifyingConnection = true)
+        try { return block() }
+        finally {
+            if (version == connectionCheckVersion) {
+                connectionChecks--
+                mutableState.value = state.value.copy(verifyingConnection = connectionChecks > 0)
+            }
+        }
+    }
     private var generation = 0L
     private var epoch = 0L
     private var sequence = 0L
@@ -136,6 +163,8 @@ class PlaybackCoordinator(
                     mutableState.value = state.value.copy(connected = false, exclusiveOwner = false,
                         message = "Playback service stopped. Reconnect and press Play explicitly.")
                 }
+                clearConnectionChecks()
+                mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.OWNER_ENDED)
             }
         }
     }
@@ -168,9 +197,14 @@ class PlaybackCoordinator(
 
     fun setServiceActive(active: Boolean) {
         if (closed || active == serviceActive) return
-        if (active && !work.isActive) { message("The playback owner scope has ended. Recreate the service connection."); return }
+        if (active && !work.isActive) {
+            mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.OWNER_ENDED,
+                message = "The playback owner scope has ended. Recreate the service connection.")
+            return
+        }
         if (active && !endpoint.supportsExactHandoff) {
-            mutableState.value = state.value.copy(message = "This playback engine cannot yet transfer the complete prepared queue safely.")
+            mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.UNSUPPORTED,
+                message = "This playback engine cannot yet transfer the complete prepared queue safely.")
             return
         }
         serviceActive = active
@@ -192,7 +226,9 @@ class PlaybackCoordinator(
             val oldId = state.value.deviceId
             lifecycle++; fenceLocal(); managedOutput = false; work.coroutineContext.cancelChildren(); heartbeat = null
             selectionJob?.cancel(); intent = null; acks.clear(); ackState = null; deliveries.clear(); pendingCommand = null
-            mutableState.value = PlaybackDevicesState(message = "Playback service is not connected. Reconnecting never starts audio automatically.")
+            clearConnectionChecks()
+            mutableState.value = PlaybackDevicesState(message = "Playback service is not connected. Reconnecting never starts audio automatically.",
+                recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED)
             if (oldId.isNotEmpty()) scope.launch { transport.withLock { try { withTimeout(4000) { api.leave(oldId) } } catch (_: Exception) { /* Single attempt only. */ } } }
         }
     }
@@ -231,31 +267,40 @@ class PlaybackCoordinator(
     fun authLost() {
         setServiceActive(false)
         lifecycle++; fenceLocal(); work.coroutineContext.cancelChildren()
-        mutableState.value = PlaybackDevicesState(message = "Sign in again to connect your players.")
+        clearConnectionChecks()
+        mutableState.value = PlaybackDevicesState(message = "Sign in again to connect your players.", recovery = PlaybackConnectionRecovery.AUTH_REQUIRED)
     }
-    fun close() { if (!closed) { setServiceActive(false); closed = true; lifecycle++; work.cancel(); cancellationGuard.cancel(); fenceLocal() } }
+    fun close() {
+        if (!closed) {
+            setServiceActive(false); closed = true; lifecycle++; work.cancel(); cancellationGuard.cancel(); fenceLocal()
+            clearConnectionChecks()
+            mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.OWNER_ENDED)
+        }
+    }
 
     fun retry() {
         if (closed) return
         if (!serviceActive) {
             // Authenticated READ-ONLY controller: browsing does not advertise a physical phone.
             val life = lifecycle
-            work.launch {
+            work.launch { verifyConnection {
                 transport.withLock {
                     try {
                         val view = withTimeout(4000) { api.view() }.validated().copy(directives = emptyList())
                         if (life == lifecycle && !closed && work.isActive && !serviceActive) mutableState.value = PlaybackDevicesState(
-                            view = view, connected = true,
-                            message = "Read-only devices. Native handoff requires an exact, authority-fenced playback service.")
+                            view = view, connected = true, verifyingConnection = connectionChecks > 0,
+                            recovery = if (endpoint.supportsExactHandoff) PlaybackConnectionRecovery.NONE else PlaybackConnectionRecovery.UNSUPPORTED,
+                            message = "") // The picker retains its explicit view-only capability label.
                     } catch (error: Exception) {
                         if (error is CancellationException && error !is TimeoutCancellationException) throw error
-                        if (life == lifecycle && !closed && work.isActive) message("Could not verify playback devices. Sign in or retry connection.")
+                        if (life == lifecycle && !closed && work.isActive && !serviceActive) readOnlyFailure(error,
+                            "Could not verify playback devices. Sign in or retry connection.")
                     }
                 }
-            }
+            } }
             return
         }
-        work.launch { transport.withLock { exchange { if (state.value.deviceId.isEmpty()) register() else poll() } } }
+        work.launch { verifyConnection { transport.withLock { exchange { if (state.value.deviceId.isEmpty()) register() else poll() } } } }
     }
 
     /** Always responsive: one in-flight selection plus ONLY the latest unsent choice. */
@@ -314,7 +359,8 @@ class PlaybackCoordinator(
                     if (life == lifecycle && !closed && work.isActive && !serviceActive) mutableState.value = state.value.copy(view = view, message = "Device name saved. Native handoff remains unavailable on this phone.")
                 } catch (error: Exception) {
                     if (error is CancellationException && error !is TimeoutCancellationException) throw error
-                    if (life == lifecycle && !closed && work.isActive) message("The name could not be confirmed. Refresh devices before trying again.")
+                    if (life == lifecycle && !closed && work.isActive && !serviceActive) readOnlyFailure(error,
+                        "The name could not be confirmed. Refresh devices before trying again.")
                 }
             } }
             return
@@ -482,10 +528,10 @@ class PlaybackCoordinator(
     }
     fun continuePlaybackHere() { if (state.value.needsTap) remoteCommand(PlaybackDeviceCommand.transport("retry")) }
 
-    private suspend fun register() {
+    private suspend fun register(): Unit = verifyConnection {
         // register(name) creates an ephemeral server ID and has no idempotency key.
         // A lost response may have succeeded: do not create an orphan every heartbeat/tap.
-        if (clockMs() < nextRegistrationAt) return
+        if (clockMs() < nextRegistrationAt) return@verifyConnection
         mutableState.value = state.value.copy(connecting = true)
         val life = lifecycle
         try {
@@ -495,15 +541,16 @@ class PlaybackCoordinator(
                 nextRegistrationAt = 0; registrationBackoffMs = 8000L
             }
         } finally {
+            if (life == lifecycle) mutableState.value = state.value.copy(connecting = false)
             if (state.value.deviceId.isEmpty()) {
                 nextRegistrationAt = clockMs() + registrationBackoffMs
                 registrationBackoffMs = (registrationBackoffMs * 2).coerceAtMost(30000L)
             }
         }
     }
-    private suspend fun poll() {
+    private suspend fun poll(): Unit = verifyConnection {
         val id = state.value.deviceId
-        if (id.isEmpty()) return
+        if (id.isEmpty()) return@verifyConnection
         val pending = acks.toList(); acks.clear()
         val final = ackState; ackState = null
         val snapshot = if (state.value.activeDeviceId == id && (authorized() && activatedEpoch == epoch || final != null)) final ?: endpoint.exportSnapshot().validated() else null
@@ -584,16 +631,23 @@ class PlaybackCoordinator(
         val completedCommand = pendingCommand.takeIf { terminal }
         if (terminal) { pendingCommand = null; observedPendingCommand = null }
         val connectedMessage = when {
+            !grantAuthority && state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED -> "Sign in again to connect your players."
+            !grantAuthority -> "Playback connection needs verification. The action was not replayed. Reconnect before pressing Play."
             view.quarantineMs > 0 -> "Waiting for previous playback permission to expire. The selected output will be prepared paused."
             view.transfer != null -> "Switching playback; waiting for the players to confirm."
-            view.activeDeviceId.isEmpty() -> "Choose an output. Reconnecting never starts audio automatically."
             outcomeForgotten || outcome?.status in setOf("timeout", "cancelled", "rejected", "media") -> "The action could not be confirmed. It was not replayed."
             else -> ""
         }
         observeInteractionBinding(id, view)
         mutableState.value = PlaybackDevicesState(id, view,
             intent?.target ?: view.transfer?.targetDeviceId.orEmpty(), intent != null, grantAuthority, false,
-            authorizedFor(id, view), view.activeDeviceId == id && view.state?.error == "blocked", connectedMessage)
+            authorizedFor(id, view), view.activeDeviceId == id && view.state?.error == "blocked", connectedMessage,
+            recovery = when {
+                grantAuthority -> PlaybackConnectionRecovery.NONE
+                state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED -> PlaybackConnectionRecovery.AUTH_REQUIRED
+                else -> PlaybackConnectionRecovery.VERIFICATION_NEEDED
+            },
+            verifyingConnection = connectionChecks > 0)
         publishAuthority()
         if (terminal) finishCommandResult(completedCommand, outcome?.status ?: "cancelled")
         leaseTimer?.cancel()
@@ -602,7 +656,8 @@ class PlaybackCoordinator(
             if (epoch == view.epoch && state.value.activeDeviceId == id) {
                 uncertainConnection = true
                 fenceLocal()
-                mutableState.value = state.value.copy(connected = false, message = "Playback permission expired. Reconnect and press Play explicitly.")
+                mutableState.value = state.value.copy(connected = false, recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED,
+                    message = "Playback permission expired. Reconnect and press Play explicitly.")
             }
         }
         // A non-directive recovery NEVER imports playing state. It stays silent until explicit Play.
@@ -708,7 +763,9 @@ class PlaybackCoordinator(
         uncertainConnection = true
         fenceLocal(); acks.clear(); ackState = null; pendingCommand = null
         mutableState.value = state.value.copy(connected = false, connecting = false, exclusiveOwner = false,
-            message = "Connection or playback changed. The action was not replayed. Retry connection, choose an output, then press Play.")
+            recovery = if (state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED) PlaybackConnectionRecovery.AUTH_REQUIRED else PlaybackConnectionRecovery.VERIFICATION_NEEDED,
+            message = if (state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED) "Sign in again to connect your players."
+                else "Connection or playback changed. The action was not replayed. Retry connection, choose an output, then press Play.")
         // Reconcile a device-scoped conflict through its validated safe view; never replay its action.
         if (error is ApiException && error.status == 401) { authLost(); return }
         if (error is ApiException && error.status == 404) {
@@ -716,14 +773,33 @@ class PlaybackCoordinator(
         }
         if (error is ApiException && error.status == 409) {
             val life = lifecycle
-            try {
-                val sent = clockMs()
-                val safe = try { error.responseBody?.let(PlaybackDevicesView::fromJson) } catch (_: IllegalArgumentException) { null }
-                val view = (safe ?: withTimeout(4000) { api.view() }).validated().copy(directives = emptyList())
-                if (life != lifecycle || closed || !serviceActive || !work.isActive) return
-                consume(view, sent, startsAllowed = false, grantAuthority = false)
-            } catch (_: Exception) { /* Existing local fence remains in force. */ }
+            verifyConnection {
+                try {
+                    val sent = clockMs()
+                    val safe = try { error.responseBody?.let(PlaybackDevicesView::fromJson) } catch (_: IllegalArgumentException) { null }
+                    val view = (safe ?: withTimeout(4000) { api.view() }).validated().copy(directives = emptyList())
+                    if (life != lifecycle || closed || !serviceActive || !work.isActive) return@verifyConnection
+                    consume(view, sent, startsAllowed = false, grantAuthority = false)
+                } catch (reconciliationError: Exception) {
+                    // A failed reconciliation never restores authority; known auth loss also
+                    // must not advertise a connection retry as a sign-in replacement.
+                    if (life == lifecycle && !closed && work.isActive && reconciliationError is ApiException && reconciliationError.status == 401) {
+                        mutableState.value = state.value.copy(recovery = PlaybackConnectionRecovery.AUTH_REQUIRED,
+                            message = "Sign in again to connect your players.")
+                    }
+                }
+            }
         }
+    }
+    private fun readOnlyFailure(error: Exception, guidance: String) {
+        val authRequired = error is ApiException && error.status == 401 || state.value.recovery == PlaybackConnectionRecovery.AUTH_REQUIRED
+        mutableState.value = state.value.copy(
+            recovery = when {
+                authRequired -> PlaybackConnectionRecovery.AUTH_REQUIRED
+                !endpoint.supportsExactHandoff -> PlaybackConnectionRecovery.UNSUPPORTED
+                else -> PlaybackConnectionRecovery.VERIFICATION_NEEDED
+            },
+            message = if (authRequired) "Sign in again to connect your players." else guidance)
     }
     private fun message(value: String) { mutableState.value = state.value.copy(message = value) }
     private fun nonce() = UUID.randomUUID().toString()
