@@ -19,7 +19,7 @@ A native **Android** listener for your own [spofify-go](../spofify-go) server. K
 
 ## Task contracts and review
 
-Follow the assigned task specs, when present under `docs/specs/`, and the roles in [AGENT_BEHAVIOUR.md](AGENT_BEHAVIOUR.md). Deleted historical specs and board metadata are not required scaffolding. Assigned leads follow [exact-SHA review and leased self-integration](docs/worktree-review.md), never self-approval or parallel main writes. Blocked native validation is not a blanket source-work dependency.
+Follow the assigned task specs, when present under `docs/specs/`, and the roles in [AGENT_BEHAVIOUR.md](AGENT_BEHAVIOUR.md). Deleted historical specs and board metadata are not required scaffolding. Assigned leads follow [exact-SHA review and coordinated self-integration](docs/worktree-review.md), never self-approval or parallel main writes. Blocked native validation is not a blanket source-work dependency.
 
 ## Run
 

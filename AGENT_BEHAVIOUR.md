@@ -8,6 +8,10 @@ If you leave files out in /tmp somewhere, remove it after it has stopped being u
 
 Exceptions are occasionally cache that can be reused
 
+## Git coordination
+
+Use normal Git internal locking for worktrees, local commits, refs and integration: **no custom Git/MAIN guard, flock, semaphore or persistent reservation**. Coordinate brief root writes with other leads/the parent; keep clean-tree, exact-base/candidate/delta checks, independent review and no-overwrite rules. BUILD/cache and NATIVE safeguards in [docs/worktree-review.md](docs/worktree-review.md) remain unchanged.
+
 ## Deliver individual features, not waterfall batches
 
 - Split work into small, independently deliverable features—not merely file-ownership slices of one large implementation.

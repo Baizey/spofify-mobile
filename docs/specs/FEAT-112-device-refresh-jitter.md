@@ -49,11 +49,10 @@
 - Own full offline API37.0 compile-platform gate in topic, shared `GRADLE_USER_HOME=/var/home/lsm/repos/spofify-mobile/.tooling/gradle`:
   `./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug --offline --no-daemon --console=plain`.
 - Storage: output+/tmp capacity/quota preflight, bounded owned scratch, verify forked JVM java.io.tmpdir (not TMPDIR alone), monitor/stop EDQUOT/ENOSPC, preserve evidence/account descendants. No cache purges/foreign cleanup.
-- BUILD/MAIN/NATIVE: absolute COMMON atomic mkdir+unique owner+persistent exclusive flock per review protocol; finite/fair acquisition, busy stop/report or bounded retry, no priorities/stealing.
-- Own build: BUILD only, release before MAIN. Root post-build: MAIN then BUILD, reverse release, never build→main. Native: standalone NATIVE after both release, exact hashed APKs, `tools/ui/validate-native.sh --skip-build`.
+- Follow canonical [Git coordination and BUILD/NATIVE safeguards](../worktree-review.md): normal Git locking/brief root-write communication, BUILD-only root/own-worktree builds and standalone NATIVE with exact hashed APKs/`--skip-build`. Retain finite acquisition, owner-token and no-stealing rules.
 - Hold through actual descendant writer shutdown, not launcher exit; owner-match release, retain lock files. Uncertainty preserves guard/evidence for coordinated recovery; no unconditional trap.
 - Commit/diff-check; independent read-only exact full candidate/base SHA review of source/tests/renders. Fix non-nits/new commits, rerun/re-review; SHA/base changes invalidate approval.
-- Squash per review procedure: continuous MAIN, clean main/exact reviewed base+topic, full staged/approved diff, commit/verification. Moved main: release, merge into topic, rerun/re-review. No main fixes/conflict cleanup. Scoped main postchecks/full SHA; parent combined smoke.
+- Squash per canonical review procedure: normal Git locking, brief root-write coordination, clean main/exact reviewed base+topic, full staged/approved diff, commit/verification. Moved main: stop, merge into topic, rerun/re-review. No main fixes/conflict cleanup. Scoped main postchecks/full SHA; parent combined smoke.
 - Cleanup per review policy: account deltas/processes/artifacts, preserve verified recovery/review evidence, non-forced worktree removal/expected-tip ref deletion only after completion.
 
 ## Native blocker / required gate
