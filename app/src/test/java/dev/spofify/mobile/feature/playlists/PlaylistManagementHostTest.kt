@@ -3,6 +3,7 @@ package dev.spofify.mobile.feature.playlists
 import androidx.activity.ComponentDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.MotionDurationScale
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.*
@@ -41,7 +42,10 @@ class PlaylistManagementHostTest {
     // These are HTTP/UI behavior tests, not virtual-delay tests. Use the standard editor-host
     // rule (as in PlaybackDevicesSheetTest/SignInUiTest): a v2 effect TestDispatcher also
     // auto-advances recurring TextField effects and can prevent the editor from becoming idle.
-    @get:Rule val compose = createComposeRule()
+    // Management behavior is independent of decorative TextField transition frames.
+    @get:Rule val compose = createComposeRule(effectContext = object : MotionDurationScale {
+        override val scaleFactor: Float = 0f
+    })
 
     @Test fun manualHeaderHasOneFullCollectionCountAndNoEmptyDescriptionOrManagementBar() = withHost(
         total = 204,
