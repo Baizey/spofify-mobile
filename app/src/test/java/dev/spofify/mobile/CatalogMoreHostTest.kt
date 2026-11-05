@@ -248,6 +248,38 @@ class CatalogMoreHostTest {
             assertEquals(0, playbackReads.get())
         }
     }
+    @Test fun heldPhysicalRightOnActualCatalogRowSurvivesBenignAppend() {
+        catalogTotal.set(30)
+        holdAppend = true
+        compose.runOnIdle { model.switchTab(Tab.SEARCH); model.catalogHolder()?.commitQuery("Synthetic", immediate = true) }
+        val holder = checkNotNull(model.catalogHolder())
+        await { holder.state.value.current.sections["tracks"]?.items?.size == 10 }
+        val version = compose.runOnIdle { holder.navigationVersion }
+        val playerKey = controls.state.value.interactionKey
+        val binding = controls.state.value.queueIntentBinding
+        compose.runOnIdle { holder.more("tracks") }
+        await { appendStarted.count == 0L }
+        val row = compose.onNodeWithText("Synthetic song")
+        row.performTouchInput { down(center.copy(x = width * .3f)); moveTo(center.copy(x = width * .6f)) }
+        releaseAppend.countDown()
+        await { holder.state.value.current.sections.getValue("tracks").items.size == 20 }
+        compose.runOnIdle { assertEquals(version, holder.navigationVersion) }
+        row.performTouchInput { moveTo(center.copy(x = width * .8f)); up() }
+        await { controls.pending.size == 1 }
+        compose.runOnIdle {
+            val pending = controls.pending.single()
+            assertEquals(PlaybackListAction.QUEUE_HIGH, pending.action)
+            assertSame(playerKey, pending.key)
+            assertEquals(binding, pending.binding)
+            assertEquals("song", (pending.selection as QueueIntentSelection.Track).track.getValue("id").jsonPrimitive.content)
+            assertTrue("The same source/row gesture remains current through append", pending.current())
+            holder.commitQuery("other", immediate = true)
+            holder.commitQuery("Synthetic", immediate = true)
+            assertFalse("An accepted swipe's source guard also rejects unsampled query ABA", pending.current())
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+            assertEquals(0, playbackReads.get())
+        }
+    }
     @Test fun openMoreDoesNotRetargetReplacementOutput() {
         openMore()
         compose.runOnIdle { controls.state.value = controls.state.value.copy(interactionKey = PlaybackInteractionKey(),

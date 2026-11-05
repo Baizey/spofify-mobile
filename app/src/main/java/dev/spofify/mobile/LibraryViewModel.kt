@@ -25,6 +25,7 @@ import dev.spofify.mobile.feature.library.CatalogStateHolder
 import dev.spofify.mobile.feature.library.ClientCatalogReader
 import dev.spofify.mobile.feature.library.ClientHomeReader
 import dev.spofify.mobile.feature.library.HomeStateHolder
+import dev.spofify.mobile.feature.playlists.PlaylistBrowseMemory
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -105,6 +106,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private val tabStacks = mutableMapOf<Tab, List<Page>>()
     private var featureClient: SpofifyClient? = null
     private var featureAccount: String? = null
+    private var featureSession: Session? = null
+    private var playlistBrowse: PlaylistBrowseMemory? = null
     private val catalogHolders = linkedMapOf<String, CatalogStateHolder>()
     private var navigationSerial = 0L
     private var searchActivationSerial = 0L
@@ -120,14 +123,15 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     private fun ensureFeatureOwner(): SpofifyClient? {
         val client = graph.client ?: return null
-        val account = client.currentSession()?.accountId ?: return null
-        if (featureClient !== client || featureAccount != account) {
+        val session = client.currentSession() ?: return null
+        val account = session.accountId
+        if (featureClient !== client || featureAccount != account || featureSession !== session) {
             clearFeatureState()
-            featureClient = client; featureAccount = account
+            featureClient = client; featureAccount = account; featureSession = session
             var previous = client.personalRevision.value
             personalJob = viewModelScope.launch {
                 client.personalRevision.collect { revision ->
-                    if (graph.client !== client || client.currentSession()?.accountId != account) return@collect
+                    if (graph.client !== client || client.currentSession() !== session) return@collect
                     if (revision.likes != previous.likes) {
                         personalChanged("likes")
                         likesDirty = true
@@ -154,6 +158,11 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         }
     }
 
+    fun playlistBrowseMemory(): PlaylistBrowseMemory? {
+        ensureFeatureOwner() ?: return null
+        return playlistBrowse ?: PlaylistBrowseMemory().also { playlistBrowse = it }
+    }
+
     fun homeHolder(): HomeStateHolder? {
         val client = ensureFeatureOwner() ?: return null
         return home ?: HomeStateHolder(ClientHomeReader(client), viewModelScope).also { home = it }
@@ -167,7 +176,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         likesCache = null; likesDirty = true
         likesNextOffset = 0; likesFailure = null; likesStale = false; likesEnded = false
         loadSerial++
-        featureClient = null; featureAccount = null
+        playlistBrowse = null
+        featureClient = null; featureAccount = null; featureSession = null
     }
 
     fun personalChanged(vararg shelves: String) { home?.invalidate(*shelves) }
@@ -180,6 +190,17 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private var signingOut = false
     private var authenticationSerial = 0L
     private var cleared = false
+
+    val browseSourceEpoch: Int get() = generation
+
+    /** Capture at composition/event acquisition, not at a held row's eventual release. */
+    fun captureBrowseSource(expectedClient: SpofifyClient): () -> Boolean {
+        val session = expectedClient.currentSession()
+        val page = state.value.page
+        val sourceGeneration = generation
+        return { !cleared && graph.client === expectedClient && session != null &&
+            expectedClient.currentSession() === session && state.value.page == page && generation == sourceGeneration }
+    }
 
     private fun captureExplicitPlayOrigin(): () -> Boolean {
         val client = graph.client
@@ -369,6 +390,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     fun open(page: Page) {
         if (!ownsNavigation()) return
+        if (page is Page.Playlist) playlistBrowseMemory()?.openPlaylist(page.playlist.id)
         mutable.update { it.copy(searchActivationId = null) }
         val destination = if (page is Page.Detail) page.copy(navigationId = ++navigationSerial) else page
         stack.add(destination)
@@ -405,10 +427,11 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     fun retryLikes() {
         val current = state.value
         if (current.page != Page.Likes || current.loading || current.error == null || current.likesStale) return
-        load(Page.Likes, append = current.offset > 0)
+        // Bypass restoration once, without erasing the latch if this attempt is canceled.
+        load(Page.Likes, append = current.offset > 0, retry = true)
     }
 
-    private fun load(page: Page, append: Boolean = false) {
+    private fun load(page: Page, append: Boolean = false, retry: Boolean = false) {
         val client = graph.client ?: return
         val session = client.currentSession() ?: return
         if (state.value.session == null || append && state.value.loading) return
@@ -424,13 +447,13 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             return
         }
         val cached = likesCache
-        if (!append && !likesDirty && cached != null) {
+        if (!append && !retry && !likesDirty && (cached != null || likesFailure != null)) {
             mutable.update { it.copy(page = page, canGoBack = stack.size > 1, loading = false,
-                error = likesFailure, likesStale = likesStale, likesEnded = likesEnded,
-                items = cached.items, total = cached.total, offset = likesNextOffset) }
+                error = likesFailure, likesStale = likesStale, likesEnded = likesEnded, likesGeneration = generation,
+                items = cached?.items.orEmpty(), total = cached?.total ?: 0, offset = likesNextOffset) }
             return
         }
-        if (!append) { likesFailure = null; likesStale = false; likesEnded = false }
+        if (!append && !retry) { likesFailure = null; likesStale = false; likesEnded = false }
         val offset = if (append) state.value.offset else 0
         val expectedTotal = state.value.total
         val personalRevision = client.personalRevision.value.likes
@@ -444,8 +467,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             try {
                 val result = client.likes(offset)
                 if (!isCurrent()) return@launch
-                if (result.offset != offset || result.total < 0 || result.limit !in 1..100 ||
-                    result.items.size > result.limit || offset + result.items.size > result.total ||
+                if (result.offset != offset || result.total < 0 || result.limit != 40 ||
+                    result.items.size > result.limit || offset.toLong() + result.items.size > result.total.toLong() ||
                     result.items.any { it.kind != "track" || it.id.isBlank() })
                     throw IllegalArgumentException("Could not continue liked songs. Retry this batch.")
                 if (append && (result.total != expectedTotal || client.personalRevision.value.likes != personalRevision)) {
@@ -454,7 +477,17 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                     throw IllegalArgumentException("Liked songs changed. Refresh to load the current list.")
                 }
                 val prefix = if (append) state.value.items else emptyList()
-                val items = (prefix + result.items).distinctBy { it.id }
+                val identities = prefix.associateBy { it.id }.toMutableMap()
+                val added = result.items.filter { item ->
+                    val previous = identities.put(item.id, item)
+                    if (previous != null && previous != item) {
+                        likesStale = true
+                        generation++
+                        throw IllegalArgumentException("Liked songs changed. Refresh to load the current list.")
+                    }
+                    previous == null
+                }
+                val items = prefix + added
                 if (append && result.items.isNotEmpty() && items.size == prefix.size)
                     throw IllegalArgumentException("Could not continue liked songs. Retry this batch.")
                 // Empty pages stop at the real available frontier without repeatedly requesting it.
@@ -473,7 +506,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                     likesFailure = message(error)
                     likesNextOffset = offset
                     // Keep exact failed batch and its latch even after Back/tab restoration.
-                    if (likesCache != null) likesDirty = false
+                    likesDirty = false
                     mutable.update { it.copy(loading = false, error = likesFailure, likesStale = likesStale,
                         likesGeneration = if (likesStale) generation else it.likesGeneration) }
                 }

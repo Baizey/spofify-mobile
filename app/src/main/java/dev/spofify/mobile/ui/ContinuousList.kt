@@ -1,5 +1,6 @@
 package dev.spofify.mobile.ui
 
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -12,6 +13,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -25,9 +27,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.launch
 
 /** Visible rows, not footer composition, express demand. Each stationary viewport may fill twice;
- * further batches require actual movement of its first visible anchor. No progress/heartbeat input.
+ * further batches require anchor movement or a genuine new user drag (including overscroll when
+ * short batches still fit). No progress/heartbeat input.
  * The owner must reserve its request synchronously and latch failures before returning.
  */
 @Composable
@@ -46,17 +50,25 @@ internal fun AutomaticListDemand(
         var anchor: Pair<Any?, Int>? = null
         var fills = 0
         var requested: List<Any>? = null
+        val gestures = mutableLongStateOf(0L)
+        var observedGesture = 0L
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+          launch {
+              state.interactionSource.interactions.collect { interaction ->
+                  if (interaction is DragInteraction.Start) gestures.longValue++
+              }
+          }
           snapshotFlow {
             val info = state.layoutInfo
             val visible = info.visibleItemsInfo.filter {
                 it.offset < info.viewportEndOffset && it.offset + it.size > info.viewportStartOffset
             }
             DemandViewport(visible.firstOrNull()?.let { it.key to it.offset },
-                visible.map { it.key }, currentFrontier.value, currentEnabled.value)
+                visible.map { it.key }, currentFrontier.value, currentEnabled.value, gestures.longValue)
         }.collect { view ->
-            if (view.anchor != anchor) {
+            if (view.anchor != anchor || view.gesture != observedGesture) {
                 anchor = view.anchor
+                observedGesture = view.gesture
                 fills = 0
             }
             if (view.enabled && view.frontier.isNotEmpty() &&
@@ -72,6 +84,7 @@ internal fun AutomaticListDemand(
 
 private data class DemandViewport(
     val anchor: Pair<Any?, Int>?, val visible: List<Any>, val frontier: List<Any>, val enabled: Boolean,
+    val gesture: Long,
 )
 
 @Composable

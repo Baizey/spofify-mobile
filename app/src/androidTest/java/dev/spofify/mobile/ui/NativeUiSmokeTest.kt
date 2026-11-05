@@ -1520,7 +1520,11 @@ class NativeUiSmokeTest {
     private fun scrollSearchToLastSongAutomatically(fixture: UiFixtureServer) {
         val last = catalogItem(UiFixtureServer.TRACK_NAMES.last())
         for (attempt in 0 until 18) {
-            val visible = compose.onAllNodes(last).fetchSemanticsNodes().any { it.boundsInRoot.height > 0 }
+            val viewport = compose.onAllNodes(hasScrollToIndexAction()).onFirst().fetchSemanticsNode().boundsInRoot
+            val visible = compose.onAllNodes(last).fetchSemanticsNodes().any {
+                val bounds = it.boundsInRoot
+                bounds.height > 0 && bounds.top >= viewport.top && bounds.bottom <= viewport.bottom
+            }
             if (visible) break
             compose.onAllNodes(hasScrollToIndexAction()).onFirst().performTouchInput {
                 swipe(center.copy(y = height * .85f), center.copy(y = height * .2f), durationMillis = 350)

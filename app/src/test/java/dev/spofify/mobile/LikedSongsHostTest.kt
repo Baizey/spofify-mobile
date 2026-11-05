@@ -349,6 +349,88 @@ class LikedSongsHostTest {
         assertBrowseOnly()
     }
 
+    @Test fun changedMetadataOverlapRetainsPrefixRequiresRefreshAndRetiresHeldQueueAction() {
+        val append = gate()
+        val changed = track(38).replace(title(38), "Changed server title")
+        likesReply = { offset, _ -> when (offset) {
+            0 -> page(0, 80, 0 until 40)
+            // Same total and valid raw positions; only a repeated song's payload changed.
+            40 -> append.hold(json("""{"items":[{"track":$changed},${(39 until 78).joinToString(",") { """{"track":${track(it)}}""" }}],"total":80,"offset":40,"limit":40}"""))
+            else -> MockResponse().setResponseCode(400)
+        } }
+        mountLikes()
+        val prefix = compose.runOnIdle { model.state.value.items.toList() }
+        val source = compose.runOnIdle { model.state.value.likesGeneration }
+        touchUntil { append.started.count == 0L }
+        val retained = anchor()
+        compose.onNodeWithContentDescription("More actions for ${retained.title}").performClick()
+        compose.onNodeWithText("Queue Low").performScrollTo().performClick()
+        compose.onNodeWithTag("music-actions").assertDoesNotExist()
+        await { controls.pending.size == 1 }
+        val pending = compose.runOnIdle { controls.pending.single() }
+        compose.runOnIdle {
+            assertTrue("Unchanged prefix action is valid while the read is held", pending.current())
+            val selected = pending.selection as QueueIntentSelection.Track
+            assertEquals(retained.title, selected.track.getValue("name").jsonPrimitive.content)
+            assertEquals(PlaybackListAction.QUEUE_LOW, pending.action)
+        }
+        // Hold a second, real physical-right gesture across the detected source change.
+        // Its pre-stale movement must actually engage the row, not merely inject an up.
+        row(retained.title).performTouchInput {
+            down(center.copy(x = width * .3f)); moveTo(center.copy(x = width * .6f))
+        }
+        assertTrue("Real row translated right before source invalidation; ${diagnostics()}",
+            rowBounds(retained.title).left > retained.bounds.left)
+        compose.runOnIdle { assertEquals("A held pointer has not committed", 1, controls.pending.size) }
+        append.release.countDown()
+        await { model.state.value.likesStale && !model.state.value.loading }
+        row(retained.title).performTouchInput { moveTo(center.copy(x = width * .8f)); up() }
+        compose.waitForIdle()
+        compose.runOnIdle { assertEquals("Releasing an old-source gesture must not dispatch", 1, controls.pending.size) }
+        assertAnchor(retained, "Detected changed overlap")
+        assertRows(0 until 40)
+        compose.runOnIdle {
+            val state = model.state.value
+            assertEquals("Never publish the changed overlap or its new suffix", prefix, state.items)
+            assertEquals(40, state.offset)
+            assertNotNull(state.error)
+            assertFalse("Changed data is not a successful end", state.likesEnded)
+            assertTrue("Detected source change advances action authority", state.likesGeneration > source)
+            assertFalse("Held prefix action cannot borrow the changed source", pending.current())
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))
+        }
+        await { !model.state.value.preparing || controls.pending.size > 1 }
+        progressFrames()
+        compose.runOnIdle {
+            assertEquals("The stale held gesture must not be admitted behind the held queue action", 1, controls.pending.size)
+            assertFalse(model.state.value.preparing)
+            assertNull("Late receipt from the old source cannot claim Playing", model.state.value.notice)
+        }
+        assertEquals("No retry, reset or skipped offset after detected change; ${diagnostics()}", listOf(0, 40), offsets.toList())
+
+        // Expose the stale footer deliberately: it must explain failure, not offer batch Retry.
+        val error = compose.runOnIdle { checkNotNull(model.state.value.error) }
+        list().performScrollToNode(hasText(error))
+        compose.onNodeWithText(error).assertIsDisplayed()
+        compose.onNodeWithText("Retry liked songs").assertDoesNotExist()
+        progressFrames()
+        list().performScrollToNode(hasText("Refresh liked songs"))
+        compose.onNodeWithText("Refresh liked songs").assertIsDisplayed().assertHeightIsAtLeast(48.dp).assertIsEnabled()
+        assertEquals("Visible stale frontier/recomposition cannot restart reads", listOf(0, 40), offsets.toList())
+        compose.onNodeWithText("Refresh liked songs").performClick()
+        await { !model.state.value.loading && !model.state.value.likesStale && model.state.value.error == null }
+        assertRows(0 until 40)
+        assertEquals("Only explicit Refresh establishes a new coherent prefix", listOf(0, 40, 0), offsets.toList())
+        compose.runOnIdle {
+            assertFalse("Refreshing cannot resurrect the retired queue action", pending.current())
+            assertEquals(1, controls.pending.size)
+            assertFalse(controls.state.value.isPlaying)
+        }
+        assertTrue("Receiver preparation never runs on the scrolling controller", requests.none {
+            it.requestUrl!!.encodedPath.endsWith("/playback") || it.requestUrl!!.encodedPath.startsWith("/api/me/player")
+        })
+    }
+
     @Test fun failedAppendStaysLatchedAcrossVisibleDemandAndDetailBackUntilExactBatchRetry() {
         val append = gate()
         val retry = gate()
@@ -398,14 +480,122 @@ class LikedSongsHostTest {
         assertBrowseOnly()
     }
 
+    @Test fun failedOffsetZeroRefreshRestoresItsLatchButExplicitRetryReadsAgain() {
+        val retry = gate()
+        val retryReturned = CountDownLatch(1)
+        val recovery = gate()
+        likesReply = { offset, attempt -> when {
+            offset != 0 -> MockResponse().setResponseCode(400)
+            attempt == 1 -> page(0, 40, 0 until 40)
+            attempt == 2 -> MockResponse().setResponseCode(503)
+            // The server handler deliberately returns a distinguishable late success even
+            // after route exit cancels the client read. It must not replace the old cache.
+            attempt == 3 -> retry.hold(page(0, 40, 40 until 80)).also { retryReturned.countDown() }
+            attempt == 4 -> recovery.hold(page(0, 40, 0 until 40))
+            else -> MockResponse().setResponseCode(400)
+        } }
+        mountLikes()
+        val prefix = compose.runOnIdle { model.state.value.items.toList() }
+        val retained = anchor()
+        // Exercise a deliberate source refresh with an existing successful cache, not an
+        // initial empty failure. Likes currently exposes refresh only for stale recovery.
+        compose.runOnIdle { model.refresh() }
+        await { model.state.value.error != null && !model.state.value.loading }
+        assertRows(0 until 40)
+        assertAnchor(retained, "Offset-zero refresh failure")
+        val failure = compose.runOnIdle { checkNotNull(model.state.value.error) }
+        compose.runOnIdle {
+            assertEquals(prefix, model.state.value.items)
+            assertEquals(0, model.state.value.offset)
+            assertFalse(model.state.value.likesStale)
+        }
+        progressFrames()
+        assertEquals("Refresh failed once at zero; ${diagnostics()}", listOf(0, 0), offsets.toList())
+        row(retained.title).performClick()
+        await { model.state.value.page is Page.Detail }
+        systemBack()
+        assertAnchor(retained, "Back restores offset-zero failure")
+        assertRows(0 until 40)
+        progressFrames()
+        compose.runOnIdle { assertNotNull(model.state.value.error); assertEquals(0, model.state.value.offset) }
+        assertEquals("Back must restore the failure without a reset or auto-retry", listOf(0, 0), offsets.toList())
+        list().performScrollToNode(hasText("Retry liked songs"))
+        compose.onNodeWithText("Retry liked songs").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        val retryAnchor = anchor()
+        compose.onNodeWithText("Retry liked songs").performClick()
+        await { retry.started.count == 0L && model.state.value.loading }
+        assertEquals("Explicit offset-zero Retry must bypass the retained cache", listOf(0, 0, 0), offsets.toList())
+        assertRows(0 until 40)
+        assertAnchor(retryAnchor, "Offset-zero Retry held in HTTP")
+        row(retryAnchor.title).performClick()
+        await { model.state.value.page is Page.Detail }
+        retry.release.countDown()
+        await { retryReturned.count == 0L }
+        // Let the real canceled call drain while the detail route remains current. Do not
+        // replace it with a fake callback or treat cancellation as server cooperation.
+        await { client.httpClient.dispatcher.runningCallsCount() == 0 && client.httpClient.dispatcher.queuedCallsCount() == 0 }
+        compose.runOnIdle { assertTrue(model.state.value.page is Page.Detail) }
+        systemBack()
+        assertAnchor(retryAnchor, "Back after canceled offset-zero Retry")
+        assertRows(0 until 40)
+        compose.runOnIdle {
+            assertEquals("Late retry success cannot replace the prior cache", prefix, model.state.value.items)
+            assertEquals("Canceling Retry must preserve the exact original failure latch", failure, model.state.value.error)
+            assertEquals(0, model.state.value.offset)
+            assertFalse(model.state.value.loading)
+        }
+        progressFrames(24)
+        assertEquals("Restoration after a canceled Retry must not auto-read zero; ${diagnostics()}",
+            listOf(0, 0, 0), offsets.toList())
+        list().performScrollToNode(hasText("Retry liked songs"))
+        compose.onNodeWithText("Retry liked songs").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        val recoveryAnchor = anchor()
+        compose.onNodeWithText("Retry liked songs").performClick()
+        await { recovery.started.count == 0L && model.state.value.loading }
+        assertEquals("A fresh explicit Retry is exactly one additional real zero read", listOf(0, 0, 0, 0), offsets.toList())
+        assertRows(0 until 40)
+        assertAnchor(recoveryAnchor, "Second offset-zero Retry held in HTTP")
+        recovery.release.countDown()
+        await { model.state.value.error == null && !model.state.value.loading && model.state.value.offset == 40 }
+        assertRows(0 until 40)
+        progressFrames()
+        compose.runOnIdle { assertTrue(model.state.value.likesEnded) }
+        assertEquals("No replay after deliberate recovery", listOf(0, 0, 0, 0), offsets.toList())
+        assertBrowseOnly()
+    }
+
     @Test fun shortFirstBatchFillsBoundedlyRatherThanDrainingAStationaryViewport() {
-        likesReply = { offset, _ -> page(offset, 10_000, listOf(offset)) }
+        likesReply = { offset, _ -> page(offset, 7, listOf(offset)) }
         mountLikes()
         await { model.state.value.offset >= 3 && !model.state.value.loading }
         progressFrames(24)
         assertRows(0..2)
         assertEquals("Initial read plus two bounded viewport fills, not whole-library fetch", listOf(0, 1, 2), offsets.toList())
         compose.runOnIdle { assertFalse(model.state.value.likesEnded) }
+        val beforeDrag = anchor()
+        val viewport = list().fetchSemanticsNode().boundsInRoot
+        assertTrue("All three short-batch rows really fit before overscroll; ${diagnostics()}",
+            rowBounds(title(2)).bottom <= viewport.bottom)
+        // Fit-content overscroll cannot move the anchor, but a real new vertical drag
+        // must re-arm bounded demand. Heartbeats alone above deliberately did not do so.
+        list().performTouchInput {
+            swipe(start = center.copy(y = height * .8f), end = center.copy(y = height * .35f), durationMillis = 600)
+        }
+        await { model.state.value.offset >= 5 && !model.state.value.loading }
+        progressFrames(24)
+        assertRows(0..4)
+        assertAnchor(beforeDrag, "Fit-content user drag re-arms without jumping")
+        assertEquals("One new user drag permits only two further stationary fills; ${diagnostics()}",
+            listOf(0, 1, 2, 3, 4), offsets.toList())
+        compose.runOnIdle { assertFalse(model.state.value.likesEnded) }
+        touchUntil { model.state.value.likesEnded && !model.state.value.loading }
+        assertRows(0..6)
+        progressFrames(24)
+        list().performTouchInput {
+            swipe(start = center.copy(y = height * .8f), end = center.copy(y = height * .35f), durationMillis = 600)
+        }
+        progressFrames()
+        assertEquals("True end stops even fresh user drags; ${diagnostics()}", (0..6).toList(), offsets.toList())
         assertBrowseOnly()
     }
 

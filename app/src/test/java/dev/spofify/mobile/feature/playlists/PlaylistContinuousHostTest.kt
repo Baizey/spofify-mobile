@@ -5,6 +5,7 @@ import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import dev.spofify.mobile.core.*
@@ -146,6 +147,7 @@ class PlaylistContinuousHostTest {
         val feedback = mutableStateOf(CatalogPlaybackFeedback(interactionKey = key,
             queueIntentBinding = QueueIntentBinding("controller", "receiver", 1, 1, "history")))
         val accepted = mutableListOf<Pair<QueueIntentSelection, PlaybackListAction>>()
+        val sourceEpoch = mutableStateOf(0)
         val initialId = mutableStateOf(if (fixture.source == Source.INDEX) null else "fixture")
         var dispatcher: OnBackPressedDispatcher? = null
         compose.setContent {
@@ -153,7 +155,7 @@ class PlaylistContinuousHostTest {
             SideEffect { dispatcher = currentDispatcher }
             MaterialTheme {
                 if (shown.value) PlaylistsRoute(fixture.client, {}, { _, _, _ -> fail("Browsing must never prepare") }, {},
-                    initialPlaylistId = initialId.value, playback = feedback.value,
+                    initialPlaylistId = initialId.value, playback = feedback.value, sourceEpoch = sourceEpoch.value,
                     onQueueIntent = { selection, action, captured, _, current ->
                         assertSame(key, captured); assertTrue(current()); accepted += selection to action
                     })
@@ -161,12 +163,14 @@ class PlaylistContinuousHostTest {
         }
         try { run(MutableHost(accepted,
             heartbeat = { feedback.value = feedback.value.copy(buffering = !feedback.value.buffering) },
-            navigate = { initialId.value = it }, back = { checkNotNull(dispatcher).onBackPressed() })) }
+            navigate = { initialId.value = it }, back = { checkNotNull(dispatcher).onBackPressed() },
+            advanceSourceEpoch = { sourceEpoch.value++ })) }
         finally { compose.runOnIdle { shown.value = false }; compose.waitForIdle() }
         assertEquals(0, fixture.preparations.get())
     }
     private class MutableHost(val accepted: MutableList<Pair<QueueIntentSelection, PlaybackListAction>>,
-        val heartbeat: () -> Unit, val navigate: (String?) -> Unit, val back: () -> Unit)
+        val heartbeat: () -> Unit, val navigate: (String?) -> Unit, val back: () -> Unit,
+        val advanceSourceEpoch: () -> Unit)
 
     @Test fun indexAppendsAtVisibleFrontierConsumesRawOffsetsDeduplicatesAndStopsAtEnd() {
         Fixture(Source.INDEX).use { fixture ->
@@ -261,6 +265,60 @@ class PlaylistContinuousHostTest {
                 scroll("$prefix-0")
                 compose.onNodeWithText(if (source == Source.INDEX) "Playlist 0" else "Song 0").assertExists()
                 if (source == Source.MANUAL) assertEquals("Each successful entry read is summary-bracketed; failed HTTP has only its before-read", 7, fixture.summaryReads.get())
+            }
+        }
+    }
+
+    @Test fun openCollectionMoreCannotBorrowNewSourceEpochAfterBenignRecomposition() {
+        Fixture(Source.DERIVED, count = 1).use { fixture ->
+            host(fixture) { host ->
+                await { visible("Song 0") }
+                compose.onNodeWithContentDescription("More actions for Fixture playlist").performClick()
+                compose.onNodeWithText("Queue Low").assertIsEnabled()
+                compose.runOnIdle { host.advanceSourceEpoch(); host.heartbeat() }
+                compose.onNodeWithText("Queue Low").performScrollTo().performClick()
+                compose.waitForIdle()
+                assertTrue("An open collection selection cannot borrow the latest VM source epoch", host.accepted.isEmpty())
+                compose.onNodeWithContentDescription("More actions for Fixture playlist").performClick()
+                compose.onNodeWithText("Queue Low").performScrollTo().performClick()
+                compose.waitForIdle()
+                val selection = host.accepted.single().first as QueueIntentSelection.Collection
+                assertEquals("fixture", selection.context.id)
+                assertEquals("fence", selection.context.fence)
+                assertEquals(listOf(0), fixture.requests())
+            }
+        }
+    }
+
+    @Test fun heldDerivedGestureCannotBorrowRefreshedSameRevisionAndFence() {
+        Fixture(Source.DERIVED, count = 1).use { fixture ->
+            host(fixture) { host ->
+                await { visible("Song 0") }
+                val row = compose.onNodeWithText("Song 0")
+                val before = row.getUnclippedBoundsInRoot()
+                row.performTouchInput { down(Offset(80f, 24f)); moveTo(Offset(180f, 24f)) }
+                assertTrue("The physical-right gesture is held beyond its commit threshold",
+                    row.getUnclippedBoundsInRoot().left > before.left)
+                // A semantics tap leaves the row pointer held while the real host explicitly resets.
+                // The synthetic server deliberately returns identical revision/fence/occurrence values.
+                compose.onNodeWithText("Refresh").performClick()
+                await {
+                    fixture.requests() == listOf(0, 0) &&
+                        compose.onAllNodes(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsProperties.ProgressBarRangeInfo))
+                            .fetchSemanticsNodes().isEmpty()
+                }
+                row.performTouchInput { up() }
+                compose.waitForIdle()
+                assertTrue("A pre-refresh gesture cannot acquire the refreshed source authority", host.accepted.isEmpty())
+                row.performTouchInput { swipe(Offset(80f, 24f), Offset(180f, 24f)) }
+                compose.waitForIdle()
+                assertEquals("A new deliberate gesture on the refreshed occurrence still works", 1, host.accepted.size)
+                val selection = host.accepted.single().first as QueueIntentSelection.Track
+                assertEquals(PlaybackListAction.QUEUE_HIGH, host.accepted.single().second)
+                assertEquals("path-0", selection.track.getValue("occurrenceId").jsonPrimitive.content)
+                assertEquals("signed-0", selection.track.getValue("selectionToken").jsonPrimitive.content)
+                assertEquals("fence", selection.context!!.fence)
+                assertEquals(listOf(0, 0), fixture.requests())
             }
         }
     }

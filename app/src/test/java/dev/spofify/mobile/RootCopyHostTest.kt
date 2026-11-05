@@ -30,6 +30,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Before
@@ -261,41 +262,201 @@ class RootCopyHostTest {
     }
 
     @Test fun playlistsLoadingErrorRefreshAndRealPagingKeepPrimaryActions() {
+        fun indexOffsets() = requests.filter {
+            it.requestUrl?.encodedPath == "/api/me/playlists" && it.requestUrl?.queryParameter("limit") == "40"
+        }.map { it.requestUrl!!.queryParameter("offset")!!.toInt() }
         val gate = hold()
+        val appendGate = hold()
         respond = { request -> if (request.requestUrl?.encodedPath == "/api/me/playlists") {
             gate.await(15, TimeUnit.SECONDS); failure()
         } else null }
         mount(); tab("Playlists")
+        await { indexOffsets() == listOf(0) }
         compose.onNodeWithText("Create playlist").assertIsDisplayed().assertIsEnabled()
         compose.onNodeWithText("Refresh").assertIsNotEnabled()
+        compose.onAllNodes(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsProperties.ProgressBarRangeInfo))
+            .fetchSemanticsNodes().also { assertTrue("Initial playlist loading must remain visible", it.isNotEmpty()) }
         compose.onNodeWithText("Next playlists").assertDoesNotExist()
+        compose.onNodeWithText("Previous").assertDoesNotExist()
         gate.countDown()
-        waitText("Playlists could not load. Refresh explicitly to try again.")
-        compose.onNodeWithText("Refresh").assertIsEnabled()
+        waitText("Playlists could not load.")
+        compose.onNodeWithText("Create playlist").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithText("Refresh").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithText("Retry").assertIsDisplayed().assertIsEnabled()
         respond = { request -> if (request.requestUrl?.encodedPath == "/api/me/playlists") {
             val offset = request.requestUrl!!.queryParameter("offset")?.toInt() ?: 0
             val limit = request.requestUrl!!.queryParameter("limit")!!.toInt()
             if (offset == 0) page((0 until limit).joinToString(",") { index ->
                 if (index == 0) playlist else playlist.replace("\"mix\"", "\"mix-$index\"").replace("Evening mix", "Mix $index")
             }, total = 41, limit = limit)
-            else page(playlist.replace("\"mix\"", "\"last\"").replace("Evening mix", "Last mix"), total = 41, offset = 40)
+            else {
+                appendGate.await(15, TimeUnit.SECONDS)
+                page(playlist.replace("\"mix\"", "\"last\"").replace("Evening mix", "Last mix"), total = 41, offset = 40)
+            }
         } else null }
-        compose.onNodeWithText("Refresh").performClick()
+        compose.onNodeWithText("Retry").performClick()
         waitText("Evening mix")
-        compose.onNodeWithText("Playlists could not load.", substring = true).assertDoesNotExist()
         awaitNoProgress()
-        scrollTo("Next playlists")
-        compose.onNodeWithText("Next playlists").assertIsEnabled().performClick()
-        waitText("Last mix")
+        assertEquals(listOf(0, 0), indexOffsets())
+        compose.onNodeWithText("Playlists could not load.").assertDoesNotExist()
+        compose.onNodeWithText("Retry").assertDoesNotExist()
+        compose.onNodeWithText("Create playlist").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithText("Refresh").assertIsDisplayed().assertIsEnabled().performClick()
+        await { indexOffsets() == listOf(0, 0, 0) }
         awaitNoProgress()
-        compose.onNodeWithText("Previous").performScrollTo().assertIsEnabled()
-        compose.onNodeWithText("Next playlists").assertIsNotEnabled()
-        compose.onNodeWithText("Previous").assertIsDisplayed().performSemanticsAction(
-            androidx.compose.ui.semantics.SemanticsActions.OnClick) { it() }
-        await { requests.count { it.requestUrl?.encodedPath == "/api/me/playlists" && it.requestUrl?.queryParameter("offset") == "0" && it.requestUrl?.queryParameter("limit") == "40" } >= 3 }
+        compose.onNodeWithText("Evening mix").assertIsDisplayed()
+        compose.onNodeWithText("Create playlist").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithText("Refresh").assertIsDisplayed().assertIsEnabled()
+
+        val list = compose.onNode(hasScrollToIndexAction())
+        // Real touch movement brings the loaded 40-row frontier into this finite root viewport.
+        // No holder callback, fetch-more action or semantic scroll-to an unloaded row substitutes.
+        for (attempt in 0 until 24) {
+            if (indexOffsets().contains(40)) break
+            list.performTouchInput { swipeUp() }
+            compose.waitForIdle()
+        }
+        await { indexOffsets() == listOf(0, 0, 0, 40) }
+        list.performTouchInput { swipeUp() }
+        await { compose.onAllNodesWithContentDescription("Loading more playlists").fetchSemanticsNodes().isNotEmpty() }
+        repeat(3) { list.performTouchInput { swipeUp() }; compose.waitForIdle() }
+        assertEquals("Held append remains single-flight at the exact raw frontier", listOf(0, 0, 0, 40), indexOffsets())
+        appendGate.countDown()
         awaitNoProgress()
-        scrollTo("Next playlists")
-        compose.onNodeWithText("Next playlists").assertIsEnabled()
+        scrollTo("Last mix")
+        compose.onNodeWithText("Last mix").assertIsDisplayed()
+        compose.onNodeWithText("All playlists loaded.").performScrollTo().assertIsDisplayed()
+        repeat(3) { list.performTouchInput { swipeUp() }; compose.waitForIdle() }
+        assertEquals("The terminal one-row batch stops automatic demand", listOf(0, 0, 0, 40), indexOffsets())
+        scrollTo("Evening mix")
+        compose.onNodeWithText("Evening mix").assertIsDisplayed() // Appending never replaces the prefix.
+        compose.onNodeWithText("Create playlist").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithText("Refresh").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithText("Next playlists").assertDoesNotExist()
+        compose.onNodeWithText("Previous").assertDoesNotExist()
+        scrollTo("Last mix")
+        compose.onNodeWithText("Last mix").assertIsDisplayed() // Prefix and terminal row coexist in one list.
+        assertEquals(listOf(0, 0, 0, 40), indexOffsets())
+    }
+
+    @Test fun playlistIndexProfileReturnRetainsPrefixAndFailedRawOffsetUntilRetry() {
+        val appendAttempts = java.util.concurrent.atomic.AtomicInteger()
+        val retryGate = hold()
+        fun offsets() = requests.filter {
+            it.requestUrl?.encodedPath == "/api/me/playlists" && it.requestUrl?.queryParameter("limit") == "40"
+        }.map { it.requestUrl!!.queryParameter("offset")!!.toInt() }
+        respond = { request -> if (request.requestUrl?.encodedPath == "/api/me/playlists") {
+            val offset = request.requestUrl!!.queryParameter("offset")!!.toInt()
+            val limit = request.requestUrl!!.queryParameter("limit")!!.toInt()
+            if (offset == 0) page((0 until limit).joinToString { index ->
+                if (index == 0) playlist else playlist.replace("\"mix\"", "\"mix-$index\"").replace("Evening mix", "Mix $index")
+            }, total = 41, limit = limit)
+            else if (appendAttempts.incrementAndGet() == 1) failure()
+            else {
+                if (appendAttempts.get() == 2) retryGate.await(15, TimeUnit.SECONDS)
+                page(playlist.replace("\"mix\"", "\"last\"").replace("Evening mix", "Last mix"), total = 41, offset = 40)
+            }
+        } else null }
+        mount(); tab("Playlists")
+        waitText("Evening mix")
+        awaitNoProgress()
+        val list = compose.onNode(hasScrollToIndexAction())
+        for (attempt in 0 until 24) {
+            if (offsets().contains(40)) break
+            list.performTouchInput { swipeUp() }; compose.waitForIdle()
+        }
+        list.performTouchInput { swipeUp() }
+        waitText("Retry")
+        assertEquals(listOf(0, 40), offsets())
+        compose.onNodeWithText("Retry").performScrollTo()
+        val beforeProfile = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        tab("Profile")
+        await { model.state.value.page == Page.Profile }
+        tab("Playlists")
+        waitText("Retry")
+        val afterProfile = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        assertEquals("Index row top survives Profile return", beforeProfile.top, afterProfile.top, 1f)
+        assertEquals("Index row bottom survives Profile return", beforeProfile.bottom, afterProfile.bottom, 1f)
+        assertEquals("Actual tab return cannot reset the prefix or retry the failed batch", listOf(0, 40), offsets())
+        compose.onNodeWithText("Retry").performScrollTo().performClick()
+        await { offsets() == listOf(0, 40, 40) }
+        val beforeCanceledRetryReturn = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        tab("Profile") // Cancel the explicitly retried read before its response exists.
+        await { model.state.value.page == Page.Profile }
+        retryGate.countDown()
+        tab("Playlists")
+        waitText("Retry")
+        assertEquals("Canceled Retry must not clear the retained failure latch", listOf(0, 40, 40), offsets())
+        val afterCanceledRetryReturn = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        assertEquals("Index row top survives canceled-Retry return", beforeCanceledRetryReturn.top, afterCanceledRetryReturn.top, 1f)
+        assertEquals("Index row bottom survives canceled-Retry return", beforeCanceledRetryReturn.bottom, afterCanceledRetryReturn.bottom, 1f)
+        compose.onNodeWithText("Retry").performScrollTo().performClick()
+        await { offsets() == listOf(0, 40, 40, 40) }
+        awaitNoProgress()
+        scrollTo("Last mix")
+        compose.onNodeWithText("Last mix").assertIsDisplayed()
+        scrollTo("Evening mix")
+        compose.onNodeWithText("Evening mix").assertIsDisplayed()
+        assertEquals(listOf(0, 40, 40, 40), offsets())
+    }
+
+    @Test fun derivedPlaylistTrackBackRetainsSelectedPrefixAndExactFailedCursor() {
+        val summary = """{"id":"rules","name":"Rules mix","kind":"derived","countState":"unevaluated","trackCount":null,"availableCount":null,"revision":5,"capabilities":{"play":true,"editMetadata":false,"editEntries":false,"editDefinition":false,"delete":false,"copyToManual":false,"addTracks":false}}"""
+        val failedCursorAttempts = java.util.concurrent.atomic.AtomicInteger()
+        fun cursors() = requests.filter { it.requestUrl?.encodedPath == "/api/me/playlists/rules/evaluation" }
+            .map { it.requestUrl!!.queryParameter("cursor") ?: "start" }
+        fun track(index: Int) = """{"kind":"track","id":"song-$index","name":"Song $index","hasAudio":true}"""
+        respond = { request -> when (request.requestUrl?.encodedPath) {
+            "/api/me/playlists" -> page(summary, limit = request.requestUrl!!.queryParameter("limit")!!.toInt())
+            "/api/me/playlists/rules" -> json(summary)
+            "/api/me/playlists/rules/evaluation" -> {
+                val offset = request.requestUrl!!.queryParameter("cursor")?.removePrefix("cursor-")?.toInt() ?: 0
+                if (offset == 80 && failedCursorAttempts.incrementAndGet() == 1) failure()
+                else {
+                    val end = minOf(offset + 40, 85)
+                    val items = (offset until end).joinToString { index ->
+                        """{"occurrenceId":"path-$index","selectionToken":"signed-$index","position":$index,"track":${track(index)}}"""
+                    }
+                    val next = if (end < 85) "\"cursor-$end\"" else "null"
+                    json("""{"items":[$items],"total":85,"availableTotal":85,"limit":40,"nextCursor":$next,"revision":5,"fence":"same-fence","complete":true}""")
+                }
+            }
+            "/api/library/tracks/song-78" -> json("""{"item":${track(78)},"revision":1}""")
+            else -> null
+        } }
+        mount(); tab("Playlists")
+        waitText("Rules mix")
+        compose.onNodeWithText("Rules mix").performClick()
+        waitText("Song 0")
+        val list = compose.onNode(hasScrollToIndexAction())
+        for (attempt in 0 until 40) {
+            if (cursors().size == 3) break
+            list.performTouchInput { swipeUp() }; compose.waitForIdle()
+        }
+        list.performTouchInput { swipeUp() }
+        waitText("Retry")
+        assertEquals(listOf("start", "cursor-40", "cursor-80"), cursors())
+        compose.onNodeWithText("Song 78").performScrollTo().assertIsDisplayed()
+        val beforeTrack = compose.onNodeWithText("Song 78").fetchSemanticsNode().boundsInRoot
+        compose.onNodeWithText("Song 78").performClick()
+        await { (model.state.value.page as? Page.Detail)?.item?.id == "song-78" }
+        await { requests.any { it.requestUrl?.encodedPath == "/api/library/tracks/song-78" } }
+        compose.runOnIdle { systemBack.onBackPressed() }
+        waitText("Retry")
+        val afterTrack = compose.onNodeWithText("Song 78").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        assertEquals("Playlist row top survives track Back", beforeTrack.top, afterTrack.top, 1f)
+        assertEquals("Playlist row bottom survives track Back", beforeTrack.bottom, afterTrack.bottom, 1f)
+        assertEquals("Track Back must not restart evaluation or retry its latched cursor",
+            listOf("start", "cursor-40", "cursor-80"), cursors())
+        compose.onNodeWithText("Retry").performScrollTo().performClick()
+        await { cursors().size == 4 }
+        awaitNoProgress()
+        scrollTo("Song 84")
+        compose.onNodeWithText("Song 84").assertIsDisplayed()
+        scrollTo("Song 0")
+        compose.onNodeWithText("Song 0").assertIsDisplayed()
+        assertEquals(listOf("start", "cursor-40", "cursor-80", "cursor-80"), cursors())
+        assertTrue("Browsing and track Back cannot prepare music", requests.none { it.requestUrl?.encodedPath?.endsWith("/playback") == true })
     }
 
     @Test fun searchLoadingPartialErrorRetryAndNoResultsAreDistinct() {

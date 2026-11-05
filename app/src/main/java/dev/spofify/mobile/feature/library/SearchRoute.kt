@@ -5,6 +5,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -74,9 +75,10 @@ fun SearchRoute(
     onSearchEditingChanged: (Boolean) -> Unit = {},
     searchActivationId: Long? = null,
     onSearchActivationConsumed: (Long) -> Unit = {},
+    sourceEpoch: Any? = null,
 ) = CatalogRoute(client, "all", initialQuery, null, onOpenItem, onPlayItem, onShowActions,
     onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder,
-    onSearchEditingChanged, searchActivationId, onSearchActivationConsumed)
+    onSearchEditingChanged, searchActivationId, onSearchActivationConsumed, sourceEpoch)
 
 /** Compatibility entry point. Still query-driven; this is not a top-level catalog landing. */
 @Composable
@@ -95,8 +97,9 @@ fun LibraryRoute(
     onToggleLike: ((LibraryItem) -> Unit)? = null,
     onVisibleItems: (List<LibraryItem>) -> Unit = {},
     stateHolder: CatalogStateHolder? = null,
+    sourceEpoch: Any? = null,
 ) = CatalogRoute(client, initialKind, initialQuery, null, onOpenItem, onPlayItem, onShowActions,
-    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder)
+    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder, sourceEpoch = sourceEpoch)
 
 /** For explicit song/credit links from Home, playlists or Now Playing, without a catalog prefetch. */
 @Composable
@@ -114,8 +117,9 @@ fun ItemDetailsRoute(
     onToggleLike: ((LibraryItem) -> Unit)? = null,
     onVisibleItems: (List<LibraryItem>) -> Unit = {},
     stateHolder: CatalogStateHolder? = null,
+    sourceEpoch: Any? = null,
 ) = CatalogRoute(client, "all", "", item, onOpenItem, onPlayItem, onShowActions,
-    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder)
+    onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onVisibleItems, stateHolder, sourceEpoch = sourceEpoch)
 
 @Composable
 private fun CatalogRoute(
@@ -137,6 +141,7 @@ private fun CatalogRoute(
     onSearchEditingChanged: (Boolean) -> Unit = {},
     searchActivationId: Long? = null,
     onSearchActivationConsumed: (Long) -> Unit = {},
+    sourceEpoch: Any? = null,
 ) {
     val scope = rememberCoroutineScope()
     val account = client.currentSession()?.accountId
@@ -173,7 +178,7 @@ private fun CatalogRoute(
         { item, shuffle -> focus.clearFocus(); keyboard?.hide(); onPlayItem(item, shuffle) },
         { item -> focus.clearFocus(); keyboard?.hide(); onShowActions(item) },
         onEnqueueItem, artwork, modifier, playback, likes, onToggleLike, onSearchEditingChanged,
-        searchActivationId, onSearchActivationConsumed)
+        searchActivationId, onSearchActivationConsumed, sourceEpoch)
 }
 
 @Composable
@@ -192,15 +197,49 @@ internal fun CatalogScreenContent(
     onSearchEditingChanged: (Boolean) -> Unit = {},
     searchActivationId: Long? = null,
     onSearchActivationConsumed: (Long) -> Unit = {},
+    sourceEpoch: Any? = null,
 ) {
     val screen = navigation.current
+    // Capture the source incarnation at composition, not from a latest callback at release.
+    // Reading the holder again at dispatch also fences an unsampled query/navigation ABA.
+    val sourceVersion = holder.navigationVersion
+    val sourceCurrent = {
+        val current = holder.state.value.current
+        holder.navigationVersion == sourceVersion && current.key == screen.key &&
+            current.resultGeneration == screen.resultGeneration && current.query == screen.query &&
+            current.kind == screen.kind && current.includeMissing == screen.includeMissing &&
+            current.releaseGroup == screen.releaseGroup && current.item?.kind == screen.item?.kind &&
+            current.item?.id == screen.item?.id && !current.detailUnavailable
+    }
+    val sourceOpen: (LibraryItem) -> Unit = { if (sourceCurrent()) onOpen(it) }
+    val sourcePlay: (LibraryItem, Boolean) -> Unit = { item, shuffle -> if (sourceCurrent()) onPlay(item, shuffle) }
+    val sourceMore: (LibraryItem) -> Unit = { if (sourceCurrent()) onMore(it) }
+    val sourceQueue: (LibraryItem) -> Unit = { if (sourceCurrent()) onQueue(it) }
+    val sourceLike = onToggleLike?.let { toggle -> { item: LibraryItem -> if (sourceCurrent()) toggle(item) } }
+    val sourcePlayback = playback.copy(
+        onContextual = playback.onContextual?.let { dispatch -> { item, playerKey, gestureCurrent ->
+            val isCurrent = { sourceCurrent() && gestureCurrent() }
+            if (isCurrent()) dispatch(item, playerKey, isCurrent)
+        } },
+        onUnselectedHigh = playback.onUnselectedHigh?.let { dispatch -> { item, origin, gestureCurrent ->
+            val isCurrent = { sourceCurrent() && gestureCurrent() }
+            if (isCurrent()) dispatch(item, origin, isCurrent)
+        } },
+    )
     val scroll = remember(screen.key, screen.resultGeneration) {
         LazyListState(screen.scrollIndex, screen.scrollOffset)
     }
     val rowKinds = remember(screen.key, screen.resultGeneration, screen.sections) {
-        screen.sectionKinds.flatMap { kind -> screen.sections[kind]?.items.orEmpty().map { item ->
-            catalogRowKey(screen, kind, item) to kind
-        } }.toMap()
+        buildMap<Any, String> {
+            screen.sectionKinds.forEach { kind ->
+                val section = screen.sections[kind]
+                section?.items.orEmpty().forEach { item -> put(catalogRowKey(screen, kind, item), kind) }
+                // A later group's visible Retry is a real boundary even when it has no rows.
+                // It can release an earlier group's yield, but never supplies error demand.
+                if (section?.error != null || section?.let { it.loading && it.loaded } == true)
+                    put("$kind:status", kind)
+            }
+        }
     }
     val lastVisibleKind by remember(scroll, rowKinds) { derivedStateOf {
         val layout = scroll.layoutInfo
@@ -245,7 +284,7 @@ internal fun CatalogScreenContent(
                         artwork(detail, Modifier.size(88.dp))
                         Column(Modifier.weight(1f)) {
                             Text(detail.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                            MusicCredits(detail, onOpen)
+                            MusicCredits(detail, sourceOpen)
                             itemMetadata(detail).takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         }
                     }
@@ -256,10 +295,10 @@ internal fun CatalogScreenContent(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         val current = detail.kind == "track" && detail.id == playback.trackId
                         Button(onClick = {
-                            if (current && playback.onToggle != null) playback.onToggle.invoke() else onPlay(detail, false)
+                            if (current && playback.onToggle != null) playback.onToggle.invoke() else sourcePlay(detail, false)
                         }, enabled = detail.playable) { Text(if (current && playback.isPlaying) "Pause" else "Play") }
-                        if (detail.kind != "track") OutlinedButton(onClick = { onPlay(detail, true) }, enabled = detail.playable) { Text("Shuffle") }
-                        IconButton(onClick = { onMore(detail) }) { Icon(Icons.Default.MoreVert, "More actions for ${detail.name}") }
+                        if (detail.kind != "track") OutlinedButton(onClick = { sourcePlay(detail, true) }, enabled = detail.playable) { Text("Shuffle") }
+                        IconButton(onClick = { sourceMore(detail) }) { Icon(Icons.Default.MoreVert, "More actions for ${detail.name}") }
                     }
                     if (detail.kind == "track" && onToggleLike != null) {
                         val like = likes[detail.id]
@@ -294,10 +333,17 @@ internal fun CatalogScreenContent(
                 Text("No saved ${catalogLabel(kind).lowercase()} in this group.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
             }
-            musicRows(section.items, key = { _, item -> catalogRowKey(screen, kind, item) },
-                onOpen, onPlay, onMore, onQueue, artwork, playback, likes, onToggleLike)
+            itemsIndexed(section.items, key = { _, item -> catalogRowKey(screen, kind, item) }) { _, item ->
+                // Preserve the lazy anchor while replacing only the gesture lifetime on a real
+                // source change. A latest onCommit must never adopt a held old swipe; ordinary
+                // append/progress keeps this subtree and its captured source authority alive.
+                key(sourceVersion, screen.resultGeneration, sourceEpoch) {
+                    MusicRow(item, sourceOpen, sourcePlay, sourceMore, sourceQueue, artwork,
+                        playback = sourcePlayback, like = likes[item.id], onToggleLike = sourceLike)
+                }
+            }
             if (section.loading && section.loaded || section.error != null) item(key = "$kind:status") {
-                AppendStatus(section.loading, section.error, { holder.retry(kind) },
+                AppendStatus(section.loading, section.error.takeUnless { section.loading }, { holder.retry(kind) },
                     loadingLabel = "Loading more ${catalogLabel(kind).lowercase()}",
                     retryLabel = "${if (section.refreshRequired) "Refresh" else "Retry"} ${catalogLabel(kind).lowercase()}")
             }

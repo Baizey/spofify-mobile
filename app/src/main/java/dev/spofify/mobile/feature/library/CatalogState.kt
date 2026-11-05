@@ -361,9 +361,11 @@ class CatalogStateHolder(
         requests[jobKey] = requestId
         fun current() = token == generation && requests[jobKey] == requestId && screen.key == state.value.current.key
         // Reserve before launching: repeated layout/demand callbacks cannot replace this flight.
-        // A benign append read does not revoke existing source/row actions.
+        // A benign append read does not revoke existing source/row actions. Keep a failed
+        // batch's latch through explicit Retry: cancellation/Back must not authorize auto-retry.
+        // Successful publication below clears the error; loading merely hides its presentation.
         update { it.copy(sections = it.sections + (kind to (it.sections[kind] ?: CatalogSection(limit = request.limit)).copy(
-            loading = true, error = null, needsReload = !append || existing?.needsReload == true))) }
+            loading = true, needsReload = !append || existing?.needsReload == true))) }
         jobs[jobKey] = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 var batchRequest = request.copy(limit = minOf(retainedCount, 100))
