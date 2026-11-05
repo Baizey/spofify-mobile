@@ -125,6 +125,16 @@ class PlaybackService : MediaSessionService() {
         fun moveQueued(expectedKey: PlaybackInteractionKey, id: String, to: Int) {
             active.get()?.guardedMove(expectedKey, id, to)
         }
+        /** Pure cancellation witness, including service and semantic queue incarnation. */
+        internal fun queueOriginFence(): () -> Boolean {
+            val service = active.get()
+            service?.currentInteractionKey() // Observe unsampled semantic ABA now.
+            val revision = service?.intentRevision?.revision
+            return {
+                service?.currentInteractionKey()
+                active.get() === service && service?.intentRevision?.revision == revision
+            }
+        }
         fun interactionKey(): PlaybackInteractionKey? = active.get()?.currentInteractionKey()
         fun canSkipPrepared(forward: Boolean): Boolean = active.get()?.canSkip(forward) == true
         fun transportCapabilityRevision(): Long = active.get()?.transportCapabilityRevision ?: 0L

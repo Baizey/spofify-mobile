@@ -64,6 +64,7 @@ private data class CatalogMoreSelection(
     val interactionKey: PlaybackInteractionKey?,
     val lifetime: RowActionLifetime,
     val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding?,
+    val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin?,
 )
 
 internal fun listeningColorScheme() = darkColorScheme(
@@ -150,7 +151,10 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             interactionKey = player.interactionKey,
             playWhenReady = player.playWhenReady,
             onContextual = { item, binding, isCurrent -> model.contextualFrom(client, item, binding, isCurrent) },
-            queueIntentBinding = player.queueIntentBinding)
+            queueIntentBinding = player.queueIntentBinding,
+            unselectedQueueOrigin = player.unselectedQueueOrigin,
+            onUnselectedHigh = { item, origin, isCurrent -> model.queueIntentFrom(client, item,
+                dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, null, isCurrent, null, origin) })
         val likeStates = state.likes.mapValues { (id, liked) ->
             CatalogLikeState(liked, id in state.pendingLikes, id in state.failedLikeStatus)
         } + state.failedLikeStatus.filterNot { it in state.likes }.associateWith { CatalogLikeState(failed = true) }
@@ -167,7 +171,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         // Inner catalog navigation/query changes also retire the old route (including A→B→A).
         val actionLifetime = remember(state.page, catalog, catalogRoute) { RowActionLifetime() }
         DisposableEffect(actionLifetime) { onDispose { actionLifetime.invalidate() } }
-        val showMore: (LibraryItem) -> Unit = { more = CatalogMoreSelection(it, player.interactionKey, actionLifetime, player.queueIntentBinding) }
+        val showMore: (LibraryItem) -> Unit = { more = CatalogMoreSelection(it, player.interactionKey, actionLifetime, player.queueIntentBinding, player.unselectedQueueOrigin) }
         val openExternal: (LibraryItem) -> Unit = { item ->
             expanded = false
             when (item.kind) {
@@ -240,6 +244,10 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                             onQueueIntent = { selection, action, binding, expectedBinding, isCurrent ->
                                 model.queueIntentSelectionFrom(client, selection, action, binding, isCurrent, expectedBinding)
                             },
+                            onUnselectedHigh = { selection, origin, isCurrent ->
+                                model.queueIntentSelectionFrom(client, selection, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
+                                    null, isCurrent, null, origin)
+                            },
                             playbackEntryId = player.item?.entryId, playbackContext = player.context,
                             onPreparedAction = { prepared, trackId, entryId, action, binding, isCurrent ->
                                 model.preparedListAction(client, accountId, prepared, trackId, entryId, action, binding, preparedGeneration, isCurrent)
@@ -290,7 +298,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                 MusicActionsContent(item, state.likes[item.id], item.id in state.pendingLikes, item.id in state.failedLikeStatus,
                     onPlay = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW, binding, isCurrent, selection.queueIntentBinding) },
                     onPlayNext = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NEXT, binding, isCurrent, selection.queueIntentBinding) },
-                    onEnqueue = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, binding, isCurrent, selection.queueIntentBinding) },
+                    onEnqueue = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, binding, isCurrent, selection.queueIntentBinding, selection.unselectedOrigin) },
                     onQueueLow = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_LOW, binding, isCurrent, selection.queueIntentBinding) },
                     contextualLabel = feedback.contextualLabel,
                     onContextual = binding?.let { capturedKey -> {

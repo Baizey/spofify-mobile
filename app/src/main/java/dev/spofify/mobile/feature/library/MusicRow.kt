@@ -35,6 +35,8 @@ data class CatalogPlaybackFeedback(
     val playWhenReady: Boolean = false,
     val onContextual: ((LibraryItem, dev.spofify.mobile.playback.PlaybackInteractionKey, () -> Boolean) -> Unit)? = null,
     val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
+    val unselectedQueueOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null,
+    val onUnselectedHigh: ((LibraryItem, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)? = null,
 ) {
     val activeIntent: Boolean get() = isPlaying || (buffering && playWhenReady)
     val contextualLabel: String get() = "Queue High"
@@ -84,9 +86,17 @@ fun MusicRow(
     val rowHeight = maxOf(72.dp, copyHeight + 20.dp)
     val subtitle = compactMusicSubtitle(item)
     val current = item.kind == "track" && playback.trackId == item.id
-    val contextualEnabled = item.playable && playback.interactionKey != null && playback.onContextual != null
-    dev.spofify.mobile.ui.ContextualSwipeRow(item, playback.interactionKey, contextualEnabled,
-        playback.contextualLabel, onCommit = { key, isCurrent -> playback.onContextual?.invoke(item, key, isCurrent) }, modifier = modifier) { swipeModifier, isCurrent ->
+    val capture = playback.interactionKey ?: playback.unselectedQueueOrigin
+    val contextualEnabled = item.playable && (playback.interactionKey != null && playback.onContextual != null ||
+        playback.unselectedQueueOrigin != null && playback.onUnselectedHigh != null)
+    fun contextual(captured: Any, current: () -> Boolean) {
+        when (captured) {
+            is dev.spofify.mobile.playback.PlaybackInteractionKey -> playback.onContextual?.invoke(item, captured, current)
+            is dev.spofify.mobile.playback.PlaybackQueueOrigin -> playback.onUnselectedHigh?.invoke(item, captured, current)
+        }
+    }
+    dev.spofify.mobile.ui.ContextualSwipeRow(item, capture, contextualEnabled,
+        playback.contextualLabel, onCommit = { captured, current -> contextual(captured, current) }, modifier = modifier) { swipeModifier, isCurrent ->
         Row(swipeModifier.fillMaxWidth().background(
             if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background)
             .combinedClickable(onClick = { onOpenItem(item) }, onLongClickLabel = "More actions for ${item.name}",
@@ -98,7 +108,7 @@ fun MusicRow(
                     if (item.playable) {
                         add(CustomAccessibilityAction("Play now") { onPlayItem(item, false); true })
                         if (contextualEnabled) add(CustomAccessibilityAction(playback.contextualLabel) {
-                            if (isCurrent()) playback.onContextual?.invoke(item, playback.interactionKey!!, isCurrent); true
+                            if (isCurrent()) capture?.let { contextual(it, isCurrent) }; true
                         })
                     }
                     if (item.kind == "track" && onToggleLike != null && like?.pending != true) {

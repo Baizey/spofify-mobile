@@ -155,8 +155,10 @@ class Handler(BaseHTTPRequestHandler):
                 if command == 'arm' and self.command == 'POST':
                     options = json.loads(body)
                     assert options.get('mode') in ('hold', 'drop')
+                    target = options.get('target', 'paused-poll')
+                    assert target in ('paused-poll', 'claim', 'queue-start')
                     assert f.fault is None
-                    f.fault = dict(mode=options['mode'], accepted=False, released=False,
+                    f.fault = dict(mode=options['mode'], target=target, accepted=False, released=False,
                                    stateSeq=None, status=None)
                 elif command == 'release' and self.command == 'POST':
                     if f.fault:
@@ -209,12 +211,18 @@ class Handler(BaseHTTPRequestHandler):
             fault = None
             if self.path == '/api/me/player' and self.command == 'POST' and response.status == 200:
                 request = json.loads(body)
-                # Only a real accepted nonplaying snapshot poll is eligible.
-                if request.get('action') == 'poll' and request.get('state', {}).get('playing') is False:
-                    with f.lock:
-                        if f.fault and not f.fault['accepted']:
-                            fault = f.fault
-                            fault.update(accepted=True, status=response.status, stateSeq=json.loads(data)['stateSeq'])
+                # Fault only a fully received real Go success, never fabricate an ACK.
+                with f.lock:
+                    target = (f.fault or {}).get('target')
+                    matches = (target == 'claim' and request.get('action') == 'transfer' and
+                               request.get('requireUnselected') is True or
+                               target == 'paused-poll' and request.get('action') == 'poll' and
+                               request.get('state', {}).get('playing') is False or
+                               target == 'queue-start' and request.get('action') == 'poll' and
+                               request.get('state', {}).get('playing') is True)
+                    if matches and f.fault and not f.fault['accepted']:
+                        fault = f.fault
+                        fault.update(accepted=True, status=response.status, stateSeq=json.loads(data)['stateSeq'])
             if fault:
                 if fault['mode'] == 'drop':
                     return  # Close actual accepted response, do not invent HTTP success.

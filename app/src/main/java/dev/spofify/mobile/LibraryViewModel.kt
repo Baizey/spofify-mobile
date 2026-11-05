@@ -471,7 +471,8 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     fun queueIntentFrom(expectedClient: SpofifyClient, item: LibraryItem, action: PlaybackListAction,
         expectedKey: PlaybackInteractionKey? = playback.state.value.interactionKey,
         callerIsCurrent: () -> Boolean = { true },
-        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = playback.state.value.queueIntentBinding) {
+        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = playback.state.value.queueIntentBinding,
+        unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null) {
         if (cleared || !callerIsCurrent() || graph.client !== expectedClient || state.value.session == null ||
             !item.playable && item.kind !in setOf("likes", "playlist", "derived")) return
         val source = state.value.page
@@ -480,13 +481,14 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             source is Page.Playlist && item.kind == "track" -> PlaybackContext("playlist", source.playlist.id, source.playlist.name)
             else -> null
         }
-        queueIntentSelectionFrom(expectedClient, queueIntentSelection(item, context), action, expectedKey, callerIsCurrent, expectedBinding)
+        queueIntentSelectionFrom(expectedClient, queueIntentSelection(item, context), action, expectedKey, callerIsCurrent, expectedBinding, unselectedOrigin)
     }
 
     fun queueIntentSelectionFrom(expectedClient: SpofifyClient, selection: QueueIntentSelection,
         action: PlaybackListAction, expectedKey: PlaybackInteractionKey? = playback.state.value.interactionKey,
         callerIsCurrent: () -> Boolean = { true },
-        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = playback.state.value.queueIntentBinding) {
+        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = playback.state.value.queueIntentBinding,
+        unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null) {
         if (cleared || !callerIsCurrent() || graph.client !== expectedClient || state.value.session == null || state.value.busy) return
         if (expectedKey != null && playback.state.value.interactionKey !== expectedKey) return
         val binding = expectedBinding
@@ -495,7 +497,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             mutable.update { it.copy(playbackIntentGeneration = queueGeneration) }
         }
         prepareListAction(null, null, action, expectedKey, null, callerIsCurrent,
-            selection = selection, expectedBinding = binding) { PlaybackQueue(emptyList(), total = 0) }
+            selection = selection, expectedBinding = binding, unselectedOrigin = unselectedOrigin) { PlaybackQueue(emptyList(), total = 0) }
     }
 
     fun enqueueFrom(expectedClient: SpofifyClient, item: LibraryItem, playNext: Boolean = false) {
@@ -579,6 +581,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         expectedKey: PlaybackInteractionKey?, context: LibraryItem?, callerIsCurrent: () -> Boolean,
         selection: QueueIntentSelection? = null,
         expectedBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
+        unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null,
         fetch: suspend (SpofifyClient) -> PlaybackQueue) {
         val client = graph.client ?: return
         if (state.value.session == null || state.value.busy || !callerIsCurrent()) return
@@ -642,7 +645,9 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                         }
                     }
                     val live = { continuation.isActive && isCurrent() }
-                    if (selection != null) playback.queueIntent(selection, client, action, ticket.key, ticket.binding, live, complete)
+                    if (selection != null && action == PlaybackListAction.QUEUE_HIGH && unselectedOrigin != null)
+                        playback.queueHighFromUnselected(selection, client, unselectedOrigin, live, complete)
+                    else if (selection != null) playback.queueIntent(selection, client, action, ticket.key, ticket.binding, live, complete)
                     else playback.performPreparedAction(queue, client, action, ticket.key, startTrackId, startEntryId, context,
                         isCurrent = live, onResult = complete)
                 }

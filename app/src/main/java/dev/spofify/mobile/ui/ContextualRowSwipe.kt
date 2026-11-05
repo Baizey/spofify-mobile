@@ -74,12 +74,12 @@ internal class RowActionLifetime {
  * A changed binding cancels the pointer coroutine (including A→B→A transitions); progress does not.
  */
 @Composable
-internal fun ContextualSwipeRow(
+internal fun <T : Any> ContextualSwipeRow(
     identity: Any,
-    interactionKey: PlaybackInteractionKey?,
+    interactionKey: T?,
     enabled: Boolean,
     label: String,
-    onCommit: (PlaybackInteractionKey, () -> Boolean) -> Unit,
+    onCommit: (T, () -> Boolean) -> Unit,
     modifier: Modifier = Modifier,
     excludeLeadingHandle: Boolean = false,
     content: @Composable (Modifier, () -> Boolean) -> Unit,

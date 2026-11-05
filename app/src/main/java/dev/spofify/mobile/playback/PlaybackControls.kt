@@ -45,6 +45,11 @@ interface PlaybackControls {
         isCurrent: () -> Boolean = { true }, onResult: (PlaybackActionResult) -> Unit) {
         onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
     }
+    /** Explicit unselected High origin captured by the real host before forwarding. */
+    fun queueHighFromUnselected(selection: dev.spofify.mobile.core.QueueIntentSelection, client: SpofifyClient,
+        origin: PlaybackQueueOrigin, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+    }
     /** Exact upcoming key selection. No duplicate, context refetch or positional jump. */
     fun queueIntentOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String,
         action: PlaybackListAction, isCurrent: () -> Boolean = { true },

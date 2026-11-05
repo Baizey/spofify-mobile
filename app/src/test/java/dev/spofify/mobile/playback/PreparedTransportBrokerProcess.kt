@@ -79,6 +79,13 @@ internal class PreparedTransportBrokerProcess private constructor(
         control("arm", "{\"mode\":\"$mode\"}")
     }
 
+    /** Narrow real-response faults for explicit unselected queue admission. */
+    suspend fun armQueueAdmissionResponse(target: String, mode: String) {
+        require(target in setOf("claim", "paused-poll", "queue-start"))
+        require(mode in setOf("hold", "drop"))
+        control("arm", "{\"mode\":\"$mode\",\"target\":\"$target\"}")
+    }
+
     /** accepted:true witnesses a fully received real Go HTTP 200, not request arrival. */
     suspend fun pauseResponseStatus(): JsonObject? = control("status", null)
 

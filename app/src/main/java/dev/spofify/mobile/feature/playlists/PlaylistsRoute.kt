@@ -56,10 +56,12 @@ internal class PlaylistPlaybackRequest(private val generation: PlaylistRequestGe
 
 private data class PlaylistRowSelection(val track: LibraryItem, val selectionToken: String? = null,
     val entryId: String? = null, val interactionKey: PlaybackInteractionKey?, val isCurrent: () -> Boolean,
-    val queueSelection: QueueIntentSelection? = null, val binding: QueueIntentBinding? = null)
+    val queueSelection: QueueIntentSelection? = null, val binding: QueueIntentBinding? = null,
+    val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null)
 
 private data class PlaylistCollectionSelection(val selection: QueueIntentSelection, val key: PlaybackInteractionKey?,
-    val binding: QueueIntentBinding?, val isCurrent: () -> Boolean)
+    val binding: QueueIntentBinding?, val isCurrent: () -> Boolean,
+    val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null)
 
 /** Account-local navigation. Browsing never prepares or starts a queue. */
 @Composable
@@ -76,6 +78,7 @@ fun PlaylistsRoute(
     playbackEntryId: String? = null,
     playbackContext: LibraryItem? = null,
     onQueueIntent: PlaylistQueueIntent? = null,
+    onUnselectedHigh: ((QueueIntentSelection, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)? = null,
 ) {
     key(client, client.currentSession()?.accountId) {
         var selectedId by remember { mutableStateOf(initialPlaylistId) }
@@ -104,7 +107,8 @@ fun PlaylistsRoute(
             selectedId != null -> PlaylistDetail(client, selectedId!!, onOpenTrack, onPlayQueue, onShowTrackActions,
                 onBack = { selectedId = null; refresh++ }, modifier = modifier, onMutationPendingChange = onMutationPendingChange,
                 playback = playback, onPreparedAction = onPreparedAction,
-                playbackEntryId = playbackEntryId, playbackContext = playbackContext, onQueueIntent = onQueueIntent)
+                playbackEntryId = playbackEntryId, playbackContext = playbackContext, onQueueIntent = onQueueIntent,
+                onUnselectedHigh = onUnselectedHigh)
             else -> LazyColumn(modifier.fillMaxSize(), state = listState,
                 contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item {
@@ -168,6 +172,7 @@ private fun PlaylistDetail(
     playback: CatalogPlaybackFeedback,
     onPreparedAction: ((PlaybackQueue, String?, String?, PlaybackListAction, PlaybackInteractionKey?, () -> Boolean) -> Unit)?,
     playbackEntryId: String?, playbackContext: LibraryItem?, onQueueIntent: PlaylistQueueIntent?,
+    onUnselectedHigh: ((QueueIntentSelection, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)?,
 ) {
     val api = remember(client) { PersonalCollectionsApi(client) }
     val derived = remember(client) { DerivedPlaylistsApi(client) }
@@ -251,16 +256,19 @@ private fun PlaylistDetail(
     }
     fun submit(selection: QueueIntentSelection?, action: PlaybackListAction,
         key: PlaybackInteractionKey? = playback.interactionKey, binding: QueueIntentBinding? = playback.queueIntentBinding,
-        current: () -> Boolean = actionLifetime::isCurrent) {
+        current: () -> Boolean = actionLifetime::isCurrent,
+        origin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null) {
         if (selection == null || busy || stale || !current() || !actionLifetime.isCurrent()) return
         if (key != null && latestInteractionKey !== key) return
         val epoch = PlaybackRequests.epoch
         val revision = saved?.revision
         val sourceTicket = generation.ticket()
-        onQueueIntent?.invoke(selection, action, key, binding) {
+        val live = {
             current() && actionLifetime.isCurrent() && generation.accepts(sourceTicket) &&
                 epoch == PlaybackRequests.epoch && !stale && summary?.revision == revision
         }
+        if (action == PlaybackListAction.QUEUE_HIGH && origin != null) onUnselectedHigh?.invoke(selection, origin, live)
+        else onQueueIntent?.invoke(selection, action, key, binding, live)
     }
     addingTrack?.let { track -> AddToPlaylistSheet(client, track, onDismiss = {
         addingTrack = null; stale = true; generation.invalidate()
@@ -355,7 +363,7 @@ private fun PlaylistDetail(
         fun perform(action: PlaybackListAction? = null) {
             occurrenceActions = null
             if (onQueueIntent != null) submit(selection.queueSelection, action ?: PlaybackListAction.PLAY_NOW,
-                selection.interactionKey, selection.binding, selection.isCurrent)
+                selection.interactionKey, selection.binding, selection.isCurrent, selection.unselectedOrigin)
             else play(selectionToken = selection.selectionToken, trackId = selection.track.id,
                 entryId = selection.entryId, action = action, expectedKey = selection.interactionKey, isCurrent = selection.isCurrent)
         }
@@ -378,7 +386,7 @@ private fun PlaylistDetail(
                 listOf("Queue Low" to PlaybackListAction.QUEUE_LOW, "Queue High" to PlaybackListAction.QUEUE_HIGH,
                     "Play next" to PlaybackListAction.PLAY_NEXT, "Play now" to PlaybackListAction.PLAY_NOW).forEach { (label, action) ->
                     TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !busy && !stale, onClick = {
-                        collectionActions = null; submit(captured.selection, action, captured.key, captured.binding, captured.isCurrent)
+                        collectionActions = null; submit(captured.selection, action, captured.key, captured.binding, captured.isCurrent, captured.unselectedOrigin)
                     }) { Text(label) }
                 }
             }
@@ -387,7 +395,7 @@ private fun PlaylistDetail(
     LazyColumn(modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             Row { TextButton(onClick = { refreshAll() }, enabled = !busy) { Text("Refresh") }
-                if (onQueueIntent != null) IconButton(onClick = { exactSelection()?.let { collectionActions = PlaylistCollectionSelection(it, playback.interactionKey, playback.queueIntentBinding, captureCurrent()) } }, modifier = Modifier.size(48.dp)) {
+                if (onQueueIntent != null) IconButton(onClick = { exactSelection()?.let { collectionActions = PlaylistCollectionSelection(it, playback.interactionKey, playback.queueIntentBinding, captureCurrent(), playback.unselectedQueueOrigin) } }, modifier = Modifier.size(48.dp)) {
                     Icon(Icons.Default.MoreVert, "More actions for ${saved?.name ?: "playlist"}")
                 }
             }
@@ -483,14 +491,19 @@ private fun PlaylistDetail(
         } else if (saved?.kind == PlaylistKind.DERIVED) {
             items(evaluation?.items.orEmpty(), key = { it.occurrenceId }) { entry ->
                 PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entry.selectionToken, interactionKey = playback.interactionKey, isCurrent = captureCurrent(isCurrent),
-                        queueSelection = exactSelection(track, entry.occurrenceId, entry.selectionToken), binding = playback.queueIntentBinding) },
+                        queueSelection = exactSelection(track, entry.occurrenceId, entry.selectionToken), binding = playback.queueIntentBinding,
+                        unselectedOrigin = playback.unselectedQueueOrigin) },
                     enabled = !busy && !stale && saved.capabilities.play && entry.selectionToken != null,
                     onPlay = { play(selectionToken = entry.selectionToken) }, actionsEnabled = !busy,
                     playback = playback, occurrenceBinding = listOf(id, saved.revision, evaluation?.fence, entry),
                     currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.DERIVED, entry.occurrenceId,
                         entry.track.id, playback.trackId, playbackEntryId, playbackContext),
                     onContextual = if (onQueueIntent != null || onPreparedAction != null) ({ expectedKey, isCurrent -> play(selectionToken = entry.selectionToken,
-                        action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = isCurrent) }) else null)
+                        action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = isCurrent) }) else null,
+                    onUnselectedHigh = if (onUnselectedHigh != null) ({ origin, current ->
+                        submit(exactSelection(entry.track, entry.occurrenceId, entry.selectionToken), PlaybackListAction.QUEUE_HIGH,
+                            null, null, captureCurrent(current), origin)
+                    }) else null)
             }
             item {
                 Row {
@@ -504,14 +517,19 @@ private fun PlaylistDetail(
             items(entries?.items.orEmpty(), key = { it.id }) { entry ->
                 Column {
                     PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entryId = entry.id, interactionKey = playback.interactionKey, isCurrent = captureCurrent(isCurrent),
-                        queueSelection = exactSelection(track, entryId = entry.id), binding = playback.queueIntentBinding) },
+                        queueSelection = exactSelection(track, entryId = entry.id), binding = playback.queueIntentBinding,
+                        unselectedOrigin = playback.unselectedQueueOrigin) },
                         enabled = !busy && !stale && saved?.capabilities?.play == true,
                         onPlay = { play(trackId = entry.track.id, entryId = entry.id) }, playback = playback,
                         occurrenceBinding = listOf(id, saved?.revision, entry),
                         currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.MANUAL, entry.id,
                             entry.track.id, playback.trackId, playbackEntryId, playbackContext),
                         onContextual = if (onQueueIntent != null || onPreparedAction != null) ({ expectedKey, isCurrent -> play(trackId = entry.track.id,
-                            entryId = entry.id, action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = isCurrent) }) else null)
+                            entryId = entry.id, action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = isCurrent) }) else null,
+                        onUnselectedHigh = if (onUnselectedHigh != null) ({ origin, current ->
+                            submit(exactSelection(entry.track, entryId = entry.id), PlaybackListAction.QUEUE_HIGH,
+                                null, null, captureCurrent(current), origin)
+                        }) else null)
                     if (saved?.capabilities?.editEntries == true) TextButton(enabled = !busy && !blocked,
                         onClick = { removing = entry.id }) { Text("Remove this occurrence") }
                 }
@@ -536,11 +554,20 @@ internal fun PlaylistTrackRow(track: LibraryItem, onOpenTrack: (LibraryItem) -> 
     onShowTrackActions: (LibraryItem, () -> Boolean) -> Unit, enabled: Boolean, onPlay: () -> Unit, actionsEnabled: Boolean = true,
     playback: CatalogPlaybackFeedback = CatalogPlaybackFeedback(), occurrenceBinding: Any = track,
     currentOccurrence: Boolean = false,
-    onContextual: ((PlaybackInteractionKey, () -> Boolean) -> Unit)? = null) {
+    onContextual: ((PlaybackInteractionKey, () -> Boolean) -> Unit)? = null,
+    onUnselectedHigh: ((dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)? = null) {
     val canPlay = enabled && track.playable
-    val canContextual = canPlay && playback.interactionKey != null && onContextual != null
-    ContextualSwipeRow(occurrenceBinding, playback.interactionKey, canContextual, playback.contextualLabel,
-        onCommit = { key, isCurrent -> onContextual?.invoke(key, isCurrent) }) { swipeModifier, isCurrent ->
+    val capture = playback.interactionKey ?: playback.unselectedQueueOrigin
+    val canContextual = canPlay && (playback.interactionKey != null && onContextual != null ||
+        playback.unselectedQueueOrigin != null && onUnselectedHigh != null)
+    fun contextual(captured: Any, current: () -> Boolean) {
+        when (captured) {
+            is PlaybackInteractionKey -> onContextual?.invoke(captured, current)
+            is dev.spofify.mobile.playback.PlaybackQueueOrigin -> onUnselectedHigh?.invoke(captured, current)
+        }
+    }
+    ContextualSwipeRow(occurrenceBinding, capture, canContextual, playback.contextualLabel,
+        onCommit = { captured, current -> contextual(captured, current) }) { swipeModifier, isCurrent ->
         Row(swipeModifier.fillMaxWidth().heightIn(min = 72.dp).background(
             if (currentOccurrence) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background),
             verticalAlignment = Alignment.CenterVertically) {
@@ -554,7 +581,7 @@ internal fun PlaylistTrackRow(track: LibraryItem, onOpenTrack: (LibraryItem) -> 
                     customActions = buildList {
                         if (canPlay) add(CustomAccessibilityAction("Play now") { onPlay(); true })
                         if (canContextual) add(CustomAccessibilityAction(playback.contextualLabel) {
-                            if (isCurrent()) onContextual?.invoke(playback.interactionKey!!, isCurrent); true
+                            if (isCurrent()) capture?.let { contextual(it, isCurrent) }; true
                         })
                         if (actionsEnabled) add(CustomAccessibilityAction("More actions") { onShowTrackActions(track, isCurrent); true })
                     }

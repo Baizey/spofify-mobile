@@ -63,6 +63,7 @@ data class PlaybackState(
     /** Accepted semantic receiver binding, captured before asynchronous queue preparation. */
     val queueIntentBinding: QueueIntentBinding? = null,
     val canQueueIntent: Boolean = false,
+    val unselectedQueueOrigin: PlaybackQueueOrigin? = null,
 )
 
 /**
@@ -407,7 +408,21 @@ class PlaybackConnection(context: Context) : PlaybackControls {
 
     override fun queueIntent(selection: QueueIntentSelection, client: SpofifyClient,
         action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?,
-        isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+        isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) =
+        queueIntentCaptured(selection, client, action, expectedKey, expectedBinding, isCurrent, onResult)
+
+    override fun queueHighFromUnselected(selection: QueueIntentSelection, client: SpofifyClient,
+        origin: PlaybackQueueOrigin, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+        if (origin.consumed || origin.owner !== coordinator || !origin.isCurrent()) {
+            onResult(PlaybackActionResult(PlaybackActionStatus.STALE)); return
+        }
+        origin.consumed = true
+        queueIntentCaptured(selection, client, PlaybackListAction.QUEUE_HIGH, null, null, isCurrent, onResult, origin)
+    }
+
+    private fun queueIntentCaptured(selection: QueueIntentSelection, client: SpofifyClient,
+        action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?,
+        isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit, origin: PlaybackQueueOrigin? = null) {
         val session = client.currentSession()
         val epoch = PlaybackRequests.epoch
         val incarnation = interactionGeneration
@@ -423,7 +438,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         fun lifetime() = incarnation == interactionGeneration && session != null && client.currentSession() === session &&
             client === (context as SpofifyApplication).graph.client && epoch == PlaybackRequests.epoch && owner === coordinator
         fun current() = !finished && lifetime() && isCurrent() &&
-            (expectedBinding == null && operation == QueueIntentIntent.NOW || output == owner?.state?.value?.activeDeviceId)
+            (expectedBinding == null && (operation == QueueIntentIntent.NOW || origin != null) ||
+                output == owner?.state?.value?.activeDeviceId)
         fun complete(result: PlaybackActionResult) {
             if (finished) return
             finished = true
@@ -441,14 +457,15 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                 complete(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE)); return@dispatch
             }
             if (devices.activeDeviceId.isNotEmpty() && !devices.canQueueIntent &&
-                !(operation == QueueIntentIntent.NOW && expectedBinding == null && devices.activeDeviceId == devices.deviceId)) {
+                !((operation == QueueIntentIntent.NOW || origin != null || operation == QueueIntentIntent.HIGH && expectedKey != null) &&
+                    expectedBinding == null && devices.activeDeviceId == devices.deviceId)) {
                 complete(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED)); return@dispatch
             }
             var transition: PlaybackAdditiveTransition? = null
             owner.queueIntent(operation, expectedBinding, selection, ::current, onResult = { detail ->
                 complete(queueIntentActionResult(detail, action).copy(additiveTransition = transition))
                 publish(refreshQueue = true)
-            }, onLocalCompleted = { local -> transition = local.additiveTransition })
+            }, onLocalCompleted = { local -> transition = local.additiveTransition }, unselectedOrigin = origin)
         }
         handler.post {
             if (!current()) complete(PlaybackActionResult(PlaybackActionStatus.STALE))
@@ -861,6 +878,36 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         )
     }
 
+    private var queuedOrigin: PlaybackQueueOrigin? = null
+    private var queuedOriginIdentity: Any? = null
+    private fun unselectedQueueOrigin(): PlaybackQueueOrigin? {
+        val owner = coordinator ?: return null
+        val devices = owner.state.value
+        val client = (context as SpofifyApplication).graph.client ?: return null
+        val session = client.currentSession() ?: return null
+        if (devices.activeDeviceId.isNotEmpty() || devices.selectionUnconfirmed || devices.view?.transfer != null ||
+            devices.recovery != dev.spofify.mobile.feature.devices.PlaybackConnectionRecovery.NONE) {
+            queuedOrigin = null; queuedOriginIdentity = null; return null
+        }
+        val snapshot = PlaybackService.exportLocalSnapshot()
+        val metadata = PlaybackService.exportLocalQueueIntentState()
+        val version = owner.interactionVersion
+        val epoch = PlaybackRequests.epoch
+        val incarnation = interactionGeneration
+        val identity = listOf(PlaybackReference(client), PlaybackReference(session), PlaybackReference(owner),
+            version, epoch, incarnation, snapshot.queueOriginIdentity(), metadata)
+        if (identity != queuedOriginIdentity || queuedOrigin?.consumed == true || queuedOrigin?.isCurrent?.invoke() != true) {
+            val serviceCurrent = PlaybackService.queueOriginFence()
+            queuedOriginIdentity = identity
+            queuedOrigin = PlaybackQueueOrigin(owner, snapshot, metadata) {
+                coordinator === owner && (context as SpofifyApplication).graph.client === client &&
+                    client.currentSession() === session && epoch == PlaybackRequests.epoch && incarnation == interactionGeneration &&
+                    owner.interactionVersion == version && owner.state.value.activeDeviceId.isEmpty() && serviceCurrent()
+            }
+        }
+        return queuedOrigin
+    }
+
     private fun publish(refreshQueue: Boolean = false) {
         if (actionNoticeIsCurrent?.invoke() != true) {
             actionNotice = null
@@ -892,6 +939,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         displayingRemote = false
         val connected = controller ?: run {
             if (wasRemote) mutableState.value = PlaybackState(error = connectionError)
+            mutableState.value = mutableState.value.copy(unselectedQueueOrigin = unselectedQueueOrigin())
             return
         }
         if (refreshQueue || wasRemote) {
@@ -928,6 +976,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             canSkipPrevious = interactive && PlaybackService.canSkipPrepared(false),
             queueIntentBinding = coordinator?.state?.value?.queueIntentBinding,
             canQueueIntent = coordinator?.state?.value?.canQueueIntent == true,
+            unselectedQueueOrigin = unselectedQueueOrigin(),
         )
     }
 

@@ -125,9 +125,14 @@ Only the next real HTTP-200 `/api/me/player` POST `poll` containing a state whos
 confirm its sequence/state independently: an unrelated nonplaying publication
 can otherwise match. `hold` lasts at most 12 seconds, and a hold timeout becomes a
 lost response, never fabricated success. Tests must release before their actual
-production HTTP request deadline to distinguish held from lost. The proxy does
-not manufacture registrations, directives, epochs, leases, bindings, ACKs, state
-or command outcomes. Maximum concurrent proxy handlers: 32; request 2 MiB;
+production HTTP request deadline to distinguish held from lost. The optional `target` control remains narrowly allowlisted: default `paused-poll`,
+`claim` (literal conditional self transfer), or `queue-start` (playing owner-state
+publication). FEAT-114 arms the default immediately before an empty High admission,
+so its first accepted paused publication is the activation ACK; it separately drops
+accepted claims and post-start queue publications. All faults act only after fully
+reading real Go success, forwarding unchanged bytes or losing that real response.
+The proxy does not manufacture registrations, directives, epochs, leases, bindings,
+ACKs, state or command outcomes. Maximum concurrent proxy handlers: 32; request 2 MiB;
 response under 8 MiB. No request bodies/auth headers are retained in diagnostics.
 
 ## Deterministic real handoff epoch boundary

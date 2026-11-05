@@ -2,6 +2,8 @@ package dev.spofify.mobile.feature.devices
 
 import dev.spofify.mobile.core.*
 import dev.spofify.mobile.playback.remoteSkipCapabilities
+import dev.spofify.mobile.playback.PlaybackQueueOrigin
+import dev.spofify.mobile.playback.queueOriginIdentity
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.*
@@ -159,7 +161,7 @@ class PlaybackCoordinator(
         var choice: Long, val deadline: Long, var origin: () -> Boolean, val lifetime: () -> Boolean,
         var staging: PlaybackSnapshot, var payloadVersion: Long,
         var action: suspend (PlaybackAuthority) -> PlaybackEndpointResult, var onRejected: (() -> Unit)?,
-        var onCompleted: ((PlaybackEndpointResult) -> Unit)?) {
+        var onCompleted: ((PlaybackEndpointResult) -> Unit)?, val queueOrigin: PlaybackQueueOrigin? = null) {
         var claimEpoch: Long? = null
         var activatedEpoch: Long? = null
         var activationDelivery: String? = null
@@ -627,23 +629,28 @@ class PlaybackCoordinator(
 
     fun queueIntent(intent: QueueIntentIntent, expected: QueueIntentBinding?, selection: QueueIntentSelection,
         isCurrent: () -> Boolean, onResult: (QueueIntentResult?) -> Unit,
-        onLocalCompleted: ((PlaybackEndpointResult) -> Unit)? = null) {
+        onLocalCompleted: ((PlaybackEndpointResult) -> Unit)? = null,
+        unselectedOrigin: PlaybackQueueOrigin? = null) {
         // Validate exact raw selection authority before any admission/claim side effect.
         try { selection.toJson(); expected?.validated() }
         catch (_: IllegalArgumentException) { onResult(null); return }
         if (expected == null) {
-            // The sole acquisition exception is deliberate app Now, with no selected output.
-            // A null binding is never permission to refresh a previously selected receiver.
+            // Null alone is never admission. High additionally requires its original typed,
+            // cancellation-only unselected capture; selected receiver bindings never refresh.
+            val high = intent == QueueIntentIntent.HIGH && unselectedOrigin?.owner === this &&
+                unselectedOrigin.consumed
             val pristineSelf = state.value.activeDeviceId == state.value.deviceId &&
                 state.value.deviceId.isNotEmpty() && executionAuthority() != null &&
                 state.value.queueIntentBinding == null
-            if (intent != QueueIntentIntent.NOW || selection is QueueIntentSelection.Occurrence ||
+            val pristineHigh = intent == QueueIntentIntent.HIGH && pristineSelf &&
+                endpoint.exportSnapshot().queue.isEmpty() && state.value.view?.state?.queue.isNullOrEmpty()
+            if (intent != QueueIntentIntent.NOW && !high && !pristineHigh || selection is QueueIntentSelection.Occurrence ||
                 state.value.activeDeviceId.isNotEmpty() && !pristineSelf ||
                 state.value.deviceId.isNotEmpty() && !receiverRegistered ||
                 !endpoint.supportsQueueIntents || !isCurrent()) { onResult(null); return }
             val completed = java.util.concurrent.atomic.AtomicBoolean()
             fun finish(detail: QueueIntentResult?) { if (completed.compareAndSet(false, true)) onResult(detail) }
-            explicitLocalPlay(isCurrent = isCurrent, onRejected = { finish(null) },
+            explicitLocalPlay(isCurrent = isCurrent, onRejected = { finish(null) }, queueOrigin = unselectedOrigin,
                 admissionIsCurrent = { isCurrent() && (state.value.deviceId.isEmpty() || receiverRegistered) },
                 onCompleted = {
                     if (localPublicationCurrent(it)) onLocalCompleted?.invoke(it)
@@ -690,13 +697,14 @@ class PlaybackCoordinator(
      * system transport and recovery never call this path. The payload stays with its origin. */
     fun explicitLocalPlay(isCurrent: () -> Boolean = { true }, onRejected: (() -> Unit)? = null,
         preparedResume: PlaybackSnapshot? = null, admissionIsCurrent: () -> Boolean = isCurrent,
+        queueOrigin: PlaybackQueueOrigin? = null,
         onCompleted: ((PlaybackEndpointResult) -> Unit)? = null,
         action: suspend (PlaybackAuthority) -> PlaybackEndpointResult) {
         val payloadVersion = explicitExecutionVersion.incrementAndGet()
         val staging = try { (preparedResume ?: PlaybackSnapshot()).paused().publicationValidated() }
             catch (_: IllegalArgumentException) { onRejected?.invoke(); return }
         val retained = playAdmission
-        if (retained != null && retained.claimEpoch != null && retained.lifecycle == lifecycle &&
+        if (queueOrigin == null && retained?.queueOrigin == null && retained != null && retained.claimEpoch != null && retained.lifecycle == lifecycle &&
             retained.revision == actionVersion && retained.choice == selectionVersion &&
             clockMs() < retained.deadline && retained.lifetime() && admissionIsCurrent() && isCurrent() &&
             !uncertainConnection && serviceActive && !closed) {
@@ -725,7 +733,7 @@ class PlaybackCoordinator(
             message("Confirming playback. Try Play again."); onRejected?.invoke(); return
         }
         val value = PlayAdmission(nonce(), lifecycle, actionVersion, selectionVersion, clockMs() + 12_000,
-            isCurrent, admissionIsCurrent, staging, payloadVersion, action, onRejected, onCompleted)
+            isCurrent, admissionIsCurrent, staging, payloadVersion, action, onRejected, onCompleted, queueOrigin)
         playAdmission = value
         var dispatched = false
         admissionJob = work.launch {
@@ -757,6 +765,16 @@ class PlaybackCoordinator(
                     // No mutex while waiting: heartbeat owns prepare/activate ACK progression.
                     if (value.claimEpoch == null && !value.accepted.isCompleted) return@withTimeout
                     if (!value.accepted.await() || !admissionCurrent(value)) return@withTimeout
+                    if (value.queueOrigin != null) {
+                        // A delayed accepted activation response is not a fresh observation
+                        // of a competing selection made while it was in flight. No retry:
+                        // observe once under the same admission before the ordinary High.
+                        transport.withLock {
+                            exchange { if (admissionCurrent(value)) poll() }
+                        }
+                        if (!admissionCurrent(value) || state.value.view?.transfer != null ||
+                            state.value.activeDeviceId != state.value.deviceId) return@withTimeout
+                    }
                     val claimed = value.claimEpoch != null
                     playAdmission = null
                     dispatched = true
@@ -1393,11 +1411,24 @@ class PlaybackCoordinator(
                             // Replacement stages empty. A captured live Resume is paused, never
                             // retained server music. If latest payload changes across activation,
                             // re-stage before ACK; the obsolete completion grants nothing.
-                            val snapshot = admission?.staging ?: (d.state ?: PlaybackSnapshot()).validated()
+                            val preserve = admission?.queueOrigin
+                            val snapshot = if (preserve != null) (d.state ?: PlaybackSnapshot()).validated()
+                                else admission?.staging ?: (d.state ?: PlaybackSnapshot()).validated()
+                            // A displayed/live queue is a stale-work fence, never import authority.
+                            // No prepared contents may be silently replaced by a conflicting room.
+                            if (preserve != null && preserve.snapshot.queue.isNotEmpty()) {
+                                val before = preserve.metadata
+                                val incoming = directiveMetadata(d)
+                                if (preserve.snapshot.queueOriginIdentity() != snapshot.queueOriginIdentity() ||
+                                    before != null && incoming != null && (before.origins != incoming.origins ||
+                                        before.highKeys != incoming.highKeys || before.provenance != incoming.provenance ||
+                                        before.receiverId == incoming.receiverId && before.revision != incoming.revision))
+                                    return@endpointAction currentPublication("rejected")
+                            }
                             val safe = if (admission != null || uncertainConnection || recoverPaused &&
                                 state.value.view?.transfer?.sourceDeviceId.isNullOrEmpty()) snapshot.paused() else snapshot
-                            latest = if (admission != null && safe.queue.isNotEmpty()) endpoint.activatePreparedResume(safe, authority)
-                                else endpoint.activate(safe, if (admission != null) null else directiveMetadata(d), authority)
+                            latest = if (admission != null && preserve == null && safe.queue.isNotEmpty()) endpoint.activatePreparedResume(safe, authority)
+                                else endpoint.activate(safe, if (admission != null && preserve == null) null else directiveMetadata(d), authority)
                             if (admission != null && payload == admission.payloadVersion && latest.status == "ok")
                                 admission.stagedVersion = payload
                         } while (admission != null && admissionCurrent(admission) && payload != admission.payloadVersion)
