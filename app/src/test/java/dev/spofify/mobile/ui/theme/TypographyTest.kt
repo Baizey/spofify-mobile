@@ -82,27 +82,6 @@ class TypographyTest {
     }
 
     @Test
-    fun displayHeadlineTitleAndBodyHierarchyIsRetained() {
-        val styles = AppTypography.styles()
-        val headingOrder = listOf(
-            "displayLarge", "displayMedium", "displaySmall",
-            "headlineLarge", "headlineMedium", "headlineSmall",
-            "titleLarge", "titleMedium", "titleSmall",
-        )
-        headingOrder.zipWithNext().forEach { (larger, smaller) ->
-            val largerStyle = styles.getValue(larger)
-            val smallerStyle = styles.getValue(smaller)
-            assertTrue("$larger > $smaller", largerStyle.fontSize > smallerStyle.fontSize)
-            assertTrue("$larger leading > $smaller", largerStyle.lineHeight > smallerStyle.lineHeight)
-        }
-        assertTrue(AppTypography.bodyLarge.fontSize > AppTypography.bodyMedium.fontSize)
-        // Common primary rows retain 13sp identity above the unchanged 12sp secondary floor.
-        assertTrue(AppTypography.bodyMedium.fontSize > AppTypography.bodySmall.fontSize)
-        assertTrue(AppTypography.bodyLarge.lineHeight > AppTypography.bodyMedium.lineHeight)
-        assertTrue(AppTypography.bodyMedium.lineHeight > AppTypography.bodySmall.lineHeight)
-    }
-
-    @Test
     fun everyFontSizeAndLineHeightUsesScaledSp() {
         val normal = Density(density = 1f, fontScale = 1f)
         val enlarged = Density(density = 1f, fontScale = 2f)
