@@ -42,9 +42,10 @@ internal class EditorPreviewState(
     val canAppend get() = !pending && !stale && !failed && page?.nextCursor != null &&
         editVersion == currentEditVersion() && session === client.currentSession()
 
-    fun checkInputs(value: JsonObject, derived: Boolean, saved: PersonalPlaylistSummary?, version: Long = 0L) {
+    fun checkInputs(value: JsonObject, derived: Boolean, saved: PersonalPlaylistSummary?, version: Long = 0L,
+        revision: Long = client.personalRevision.value.playlists) {
         if (rules != null && (editVersion != version || rules != value || !derived || target != saved ||
-                session !== client.currentSession() || sourceRevision != client.personalRevision.value.playlists)) invalidate()
+                session !== client.currentSession() || sourceRevision != revision)) invalidate()
     }
 
     fun invalidate() {
@@ -67,8 +68,10 @@ internal class EditorPreviewState(
 
     private fun request(cursor: String?) {
         val candidate = rules ?: return
-        if (session !== client.currentSession() || editVersion != currentEditVersion()) { invalidate(); return }
+        if (session !== client.currentSession() || editVersion != currentEditVersion() ||
+            sourceRevision != client.personalRevision.value.playlists) { invalidate(); return }
         val capturedSession = session
+        val capturedRevision = sourceRevision
         val capturedTarget = target
         val ticket = identity
         val before = page
@@ -77,10 +80,15 @@ internal class EditorPreviewState(
         if (before == null) message = "Evaluating preview…"
         job = scope.launch {
             try {
+                // The source may change after reservation but before this coroutine dispatches.
+                // Do not send an obsolete cursor while waiting for the composition-time fence.
+                if (identity !== ticket) return@launch
+                if (capturedSession !== client.currentSession() || editVersion != currentEditVersion() ||
+                    capturedRevision != client.personalRevision.value.playlists) { invalidate(); return@launch }
                 val result = api.preview(candidate, capturedTarget?.id, capturedTarget?.revision, limit = 40, cursor = cursor)
                 if (identity !== ticket) return@launch
                 if (editVersion != currentEditVersion()) { invalidate(); return@launch }
-                check(capturedSession === client.currentSession() && sourceRevision == client.personalRevision.value.playlists)
+                check(capturedSession === client.currentSession() && capturedRevision == client.personalRevision.value.playlists)
                 check(result.limit == 40)
                 if (before != null) check(result.revision == before.revision && result.fence == before.fence &&
                     result.total == before.total && result.availableTotal == before.availableTotal)
@@ -157,15 +165,15 @@ internal fun PlaylistEditor(
     val listState = rememberLazyListState()
     val preview = evaluation.page
     val previewPending = evaluation.pending
-    val personalRevision by client.personalRevision.collectAsState()
+    // Subscribe in composition, not only inside SideEffect: idle source changes must recompose.
+    val playlistRevision = client.personalRevision.collectAsState().value.playlists
     val metadataError = playlistMetadataError(draft.name, draft.description)
     val rulesError = if (draft.derived) recipeValidationError(draft.rules) else null
     BackHandler { if (!saving) onBack() }
     DisposableEffect(evaluation) { onDispose { evaluation.invalidate() } }
     // Also fence programmatic/ABA edits, not only callbacks from this form.
     SideEffect {
-        personalRevision // Subscribe even while no other editor state changes.
-        evaluation.checkInputs(draft.rules, draft.derived, target, draft.editVersion)
+        evaluation.checkInputs(draft.rules, draft.derived, target, draft.editVersion, playlistRevision)
     }
     LaunchedEffect(client, sourceRefresh) {
         try { sources = api.playlists(limit = 100).items.map { it.id to it.name }; sourceFailed = false }

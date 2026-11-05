@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import dev.spofify.mobile.core.ApiException
 import dev.spofify.mobile.core.LibraryItem
 import java.io.IOException
+import dev.spofify.mobile.core.PersonalCollection
 import dev.spofify.mobile.core.PersonalCollectionsApi
 import dev.spofify.mobile.core.ServerAddress
 import dev.spofify.mobile.core.SessionStore
@@ -24,6 +25,7 @@ import dev.spofify.mobile.core.StoredSession
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -50,6 +52,52 @@ class AddToPlaylistSheetHostTest {
 
     @Test fun visibleFrontierRetriesSameOffsetAndAppendRetainsChosenTarget() = host(uncertainCreate = false)
     @Test fun verificationFrontierIsReadOnlyAfterLostCreateAndCannotRestoreWriteAuthority() = host(uncertainCreate = true)
+
+    @Test fun idlePlaylistRevisionEmissionDisablesRetainedTargetAndOffersRefresh() {
+        MockWebServer().use { web ->
+            web.start()
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), object : SessionStore {
+                override fun read(): StoredSession? = null
+                override fun write(value: StoredSession?) = Unit
+            })
+            val shown = mutableStateOf(true)
+            try {
+                web.enqueue(json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
+                    .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600"))
+                runBlocking { client.login("listener", "synthetic") }
+                web.enqueue(json("""{"items":[${summary("p0", 7)}],"total":1,"limit":40,"offset":0}"""))
+                compose.setContent { MaterialTheme {
+                    if (shown.value) AddToPlaylistSheet(client, LibraryItem("track", "t", "Song"), { shown.value = false })
+                } }
+                waitFor("Playlist p0")
+                compose.waitForIdle()
+                compose.onNodeWithText("Add track").assertIsEnabled()
+                val before = client.personalRevision.value.playlists
+
+                // No click, scroll, draft edit or explicit freshness helper may make this pass.
+                // The production host must observe this emission while otherwise idle.
+                compose.runOnIdle { client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
+                assertEquals(before + 1, client.personalRevision.value.playlists)
+                waitFor("Playlists changed. Refresh before choosing a target.")
+                compose.onNodeWithText("Add track").assertIsNotEnabled()
+                compose.onNode(hasText("Playlist p0") and hasClickAction()).assertIsNotEnabled()
+                compose.onNodeWithText("Refresh playlists").assertExists()
+                assertEquals("Invalidation neither writes nor automatically resets the chooser", 2, web.requestCount)
+
+                web.enqueue(json("""{"items":[${summary("p1", 8)}],"total":1,"limit":40,"offset":0}"""))
+                compose.onNodeWithText("Refresh playlists").performClick()
+                waitFor("Playlist p1")
+                compose.onNodeWithText("Add track").assertIsEnabled()
+                assertEquals(3, web.requestCount)
+                assertEquals("POST", web.takeRequest(1, TimeUnit.SECONDS)!!.method) // Synthetic login only.
+                repeat(2) { assertEquals("GET", web.takeRequest(1, TimeUnit.SECONDS)!!.method) }
+            } finally {
+                compose.runOnIdle { shown.value = false }; compose.waitForIdle()
+                client.httpClient.dispatcher.cancelAll(); client.httpClient.connectionPool.evictAll()
+                client.httpClient.dispatcher.executorService.shutdown()
+            }
+        }
+    }
 
     private fun host(uncertainCreate: Boolean) {
         val requests = CopyOnWriteArrayList<Pair<String, String?>>()

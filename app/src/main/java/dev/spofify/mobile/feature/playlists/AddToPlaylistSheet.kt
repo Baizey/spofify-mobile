@@ -64,8 +64,9 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
             AddToPlaylistState(PersonalCollectionsApi(client), track, scope,
                 personalRevision = { client.personalRevision.value.playlists }, currentSession = { client.currentSession() })
         }
-        val personalRevision by client.personalRevision.collectAsState()
-        SideEffect { state.checkFreshness(personalRevision.playlists) }
+        // Read during composition so an otherwise idle revision emission schedules the fence.
+        val playlistRevision = client.personalRevision.collectAsState().value.playlists
+        SideEffect { state.checkFreshness(playlistRevision) }
         val listState = rememberLazyListState()
         DisposableEffect(state) { onDispose { state.dispose() } }
         AutomaticListDemand(listState, state.targetIdentity,

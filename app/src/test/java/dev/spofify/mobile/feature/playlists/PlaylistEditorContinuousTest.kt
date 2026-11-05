@@ -6,6 +6,7 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import dev.spofify.mobile.core.*
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.*
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
@@ -167,6 +168,39 @@ class PlaylistEditorPreviewStateTest {
         }
     }
 
+    @Test fun playlistRevisionChangeBeforeReservationOrDispatchCannotSendObsoletePreviewCursor() = runTest {
+        for (afterReservation in listOf(false, true)) MockWebServer().use { web ->
+            web.start(); val client = previewClient(web)
+            try {
+                web.enqueue(previewResponse("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
+                    .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600"))
+                client.login("listener", "synthetic")
+                val state = EditorPreviewState(DerivedPlaylistsApi(client), client, this)
+                web.enqueue(previewResponse(previewPage(0)))
+                state.refresh(blankRecipe(), true, null); until { !state.pending }
+                val prefix = state.entries
+                val before = client.personalRevision.value.playlists
+                if (afterReservation) {
+                    state.more()
+                    assertTrue(state.pending)
+                }
+                client.notifyPersonalChange(PersonalCollection.PLAYLISTS)
+                assertEquals(before + 1, client.personalRevision.value.playlists)
+                if (!afterReservation) state.more()
+                runCurrent()
+                assertTrue("The source fence must precede the HTTP read", state.stale)
+                assertFalse(state.pending)
+                assertEquals(prefix, state.entries)
+                state.more(); state.retry(); runCurrent()
+                assertEquals("Only login and the established prefix were requested", 2, web.requestCount)
+                state.invalidate()
+            } finally {
+                client.httpClient.dispatcher.cancelAll(); client.httpClient.connectionPool.evictAll()
+                client.httpClient.dispatcher.executorService.shutdown()
+            }
+        }
+    }
+
     @Test fun invalidOrEditedDraftCannotEstablishOrContinuePreviewWithoutNewExplicitRefresh() = runTest {
         MockWebServer().use { web ->
             web.start(); val client = previewClient(web)
@@ -253,6 +287,71 @@ class PlaylistEditorContinuousHostTest {
             }
         }
     }
+    @Test fun idlePlaylistRevisionEmissionMarksPreviewStaleWithoutDispatchingAnotherCursor() {
+        val cursors = CopyOnWriteArrayList<String>()
+        MockWebServer().use { web ->
+            web.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    if (request.requestUrl!!.encodedPath == "/api/auth/login")
+                        return previewResponse("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
+                            .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
+                    if (request.method == "GET") return previewResponse("""{"items":[],"total":0,"limit":100,"offset":0}""")
+                    assertEquals("/api/me/playlists/preview", request.requestUrl!!.encodedPath)
+                    val body = ApiJson.parseToJsonElement(request.body.readUtf8()).jsonObject
+                    val cursor = body["cursor"]?.jsonPrimitive?.content ?: "initial"
+                    cursors += cursor
+                    return previewResponse(previewPage(if (cursor == "initial") 0 else cursor.removePrefix("cursor-").toInt()))
+                }
+            }
+            web.start(); val client = previewClient(web)
+            val shown = mutableStateOf(true)
+            val draft = PlaylistEditorDraft().apply { derived = true; name = "Retained draft" }
+            val rules = draft.rules
+            try {
+                runBlocking { client.login("listener", "synthetic") }
+                compose.setContent { MaterialTheme {
+                    if (shown.value) PlaylistEditor(client, null, draft, {}, { fail("Revision invalidation must not save") })
+                } }
+                compose.waitForIdle()
+                compose.onNodeWithText("Refresh preview").performScrollTo().performClick()
+                waitForRequests(cursors, 1)
+                waitForPublishedPreview()
+                scrollTo("81 matches · 81 with recorded audio. Preview is read-only.")
+                compose.waitForIdle()
+                assertEquals(listOf("initial"), cursors.toList())
+                val before = client.personalRevision.value.playlists
+
+                // Assert the idle host changes BEFORE any scroll or edit could incidentally
+                // recompose it. No direct checkInputs/invalidate call substitutes for the host.
+                compose.runOnIdle { client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
+                assertEquals(before + 1, client.personalRevision.value.playlists)
+                val stale = "Preview is not current. Draft retained; refresh preview explicitly."
+                compose.waitUntil(5_000) {
+                    compose.waitForIdle()
+                    compose.onAllNodesWithText(stale).fetchSemanticsNodes().isNotEmpty()
+                }
+                compose.onNodeWithText(stale).assertExists()
+                assertEquals("Retained draft", draft.name)
+                assertEquals(rules, draft.rules)
+                assertEquals(listOf("initial"), cursors.toList())
+                scrollTo("40. Song 39")
+                compose.onNodeWithText("40. Song 39").assertExists()
+                compose.waitForIdle()
+                assertEquals("Stale rows at the frontier cannot continue the old chain", listOf("initial"), cursors.toList())
+
+                scrollTo("Refresh preview")
+                compose.onNodeWithText("Refresh preview").performScrollTo().performClick()
+                waitForRequests(cursors, 2)
+                waitForPublishedPreview()
+                assertEquals(listOf("initial", "initial"), cursors.toList())
+            } finally {
+                compose.runOnIdle { shown.value = false }; compose.waitForIdle()
+                client.httpClient.dispatcher.cancelAll(); client.httpClient.connectionPool.evictAll()
+                client.httpClient.dispatcher.executorService.shutdown()
+            }
+        }
+    }
+
     private fun waitForPublishedPreview() {
         // Server receipt is not UI publication: response decoding runs on the HTTP dispatcher.
         compose.waitUntil(5_000) {
