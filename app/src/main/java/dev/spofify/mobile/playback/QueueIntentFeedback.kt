@@ -22,12 +22,16 @@ internal fun queueIntentMessage(result: QueueIntentResult, action: PlaybackListA
     val accepted = result.acceptedCount > 0
     val selection = action == PlaybackListAction.PLAY_NOW
     if (result.playback == "superseded") return "${if (selection) "Selection" else "Queue change"} accepted; playback start superseded by a newer action."
+    if (result.playback in setOf("started", "resumed") &&
+        result.outcome in setOf("playing", "queued") && result.notice.isNullOrEmpty()) {
+        return if (result.acceptedCount > 1) "Playing · ${result.acceptedCount} tracks queued" else "Playing track"
+    }
     val acceptance = when {
         !accepted -> null
         result.outcome == "limited" -> "Queued ${result.acceptedCount}; queue limited to 1,000 songs."
-        selection -> "Selection accepted."
-        result.acceptedCount == 1 -> "Queued"
-        else -> "Queued ${result.acceptedCount} songs."
+        selection -> "Selection accepted"
+        result.acceptedCount == 1 -> "Track queued"
+        else -> "${result.acceptedCount} tracks queued"
     }
     val playback = when (result.playback) {
         "started", "resumed" -> "Playback started"

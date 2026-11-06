@@ -20,6 +20,8 @@ import dev.spofify.mobile.playback.PlaybackRequests
 import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.playback.PlaybackListAction
 import dev.spofify.mobile.playback.PlaybackActionResult
+import dev.spofify.mobile.playback.PlaybackFeedback
+import dev.spofify.mobile.playback.nextPlaybackFeedback
 import dev.spofify.mobile.playback.PlaybackListActionTickets
 import dev.spofify.mobile.feature.library.CatalogStateHolder
 import dev.spofify.mobile.feature.library.ClientCatalogReader
@@ -75,6 +77,7 @@ data class LibraryState(
     val likesGeneration: Int = 0,
     val error: String? = null,
     val notice: String? = null,
+    val feedback: PlaybackFeedback? = null,
     val preparing: Boolean = false,
     val playbackIntentGeneration: Int = 0,
     val likes: Map<String, Boolean> = emptyMap(),
@@ -736,10 +739,16 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                     else playback.performPreparedAction(queue, client, action, ticket.key, startTrackId, startEntryId, context,
                         isCurrent = live, onResult = complete)
                 }
-                if (isCurrent() && feedbackRequest == actionFeedbackSerial) mutable.update { it.copy(notice = result.userMessage) }
+                if (isCurrent() && feedbackRequest == actionFeedbackSerial) {
+                    val feedback = PlaybackFeedback.from(result, ::isCurrent)
+                    mutable.update {
+                        val next = nextPlaybackFeedback(it.feedback, feedback)
+                        it.copy(notice = next.message, feedback = next)
+                    }
+                }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                if (isCurrent() && feedbackRequest == actionFeedbackSerial) mutable.update { it.copy(notice = message(error)) }
+                if (isCurrent() && feedbackRequest == actionFeedbackSerial) mutable.update { it.copy(notice = message(error), feedback = null) }
             }
         }
         listPreparationJobs.add(job)
@@ -828,6 +837,14 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     fun clearNotice() { mutable.update { it.copy(notice = null) } }
+
+    /** A completed timer must never consume a newer identical action. */
+    fun consumeFeedback(id: Long) {
+        mutable.update { state ->
+            if (state.feedback?.id != id) state else state.copy(feedback = null,
+                notice = state.notice.takeUnless { it == state.feedback.message })
+        }
+    }
 
     private fun message(error: Exception): String = when (error) {
         is ApiException -> error.message

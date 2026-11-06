@@ -82,8 +82,8 @@ class PlaybackManualTierTest {
     }
 
     @Test fun feedbackDistinguishesNoopFailureAndActualAcceptance() {
-        assertEquals("Playing", PlaybackActionResult(PlaybackActionStatus.PLAYING).userMessage)
-        assertEquals("Added to queue", PlaybackActionResult(PlaybackActionStatus.ADDED, 1).userMessage)
+        assertEquals("Playing track", PlaybackActionResult(PlaybackActionStatus.PLAYING).userMessage)
+        assertEquals("Track queued", PlaybackActionResult(PlaybackActionStatus.ADDED, 1).userMessage)
         assertFalse(PlaybackActionResult(PlaybackActionStatus.NO_OP).userMessage.startsWith("Added"))
         for (status in listOf(PlaybackActionStatus.STALE, PlaybackActionStatus.UNAVAILABLE,
             PlaybackActionStatus.UNSUPPORTED_REMOTE, PlaybackActionStatus.FULL, PlaybackActionStatus.BLOCKED)) {

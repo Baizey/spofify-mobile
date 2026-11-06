@@ -769,7 +769,7 @@ class PreparedTransportAppGraphTest {
                     val detail = requireNotNull(result.queueIntentResult)
                     assertEquals("queued", detail.outcome); assertEquals(1, detail.acceptedCount)
                     assertEquals("unchanged", detail.playback); assertNull(detail.playbackKey)
-                    assertEquals("Queued", result.userMessage)
+                    assertEquals("Track queued", result.userMessage)
                     assertEquals("Old refusal cannot mask a fresh real ViewModel Queued receipt",
                         result.userMessage, model.state.value.notice)
                     val successor = PlaybackService.exportLocalSnapshot()

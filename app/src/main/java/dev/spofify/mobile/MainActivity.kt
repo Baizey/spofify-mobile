@@ -43,6 +43,9 @@ import dev.spofify.mobile.feature.player.NativeNowPlaying
 import dev.spofify.mobile.feature.player.NativeNowPlayingDialog
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
+import dev.spofify.mobile.ui.PlaybackFeedbackPresentation
+import dev.spofify.mobile.ui.PlaybackFeedbackTimer
+import dev.spofify.mobile.ui.PlaybackFeedbackHost
 import dev.spofify.mobile.ui.AutomaticListDemand
 import dev.spofify.mobile.ui.AppendStatus
 import dev.spofify.mobile.ui.ListeningChrome
@@ -99,7 +102,10 @@ internal fun SpofifyApp(model: LibraryViewModel) {
     val player by model.playback.state.collectAsStateWithLifecycle()
     var expanded by rememberSaveable { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
-    LaunchedEffect(state.notice) { state.notice?.let { snackbar.showSnackbar(it); model.clearNotice() } }
+    val ordinaryNotice = state.notice?.takeUnless { it == state.feedback?.message }
+    LaunchedEffect(ordinaryNotice) {
+        ordinaryNotice?.let { snackbar.showSnackbar(it, duration = SnackbarDuration.Long); model.clearNotice() }
+    }
     LaunchedEffect(state.session) { if (state.session == null) expanded = false }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     BackHandler(state.canGoBack && !expanded && state.session != null && !imeVisible) { model.back() }
@@ -136,6 +142,35 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         }
     }
     key(client, state.session?.accountId) {
+        val presentation = remember { PlaybackFeedbackPresentation() }
+        val consumeFeedback: (Long) -> Unit = { id ->
+            model.consumeFeedback(id)
+            model.playback.consumeFeedback(id)
+        }
+        val currentFeedback = presentation.current
+        val feedbackValid = currentFeedback?.isCurrent?.invoke() != false
+        LaunchedEffect(state.feedback?.id, player.feedback?.id, feedbackValid) {
+            if (!feedbackValid) currentFeedback?.let { presentation.consume(it.id); consumeFeedback(it.id) }
+            listOfNotNull(state.feedback, player.feedback).sortedBy { it.id }.forEach { event ->
+                if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) presentation.offer(event)
+                else consumeFeedback(event.id)
+            }
+        }
+        PlaybackFeedbackTimer(presentation, visible = snackbar.currentSnackbarData == null,
+            onConsumed = consumeFeedback)
+        DisposableEffect(lifecycle, presentation) {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_STOP) {
+                    presentation.current?.let { consumeFeedback(it.id) }
+                    presentation.discardSuccess()
+                }
+            }
+            lifecycle.addObserver(observer)
+            onDispose {
+                lifecycle.removeObserver(observer)
+                presentation.current?.let { consumeFeedback(it.id) }
+            }
+        }
         val pages = rememberSaveableStateHolder()
         val deviceCoordinator = model.graph.playbackCoordinator
         var devices by remember(deviceCoordinator) { mutableStateOf(false) }
@@ -202,7 +237,12 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         }
         ListeningChrome(
             chromeHidden = hideListeningChrome(searchPage, searchEditing.value, imeVisible),
-            snackbarHost = { SnackbarHost(snackbar) },
+            snackbarHost = {
+                if (!expanded || player.item == null) {
+                    if (snackbar.currentSnackbarData != null) SnackbarHost(snackbar)
+                    else PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
+                }
+            },
             connectionActions = null,
             miniPlayer = {
                 NativeMiniPlayer(player, model.playback, {
@@ -297,16 +337,22 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             LaunchedEffect(item.id) { model.checkLike(item) }
             // No draggable sheet/nested-scroll anchors: the player has stable window bounds and
             // only its queue scrolls. Dialog Back dismisses presentation, never playback.
-            NativeNowPlayingDialog(onCollapse = { expanded = false }) { presentation ->
+            NativeNowPlayingDialog(onCollapse = { expanded = false }) { playerPresentation ->
                 Surface(Modifier.fillMaxSize(), color = Background) {
-                    NativeNowPlaying(player, model.playback, state.likes[item.id], item.id in state.pendingLikes,
-                        item.id in state.failedLikeStatus, { model.toggleLike(item) }, { model.checkLike(item) },
-                        onAddToPlaylist = { expanded = false; addToPlaylist = it }, onOpenItem = openExternal,
-                        artwork = art, modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
-                        presentation = presentation, onPlaybackDevices = openDevices)
-                    // Compose the single picker in the current player window, above its Dialog.
-                    // The underlying player and its queue/list state remain mounted on dismissal.
-                    deviceSheet()
+                    Box(Modifier.fillMaxSize()) {
+                        NativeNowPlaying(player, model.playback, state.likes[item.id], item.id in state.pendingLikes,
+                            item.id in state.failedLikeStatus, { model.toggleLike(item) }, { model.checkLike(item) },
+                            onAddToPlaylist = { expanded = false; addToPlaylist = it }, onOpenItem = openExternal,
+                            artwork = art, modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
+                            presentation = playerPresentation, onPlaybackDevices = openDevices)
+                        // One picker and one feedback host in the visible player window.
+                        deviceSheet()
+                        Box(Modifier.align(Alignment.BottomCenter)
+                            .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime))) {
+                            if (snackbar.currentSnackbarData != null) SnackbarHost(snackbar)
+                            else PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
+                        }
+                    }
                 }
             }
         }

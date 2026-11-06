@@ -7,6 +7,8 @@ import kotlinx.coroutines.flow.StateFlow
 /** UI-facing transport boundary; the implementation delegates lifetime to Media3. */
 interface PlaybackControls {
     val state: StateFlow<PlaybackState>
+    /** Presentation acknowledgement only; never mutates the musical queue. */
+    fun consumeFeedback(id: Long) {}
     fun connect()
     fun release()
     /** Capture an immutable host-origin fence for deliberate in-app Play/Resume at gesture

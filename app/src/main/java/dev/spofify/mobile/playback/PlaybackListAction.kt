@@ -37,8 +37,8 @@ data class PlaybackActionResult(
     val userMessage: String get() {
         queueIntentResult?.let { return queueIntentMessage(it, requestedAction) }
         return when (status) {
-        PlaybackActionStatus.PLAYING -> "Playing"
-        PlaybackActionStatus.ADDED -> "Added to queue"
+        PlaybackActionStatus.PLAYING -> "Playing track"
+        PlaybackActionStatus.ADDED -> if (acceptedCount > 1) "$acceptedCount tracks queued" else "Track queued"
         PlaybackActionStatus.LIMITED -> "Added $acceptedCount to queue; queue limited to 1,000 songs."
         PlaybackActionStatus.FULL -> "Queue is full (1,000 songs)."
         PlaybackActionStatus.NO_OP -> "Already in this queue position."

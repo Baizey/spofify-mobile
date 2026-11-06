@@ -149,10 +149,37 @@ class PlaybackListActionViewModelTest {
             assertTrue(f.model.state.value.preparing); assertNull(f.model.state.value.notice)
             pending.complete(queueIntentActionResult(QueueIntentResult("queued", 1, 6, "high", "unchanged", null, ""), action))
             until { !f.model.state.value.preparing }
-            assertEquals(if (action == PlaybackListAction.PLAY_NOW) "Selection accepted." else "Queued", f.model.state.value.notice)
+            assertEquals(if (action == PlaybackListAction.PLAY_NOW) "Selection accepted" else "Track queued", f.model.state.value.notice)
         }
         assertEquals(0, f.playbackReads.get())
     }
+    @Test fun identicalTerminalMessagesRemainDistinctAndOldConsumptionCannotClearNewEvent() = fixture { f ->
+        f.submit(); runCurrent()
+        f.controls.pending.last().complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+        val first = requireNotNull(f.model.state.value.feedback)
+        f.submit(); runCurrent()
+        f.controls.pending.last().complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+        val second = requireNotNull(f.model.state.value.feedback)
+        assertEquals(first.message, second.message)
+        assertNotEquals(first.id, second.id)
+        f.model.consumeFeedback(first.id)
+        assertEquals(second.id, f.model.state.value.feedback?.id)
+        assertEquals("Track queued", f.model.state.value.notice)
+        f.model.consumeFeedback(second.id)
+        assertNull(f.model.state.value.feedback)
+        assertNull(f.model.state.value.notice)
+    }
+
+    @Test fun unreadGuidanceIsNotShortenedByLaterRoutineAcceptance() = fixture { f ->
+        f.submit(); runCurrent()
+        f.controls.pending.last().complete(PlaybackActionResult(PlaybackActionStatus.FULL)); runCurrent()
+        val guidance = requireNotNull(f.model.state.value.feedback)
+        f.submit(); runCurrent()
+        f.controls.pending.last().complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
+        assertEquals(guidance.id, f.model.state.value.feedback?.id)
+        assertEquals(guidance.message, f.model.state.value.notice)
+    }
+
     @Test fun rowHighIsOneTrackButAlbumHighIsWholeBoundedContext() = fixture { f ->
         f.submit(); runCurrent(); val row = f.controls.pending.single()
         assertTrue(row.selection is QueueIntentSelection.Track)
@@ -202,7 +229,7 @@ class PlaybackListActionViewModelTest {
         runCurrent(); val pending = f.controls.pending.single()
         val result = QueueIntentResult("queued", 2, 6, "low", "unchanged", null, "")
         pending.complete(queueIntentActionResult(result, pending.action)); runCurrent()
-        assertEquals("Queued 2 songs.", f.model.state.value.notice)
+        assertEquals("2 tracks queued", f.model.state.value.notice)
         assertFalse(f.controls.state.value.isPlaying)
         assertNull(result.playbackKey)
     }
@@ -415,7 +442,7 @@ class PlaybackListActionViewModelTest {
             addition.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
             until { !f.model.state.value.preparing }
             val acceptedNotice = f.model.state.value.notice
-            assertEquals("Added to queue", acceptedNotice)
+            assertEquals("Track queued", acceptedNotice)
             gate.release.countDown()
             assertTrue(gate.responded.await(5, TimeUnit.SECONDS))
             until { f.client.httpClient.dispatcher.runningCallsCount() == 0 }
@@ -513,7 +540,7 @@ class PlaybackListActionViewModelTest {
             assertNull("Preparing/submitting a manual duplicate is not acceptance", f.model.state.value.notice)
             held.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
             until { !f.model.state.value.preparing }
-            assertEquals("Added to queue", f.model.state.value.notice)
+            assertEquals("Track queued", f.model.state.value.notice)
         }
         assertEquals(0, f.playbackReads.get())
     }

@@ -9,7 +9,7 @@ class QueueIntentFeedbackTest {
         val detail = QueueIntentResult("queued", 2, 32, "low", "unchanged", null, "")
         val result = queueIntentActionResult(detail, PlaybackListAction.QUEUE_LOW)
         assertSame(detail, result.queueIntentResult)
-        assertEquals("Queued 2 songs.", result.userMessage)
+        assertEquals("2 tracks queued", result.userMessage)
         assertFalse(result.userMessage.contains("Playing"))
         assertFalse(result.userMessage.contains("started"))
     }
@@ -35,8 +35,8 @@ class QueueIntentFeedbackTest {
     }
     @Test fun startedReceiptNeverGuessesRequestedItemFromCurrentDisplay() {
         val result = queueIntentActionResult(QueueIntentResult("playing", 2, 32, "high", "started", 105, ""), PlaybackListAction.QUEUE_HIGH)
-        assertTrue(result.userMessage.contains("Playback started"))
-        assertFalse(result.userMessage.contains("Playing"))
+        assertEquals("Playing · 2 tracks queued", result.userMessage)
+        assertEquals(2, result.acceptedCount)
         assertFalse(result.userMessage.contains("105"))
     }
     @Test fun unsupportedAsksForUpdateAndUncertainCompletionDoesNotReportQueued() {

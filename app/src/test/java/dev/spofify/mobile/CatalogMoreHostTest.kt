@@ -292,7 +292,7 @@ class CatalogMoreHostTest {
         compose.runOnIdle {
             pending.complete(queueIntentActionResult(QueueIntentResult("queued", 2, 8, "low", "unchanged", null, ""), pending.action))
         }
-        compose.onNodeWithText("Queued 2 songs.").assertExists()
+        compose.onNodeWithText("2 tracks queued").assertExists()
         compose.runOnIdle { assertFalse(controls.state.value.isPlaying) }
     }
     @Test fun blockedAndMediaAndSupersededReceiptsKeepPositiveAcceptance() {
@@ -342,7 +342,7 @@ class CatalogMoreHostTest {
             assertNull(model.state.value.notice)
             pending.complete(queueIntentActionResult(QueueIntentResult("queued", 1, 8, "high", "unchanged", null, ""), pending.action))
         }
-        compose.onNodeWithText("Queued").assertExists()
+        compose.onNodeWithText("Track queued").assertExists()
         compose.runOnIdle { assertEquals(1, controls.pending.size); assertEquals(0, playbackReads.get()) }
     }
     @Test fun innerRouteNavigationAfterAcceptedDismissalRetiresWorkEvenAfterReturn() {
@@ -390,7 +390,7 @@ class CatalogMoreHostTest {
         compose.waitForIdle()
         compose.runOnIdle {
             assertEquals(signedOutNotice, model.state.value.notice)
-            assertNotEquals("Added to queue", model.state.value.notice)
+            assertNotEquals("Track queued", model.state.value.notice)
             assertEquals(1, controls.pending.size)
         }
     }

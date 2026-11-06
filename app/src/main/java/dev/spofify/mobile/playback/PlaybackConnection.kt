@@ -47,6 +47,7 @@ data class PlaybackState(
     val canUndoQueueRemoval: Boolean = false,
     val playWhenReady: Boolean = false,
     val notice: String? = null,
+    val feedback: PlaybackFeedback? = null,
     /** Exact remote wire metadata, including each occurrence's playbackContext and baseline order.
      * LibraryItem is only a display projection; this snapshot is never imported into local audio. */
     val remoteSnapshot: PlaybackSnapshot? = null,
@@ -103,7 +104,16 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         if (releaseAfterPending) releaseInternal()
     }
     private var connectionError: String? = null
-    private var actionNotice: String? = null
+    private var actionNotice: PlaybackFeedback? = null
+    private var feedbackRequestSerial = 0L
+
+    override fun consumeFeedback(id: Long) = onMain {
+        if (actionNotice?.id == id) {
+            actionNotice = null
+            actionNoticeIsCurrent = null
+            publish()
+        }
+    }
     private var actionNoticeIsCurrent: (() -> Boolean)? = null
     private var queueSnapshot: List<LibraryItem> = emptyList()
     private var requestedContext: LibraryItem? = null
@@ -494,10 +504,13 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         val key = snapshot?.let { remoteUpcomingKey(it, occurrenceId) }
         if (client == null || key == null) { onResult(PlaybackActionResult(PlaybackActionStatus.STALE)); return }
         val binding = coordinator?.state?.value?.queueIntentBinding
+        val feedbackRequest = ++feedbackRequestSerial
         queueIntent(QueueIntentSelection.Occurrence(key), client, action, expectedKey, binding, isCurrent) { result ->
-            if (isCurrent()) {
-                actionNotice = result.userMessage
-                actionNoticeIsCurrent = isCurrent
+            if (isCurrent() && feedbackRequest == feedbackRequestSerial) {
+                val incoming = PlaybackFeedback.from(result, isCurrent)
+                val next = nextPlaybackFeedback(actionNotice, incoming)
+                if (next === incoming) actionNoticeIsCurrent = isCurrent
+                actionNotice = next
                 publish(refreshQueue = true)
             }
             onResult(result)
@@ -518,6 +531,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         onResult: (PlaybackActionResult) -> Unit, publishNotice: Boolean = true, allowRemote: Boolean = false,
         dispatch: (() -> Boolean, (PlaybackActionResult) -> Unit) -> Unit) {
         val epoch = PlaybackRequests.epoch
+        val feedbackRequest = if (publishNotice) ++feedbackRequestSerial else feedbackRequestSerial
         val session = client?.currentSession()
         val owner = coordinator
         val output = owner?.state?.value?.activeDeviceId
@@ -539,9 +553,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                 // its interaction key; the service checked the old key at actual dispatch.
                 // Prepared host actions publish their route-fenced callback in the ViewModel;
                 // only Up next needs an application-owned notice without host route plumbing.
-                if (valid && publishNotice) {
-                    actionNotice = actual.userMessage
-                    actionNoticeIsCurrent = ::authorityCurrent
+                if (valid && publishNotice && feedbackRequest == feedbackRequestSerial) {
+                    val incoming = PlaybackFeedback.from(actual, ::authorityCurrent)
+                    val next = nextPlaybackFeedback(actionNotice, incoming)
+                    if (next === incoming) actionNoticeIsCurrent = ::authorityCurrent
+                    actionNotice = next
                     publish(refreshQueue = true)
                 }
                 onResult(actual)
@@ -932,7 +948,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                 transportInteractionKey = transportKey,
                 canSkipNext = transportKey != null && directions.first,
                 canSkipPrevious = transportKey != null && directions.second,
-                notice = actionNotice ?: remote.notice,
+                notice = remote.notice,
+                feedback = actionNotice,
                 queueIntentBinding = coordinator?.state?.value?.queueIntentBinding,
                 canQueueIntent = coordinator?.state?.value?.canQueueIntent == true,
             )
@@ -973,7 +990,8 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             currentEntryId = PlaybackMedia.occurrence(connected.currentMediaItem),
             context = PlaybackService.queueContext(),
             canUndoQueueRemoval = PlaybackService.canUndoRemoval(),
-            notice = actionNotice ?: PlaybackService.queueNotice(),
+            notice = PlaybackService.queueNotice(),
+            feedback = actionNotice,
             interactionKey = rawKey,
             transportInteractionKey = transportKey,
             canMoveUpcomingAbsolutely = rawKey != null,
