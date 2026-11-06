@@ -20,7 +20,7 @@ internal fun playlistCountLabel(summary: PersonalPlaylistSummary, page: DerivedE
     return when (state) {
         PlaylistEvaluationState.READY -> counts ?: "Playlist ready"
         PlaylistEvaluationState.ERROR -> counts?.let { "$it · Previous result; update failed" }
-            ?: "Playlist could not update. Try Refresh."
+            ?: "Playlist could not update on the server."
         PlaylistEvaluationState.PENDING, PlaylistEvaluationState.STALE -> counts?.let { "$it · Updating; previous result" }
             ?: "Updating playlist…"
         null -> if (page?.current == true) counts!! else "Updating playlist…"

@@ -77,7 +77,7 @@ class PlaylistManagementHostTest {
     @Test fun manualManagementWorksWithoutQueueIntentCallbackAndReorderIsExplicit() = withHost {
         awaitLoaded()
         openMore()
-        listOf("Refresh", "Edit details", "Delete", "Reorder all occurrences").forEach { menuAction(it).assertIsEnabled() }
+        listOf("Edit details", "Delete", "Reorder all occurrences").forEach { menuAction(it).assertIsEnabled() }
         listOf("Edit rules", "Make editable copy", "Queue Low", "Queue High", "Play next", "Play now").forEach {
             compose.onNodeWithText(it).assertDoesNotExist()
         }
@@ -105,14 +105,12 @@ class PlaylistManagementHostTest {
     @Test fun derivedManagementStillOpensRulesAndCopyWithoutQueueIntentCallback() = withHost(derived = true) {
         awaitLoaded()
         openMore()
-        listOf("Refresh", "Edit details", "Edit rules", "Make editable copy", "Delete").forEach { menuAction(it).assertIsEnabled() }
+        listOf("Edit details", "Edit rules", "Make editable copy", "Delete").forEach { menuAction(it).assertIsEnabled() }
+        compose.onNodeWithText("Refresh").assertDoesNotExist()
         compose.onNodeWithText("Reorder all occurrences").assertDoesNotExist()
         menuAction("Edit rules").performClick()
         waitText("Back — keep draft")
         compose.onNodeWithText("Back — keep draft").performClick()
-        // Leaving the recipe editor invalidates evaluation authority; refresh is intentional.
-        openMore()
-        menuAction("Refresh").performClick()
         awaitLoaded()
         openMore()
         menuAction("Make editable copy").performClick()
@@ -132,7 +130,7 @@ class PlaylistManagementHostTest {
         awaitLoaded()
         compose.onNodeWithText("Play").assertDoesNotExist()
         openMore()
-        menuAction("Refresh").assertIsEnabled()
+        compose.onNodeWithText("Refresh").assertDoesNotExist()
         managementActions.forEach { compose.onNodeWithText(it).assertDoesNotExist() }
         assertTrue(writes().isEmpty())
     }
@@ -141,12 +139,12 @@ class PlaylistManagementHostTest {
         derived = true,
         beforeMount = { evaluationGate = CountDownLatch(1) },
     ) {
-        await { requests.any { it.requestUrl?.encodedPath == "$detailPath/evaluation" } }
+        await { requests.any { it.requestUrl?.encodedPath == "$detailPath/entries" } }
         compose.onNodeWithText("Playlist fixture").assertIsDisplayed()
         compose.onAllNodes(songCount).assertCountEquals(0)
         compose.onNodeWithText("Play").assertIsNotEnabled()
         openMore()
-        listOf("Refresh", "Edit details", "Edit rules", "Make editable copy", "Delete").forEach {
+        listOf("Edit details", "Edit rules", "Make editable copy", "Delete").forEach {
             menuAction(it).assertIsNotEnabled()
         }
         dismissDialogWithBack()
@@ -157,13 +155,12 @@ class PlaylistManagementHostTest {
         assertTrue(writes().isEmpty())
     }
 
-    @Test fun moreOffersExplicitRefreshEvenWhenInitialSummaryCouldNotLoad() = withHost(
+    @Test fun failedInitialFetchOffersReadOnlyRetry() = withHost(
         beforeMount = { failSummaryOnce.set(true) },
     ) {
         await { noProgress() && requests.any { it.requestUrl?.encodedPath == detailPath } }
         compose.onAllNodes(songCount).assertCountEquals(0)
-        compose.onNodeWithContentDescription("More actions for playlist").assertIsEnabled().performClick()
-        menuAction("Refresh").assertIsEnabled().performClick()
+        compose.onNodeWithText("Retry loading playlist").assertIsEnabled().performClick()
         awaitLoaded()
         compose.onNodeWithText("2 songs").assertIsDisplayed()
         assertTrue(writes().isEmpty())
@@ -172,18 +169,17 @@ class PlaylistManagementHostTest {
     @Test fun failedReevaluationRetainsRowsButDoesNotOfferStaleCountPlaybackOrCopy() = withHost(derived = true) {
         awaitLoaded()
         failEvaluation.set(true)
-        openMore()
-        menuAction("Refresh").performClick()
-        waitText("Nothing was resubmitted.", substring = true)
+        compose.runOnIdle { client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
+        waitText("Playlist could not load.")
         compose.onAllNodesWithContentDescription(songMore).assertCountEquals(2)
         compose.onAllNodes(songCount).assertCountEquals(0)
         compose.onNodeWithText("Play").assertIsNotEnabled()
         openMore()
-        menuAction("Refresh").assertIsEnabled()
+        compose.onNodeWithText("Refresh").assertDoesNotExist()
         menuAction("Make editable copy").assertIsNotEnabled()
-        // A stale read does not itself grant or revoke these independent saved-data capabilities.
-        menuAction("Edit details").assertIsEnabled()
-        menuAction("Delete").assertIsEnabled()
+        // A failed read cannot authorize management against the old source revision.
+        menuAction("Edit details").assertIsNotEnabled()
+        menuAction("Delete").assertIsNotEnabled()
         dismissDialogWithBack()
         compose.onAllNodesWithContentDescription(songMore)[1].performClick()
         waitText("Like song")
@@ -203,7 +199,8 @@ class PlaylistManagementHostTest {
         compose.onNodeWithText("Cancel").performClick()
         openMore()
         listOf("Edit details", "Delete", "Reorder all occurrences").forEach { menuAction(it).assertIsNotEnabled() }
-        menuAction("Refresh").assertIsEnabled().performClick()
+        dismissDialogWithBack()
+        compose.onNodeWithText("Verify saved playlist").performScrollTo().performClick()
         awaitLoaded()
         openMore()
         listOf("Edit details", "Delete", "Reorder all occurrences").forEach { menuAction(it).assertIsEnabled() }
@@ -261,7 +258,8 @@ class PlaylistManagementHostTest {
         openMore()
         menuAction("Verify saved copies").assertIsEnabled()
         menuAction("Make editable copy").assertIsNotEnabled()
-        menuAction("Refresh").performClick()
+        dismissDialogWithBack()
+        compose.onNodeWithText("Verify saved playlist").performScrollTo().performClick()
         awaitLoaded()
         openMore()
         menuAction("Make editable copy").assertIsNotEnabled()
@@ -400,19 +398,25 @@ class PlaylistManagementHostTest {
                             removed.set(true)
                             typedJson(summary())
                         }
-                        path == "$detailPath/entries" -> {
+                        path == "$detailPath/entries" && !derived -> {
                             val entries = listOf(PersonalPlaylistEntry("first-entry", 0, track)) +
                                 if (removed.get()) emptyList() else listOf(PersonalPlaylistEntry("second-entry", 1, track))
                             typedJson(PersonalEntriesPage(entries, total - if (removed.get()) 1 else 0,
                                 limit = request.requestUrl!!.queryParameter("limit")?.toInt() ?: 40))
                         }
-                        path == "$detailPath/evaluation" -> {
+                        path == "$detailPath/entries" && derived -> {
                             if (!evaluationGate.await(20, TimeUnit.SECONDS)) failure(503)
                             else if (failEvaluation.get()) failure(409)
-                            else typedJson(DerivedEvaluationPage(listOf(
-                                DerivedEvaluationEntry("first-path", "opaque.first.signature", 0, track),
-                                DerivedEvaluationEntry("second-path", "opaque.second.signature", 1, track),
-                            ), total.toLong(), total.toLong(), 40, null, 5, "evaluation-fence", true))
+                            else {
+                                val items = if (total > 40) (0 until 40).map { index ->
+                                    DerivedEvaluationEntry("path-$index", "opaque.$index.signature", index.toLong(), track)
+                                } else listOf(
+                                    DerivedEvaluationEntry("first-path", "opaque.first.signature", 0, track),
+                                    DerivedEvaluationEntry("second-path", "opaque.second.signature", 1, track),
+                                )
+                                typedJson(DerivedEvaluationPage(items, total.toLong(), total.toLong(), 40,
+                                    if (total > 40) "next-page" else null, 5, "evaluation-fence", true))
+                            }
                         }
                         path == "$detailPath/definition" -> typedJson(DerivedDefinitionResult(Recipe(
                             listOf(RecipeSource.Likes("s_00000000000000000000000000000001")), RecipeDuplicates.KEEP, RecipeSort.SOURCE_ORDER,
@@ -445,7 +449,8 @@ class PlaylistManagementHostTest {
                 path != "/api/auth/login" && !readOnlyStatus
         }
         fun awaitLoaded() = await {
-            noProgress() && compose.onAllNodesWithContentDescription(songMore).fetchSemanticsNodes().size == if (removed.get()) 1 else 2
+            val count = compose.onAllNodesWithContentDescription(songMore).fetchSemanticsNodes().size
+            noProgress() && if (total > 40) count > 0 else count == if (removed.get()) 1 else 2
         }
     }
 

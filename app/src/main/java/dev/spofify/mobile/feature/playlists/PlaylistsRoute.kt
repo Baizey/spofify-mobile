@@ -18,6 +18,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import dev.spofify.mobile.feature.library.CatalogPlaybackFeedback
 import dev.spofify.mobile.feature.library.MusicListLayout
 import dev.spofify.mobile.feature.library.MusicRow
@@ -32,6 +35,7 @@ import dev.spofify.mobile.playback.PlaybackRequests
 import dev.spofify.mobile.playback.queueIntentSelection
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** Entries have no revision: these checks supplement, never replace, the before/after summaries. */
@@ -47,7 +51,7 @@ private fun samePlaylistSnapshot(before: PersonalPlaylistSummary, after: Persona
     before.id == after.id && before.kind == after.kind && before.revision == after.revision &&
         before.trackCount == after.trackCount && before.availableCount == after.availableCount
 
-private fun playlistBrowseChanged() = ApiException(409, "Playlist results changed. Refresh before continuing.")
+private fun playlistBrowseChanged() = ApiException(409, "Playlist results changed. Reload before continuing.")
 
 internal fun validatePlaylistEvaluationPrefix(items: List<DerivedEvaluationEntry>, total: Long, nextCursor: String?) {
     if (items.withIndex().any { (index, entry) -> entry.position != index.toLong() } ||
@@ -159,6 +163,8 @@ internal class PlaylistDetailBrowseMemory(change: Long) {
     val derivedEntries = mutableStateOf<List<DerivedEvaluationEntry>>(emptyList())
     val offset = mutableIntStateOf(0)
     val appendError = mutableStateOf<String?>(null)
+    val fetchFailed = mutableStateOf(false)
+    val observationChecks = mutableIntStateOf(0)
     val browseChange = mutableLongStateOf(change)
     val usedCursors = mutableStateOf<Set<String>>(emptySet())
     val refresh = mutableIntStateOf(0)
@@ -252,7 +258,7 @@ fun PlaylistsRoute(
                     if (requests.accepts(ticket) && client.currentSession() === session &&
                         memory.navigationVersion.longValue == navigation && selectedId == null && !creating) {
                         if (e is ApiException && (e.status in 200..299 || e.status == 409)) {
-                            message = "Playlists changed. Refresh to continue."; appendError = null
+                            message = null; appendError = "Playlists changed. Reload the list to continue."; failedIndexReset = true
                         } else { appendError = "Playlists could not load."; failedIndexReset = reset }
                     }
                 } finally {
@@ -296,11 +302,10 @@ fun PlaylistsRoute(
                 item {
                     Row {
                         Button(onClick = { creating = true }) { Text("Create playlist") }
-                        TextButton(onClick = { refresh++; loadIndex(reset = true) }, enabled = !loading && !appending) { Text("Refresh") }
                     }
                     if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
                     message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                    if (indexChanged) Text("Playlists changed. Refresh to continue.")
+                    if (indexChanged && loading) Text("Playlists changed. Updating list…")
                 }
                 items(page?.items.orEmpty(), key = { it.id }) { playlist ->
                     PlaylistCard(playlist, onClick = { memory.openPlaylist(playlist.id) })
@@ -334,17 +339,17 @@ private fun PlaylistCard(playlist: PersonalPlaylistSummary, onClick: () -> Unit)
 
 private fun playlistFailure(error: Exception, mutation: Boolean = false): String = when {
     error is ApiException && error.code == "SOURCE_REFERENCED" -> "Another recipe references this playlist. Remove those references explicitly before deleting it."
-    error is ApiException && error.code == "PLAYLIST_KIND_MISMATCH" -> "This operation is not supported by this playlist type. Refresh and review the playlist."
+    error is ApiException && error.code == "PLAYLIST_KIND_MISMATCH" -> "This operation is not supported by this playlist type. Reload and review the playlist."
     error is ApiException && error.code == "COPY_LIMIT_EXCEEDED" -> "The complete result exceeds 1,000 occurrences. No editable copy was created."
     error is ApiException && error.code == "RECIPE_CYCLE" -> "These collection references form a cycle. Choose different sources or membership conditions."
     error is ApiException && error.code == "RECIPE_LIMIT_EXCEEDED" -> "The recipe exceeds supported graph or condition limits. Simplify it."
     error is ApiException && error.code == "OCCURRENCE_UNAVAILABLE" -> "This occurrence has no recorded audio. No queue was replaced."
-    error is ApiException && error.status == 409 -> "The playlist or its inputs changed. Refresh and review before trying again. Nothing was resubmitted."
+    error is ApiException && error.status == 409 -> "The playlist or its inputs changed. Verify the saved playlist before trying again. Nothing was resubmitted."
     error is ApiException && error.status == 429 -> "Playlist is updating. Try again in a moment."
     error is ApiException && error.status == 422 -> "The request could not be accepted. Check the rules and limits. Copies require at most 1,000 complete occurrences; referenced playlists cannot be deleted."
     error is ApiException && error.status == 404 -> "This playlist or a referenced collection is unavailable."
     mutation && playlistWriteUncertain(error) -> "The response was lost. This change may already be saved. Verify saved playlists before making another change; nothing was resubmitted."
-    else -> "The request could not finish. Refresh explicitly; no partial result is current."
+    else -> "The request could not finish. No partial result is current."
 }
 
 @Composable
@@ -392,6 +397,7 @@ private fun PlaylistDetail(
     var message by browse.message
     var readSource by browse.readSource
     var reconcileOnNextRead by remember(id) { mutableStateOf(false) }
+    var fetchFailed by browse.fetchFailed
     var metadata by remember(id) { mutableStateOf(false) }
     var deleting by remember(id) { mutableStateOf(false) }
     var removing by remember(id) { mutableStateOf<PlaylistRowSelection?>(null) }
@@ -420,7 +426,8 @@ private fun PlaylistDetail(
     var ordered by remember(id) { mutableStateOf<List<PersonalPlaylistEntry>>(emptyList()) }
     val listState = rememberLazyListState()
 
-    fun refreshAll(verifyBlocked: Boolean = false) {
+    fun refreshAll(verifyBlocked: Boolean = false, resetObservationBudget: Boolean = true) {
+        if (resetObservationBudget) browse.observationChecks.intValue = 0
         generation.invalidate(); browseRequests.invalidate(); appendJob?.cancel(); appending = false
         reconcileOnNextRead = verifyBlocked && blocked
         stale = true; snapshot = null; offset = 0; appendError = null; usedCursors = emptySet()
@@ -447,8 +454,9 @@ private fun PlaylistDetail(
         val request = browseRequests.invalidate()
         val session = client.currentSession()
         val change = client.personalRevision.value.playlists
+        if (change != browseChange) browse.observationChecks.intValue = 0
         fun current() = source.isCurrent() && navigationCurrent() && generation.accepts(ticket) && browseRequests.accepts(request) && client.currentSession() === session
-        busy = true; stale = true; appendError = null
+        busy = true; stale = true; appendError = null; fetchFailed = false
         try {
             val saved = api.playlist(id)
             if (current()) summary = saved
@@ -476,8 +484,41 @@ private fun PlaylistDetail(
                 browse.initialized.value = true
             }
         } catch (e: CancellationException) { throw e }
-        catch (e: Exception) { if (current()) { message = playlistFailure(e); stale = true; browse.initialized.value = true } }
+        catch (e: Exception) { if (current()) { message = "Playlist could not load."; fetchFailed = true; stale = true; browse.initialized.value = true } }
         finally { if (generation.accepts(ticket)) busy = false }
+    }
+    // Observe only a displayed pending result, with a finite per-snapshot budget even if
+    // the server returns inconsistent status and entries. Never evaluate rules or write.
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(id, refresh, evaluation, readSource, lifecycle) {
+        val pending = evaluation ?: return@LaunchedEffect
+        val source = readSource ?: return@LaunchedEffect
+        if (pending.current || pending.evaluationState !in setOf(PlaylistEvaluationState.PENDING, PlaylistEvaluationState.STALE)) return@LaunchedEffect
+        val ticket = generation.ticket()
+        val session = client.currentSession()
+        val revision = pending.revision
+        fun current() = navigationCurrent() && source.isCurrent() && readSource === source &&
+            generation.accepts(ticket) && client.currentSession() === session && !busy && !mutating &&
+            !editing && !copying && !blocked && !fetchFailed
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (browse.observationChecks.intValue < 6) {
+                delay(2_000)
+                if (!current()) return@repeatOnLifecycle
+                browse.observationChecks.intValue++
+                try {
+                    val latest = api.playlist(id)
+                    if (!current()) return@repeatOnLifecycle
+                    if (latest.revision != revision || latest.evaluationState != pending.evaluationState) {
+                        refreshAll(resetObservationBudget = false)
+                        return@repeatOnLifecycle
+                    }
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) {
+                    if (current()) { message = "Playlist could not load."; fetchFailed = true }
+                    return@repeatOnLifecycle
+                }
+            }
+        }
     }
     fun append() {
         val baseline = summary ?: return
@@ -531,7 +572,7 @@ private fun PlaylistDetail(
             catch (e: Exception) {
                 if (current()) {
                     if (e is ApiException && (e.status == 409 || e.status == 410 || e.status in 200..299)) {
-                        stale = true; generation.invalidate(); message = playlistFailure(e); appendError = null
+                        stale = true; generation.invalidate(); message = "Playlist changed. Reload to continue."; fetchFailed = true; appendError = null
                     } else appendError = "More songs could not load."
                 }
             } finally { if (browseRequests.accepts(request)) appending = false }
@@ -617,7 +658,7 @@ private fun PlaylistDetail(
             scope.launch {
                 try {
                     val targets = api.playlists(kind = PlaylistKind.MANUAL, limit = 100)
-                    copyReviewMessage = "Saved manual playlists: ${targets.items.joinToString { it.name }}. A matching name cannot prove whether the last copy committed. Close, review saved playlists, then explicitly refresh the source before deciding on another copy."
+                    copyReviewMessage = "Saved manual playlists: ${targets.items.joinToString { it.name }}. A matching name cannot prove whether the last copy committed. Close and review saved playlists before deciding on another copy."
                     copyReviewed = true
                 } catch (e: CancellationException) { throw e }
                 catch (_: Exception) { copyReviewMessage = "Saved copies could not load. No copy was resubmitted; verify again explicitly." }
@@ -736,9 +777,6 @@ private fun PlaylistDetail(
                     }
                     HorizontalDivider()
                 }
-                TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !busy, onClick = {
-                    collectionActions = null; refreshAll(verifyBlocked = true)
-                }) { Text("Refresh") }
                 saved?.let { playlist ->
                     if (playlist.capabilities.editMetadata) TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                         enabled = managementEnabled, onClick = { collectionActions = null; metadata = true }) { Text("Edit details") }
@@ -752,7 +790,7 @@ private fun PlaylistDetail(
                                 try {
                                     val rules = derived.definition(id)
                                     if (!source.isCurrent() || !generation.accepts(ticket) || !actionLifetime.isCurrent()) return@launch
-                                    if (rules.revision != playlist.revision) { stale = true; message = "Playlist changed. Refresh before editing rules." }
+                                    if (rules.revision != playlist.revision) { stale = true; message = "Playlist changed. Reload before editing rules."; fetchFailed = true }
                                     else {
                                         if (editorDraft == null) { editorDraft = PlaylistEditorDraft(playlist, rules.definition); editorTarget = playlist }
                                         else if (editorTarget?.revision != rules.revision) {
@@ -824,6 +862,8 @@ private fun PlaylistDetail(
                 }
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                if (!busy && fetchFailed) TextButton(onClick = { refreshAll() }) { Text("Retry loading playlist") }
+                if (!busy && blocked) TextButton(onClick = { refreshAll(verifyBlocked = true) }) { Text("Verify saved playlist") }
                 if (stale && saved?.kind == PlaylistKind.DERIVED && message == null) Text(playlistCountLabel(saved, evaluation))
                 if (copyNeedsReview) Text("A copy may already exist. Use More to verify saved copies.")
                 if (!busy && !stale && (if (saved?.kind == PlaylistKind.DERIVED) evaluation?.total == 0L else saved?.trackCount == 0L)) Text("No songs in this playlist.")

@@ -51,6 +51,7 @@ class PlaylistContinuousHostTest {
         val reads = Collections.synchronizedList(mutableListOf<Int>())
         val summaryReads = AtomicInteger()
         val preparations = AtomicInteger()
+        val regenerationRequests = AtomicInteger()
         val failNextAppend = AtomicBoolean()
         val holdAppend = AtomicBoolean()
         val enteredAppend = CountDownLatch(1)
@@ -66,6 +67,7 @@ class PlaylistContinuousHostTest {
                     val url = request.requestUrl!!
                     val path = url.encodedPath
                     if (path.endsWith("/playback")) preparations.incrementAndGet()
+                    if (path.endsWith("/evaluation") || path.endsWith("/preview")) regenerationRequests.incrementAndGet()
                     return when (path) {
                         "/api/auth/login" -> json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
                             .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
@@ -80,8 +82,8 @@ class PlaylistContinuousHostTest {
                         }
                         "/api/me/playlists/fixture/entries" -> if (source == Source.INDEX)
                             json("""{"items":[{"id":"entry-0","position":0,"track":{"kind":"track","id":"same","name":"Song 0","hasAudio":true}}],"total":1,"offset":0,"limit":40}""")
+                        else if (source == Source.DERIVED) batch(url.queryParameter("cursor")?.removePrefix("cursor-")?.toInt() ?: 0)
                         else batch(url.queryParameter("offset")!!.toInt())
-                        "/api/me/playlists/fixture/evaluation" -> batch(url.queryParameter("cursor")?.removePrefix("cursor-")?.toInt() ?: 0)
                         "/api/me/likes/status" -> json("""{"items":[{"trackId":"same","liked":false}]}""")
                         else -> MockResponse().setResponseCode(404)
                     }
@@ -167,6 +169,7 @@ class PlaylistContinuousHostTest {
             advanceSourceEpoch = { sourceEpoch.value++ })) }
         finally { compose.runOnIdle { shown.value = false }; compose.waitForIdle() }
         assertEquals(0, fixture.preparations.get())
+        assertEquals(0, fixture.regenerationRequests.get())
     }
     private class MutableHost(val accepted: MutableList<Pair<QueueIntentSelection, PlaybackListAction>>,
         val heartbeat: () -> Unit, val navigate: (String?) -> Unit, val back: () -> Unit,
@@ -177,6 +180,7 @@ class PlaylistContinuousHostTest {
             fixture.overlapIndex.set(true)
             host(fixture) { host ->
                 await { visible("Playlist 0") }
+                compose.onNodeWithText("Refresh").assertDoesNotExist()
                 assertEquals(listOf(0), fixture.requests()) // An offscreen frontier cannot load.
                 scroll("playlist-38")
                 await { fixture.requests().size == 2 && appendSettled() }
@@ -299,9 +303,9 @@ class PlaylistContinuousHostTest {
                 row.performTouchInput { down(Offset(80f, 24f)); moveTo(Offset(180f, 24f)) }
                 assertTrue("The physical-right gesture is held beyond its commit threshold",
                     row.getUnclippedBoundsInRoot().left > before.left)
-                // A semantics tap leaves the row pointer held while the real host explicitly resets.
+                // A known input change triggers a read-only resync while the pointer is held.
                 // The synthetic server deliberately returns identical revision/fence/occurrence values.
-                compose.onNodeWithText("Refresh").performClick()
+                compose.runOnIdle { fixture.client.notifyPersonalChange(PersonalCollection.LIKES) }
                 await {
                     fixture.requests() == listOf(0, 0) &&
                         compose.onAllNodes(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsProperties.ProgressBarRangeInfo))
@@ -366,7 +370,7 @@ class PlaylistContinuousHostTest {
                 scroll("path-38")
                 await { fixture.requests().size == 2 && appendSettled() }
                 compose.onNode(hasScrollToIndexAction()).performScrollToIndex(0)
-                await { visible("The playlist or its inputs changed. Refresh and review before trying again. Nothing was resubmitted.") }
+                await { visible("Playlist changed. Reload to continue.") }
                 compose.onNodeWithText("Song 0").assertExists()
                 compose.onAllNodesWithText("All songs loaded.").assertCountEquals(0)
                 compose.onAllNodesWithText("Retry").assertCountEquals(0)
@@ -386,8 +390,8 @@ class PlaylistContinuousHostTest {
                 scroll(if (source == Source.MANUAL) "entry-38" else "path-38")
                 await { fixture.requests().size == 2 && appendSettled() }
                 compose.onNode(hasScrollToIndexAction()).performScrollToIndex(0)
-                await { visible("The playlist or its inputs changed. Refresh and review before trying again. Nothing was resubmitted.") }
-                compose.onAllNodesWithText("Retry").assertCountEquals(0)
+                await { visible("Playlist changed. Reload to continue.") }
+                compose.onNodeWithText("Retry loading playlist").assertExists()
                 scroll(if (source == Source.MANUAL) "entry-0" else "path-0")
                 compose.onNodeWithText("Song 0").assertExists()
                 compose.onNodeWithContentDescription("More actions for Song 0").performClick()

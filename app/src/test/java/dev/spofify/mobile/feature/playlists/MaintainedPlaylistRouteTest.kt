@@ -38,7 +38,8 @@ class MaintainedPlaylistRouteTest {
     @get:Rule val compose = createComposeRule(effectContext = StandardTestDispatcher(scheduler))
 
     @Test fun unchangedRulesCancelAndAddDismissKeepSavedResultUsableWithoutAnotherRead() = fixture { f ->
-        awaitText("1 tracks · 1 with audio")
+        awaitText("1 song")
+        openPlaylistMore()
         compose.onNodeWithText("Edit rules").performScrollTo().performClick()
         awaitText("Back — keep draft")
         compose.onNodeWithText("Back — keep draft").performClick()
@@ -103,7 +104,7 @@ class MaintainedPlaylistRouteTest {
         compose.onNodeWithText("Play now").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Done").performClick()
         f.resultState = "error"
-        compose.onNodeWithText("Refresh").performScrollTo().performClick()
+        compose.runOnIdle { f.client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
         awaitText("1 tracks · 1 with audio · Previous result; update failed")
         compose.onNodeWithText("Play").performScrollTo().assertIsNotEnabled()
         assertTrue(f.actions.isEmpty())
@@ -111,14 +112,57 @@ class MaintainedPlaylistRouteTest {
         compose.runOnIdle { f.shown.value = false }
         compose.waitForIdle()
         compose.runOnIdle { f.shown.value = true }
-        awaitText("1 tracks · 1 with audio")
+        awaitText("1 song")
         compose.onNodeWithText("Play").performScrollTo().assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(PlaybackListAction.PLAY_NOW, f.actions.single().action) }
         assertEquals(4, f.entries.get())
+        assertTrue(f.paths.none { it.contains("/evaluation") || it.contains("/preview") || it.contains("/playback") })
+        assertEquals(0, f.mutations.get())
+    }
+
+    @Test fun pendingResultBecomesReadyFromServerStatusWithoutLocalChangeOrRefresh() = fixture(initialState = "pending") { f ->
+        awaitText("1 tracks · 1 with audio · Updating; previous result")
+        compose.onNodeWithText("Play").assertIsNotEnabled()
+        assertEquals(1, f.entries.get())
+        f.resultState = "ready"
+        compose.runOnIdle { scheduler.advanceTimeBy(2_001) }
+        compose.waitUntil(5_000) { compose.waitForIdle(); f.entries.get() == 2 }
+        awaitText("1 song")
+        compose.onNodeWithText("Play").assertIsEnabled()
+        assertEquals(0, f.mutations.get())
+        assertTrue(f.paths.none { it.contains("/evaluation") || it.contains("/preview") || it.contains("/playback") })
+    }
+
+    @Test fun leavingPendingPlaylistCancelsStatusObservation() = fixture(initialState = "pending") { f ->
+        awaitText("1 tracks · 1 with audio · Updating; previous result")
+        val reads = f.paths.count { it == "/api/me/playlists/rules" }
+        compose.runOnIdle { f.shown.value = false }
+        compose.waitForIdle()
+        compose.runOnIdle { scheduler.advanceTimeBy(20_000) }
+        compose.waitForIdle()
+        assertEquals(reads, f.paths.count { it == "/api/me/playlists/rules" })
+        assertEquals(1, f.entries.get())
+        assertEquals(0, f.mutations.get())
+    }
+
+    @Test fun failedFetchOffersRetryWithoutRepeatingMutationOrRegenerating() = fixture { f ->
+        awaitText("Song 0")
+        f.failSummaryReads = true
+        compose.runOnIdle { f.client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
+        awaitText(readFailure)
+        compose.onNodeWithText("Retry loading playlist").assertIsEnabled()
+        compose.onNodeWithText("Song 0").assertExists()
+        f.failSummaryReads = false
+        compose.onNodeWithText("Retry loading playlist").performClick()
+        awaitText("1 song")
+        compose.onAllNodesWithText("Retry loading playlist").assertCountEquals(0)
+        assertEquals(0, f.mutations.get())
+        assertTrue(f.paths.none { it.contains("/evaluation") || it.contains("/preview") || it.contains("/playback") })
     }
 
     @Test fun copyDialogDoesNotBorrowNewFenceAfterConfirmedInputChange() = fixture { f ->
         awaitText("Song 0")
+        openPlaylistMore()
         compose.onNodeWithText("Make editable copy").performScrollTo().performClick()
         awaitText("Save")
         f.likes.incrementAndGet()
@@ -127,6 +171,7 @@ class MaintainedPlaylistRouteTest {
         compose.onAllNodesWithText("Save").assertCountEquals(0)
         compose.onNodeWithText("Cancel").performClick()
         compose.waitUntil(5_000) { compose.waitForIdle(); f.entries.get() == 2 }
+        openPlaylistMore()
         compose.onNodeWithText("Make editable copy").performScrollTo().performClick()
         awaitText("Save")
         compose.onNodeWithText("Save").performClick()
@@ -169,12 +214,14 @@ class MaintainedPlaylistRouteTest {
         assertWriteControlsBlocked(f)
         assertEquals(1, f.mutations.get())
 
-        compose.onNodeWithText("Refresh").performScrollTo().performClick()
+        compose.onNodeWithText("Verify saved playlist").performScrollTo().performClick()
         compose.waitUntil(5_000) {
             compose.waitForIdle()
             compose.onAllNodesWithText(readFailure).fetchSemanticsNodes().isEmpty()
         }
+        openPlaylistMore()
         compose.onNodeWithText("Edit details").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Done").performClick()
         assertEquals("Reconciliation is read-only; the uncertain write is never replayed", 1, f.mutations.get())
     }
 
@@ -195,6 +242,7 @@ class MaintainedPlaylistRouteTest {
 
     private fun makeMetadataWriteUncertain(f: Fixture) {
         awaitText("Song 0")
+        openPlaylistMore()
         compose.onNodeWithText("Edit details").performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
         awaitText("Verify saved playlist")
@@ -203,15 +251,18 @@ class MaintainedPlaylistRouteTest {
     }
 
     private fun assertWriteControlsBlocked(f: Fixture) {
-        compose.onNodeWithText("Edit details").performScrollTo().assertIsNotEnabled().performClick()
-        compose.onNodeWithText("Delete").performScrollTo().assertIsNotEnabled().performClick()
+        openPlaylistMore()
+        compose.onNodeWithText("Edit details").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Delete").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Edit rules").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Make editable copy").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Done").performClick()
         compose.onAllNodesWithText("Save").assertCountEquals(0)
         assertEquals("Failed/cancelled verification cannot admit a second mutation", 1, f.mutations.get())
     }
 
-    private val readFailure = "The request could not finish. Refresh explicitly; no partial result is current."
+    private val readFailure = "Playlist could not load."
+    private fun openPlaylistMore() = compose.onNodeWithContentDescription("More actions for Rules").performScrollTo().performClick()
     private fun more(song: String) = compose.onNodeWithContentDescription("More actions for $song").performScrollTo().performClick()
     private fun awaitText(text: String) {
         compose.waitUntil(5_000) { compose.waitForIdle(); compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty() }
@@ -243,9 +294,10 @@ class MaintainedPlaylistRouteTest {
         }
     }
 
-    private fun fixture(body: (Fixture) -> Unit) {
+    private fun fixture(initialState: String = "ready", body: (Fixture) -> Unit) {
         MockWebServer().use { web ->
             val f = Fixture(web)
+            f.resultState = initialState
             web.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse {
                     val path = request.requestUrl!!.encodedPath
