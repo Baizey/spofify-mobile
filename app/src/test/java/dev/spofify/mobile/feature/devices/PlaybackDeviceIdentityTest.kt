@@ -22,10 +22,42 @@ class PlaybackDeviceIdentityTest {
     private val context: Context get() = ApplicationProvider.getApplicationContext()
     private val preferences get() = context.getSharedPreferences(PlaybackDeviceIdentityStore.PREFERENCES, Context.MODE_PRIVATE)
     private val key: SecretKey = SecretKeySpec(ByteArray(32) { (it + 1).toByte() }, "AES")
-    private fun store(origin: String = "https://music.example", account: String = "account-one") =
-        PlaybackDeviceIdentityStore(preferences, { key }, ServerAddress.parse(origin), account)
+    private fun store(origin: String = "https://music.example", account: String = "account-one", androidId: String? = null) =
+        PlaybackDeviceIdentityStore(preferences, { key }, ServerAddress.parse(origin), account, { androidId })
 
     @Before fun reset() { assertTrue(preferences.edit().clear().commit()) }
+
+    @Test fun validAndroidIdIsDomainSeparatedStableAndPrivateAcrossRecreationAndStorageReset() {
+        val raw = "1234567890abcdef"
+        val first = store(androidId = raw).readOrCreate("Phone")
+        assertTrue(validPlaybackInstallationId(first.stableDeviceId))
+        assertEquals(64, first.stableDeviceId.length)
+        assertFalse(first.stableDeviceId.contains(raw))
+        assertEquals(first.stableDeviceId, store(androidId = raw.uppercase()).readOrCreate().stableDeviceId)
+        val distinct = listOf(first.stableDeviceId,
+            store(account = "account-two", androidId = raw).readOrCreate().stableDeviceId,
+            store(origin = "http://music.example", androidId = raw).readOrCreate().stableDeviceId,
+            store(origin = "https://music.example:8443", androidId = raw).readOrCreate().stableDeviceId,
+            store(androidId = "abcdef1234567890").readOrCreate().stableDeviceId)
+        assertEquals(5, distinct.toSet().size)
+        assertFalse(preferences.all.toString().contains(raw))
+        assertTrue(preferences.edit().clear().commit())
+        val recreated = store(androidId = raw).readOrCreate()
+        assertNotEquals(first.installationId, recreated.installationId)
+        assertEquals(first.stableDeviceId, recreated.stableDeviceId)
+    }
+
+    @Test fun invalidAbsentAndKnownBadAndroidIdsUseSecurelyPersistedDistinctRandomFallback() {
+        for (bad in listOf(null, "", "null", "short", "1234567890abcdeg", "9774d56d682e549c", "0000000000000000", "ffffffffffffffff")) {
+            assertTrue(preferences.edit().clear().commit())
+            val one = store(androidId = bad).readOrCreate()
+            assertTrue(validPlaybackInstallationId(one.stableDeviceId))
+            assertEquals(one.stableDeviceId, store(androidId = bad).readOrCreate().stableDeviceId)
+            assertNotEquals(one.stableDeviceId, store(account = "other", androidId = bad).readOrCreate().stableDeviceId)
+            assertTrue(preferences.edit().clear().commit())
+            assertNotEquals(one.stableDeviceId, store(androidId = bad).readOrCreate().stableDeviceId)
+        }
+    }
 
     @Test fun installationAndConfirmedNameSurviveStoreRecreationWithoutPersistingServerDeviceId() {
         val original = store().readOrCreate("Phone 🎵")

@@ -31,6 +31,7 @@ class ApiTransport(val client: SpofifyClient) {
         body: JsonObject? = null,
         query: Map<String, String> = emptyMap(),
         playbackExtensions: Boolean = false,
+        playbackRegistration: Boolean = false,
     ): JsonObject? {
         require(method in setOf("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")) { "Unsupported API method" }
         require(path.isNotEmpty() && path.none { segment -> segment.isEmpty() || segment == "." || segment == ".." || segment.any { it.isISOControl() } }) { "Invalid API path" }
@@ -44,11 +45,12 @@ class ApiTransport(val client: SpofifyClient) {
             else -> null
         }
         val deviceRequest = path == listOf("api", "me", "player")
-        require(!playbackExtensions || deviceRequest)
+        require(!(playbackExtensions || playbackRegistration) || deviceRequest)
         val request = Request.Builder().url(url).header("Accept", "application/json").apply {
             if (playbackExtensions) header("X-Spofify-Playback-Extensions", "queue-intents-v1")
+            if (playbackRegistration) header("X-Spofify-Playback-Registration", "installation-v1")
         }.method(method, payload).build()
-        return client.response(request, errorFactory = { safeApiError(it, deviceRequest, playbackExtensions) }) { response ->
+        return client.response(request, errorFactory = { safeApiError(it, deviceRequest, playbackExtensions, playbackRegistration) }) { response ->
             if (response.code == 204) null
             else {
                 requireJson(response)
@@ -99,7 +101,7 @@ private val SAFE_ERROR_CODES = setOf(
     "EVALUATION_BUSY", "EVALUATION_TIMEOUT", "EVALUATION_FAILED",
 )
 
-private fun safeApiError(response: Response, deviceRequest: Boolean, playbackExtensions: Boolean): ApiException {
+private fun safeApiError(response: Response, deviceRequest: Boolean, playbackExtensions: Boolean, playbackRegistration: Boolean): ApiException {
     // A server's free-form message is never surfaced, even when the typed code is recognized.
     val deviceConflict = deviceRequest && response.code in setOf(404, 409)
     val root = if (isJson(response)) {
@@ -119,7 +121,7 @@ private fun safeApiError(response: Response, deviceRequest: Boolean, playbackExt
     val reconciliation = if (deviceConflict && root != null && directives != null && directives.isEmpty()) {
         try {
             require(root["queueIntents"]?.jsonObject?.get("directives")?.let { it is JsonArray && it.isEmpty() } != false)
-            val view = PlaybackDevicesView.fromJson(JsonObject(root.filterKeys { it != "error" }), playbackExtensions)
+            val view = PlaybackDevicesView.fromJson(JsonObject(root.filterKeys { it != "error" }), playbackExtensions, playbackRegistration)
             view.toJson()
         } catch (_: IllegalArgumentException) { null }
     } else null

@@ -233,7 +233,11 @@ class SpofifyClient internal constructor(
 
     /** Only the fixed player leave may outlive clearSession/cancelAll. No client, store, session
      * object or mutable auth provider escapes. The clock seam is per capability, for core tests. */
-    internal fun preparePlaybackLeave(deviceId: String, nanoTime: () -> Long = System::nanoTime): suspend () -> Unit {
+    internal fun preparePlaybackLeave(deviceId: String, nanoTime: () -> Long = System::nanoTime): suspend () -> Unit =
+        preparePlaybackLeave(deviceId, registrationGeneration = null, nanoTime = nanoTime)
+
+    internal fun preparePlaybackLeave(deviceId: String, registrationGeneration: String?, nanoTime: () -> Long = System::nanoTime): suspend () -> Unit {
+        require(registrationGeneration == null || validPlaybackProtocolId(registrationGeneration))
         require(validPlaybackProtocolId(deviceId)) { "Invalid playback device identifier" }
         val capturedAt = nanoTime()
         val request = synchronized(lock) {
@@ -242,13 +246,17 @@ class SpofifyClient internal constructor(
             val oldAddress = playbackLeaveAddress
             if (oldCookie == null || oldSession == null || oldAddress == null || oldCookie.expiresAt <= System.currentTimeMillis()) null
             else {
-                val body = buildJsonObject { put("action", "leave"); put("deviceId", deviceId) }.toString()
+                val body = buildJsonObject {
+                    put("action", "leave"); put("deviceId", deviceId)
+                    registrationGeneration?.let { put("registrationGeneration", it) }
+                }.toString()
                 PlaybackLeaveAuthority(
                     Request.Builder().url(server.url("api", "me", "player"))
                         .header("Origin", server.origin)
                         .header("Cookie", "${oldCookie.name}=${oldCookie.value}")
                         .header("X-CSRF-Token", oldSession.csrfToken)
                         .header("Accept", "application/json")
+                        .apply { if (registrationGeneration != null) header("X-Spofify-Playback-Registration", "installation-v1") }
                         .post(OneShotBody(body.toRequestBody("application/json; charset=utf-8".toMediaType())))
                         .build(),
                     oldCookie.expiresAt, oldAddress,

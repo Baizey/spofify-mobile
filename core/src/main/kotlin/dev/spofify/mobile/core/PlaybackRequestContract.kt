@@ -10,6 +10,17 @@ object PlaybackRequestContract {
         val root = PlaybackRawJson.parse(raw)
         requireWireTypes(root)
         val action = root.getValue("action").jsonPrimitive.content
+        root["registrationGeneration"]?.let { require(action != "register" && validPlaybackProtocolId(it.jsonPrimitive.content)) }
+        root["targetRegistrationGeneration"]?.let { require(action == "transfer" && validPlaybackProtocolId(it.jsonPrimitive.content)) }
+        root["registration"]?.let {
+            require(action == "register")
+            val registration = it.jsonObject
+            require(registration.keys == setOf("deviceId", "receiverId", "attemptId", "expectedGeneration", "admissionToken"))
+            require(validPlaybackInstallationId(registration.getValue("deviceId").jsonPrimitive.content))
+            listOf("receiverId", "attemptId", "expectedGeneration", "admissionToken").forEach { key ->
+                require(validPlaybackProtocolId(registration.getValue(key).jsonPrimitive.content))
+            }
+        }
         when (action) {
             "register" -> {
                 require(validPlaybackDeviceName(root.getValue("name").jsonPrimitive.content))

@@ -77,6 +77,8 @@ class PlaybackCoordinator(
     // Negotiation belongs to this authenticated coordinator, not an installation/name.
     private var queueIntentsNegotiated = false
     private var receiverRegistered = false
+    private var registrationReceiverId = UUID.randomUUID().toString()
+    private var ownRegistration: PlaybackRegistrationDevice? = null
 
     private suspend fun probeQueueIntents(): PlaybackDevicesView {
         val life = lifecycle
@@ -215,7 +217,7 @@ class PlaybackCoordinator(
     private var ackQueueIntentState: QueueIntentState? = null
     private var pendingFinalClose: PlaybackFinalClose? = null
     private var finalCloseVersion = 0L
-    private data class Selection(val target: String, val version: Long)
+    private data class Selection(val target: String, val version: Long, val registrationGeneration: String?)
 
     private enum class HandoffPhase { ACCEPTED, AWAITING_ACTIVATION, RETIRED }
     /** Memory-only correlation, never a lease or playback permission. After reconciliation
@@ -393,6 +395,8 @@ class PlaybackCoordinator(
             // Binding is not a user cancellation: preserve a genuine pre-bind Play request.
             fenceLocal(invalidateActions = false)
             managedOutput = true
+            registrationReceiverId = endpoint.exportQueueIntentState()?.receiverId ?: UUID.randomUUID().toString()
+            ownRegistration = null
             heartbeat = work.launch {
                 // UI reattachment never enters this branch. Actual disposal/recreation must
                 // not race a still-running exact-ID leave with the next registration.
@@ -542,7 +546,8 @@ class PlaybackCoordinator(
         retainedPreparedEpoch = 0L
         val pendingHandoffActivation = activating && handoffWitness?.phase == HandoffPhase.AWAITING_ACTIVATION
         retireHandoff() // Same-target selection and A -> B -> A also retire the old request.
-        val selection = Selection(targetDeviceId, ++selectionVersion)
+        val selection = Selection(targetDeviceId, ++selectionVersion,
+            state.value.view?.registration?.devices?.find { it.deviceId == targetDeviceId }?.registrationGeneration)
         // Do not let a queued/suspended explicit local action follow a newer output choice.
         val pendingLocalExecution = commandJob?.isActive == true && endpointJob?.isActive == true
         commandJob?.cancel()
@@ -579,7 +584,7 @@ class PlaybackCoordinator(
                         }
                         val id = state.value.deviceId; val sentEpoch = epoch; val revision = actionVersion
                         request {
-                            api.transfer(id, sentEpoch, commandId, latest.target, latest.version).validated().also {
+                            api.transfer(id, sentEpoch, commandId, latest.target, latest.version, latest.registrationGeneration).validated().also {
                                 rememberHandoff(latest, id, commandId, sentEpoch, life, revision, it)
                             }
                         }
@@ -1018,8 +1023,8 @@ class PlaybackCoordinator(
     fun continuePlaybackHere() { if (state.value.needsTap) remoteCommand(PlaybackDeviceCommand.transport("retry")) }
 
     private suspend fun register(): Unit = verifyConnection {
-        // register(name) creates an ephemeral server ID and has no idempotency key.
-        // A lost response may have succeeded: do not create an orphan every heartbeat/tap.
+        // Legacy registration is uncertain after a lost reply. Managed enrollment retains
+        // one exact attempt in the API for idempotent lookup; neither path starts music.
         // Manual Retry/action paths also call register under transport: never join a leave
         // while holding its mutex. The heartbeat awaits completion outside the lock.
         if (predecessorDisposal?.isCompleted == false || disposal?.isCompleted == false ||
@@ -1027,17 +1032,25 @@ class PlaybackCoordinator(
         mutableState.value = state.value.copy(connecting = true)
         val life = lifecycle
         try {
-            val deviceName = try { identity?.invoke()?.readOrCreate(name)?.name ?: name } catch (_: Exception) { name }
+            val deviceIdentity = try { identity?.invoke()?.readOrCreate(name) } catch (_: Exception) { null }
+            val deviceName = deviceIdentity?.name ?: name
             // Read-only negotiation MUST precede any extension-bearing mutation. Older
             // servers return an absent sidecar, then receive the exact legacy register.
-            probeQueueIntents()
+            val capabilities = probeQueueIntents()
             if (life != lifecycle || closed || !serviceActive) return@verifyConnection
+            // A negotiated server must never silently fall back to ephemeral registrations
+            // when encrypted fallback persistence failed.
+            check(capabilities.registration == null || deviceIdentity != null) { "Stable playback identity is unavailable" }
             val capable = queueIntentsNegotiated && endpoint.supportsQueueIntents
+            // Queue-intent publication and installation registration describe the SAME
+            // live service receiver, not two independently rotated incarnation tokens.
+            if (capable) registrationReceiverId = requireNotNull(endpoint.exportQueueIntentState()).receiverId
             receiverRegistered = capable
             // Record uncertainty BEFORE dispatch, so cancellation/lifecycle replacement
             // cannot reopen the write floodgate. Probe failures never mark a sent write.
             val attempt = registrationPacing.dispatched(clockMs())
-            request(registration = true) { api.register(deviceName, if (capable) 1 else null) }
+            request(registration = true) { api.register(deviceName, if (capable) 1 else null,
+                deviceIdentity?.stableDeviceId, registrationReceiverId) }
             if (life == lifecycle && !closed && serviceActive && state.value.deviceId.isNotEmpty()) {
                 registrationPacing.confirmed(attempt)
             }
@@ -1239,6 +1252,14 @@ class PlaybackCoordinator(
         admissionPublication: Pair<String, Long>? = null,
         handoffReconciliation: HandoffWitness? = null,
     ) {
+        if (registration) {
+            ownRegistration = view.registration?.devices?.singleOrNull { it.deviceId == view.deviceId }
+            require(view.registration == null || ownRegistration?.receiverId == registrationReceiverId)
+        } else ownRegistration?.let { own ->
+            require(view.registration?.devices?.singleOrNull { it.deviceId == own.deviceId } == own) {
+                "Playback registration was replaced"
+            }
+        }
         if (!registration && view.epoch < epoch) return
         if (!registration && view.epoch == epoch && view.stateSeq < (state.value.view?.stateSeq ?: 0)) return
         requireHandoffSidecars(view)
