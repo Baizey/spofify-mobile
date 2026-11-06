@@ -198,7 +198,8 @@ class MaintainedPlaylistRouteTest {
         compose.onNodeWithText("Edit details").performScrollTo().performClick()
         compose.onNodeWithText("Save").performClick()
         awaitText("Verify saved playlist")
-        assertEquals(1, f.mutations.get())
+        assertEquals("The production metadata PATCH must receive the intended uncertain 503", 1, f.uncertainMetadataResponses.get())
+        assertEquals("No unexpected mutation method may substitute for that PATCH", 1, f.mutations.get())
     }
 
     private fun assertWriteControlsBlocked(f: Fixture) {
@@ -222,6 +223,7 @@ class MaintainedPlaylistRouteTest {
         val likes = AtomicInteger()
         val copies = AtomicInteger()
         val mutations = AtomicInteger()
+        val uncertainMetadataResponses = AtomicInteger()
         val paths = CopyOnWriteArrayList<String>()
         val copyBodies = CopyOnWriteArrayList<String>()
         val actions = mutableListOf<Action>()
@@ -254,8 +256,9 @@ class MaintainedPlaylistRouteTest {
                     return when (path) {
                         "/api/me/playlists" -> json("""{"items":[${if (request.requestUrl!!.queryParameter("kind") == "manual") manual else f.summary()}],"total":1,"limit":40,"offset":0}""")
                         "/api/me/playlists/rules" -> when (request.method) {
-                            "PUT" -> {
+                            "PATCH" -> {
                                 f.mutations.incrementAndGet()
+                                f.uncertainMetadataResponses.incrementAndGet()
                                 json("""{"error":{"code":"UNAVAILABLE","message":"Synthetic uncertain response"}}""").setResponseCode(503)
                             }
                             "GET" -> if (f.failSummaryReads) MockResponse().setResponseCode(503) else json(f.summary())
