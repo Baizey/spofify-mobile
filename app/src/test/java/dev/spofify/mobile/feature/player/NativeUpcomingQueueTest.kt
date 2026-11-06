@@ -26,6 +26,7 @@ import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -181,19 +182,20 @@ class NativeUpcomingQueueTest {
             }
         }
         for (presentation in listOf(false, true)) {
-            compose.runOnIdle { compact.value = presentation; controls.contextual.clear() }
+            compose.runOnIdle { compact.value = presentation; controls.playNexts.clear(); controls.contextual.clear() }
             compose.onAllNodesWithContentDescription("Play queued song Duplicate song").assertCountEquals(0)
             compose.onNodeWithText("Duplicate song").performTouchInput {
                 // This is in the identity target, not More or the dedicated reorder handle.
                 down(Offset(60f, 20f)); moveTo(Offset(150f, 20f))
             }
-            compose.runOnIdle { assertTrue(controls.contextual.isEmpty()) }
+            compose.runOnIdle { assertTrue(controls.playNexts.isEmpty()) }
             compose.onNodeWithText("Duplicate song").performTouchInput { up() }
-            compose.runOnIdle { assertEquals(listOf("exact-duplicate"), controls.contextual) }
+            compose.runOnIdle { assertEquals(listOf(key to "exact-duplicate"), controls.playNexts) }
             compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
             compose.onNodeWithText("Queue High").performClick()
             compose.runOnIdle {
-                assertEquals(listOf("exact-duplicate", "exact-duplicate"), controls.contextual)
+                assertEquals(listOf("exact-duplicate"), controls.contextual)
+                assertEquals(listOf(key to "exact-duplicate"), controls.playNexts)
                 assertTrue(controls.selected.isEmpty())
                 assertEquals(0, controls.playbackCalls)
             }
@@ -248,6 +250,53 @@ class NativeUpcomingQueueTest {
             compose.onNodeWithText("Remove from queue").performClick() // Dismiss without a playback action.
             assertTrue(actions().none { it.label == "Play next" })
             compose.runOnIdle { assertEquals(2, controls.playNexts.size); assertTrue(controls.moves.isEmpty()) }
+        }
+    }
+
+    @Test fun bothPresentationsLeftRemovesOnlySecondDuplicateAndHeldStaleOrVerticalDoesNothing() {
+        val controls = QueueRecordingControls()
+        val compact = mutableStateOf(false)
+        val key = PlaybackInteractionKey()
+        val snapshot = mutableStateOf(PlaybackState(item = track, isPlaying = false,
+            positionMs = 42_000, interactionKey = key,
+            upcoming = listOf(QueueEntry("first", track, 4), QueueEntry("second", track, 7))))
+        compose.setContent { MaterialTheme { Column(Modifier.size(400.dp, 500.dp)) {
+            NativeUpcomingQueue(snapshot.value, controls, {}, { _, modifier -> Box(modifier) }, compact = compact.value)
+        } } }
+        for (presentation in listOf(false, true)) {
+            compose.runOnIdle {
+                compact.value = presentation
+                snapshot.value = snapshot.value.copy(interactionKey = key)
+                controls.removed.clear()
+            }
+            fun duplicate() = compose.onAllNodesWithText("Duplicate song")[1]
+            duplicate().performTouchInput { down(Offset(140f, 20f)); moveTo(Offset(40f, 20f)) }
+            compose.runOnIdle { assertTrue(controls.removed.isEmpty()) }
+            duplicate().performTouchInput { up() }
+            compose.runOnIdle {
+                assertEquals(listOf(key to "second"), controls.removed)
+                assertTrue(controls.playNexts.isEmpty())
+                assertEquals(42_000L, snapshot.value.positionMs)
+                assertFalse(snapshot.value.isPlaying)
+                assertEquals(0, controls.playbackCalls)
+                controls.removed.clear()
+            }
+            // Queue/session/output binding replacement while held cannot borrow the new key.
+            duplicate().performTouchInput { down(Offset(140f, 20f)); moveTo(Offset(40f, 20f)) }
+            compose.runOnIdle { snapshot.value = snapshot.value.copy(interactionKey = PlaybackInteractionKey()) }
+            duplicate().performTouchInput { up() }
+            duplicate().performTouchInput {
+                down(Offset(140f, 20f)); moveBy(Offset(1f, -30f)); moveBy(Offset(-100f, 0f)); up()
+            }
+            duplicate().performTouchInput {
+                down(Offset(140f, 20f)); moveBy(Offset(-90f, 0f))
+                down(1, Offset(160f, 20f)); up(1); up()
+            }
+            compose.runOnIdle {
+                assertTrue(controls.removed.isEmpty())
+                assertTrue(controls.playNexts.isEmpty())
+                assertEquals(0, controls.playbackCalls)
+            }
         }
     }
 
@@ -334,13 +383,13 @@ class NativeUpcomingQueueTest {
         compose.onNodeWithText("Selected queued song").performTouchInput {
             down(Offset(60f, 20f)); moveTo(Offset(150f, 20f))
         }
-        compose.runOnIdle { assertTrue("Held idle swipe is not yet accepted", controls.contextualPredicates.isEmpty()) }
+        compose.runOnIdle { assertTrue("Held idle swipe is not yet accepted", controls.playNextPredicates.isEmpty()) }
         compose.onNodeWithText("Selected queued song").performTouchInput { up() }
         lateinit var acceptedIsCurrent: () -> Boolean
         compose.runOnIdle {
-            assertEquals(listOf("selected-occurrence"), controls.contextual)
-            assertEquals(1, controls.contextualPredicates.size)
-            acceptedIsCurrent = controls.contextualPredicates.single()
+            assertEquals(listOf(key to "selected-occurrence"), controls.playNexts)
+            assertEquals(1, controls.playNextPredicates.size)
+            acceptedIsCurrent = controls.playNextPredicates.single()
             assertTrue(acceptedIsCurrent())
             // A real idle select/seek removes this exact occurrence from upcoming and publishes
             // a new key. That accepted mutation must not invalidate the queue-owned predicate.
@@ -352,8 +401,8 @@ class NativeUpcomingQueueTest {
         compose.runOnIdle {
             assertTrue("Accepted intent survives its own row disposal and key publication", acceptedIsCurrent())
             stalePlayNext.action()
-            assertTrue("Disposed row accessibility must not invoke Play next", controls.playNexts.isEmpty())
-            assertTrue("No stale request may reach the fake boundary", controls.playNextPredicates.isEmpty())
+            assertEquals("Disposed row accessibility must not invoke Play next", 1, controls.playNexts.size)
+            assertEquals("No stale request may reach the fake boundary", 1, controls.playNextPredicates.size)
             assertTrue(controls.moves.isEmpty())
             assertTrue(controls.selected.isEmpty())
             assertEquals(0, controls.playbackCalls)
@@ -367,6 +416,10 @@ class NativeUpcomingQueueTest {
         override val state = MutableStateFlow(PlaybackState())
         var playbackCalls = 0
         var undos = 0
+        val removed = mutableListOf<Pair<PlaybackInteractionKey, String>>()
+        override fun removeUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, isCurrent: () -> Boolean) {
+            if (isCurrent()) removed += expectedKey to occurrenceId
+        }
         val moves = mutableListOf<Pair<String, Int>>()
         val selected = mutableListOf<String>()
         val contextual = mutableListOf<String>()

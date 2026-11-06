@@ -125,6 +125,11 @@ class PlaybackService : MediaSessionService() {
             else service.requestPlayNextOccurrence(expectedKey, occurrenceId, isCurrent, onResult)
         }
         fun removeQueued(id: String) { active.get()?.localEdit { removeUpcoming(id) } }
+        fun removeQueued(expectedKey: PlaybackInteractionKey, id: String, isCurrent: () -> Boolean) {
+            active.get()?.localEdit {
+                if (isCurrent() && currentInteractionKey() === expectedKey) removeUpcoming(id)
+            }
+        }
         fun moveQueued(id: String, to: Int) { active.get()?.localEdit { moveUpcoming(id, to) } }
         fun moveQueued(expectedKey: PlaybackInteractionKey, id: String, to: Int) {
             active.get()?.guardedMove(expectedKey, id, to)

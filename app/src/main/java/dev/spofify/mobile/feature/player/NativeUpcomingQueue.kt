@@ -215,17 +215,14 @@ private fun CompactUpcomingRow(
     // An open action menu belongs to the rendered queue binding, not a later publication.
     // Progress keeps the key; queue/output/session replacement disposes the old menu.
     var menuOpen by remember(entry.occurrenceId, state.interactionKey) { mutableStateOf(false) }
-    val label = "Queue High"
-    ContextualSwipeRow(entry, state.interactionKey, entry.item.playable && state.interactionKey != null, label,
+    ContextualSwipeRow(entry, state.interactionKey, state.interactionKey != null, "Play next",
         onCommit = { key, rowIsCurrent ->
+            if (entry.item.playable && rowIsCurrent() && actionIsCurrent())
+                controls.playNextOccurrence(key, entry.occurrenceId, actionIsCurrent) {}
+        }, onLeftCommit = { key, rowIsCurrent ->
             if (rowIsCurrent() && actionIsCurrent())
-                controls.contextualOccurrence(key, entry.occurrenceId, actionIsCurrent) {}
+                controls.removeUpcoming(key, entry.occurrenceId, actionIsCurrent)
         }) { swipeModifier, isCurrent ->
-    val playNext = {
-        if (isCurrent() && actionIsCurrent()) state.interactionKey?.let { expectedKey ->
-            controls.playNextOccurrence(expectedKey, entry.occurrenceId, actionIsCurrent) {}
-        }
-    }
     val intents = upcomingIntentActions(entry, state, controls, isCurrent, actionIsCurrent)
     Row(swipeModifier.fillMaxWidth().heightIn(min = 72.dp).background(MaterialTheme.colorScheme.surface).semantics {
         customActions = buildList {
@@ -288,22 +285,17 @@ private fun UpcomingRow(
     val moveUp = { controls.moveUpcoming(entry.occurrenceId, (index - 1).coerceAtLeast(0)) }
     val moveDown = { controls.moveUpcoming(entry.occurrenceId, (index + 1).coerceAtMost(count - 1)) }
     val remove = { controls.removeUpcoming(entry.occurrenceId) }
-    val label = "Queue High"
-    ContextualSwipeRow(entry, state.interactionKey, entry.item.playable && state.interactionKey != null, label,
+    ContextualSwipeRow(entry, state.interactionKey, state.interactionKey != null, "Play next",
         onCommit = { key, rowIsCurrent ->
+            if (entry.item.playable && rowIsCurrent() && actionIsCurrent())
+                controls.playNextOccurrence(key, entry.occurrenceId, actionIsCurrent) {}
+        }, onLeftCommit = { key, rowIsCurrent ->
             if (rowIsCurrent() && actionIsCurrent())
-                controls.contextualOccurrence(key, entry.occurrenceId, actionIsCurrent) {}
-        },
-        excludeLeadingHandle = true) { swipeModifier, isCurrent ->
-    val playNext = {
-        if (isCurrent() && actionIsCurrent()) state.interactionKey?.let { expectedKey ->
-            controls.playNextOccurrence(expectedKey, entry.occurrenceId, actionIsCurrent) {}
-        }
-    }
+                controls.removeUpcoming(key, entry.occurrenceId, actionIsCurrent)
+        }, excludeLeadingHandle = true, leadingTargetWidth = 88.dp) { swipeModifier, isCurrent ->
     val intents = upcomingIntentActions(entry, state, controls, isCurrent, actionIsCurrent)
     Row(
         swipeModifier.fillMaxWidth().heightIn(min = 80.dp).background(MaterialTheme.colorScheme.surface).onSizeChanged { rowHeight = it.height }
-            .playerSwipe(PlayerSwipeArea.UPCOMING) { remove() }
             .semantics {
                 customActions = buildList {
                     if (entry.item.playable && state.interactionKey != null)

@@ -74,6 +74,8 @@ interface PlaybackControls {
     /** Prepared items only: fetching a collection remains an explicit host action. Never autoplays. */
     fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean = false) {}
     fun removeUpcoming(occurrenceId: String) {}
+    /** Captured queue binding; unknown implementations fail closed. */
+    fun removeUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, isCurrent: () -> Boolean) {}
     /** Zero-based index within the displayed upcoming list. Manual moves exit shuffle. */
     fun moveUpcoming(occurrenceId: String, toIndex: Int) {}
     /** Guarded at serialized service/coordinator dispatch. Local: arbitrary upcoming index.

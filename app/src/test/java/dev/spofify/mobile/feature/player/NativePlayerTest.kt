@@ -1449,6 +1449,9 @@ class NativePlayerTest {
             onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP))
         }
         override fun removeUpcoming(occurrenceId: String) { removed += occurrenceId }
+        override fun removeUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, isCurrent: () -> Boolean) {
+            if (isCurrent()) removed += occurrenceId
+        }
         override fun selectOccurrence(occurrenceId: String) { selected += occurrenceId }
         override fun undoQueueRemoval() { undos++ }
         override fun clearUpcoming() { clears++ }

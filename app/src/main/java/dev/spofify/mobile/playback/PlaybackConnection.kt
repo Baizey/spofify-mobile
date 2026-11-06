@@ -661,6 +661,24 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         publish(true)
     }
 
+    override fun removeUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String,
+        isCurrent: () -> Boolean) = onMainQueue {
+        if (!isCurrent()) return@onMainQueue
+        if (hasRemoteOutput()) {
+            val owner = coordinator ?: return@onMainQueue
+            if (currentRemoteInteractionKey() !== expectedKey) return@onMainQueue
+            val snapshot = remoteSnapshot() ?: return@onMainQueue
+            val wireKey = remoteUpcomingKey(snapshot, occurrenceId) ?: return@onMainQueue
+            owner.remoteCommand(PlaybackDeviceCommand.queue("remove", wireKey)) {
+                isCurrent() && owner === coordinator && hasRemoteOutput() && currentRemoteInteractionKey() === expectedKey
+            }
+        } else {
+            if (controller == null) return@onMainQueue
+            PlaybackService.removeQueued(expectedKey, occurrenceId, isCurrent)
+        }
+        publish(true)
+    }
+
     override fun moveUpcoming(occurrenceId: String, toIndex: Int) = onMainQueue {
         if (hasRemoteOutput()) {
             val snapshot = remoteSnapshot() ?: return@onMainQueue

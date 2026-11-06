@@ -219,6 +219,29 @@ class PlaybackQueueCommandsTest {
         assertFalse(output.playWhenReady)
     }
 
+    @Test fun guardedRemovalPreservesPausedCurrentAndOtherDuplicateAndRejectsStaleKey() = runTest {
+        val base = prepared()
+        val extended = base.copy(queue = base.queue + base.queue.last().copy(key = 60L, order = 3L))
+        remoteOwner(output = "phone", initial = extended)
+        graph.playbackCoordinator!!.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
+        val before = endpoint.exportSnapshot()
+        val future = PlaybackService.upcomingEntries()
+        val key = requireNotNull(PlaybackService.interactionKey())
+        PlaybackService.removeQueued(PlaybackInteractionKey(), future.last().occurrenceId) { true }
+        PlaybackService.removeQueued(key, future.last().occurrenceId) { false }
+        // Even a valid key must not remove the current occurrence.
+        PlaybackService.removeQueued(key, requireNotNull(output.currentMediaItem?.let(PlaybackMedia::occurrence))) { true }
+        runCurrent()
+        assertEquals(before.queue.map { it.key }, endpoint.exportSnapshot().queue.map { it.key })
+        PlaybackService.removeQueued(key, future.last().occurrenceId) { true }; runCurrent()
+        val after = endpoint.exportSnapshot()
+        assertEquals(before.queue.map { it.key }.filterNot { it == 60L }, after.queue.map { it.key })
+        assertEquals(before.queue[before.position].key, after.queue[after.position].key)
+        assertEquals(before.elapsed, after.elapsed, 0.0)
+        assertEquals(before.occurrence, after.occurrence)
+        assertFalse(output.playWhenReady)
+    }
+
     private fun remoteNext(results: MutableList<PlaybackActionResult>, isCurrent: () -> Boolean = { true }) {
         val queue = dev.spofify.mobile.core.PlaybackQueue(listOf(LibraryItem(kind = "track", id = "remote-next",
             name = "Prepared remote selection", hasAudio = true)), total = 1)
