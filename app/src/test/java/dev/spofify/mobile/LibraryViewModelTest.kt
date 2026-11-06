@@ -109,6 +109,8 @@ class LibraryViewModelTest {
             val model = LibraryViewModel(app, graph, playback)
             store.put("subject", model)
             until { model.state.value.session != null && !model.state.value.loading }
+            val browseSource = model.captureBrowseSource(client)
+            assertTrue(browseSource())
             val album = LibraryItem("album", "album", "Album", coverage = Coverage(inLibrary = 1))
             fun request() {
                 if (enqueue) model.enqueueFrom(client, album, playNext = true) else model.play(album)
@@ -130,6 +132,9 @@ class LibraryViewModelTest {
                 assertEquals(Page.Home, model.state.value.page)
                 assertEquals(playing, playback.state.value)
             } else if (!invalidateBeforeLaunch) PlaybackRequests.invalidate()
+            assertEquals("Unsampled navigation ABA retires source authority; transport revocation is separate",
+                !retireThroughProfile, browseSource())
+            assertTrue("A fresh source capture may be acquired only by a fresh composition/event", model.captureBrowseSource(client)())
             if (enqueue) {
                 assertFalse("Held receiver work must observe route/epoch cancellation", playback.actionCurrents.removeFirst().invoke())
                 playback.actionResults.removeFirst().invoke(PlaybackActionResult(PlaybackActionStatus.STALE))

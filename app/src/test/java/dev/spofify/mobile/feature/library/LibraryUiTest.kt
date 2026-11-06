@@ -129,12 +129,14 @@ class LibraryUiTest {
         } finally { holder.close(); scope.cancel() }
     }
 
-    @Test fun groupedSearchHasGenerousMoreActionsWithoutFilterOrNavigationKnobs() {
+    @Test fun groupedSearchLoadsVisibleFrontierWithoutFilterOrPaginationKnobs() {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         val reader = object : CatalogReader {
             override suspend fun browse(request: CatalogRequest) = LibraryPage(
-                listOf(LibraryItem(request.kind.removeSuffix("s"), "${request.kind}-${request.offset}", "Result")),
-                20, request.limit, request.offset, revision = 1)
+                List(minOf(request.limit, 20 - request.offset)) { index ->
+                    LibraryItem(request.kind.removeSuffix("s"), "${request.kind}-${request.offset + index}",
+                        "${request.kind} ${request.offset + index}")
+                }, 20, request.limit, request.offset, revision = 1)
             override suspend fun detail(kind: String, id: String) = LibraryItem(kind, id, id)
             override suspend fun revision() = 1L
         }
@@ -157,10 +159,14 @@ class LibraryUiTest {
             compose.onNodeWithText("Previous").assertDoesNotExist()
             compose.onNodeWithText("Next").assertDoesNotExist()
             compose.onNodeWithText("Back").assertDoesNotExist()
-            val more = compose.onNodeWithText("See more artists").performScrollTo()
-            more.assertHeightIsAtLeast(48.dp)
-            more.performClick()
-            compose.runOnIdle { assertEquals(2, holder.state.value.current.sections.getValue("artists").items.size) }
+            compose.onNodeWithText("See more artists").assertDoesNotExist()
+            // Grouped demand deliberately waits for its actual final row, not the old
+            // three-row near-end window, so later result groups cannot be starved.
+            compose.onNodeWithTag("catalog-results").performScrollToNode(hasText("tracks 9"))
+            compose.waitUntil(5_000) { compose.runOnIdle {
+                holder.state.value.current.sections.getValue("tracks").items.size == 20
+            } }
+            compose.runOnIdle { assertTrue(holder.state.value.current.sections.getValue("tracks").ended) }
         } finally { holder.close(); scope.cancel() }
     }
 

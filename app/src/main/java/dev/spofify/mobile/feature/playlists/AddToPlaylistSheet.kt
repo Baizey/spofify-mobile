@@ -9,6 +9,13 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
+import dev.spofify.mobile.ui.AutomaticListDemand
+import dev.spofify.mobile.ui.AppendStatus
+import kotlinx.coroutines.isActive
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
@@ -54,8 +61,20 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
     key(client, track.id) {
         val scope = rememberCoroutineScope()
         val state = remember(client, track.id) {
-            AddToPlaylistState(PersonalCollectionsApi(client), track, scope)
+            AddToPlaylistState(PersonalCollectionsApi(client), track, scope,
+                personalRevision = { client.personalRevision.value.playlists }, currentSession = { client.currentSession() })
         }
+        // Read during composition so an otherwise idle revision emission schedules the fence.
+        val playlistRevision = client.personalRevision.collectAsState().value.playlists
+        SideEffect { state.checkFreshness(playlistRevision) }
+        val listState = rememberLazyListState()
+        DisposableEffect(state) { onDispose { state.dispose() } }
+        AutomaticListDemand(listState, state.targetIdentity,
+            state.targets?.items.orEmpty().takeLast(3).map { it.id }, state.canLoadMoreTargets,
+            state::moreTargets)
+        AutomaticListDemand(listState, state.verificationIdentity,
+            state.verifiedTargets?.items.orEmpty().takeLast(3).map { "verified-${it.id}" },
+            state.canLoadMoreVerification, state::moreVerification)
         val sheet = rememberModalBottomSheetState(
             skipPartiallyExpanded = true,
             confirmValueChange = { it != SheetValue.Hidden || !state.mutating },
@@ -74,6 +93,7 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
                 Text("Add to playlist", style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
                 LazyColumn(
+                    state = listState,
                     modifier = Modifier.weight(1f, fill = false).fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
@@ -83,7 +103,7 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
                             Text("Manual playlists only. Each add saves a separate occurrence, including duplicates.")
                         }
                     }
-                    if (state.busy) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 24.dp)) }
+                    if (state.mutating || (state.reading && state.targets == null && state.verifiedTargets == null)) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 24.dp)) }
                     if (state.message.isNotEmpty()) item {
                         Text(state.message, modifier = Modifier.padding(horizontal = 24.dp)
                             .semantics { liveRegion = LiveRegionMode.Polite })
@@ -107,7 +127,7 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
                     }
                     if (!state.creating) {
                         items(state.targets?.items.orEmpty(), key = { it.id }) { target ->
-                            val enabled = !state.busy && state.blocked == null && !state.finished
+                            val enabled = !state.busy && !state.targetsStale && state.blocked == null && !state.finished
                             Row(Modifier.fillMaxWidth().clickable(enabled = enabled) { state.select(target.id) }
                                 .padding(horizontal = 16.dp, vertical = 4.dp)) {
                                 RadioButton(selected = state.selected?.id == target.id,
@@ -118,13 +138,12 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
                                 }
                             }
                         }
-                        if (state.targets != null && !state.createdTarget && state.blocked == null) item {
-                            val page = state.targets!!
-                            TargetPagination(page, state.busy, "playlists", state::loadTargets)
-                        }
-                        if (state.targets == null && !state.busy && state.blocked == null) item {
-                            TextButton(onClick = { state.loadTargets(state.targetOffset) },
-                                modifier = Modifier.padding(horizontal = 16.dp)) { Text("Retry loading playlists") }
+                        if (!state.createdTarget && state.blocked == null) item {
+                            AppendStatus(state.reading && state.targets != null, state.targetError, state::retryTargets, retryLabel = "Retry loading playlists")
+                            if (state.targetsStale) TextButton(onClick = state::refreshTargets,
+                                modifier = Modifier.heightIn(min = 48.dp)) { Text("Refresh playlists") }
+                            if (state.targets?.items?.isEmpty() == true) Text("No manual playlists. Create one to save this track.")
+                            else if (state.targetsEnded) Text("End of playlists")
                         }
                     }
                     if (state.blocked != null) item {
@@ -139,8 +158,9 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
                             Text(addTargetCountText(saved))
                         }
                     }
-                    state.verifiedTargets?.let { page ->
-                        item { TargetPagination(page, state.busy, "saved playlists", state::verify) }
+                    if (state.verifiedTargets != null || state.verificationError != null) item {
+                        AppendStatus(state.reading && state.verifiedTargets != null, state.verificationError, state::retryVerification, retryLabel = "Retry verification")
+                        if (state.verificationEnded) Text("End of saved playlists")
                     }
                 }
                 Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
@@ -154,22 +174,6 @@ fun AddToPlaylistSheet(client: SpofifyClient, track: LibraryItem, onDismiss: () 
                         Button(onClick = state::add, enabled = state.canAdd, modifier = Modifier.fillMaxWidth()) { Text("Add track") }
                     }
                 }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TargetPagination(page: PersonalPlaylistPage, busy: Boolean, label: String, load: (Int) -> Unit) {
-    Column(Modifier.padding(horizontal = 16.dp)) {
-        Text(if (page.items.isEmpty()) "No $label on this page (${page.total} total)"
-            else "${page.offset + 1}–${page.offset + page.items.size} of ${page.total} $label")
-        Row {
-            TextButton(onClick = { load((page.offset - 40).coerceAtLeast(0)) }, enabled = !busy && page.offset > 0) {
-                Text("Previous $label")
-            }
-            TextButton(onClick = { load(page.offset + 40) }, enabled = !busy && page.offset + page.items.size < page.total) {
-                Text("Next $label")
             }
         }
     }
@@ -197,7 +201,54 @@ internal class AddToPlaylistState(
     private val api: PersonalCollectionsApi,
     private val track: LibraryItem,
     private val scope: CoroutineScope,
+    private val personalRevision: () -> Long = { 0L },
+    private val currentSession: () -> Any? = { null },
 ) {
+    private val session = currentSession()
+    private var closed = false
+    fun dispose() { closed = true }
+    private fun current() {
+        if (closed || !scope.isActive) throw CancellationException()
+        check(session === currentSession())
+    }
+    var targetIdentity by mutableStateOf<Any>(Any()); private set
+    var verificationIdentity by mutableStateOf<Any>(Any()); private set
+    fun checkFreshness(revision: Long) {
+        if (session !== currentSession() || (!createdTarget && blocked == null && targetRevision != null && targetRevision != revision)) {
+            targetsStale = true
+            message = "Playlists changed. Refresh before choosing a target."
+        }
+    }
+    var targetError by mutableStateOf<String?>(null); private set
+    var verificationError by mutableStateOf<String?>(null); private set
+    var targetsStale by mutableStateOf(false); private set
+    private var targetRevision: Long? = null
+    private var verificationRevision: Long? = null
+    private var verificationOffset = 0
+    private var failedVerificationOffset = 0
+    private var failedTargetOffset = 0
+    var targetsEnded by mutableStateOf(false); private set
+    var verificationEnded by mutableStateOf(false); private set
+    val canLoadMoreTargets get() = !closed && !busy && !creating && !createdTarget && !finished &&
+        blocked == null && targets != null && !targetsEnded && !targetsStale && targetError == null
+    val canLoadMoreVerification get() = !closed && !busy && blocked?.target == null && blocked != null &&
+        verifiedTargets != null && !verificationEnded && verificationError == null
+    fun moreTargets() { if (canLoadMoreTargets) loadTargets(targetOffset) }
+    fun retryTargets() {
+        if (targetError != null && !targetsStale && !busy) {
+            targetError = null; loadTargets(failedTargetOffset)
+        }
+    }
+    fun refreshTargets() {
+        if (busy || blocked != null || closed) return
+        targetIdentity = Any()
+        targets = null; selected = null; targetRevision = null; targetError = null; targetsStale = false
+        targetsEnded = false; targetOffset = 0; loadTargets(0)
+    }
+    fun moreVerification() { if (canLoadMoreVerification) verify(verificationOffset) }
+    fun retryVerification() {
+        if (verificationError != null && !busy) { verificationError = null; verify(failedVerificationOffset) }
+    }
     var targets by mutableStateOf<PersonalPlaylistPage?>(null)
         private set
     var selected by mutableStateOf<PersonalPlaylistSummary?>(null)
@@ -223,39 +274,49 @@ internal class AddToPlaylistState(
     var message by mutableStateOf("")
         private set
     val busy: Boolean get() = mutating || reading
-    val canAdd: Boolean get() = !busy && !finished && blocked == null && !creating &&
-        track.kind == "track" && selected?.let { it.kind == PlaylistKind.MANUAL && it.capabilities.addTracks } == true
+    val canAdd: Boolean get() = !closed && session === currentSession() && !busy && !finished && blocked == null && !creating && !targetsStale &&
+        (createdTarget || targetRevision == personalRevision()) && track.kind == "track" && selected?.let { it.kind == PlaylistKind.MANUAL && it.capabilities.addTracks } == true
 
     fun loadTargets(offset: Int) {
-        if (busy || blocked != null || creating || createdTarget || finished) return
-        targetOffset = offset
-        targets = null
-        selected = null
-        read("Editable playlists could not load. Retry explicitly or close.") {
+        if (closed || session !== currentSession() || busy || blocked != null || creating || createdTarget || finished || targetsStale || targetError != null) return
+        if (offset != targetOffset || targetsEnded) return
+        val revision = targetRevision ?: personalRevision().also { targetRevision = it }
+        failedTargetOffset = offset
+        read("Editable playlists could not load. Retry explicitly or close.", onFailure = { error ->
+            targetsStale = error is IllegalStateException
+            targetError = if (targetsStale) null else "Playlists could not load. Retained targets have not changed."
+            if (targetsStale) message = "Playlists changed. Refresh before choosing a target."
+        }) {
+            check(revision == personalRevision())
             val page = manualPage(offset)
-            targets = page
-            selected = page.items.firstOrNull()
-            message = if (page.items.isEmpty()) "No manual playlists on this page. Create one to save this track." else ""
+            check(revision == personalRevision())
+            val merged = appendPage(targets, page)
+            targets = merged
+            targetOffset = offset + page.items.size // Raw consumed offset, never the deduplicated row count.
+            targetsEnded = targetOffset == page.total
+            if (selected == null) selected = merged.items.firstOrNull()
+            message = ""
         }
     }
 
     fun select(id: String) {
-        if (!busy && blocked == null && !creating && !finished) selected = targets?.items?.find { it.id == id }
+        if (!closed && !busy && !targetsStale && targetRevision == personalRevision() && blocked == null && !creating && !finished) selected = targets?.items?.find { it.id == id }
     }
 
     fun beginCreate() {
-        if (busy || blocked != null || finished || createdTarget) return
+        if (closed || session !== currentSession() || busy || blocked != null || finished || createdTarget) return
         creating = true
         message = "Create a manual playlist first, then choose Add track to confirm the separate add."
     }
 
     fun create() {
-        if (!creating || busy || blocked != null || finished) return
+        if (closed || session !== currentSession() || !creating || busy || blocked != null || finished) return
         val title = name.trim()
         val details = description.trim()
         playlistMetadataError(title, details)?.let { message = it; return }
         mutate(null) {
             val saved = api.createPlaylist(title, details)
+            current()
             check(saved.kind == PlaylistKind.MANUAL && saved.capabilities.addTracks)
             targets = PersonalPlaylistPage(listOf(saved), 1)
             selected = saved
@@ -270,6 +331,7 @@ internal class AddToPlaylistState(
         val snapshot = selected ?: return
         mutate(snapshot) {
             val saved = api.addEntry(snapshot.id, track.id, snapshot.revision)
+            current()
             check(saved.id == snapshot.id && saved.kind == PlaylistKind.MANUAL)
             finished = true
         }
@@ -277,15 +339,29 @@ internal class AddToPlaylistState(
 
     fun verify(offset: Int = 0) {
         val failure = blocked ?: return
-        if (busy || finished) return
-        read("Verification could not load. No change was resubmitted. Check again or close and review.") {
+        if (closed || session !== currentSession() || busy || finished) return
+        // A deliberate verification starts a fresh read-only chain; continuation/retry keeps its exact offset.
+        if (offset == 0) {
+            verificationIdentity = Any()
+            verifiedTargets = null; verificationOffset = 0; verificationEnded = false
+            verificationRevision = personalRevision(); verificationError = null
+        } else if (offset != verificationOffset || verificationEnded || verificationError != null) return
+        failedVerificationOffset = offset
+        read("Verification could not load. No change was resubmitted. Check again or close and review.",
+            onFailure = { verificationError = "Verification could not load. No change was resubmitted." }) {
             val target = failure.target
             if (target == null) {
-                verifiedTargets = manualPage(offset)
+                check(verificationRevision == personalRevision())
+                val page = manualPage(offset)
+                check(verificationRevision == personalRevision())
+                verifiedTargets = appendPage(verifiedTargets, page)
+                verificationOffset = offset + page.items.size
+                verificationEnded = verificationOffset == page.total
                 message = "These are saved manual playlists. A matching name does not prove which request created it. " +
                     "No add was submitted. Close and review before creating another."
             } else {
                 val saved = api.playlist(target.id)
+                current()
                 check(saved.id == target.id)
                 if (failure.uncertain) {
                     check(saved.kind == PlaylistKind.MANUAL)
@@ -296,6 +372,7 @@ internal class AddToPlaylistState(
                     var occurrences = 0
                     do {
                         val page = api.entries(target.id, limit = 100, offset = seen)
+                        current()
                         check(page.offset == seen && page.limit in 1..100 && page.items.size <= page.limit &&
                             page.total.toLong() == count && seen + page.items.size <= count)
                         check(page.items.isNotEmpty() || seen.toLong() == count)
@@ -306,6 +383,7 @@ internal class AddToPlaylistState(
                         seen += page.items.size
                     } while (seen.toLong() < count)
                     val after = api.playlist(target.id)
+                    current()
                     check(after.id == saved.id && after.kind == PlaylistKind.MANUAL &&
                         after.revision == saved.revision && after.trackCount == count)
                     message = "Saved playlist has $occurrences occurrence${if (occurrences == 1) "" else "s"} of this track. " +
@@ -320,6 +398,7 @@ internal class AddToPlaylistState(
 
     private suspend fun manualPage(offset: Int): PersonalPlaylistPage {
         val page = api.playlists(kind = PlaylistKind.MANUAL, limit = 40, offset = offset)
+        current()
         check(page.offset == offset && page.limit == 40 && page.total in 0..100 && page.items.size <= 40)
         check(page.items.size == (page.total - offset).coerceIn(0, 40))
         check(page.items.map { it.id }.toSet().size == page.items.size)
@@ -327,12 +406,24 @@ internal class AddToPlaylistState(
         return page
     }
 
-    private fun read(failureText: String, action: suspend () -> Unit) {
+    private fun appendPage(prefix: PersonalPlaylistPage?, page: PersonalPlaylistPage): PersonalPlaylistPage {
+        if (prefix != null) check(prefix.total == page.total)
+        val old = prefix?.items.orEmpty().associateBy { it.id }
+        check(page.items.all { old[it.id]?.let { previous -> previous == it } ?: true })
+        val fresh = page.items.filter { it.id !in old }
+        check(fresh.isNotEmpty() || page.total == 0)
+        val all = prefix?.items.orEmpty() + fresh
+        // An overlapping offset page cannot truthfully establish a complete chooser.
+        check(page.offset + page.items.size < page.total || all.size == page.total)
+        return page.copy(items = all, offset = 0)
+    }
+
+    private fun read(failureText: String, onFailure: (Exception) -> Unit = {}, action: suspend () -> Unit) {
         reading = true
         scope.launch {
             try { action() }
             catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { message = failureText }
+            catch (error: Exception) { if (!closed) { message = failureText; onFailure(error) } }
             finally { reading = false }
         }
     }

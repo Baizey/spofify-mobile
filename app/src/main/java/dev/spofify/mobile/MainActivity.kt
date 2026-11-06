@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.*
@@ -42,6 +43,8 @@ import dev.spofify.mobile.feature.player.NativeNowPlaying
 import dev.spofify.mobile.feature.player.NativeNowPlayingDialog
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
+import dev.spofify.mobile.ui.AutomaticListDemand
+import dev.spofify.mobile.ui.AppendStatus
 import dev.spofify.mobile.ui.ListeningChrome
 import dev.spofify.mobile.ui.CompactNavigation
 import dev.spofify.mobile.ui.CompactNavigationItem
@@ -65,6 +68,7 @@ private data class CatalogMoreSelection(
     val lifetime: RowActionLifetime,
     val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding?,
     val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin?,
+    val sourceCurrent: () -> Boolean,
 )
 
 internal fun listeningColorScheme() = darkColorScheme(
@@ -111,6 +115,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         return
     }
     val client = model.graph.client ?: return
+    val playlistBrowse = model.playlistBrowseMemory() ?: return
     val searchPage = state.page is Page.Search || state.page is Page.Catalog
     val searchEditing = rememberSearchEditing(client, state.session?.accountId, searchPage)
     val onSearchEditingChanged = remember(searchEditing) { { editing: Boolean -> searchEditing.value = editing } }
@@ -143,23 +148,29 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         var creditsLicense by remember(state.page) { mutableStateOf(false) }
         var more by remember { mutableStateOf<CatalogMoreSelection?>(null) }
         var addToPlaylist by remember { mutableStateOf<LibraryItem?>(null) }
-        var initialPlaylistId by rememberSaveable { mutableStateOf<String?>(null) }
         val accountId = state.session?.accountId
+        val sourceCurrent = model.captureBrowseSource(client)
+        val sourceEpoch = model.browseSourceEpoch
         val preparedGeneration = state.playbackIntentGeneration
         val art: @Composable (LibraryItem, Modifier) -> Unit = { item, modifier -> Artwork(item, model, modifier) }
         val feedback = CatalogPlaybackFeedback(player.item?.id, player.isPlaying, player.isBuffering, model.playback::toggle,
             interactionKey = player.interactionKey,
             playWhenReady = player.playWhenReady,
-            onContextual = { item, binding, isCurrent -> model.contextualFrom(client, item, binding, isCurrent) },
+            onContextual = { item, binding, isCurrent ->
+                if (sourceCurrent()) model.contextualFrom(client, item, binding, { sourceCurrent() && isCurrent() })
+            },
             queueIntentBinding = player.queueIntentBinding,
             unselectedQueueOrigin = player.unselectedQueueOrigin,
-            onUnselectedHigh = { item, origin, isCurrent -> model.queueIntentFrom(client, item,
-                dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, null, isCurrent, null, origin) })
+            onUnselectedHigh = { item, origin, isCurrent ->
+                if (sourceCurrent()) model.queueIntentFrom(client, item,
+                    dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, null, { sourceCurrent() && isCurrent() }, null, origin)
+            })
         val likeStates = state.likes.mapValues { (id, liked) ->
             CatalogLikeState(liked, id in state.pendingLikes, id in state.failedLikeStatus)
         } + state.failedLikeStatus.filterNot { it in state.likes }.associateWith { CatalogLikeState(failed = true) }
-        val play: (LibraryItem, Boolean) -> Unit = { item, shuffle -> model.playFrom(client, item, shuffle) }
-        val queue: (LibraryItem) -> Unit = { model.enqueueFrom(client, it) }
+        val play: (LibraryItem, Boolean) -> Unit = { item, shuffle -> if (sourceCurrent()) model.playFrom(client, item, shuffle) }
+        val queue: (LibraryItem) -> Unit = { if (sourceCurrent()) model.enqueueFrom(client, it) }
+        val toggleLike: (LibraryItem) -> Unit = { if (sourceCurrent()) model.likeAction(it) }
         val catalog = when (val page = state.page) {
             is Page.Search, is Page.Catalog -> model.catalogHolder()
             is Page.Detail -> model.catalogHolder(page.item, page.navigationId)
@@ -169,15 +180,24 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         val catalogRoute = catalogScreen?.let { Triple(catalog.navigationVersion, it.key, it.query) }
         // Own accepted intents outside the sheet: dismissal is presentation, not cancellation.
         // Inner catalog navigation/query changes also retire the old route (including A→B→A).
-        val actionLifetime = remember(state.page, catalog, catalogRoute) { RowActionLifetime() }
+        val likesSource = state.likesGeneration.takeIf { state.page == Page.Likes }
+        val actionLifetime = remember(state.page, catalog, catalogRoute, likesSource, sourceEpoch) { RowActionLifetime() }
         DisposableEffect(actionLifetime) { onDispose { actionLifetime.invalidate() } }
-        val showMore: (LibraryItem) -> Unit = { more = CatalogMoreSelection(it, player.interactionKey, actionLifetime, player.queueIntentBinding, player.unselectedQueueOrigin) }
+        val showMore: (LibraryItem) -> Unit = { item ->
+            val rowSourceCurrent = { sourceCurrent() && (likesSource == null || model.state.value.let {
+                it.page == Page.Likes && it.likesGeneration == likesSource && !it.likesStale
+            }) }
+            if (rowSourceCurrent()) more = CatalogMoreSelection(item, player.interactionKey, actionLifetime,
+                player.queueIntentBinding, player.unselectedQueueOrigin, rowSourceCurrent)
+        }
         val openExternal: (LibraryItem) -> Unit = { item ->
-            expanded = false
-            when (item.kind) {
-                "playlist", "derived" -> { initialPlaylistId = item.id; model.switchTab(Tab.PLAYLISTS) }
-                "likes" -> model.open(Page.Likes)
-                "artist", "album", "track" -> model.open(Page.Detail(item))
+            if (sourceCurrent()) {
+                expanded = false
+                when (item.kind) {
+                    "playlist", "derived" -> { playlistBrowse.openPlaylist(item.id); model.switchTab(Tab.PLAYLISTS) }
+                    "likes" -> model.open(Page.Likes)
+                    "artist", "album", "track" -> model.open(Page.Detail(item))
+                }
             }
         }
         ListeningChrome(
@@ -221,38 +241,43 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                         Page.Home -> model.homeHolder()?.let { home ->
                             LibraryHome(home, openExternal, play, showMore, queue,
                                 onOpenLikes = { model.open(Page.Likes) },
-                                onOpenPlaylists = { id -> initialPlaylistId = id; model.switchTab(Tab.PLAYLISTS) },
+                                onOpenPlaylists = { id -> playlistBrowse.openPlaylist(id); model.switchTab(Tab.PLAYLISTS) },
                                 artwork = art, modifier = contentModifier, playback = feedback, likes = likeStates,
-                                onToggleLike = model::likeAction, onVisibleItems = model::checkVisibleLikes)
+                                onToggleLike = toggleLike, onVisibleItems = model::checkVisibleLikes)
                         }
                         is Page.Search, is Page.Catalog -> SearchRoute(client,
                             onOpenItem = {}, onPlayItem = play, onShowActions = showMore, onEnqueueItem = queue,
                             artwork = art, modifier = contentModifier, playback = feedback, likes = likeStates,
-                            onToggleLike = model::likeAction, onVisibleItems = model::checkVisibleLikes,
-                            stateHolder = model.catalogHolder(), onSearchEditingChanged = onSearchEditingChanged,
+                            onToggleLike = toggleLike, onVisibleItems = model::checkVisibleLikes,
+                            stateHolder = model.catalogHolder(), sourceEpoch = sourceEpoch,
+                            onSearchEditingChanged = onSearchEditingChanged,
                             searchActivationId = state.searchActivationId,
                             onSearchActivationConsumed = { model.consumeSearchActivation(client, accountId, it) })
                         is Page.Detail -> ItemDetailsRoute(client, page.item,
                             onOpenItem = {}, onPlayItem = play, onShowActions = showMore, onEnqueueItem = queue,
                             artwork = art, modifier = contentModifier, playback = feedback, likes = likeStates,
-                            onToggleLike = model::likeAction, onVisibleItems = model::checkVisibleLikes,
-                            stateHolder = model.catalogHolder(page.item, page.navigationId))
+                            onToggleLike = toggleLike, onVisibleItems = model::checkVisibleLikes,
+                            stateHolder = model.catalogHolder(page.item, page.navigationId), sourceEpoch = sourceEpoch)
                         Page.Playlists, is Page.Playlist -> PlaylistsRoute(client,
                             onOpenTrack = openExternal,
-                            onPlayQueue = { prepared, trackId, entryId -> model.playPrepared(client, accountId, prepared, trackId, entryId, preparedGeneration) },
+                            onPlayQueue = { prepared, trackId, entryId ->
+                                if (sourceCurrent()) model.playPrepared(client, accountId, prepared, trackId, entryId, preparedGeneration)
+                            },
                             onShowTrackActions = showMore, modifier = contentModifier, playback = feedback, artwork = art,
                             onQueueIntent = { selection, action, binding, expectedBinding, isCurrent ->
-                                model.queueIntentSelectionFrom(client, selection, action, binding, isCurrent, expectedBinding)
+                                if (sourceCurrent()) model.queueIntentSelectionFrom(client, selection, action, binding,
+                                    { sourceCurrent() && isCurrent() }, expectedBinding)
                             },
                             onUnselectedHigh = { selection, origin, isCurrent ->
-                                model.queueIntentSelectionFrom(client, selection, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
-                                    null, isCurrent, null, origin)
+                                if (sourceCurrent()) model.queueIntentSelectionFrom(client, selection, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
+                                    null, { sourceCurrent() && isCurrent() }, null, origin)
                             },
                             playbackEntryId = player.item?.entryId, playbackContext = player.context,
                             onPreparedAction = { prepared, trackId, entryId, action, binding, isCurrent ->
-                                model.preparedListAction(client, accountId, prepared, trackId, entryId, action, binding, preparedGeneration, isCurrent)
+                                if (sourceCurrent()) model.preparedListAction(client, accountId, prepared, trackId, entryId, action, binding,
+                                    preparedGeneration, { sourceCurrent() && isCurrent() })
                             },
-                            initialPlaylistId = (page as? Page.Playlist)?.playlist?.id ?: initialPlaylistId)
+                            browseMemory = playlistBrowse, sourceEpoch = sourceEpoch)
                         Page.Likes -> LikedSongs(state, model, openExternal, play, showMore, queue, art,
                             feedback, likeStates, contentModifier)
                         Page.Profile -> ProfileScreen(
@@ -289,11 +314,11 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             val item = selection.item
             val binding = selection.interactionKey
             val isCurrent = {
-                selection.lifetime.isCurrent() && (catalog?.state?.value?.current?.let {
+                selection.lifetime.isCurrent() && selection.sourceCurrent() && (catalog?.state?.value?.current?.let {
                     Triple(catalog.navigationVersion, it.key, it.query)
                 } == catalogRoute)
             }
-            LaunchedEffect(item.id) { if (item.kind == "track") model.checkLike(item) }
+            LaunchedEffect(item.id) { if (isCurrent() && item.kind == "track") model.checkLike(item) }
             ModalBottomSheet(onDismissRequest = { more = null }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
                 MusicActionsContent(item, state.likes[item.id], item.id in state.pendingLikes, item.id in state.failedLikeStatus,
                     onPlay = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW, binding, isCurrent, selection.queueIntentBinding) },
@@ -306,9 +331,10 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                         model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
                             capturedKey, isCurrent, selection.queueIntentBinding)
                     } },
-                    onToggleLike = { model.likeAction(item) }, onRetryLike = { model.checkLike(item) },
-                    onAddToPlaylist = { more = null; addToPlaylist = item },
-                    onOpenItem = { target -> more = null; openExternal(target) })
+                    onToggleLike = { if (isCurrent()) model.likeAction(item) },
+                    onRetryLike = { if (isCurrent()) model.checkLike(item) },
+                    onAddToPlaylist = { if (isCurrent()) { more = null; addToPlaylist = item } },
+                    onOpenItem = { target -> if (isCurrent()) { more = null; openExternal(target) } })
             }
         }
         addToPlaylist?.let { item -> AddToPlaylistSheet(client, item, onDismiss = {
@@ -319,7 +345,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
 }
 
 @Composable
-private fun LikedSongs(
+internal fun LikedSongs(
     state: LibraryState, model: LibraryViewModel,
     onOpen: (LibraryItem) -> Unit, onPlay: (LibraryItem, Boolean) -> Unit,
     onMore: (LibraryItem) -> Unit, onQueue: (LibraryItem) -> Unit,
@@ -327,23 +353,46 @@ private fun LikedSongs(
     feedback: CatalogPlaybackFeedback, likes: Map<String, CatalogLikeState>, modifier: Modifier,
 ) {
     LaunchedEffect(state.items) { model.checkVisibleLikes(state.items) }
-    LazyColumn(modifier, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    val list = rememberLazyListState()
+    val source = state.likesGeneration
+    val sourceCurrent = { model.state.value.let { it.page == Page.Likes && it.likesGeneration == source && !it.likesStale } }
+    val rowFeedback = feedback.copy(
+        onContextual = feedback.onContextual?.let { action -> { item, binding, rowCurrent ->
+            if (sourceCurrent()) action(item, binding, { sourceCurrent() && rowCurrent() })
+        } },
+        onUnselectedHigh = feedback.onUnselectedHigh?.let { action -> { item, origin, rowCurrent ->
+            if (sourceCurrent()) action(item, origin, { sourceCurrent() && rowCurrent() })
+        } },
+    )
+    AutomaticListDemand(list, model to state.likesGeneration, state.items.takeLast(3).map { "liked:${it.id}" },
+        state.page == Page.Likes && !state.loading && state.error == null && !state.likesStale &&
+            !state.likesEnded && state.offset < state.total, model::more)
+    LazyColumn(modifier.testTag("liked-songs-list"), state = list, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
             Text("Liked songs", style = MaterialTheme.typography.headlineLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = { model.playPage(false) }, enabled = state.items.any { it.playable } && !state.preparing) { Text("Play") }
-                OutlinedButton(onClick = { model.playPage(true) }, enabled = state.items.any { it.playable } && !state.preparing) { Text("Shuffle") }
+                Button(onClick = { model.playPage(false) }, enabled = state.items.any { it.playable } && !state.preparing && !state.likesStale) { Text("Play") }
+                OutlinedButton(onClick = { model.playPage(true) }, enabled = state.items.any { it.playable } && !state.preparing && !state.likesStale) { Text("Shuffle") }
             }
-            if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            state.error?.let { LoadError(it, "Retry liked songs", model::refresh) }
+            if (state.items.isEmpty()) AppendStatus(state.loading, state.error, model::retryLikes,
+                loadingLabel = "Loading liked songs", retryLabel = "Retry liked songs")
+            if (state.likesStale) TextButton(onClick = model::refresh, modifier = Modifier.heightIn(min = 48.dp)) { Text("Refresh liked songs") }
             if (!state.loading && state.items.isEmpty() && state.error == null) Text("No liked songs yet.")
         }
-        itemsIndexed(state.items, key = { index, item -> "${item.id}:$index" }) { _, item ->
-            MusicRow(item, onOpen, onPlay, onMore, onQueue, artwork, playback = feedback,
-                like = likes[item.id], onToggleLike = model::likeAction)
+        itemsIndexed(state.items, key = { _, item -> "liked:${item.id}" }) { _, item ->
+            // Preserve the lazy anchor through append; only source changes retire held gestures.
+            key(source) {
+                MusicRow(item, onOpen,
+                    { track, shuffle -> if (sourceCurrent()) onPlay(track, shuffle) },
+                    { track -> if (sourceCurrent()) onMore(track) },
+                    { track -> if (sourceCurrent()) onQueue(track) }, artwork, playback = rowFeedback,
+                    like = likes[item.id], onToggleLike = { if (sourceCurrent()) model.likeAction(it) })
+            }
         }
-        if (!state.loading && state.offset < state.total) item {
-            TextButton(onClick = model::more, modifier = Modifier.fillMaxWidth()) { Text("Show more (${state.offset} of ${state.total})") }
+        if (state.items.isNotEmpty()) item(key = "likes-continuation") {
+            if (state.likesStale) state.error?.let { Text(it) }
+            else AppendStatus(state.loading, state.error, model::retryLikes,
+                loadingLabel = "Loading more liked songs", retryLabel = "Retry liked songs")
         }
     }
 }

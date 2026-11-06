@@ -28,6 +28,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /** Actual Source -> host -> More -> VM boundary. Robolectric is not native acceptance. */
 @RunWith(RobolectricTestRunner::class)
@@ -79,6 +81,10 @@ class CatalogMoreHostTest {
     private val controls = Controls()
     private val shown = mutableStateOf(true)
     private val playbackReads = AtomicInteger()
+    private val catalogTotal = AtomicInteger(1)
+    private val appendStarted = CountDownLatch(1)
+    private val releaseAppend = CountDownLatch(1)
+    @Volatile private var holdAppend = false
     private lateinit var graph: AppGraph
     private lateinit var model: LibraryViewModel
     private val trackJson = """{"kind":"track","id":"song","name":"Synthetic song","albumId":"album","hasAudio":true}"""
@@ -96,9 +102,20 @@ class CatalogMoreHostTest {
                     "/api/library/tracks/song" -> json("""{"item":$trackJson,"revision":1}""")
                     "/api/me/recent" -> json("""{"items":[{"track":$trackJson}],"total":1,"offset":0,"limit":40}""")
                     "/api/me/likes/status" -> json("""{"items":[{"trackId":"song","liked":false}]}""")
-                    "/api/library" -> if (request.requestUrl!!.queryParameter("kind") == "tracks")
-                        json("""{"items":[$trackJson],"total":1,"offset":0,"limit":40,"revision":1}""")
-                    else json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
+                    "/api/library" -> {
+                        val url = request.requestUrl!!
+                        val offset = url.queryParameter("offset")!!.toInt()
+                        val limit = url.queryParameter("limit")!!.toInt()
+                        val total = if (url.queryParameter("kind") == "tracks") catalogTotal.get() else 0
+                        if (holdAppend && offset > 0) {
+                            appendStarted.countDown()
+                            check(releaseAppend.await(5, TimeUnit.SECONDS)) { "Test did not release held catalog append" }
+                        }
+                        val rows = (offset until minOf(total, offset + limit)).joinToString(",") { index ->
+                            if (index == 0) trackJson else """{"kind":"track","id":"song-$index","name":"Synthetic song $index","hasAudio":true}"""
+                        }
+                        json("""{"items":[$rows],"total":$total,"offset":$offset,"limit":$limit,"revision":1}""")
+                    }
                     "/api/library/albums/album" -> json("""{"item":{"kind":"album","id":"album","name":"Synthetic album","coverage":{"inLibrary":2}},"revision":1}""")
                     else -> json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
                 }
@@ -124,6 +141,7 @@ class CatalogMoreHostTest {
         await { model.homeHolder()?.state?.value?.recent?.value?.isNotEmpty() == true }
     }
     @After fun tearDown() {
+        releaseAppend.countDown()
         try {
             compose.runOnIdle { shown.value = false }; compose.waitForIdle()
             compose.runOnIdle { store.clear(); if (::graph.isInitialized) graph.clear() }
@@ -202,6 +220,64 @@ class CatalogMoreHostTest {
             assertEquals(QueueIntentSelection.Collection(PlaybackContext("album", "album", "Synthetic album")), collection.selection)
             assertEquals(0, playbackReads.get())
             collection.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+        }
+    }
+    @Test fun unchangedOpenMoreAndAcceptedActionSurviveBenignCatalogAppend() {
+        catalogTotal.set(30)
+        holdAppend = true
+        compose.runOnIdle { model.switchTab(Tab.SEARCH); model.catalogHolder()?.commitQuery("Synthetic", immediate = true) }
+        await { model.catalogHolder()?.state?.value?.current?.sections?.get("tracks")?.items?.size == 10 }
+        openMore()
+        val holder = checkNotNull(model.catalogHolder())
+        val version = compose.runOnIdle { holder.navigationVersion }
+        compose.runOnIdle { holder.more("tracks") }
+        await { appendStarted.count == 0L }
+        compose.runOnIdle {
+            assertEquals(version, holder.navigationVersion)
+            assertEquals(10, holder.state.value.current.sections.getValue("tracks").items.size)
+        }
+        val pending = choose("Queue High")
+        compose.runOnIdle { assertTrue("Starting an append must not revoke an open row action", pending.current()) }
+        releaseAppend.countDown()
+        await { holder.state.value.current.sections.getValue("tracks").items.size == 20 }
+        compose.runOnIdle {
+            assertEquals(version, holder.navigationVersion)
+            assertTrue("Appending another row must not revoke accepted source authority", pending.current())
+            assertEquals("song", (pending.selection as QueueIntentSelection.Track).track.getValue("id").jsonPrimitive.content)
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+            assertEquals(0, playbackReads.get())
+        }
+    }
+    @Test fun heldPhysicalRightOnActualCatalogRowSurvivesBenignAppend() {
+        catalogTotal.set(30)
+        holdAppend = true
+        compose.runOnIdle { model.switchTab(Tab.SEARCH); model.catalogHolder()?.commitQuery("Synthetic", immediate = true) }
+        val holder = checkNotNull(model.catalogHolder())
+        await { holder.state.value.current.sections["tracks"]?.items?.size == 10 }
+        val version = compose.runOnIdle { holder.navigationVersion }
+        val playerKey = controls.state.value.interactionKey
+        val binding = controls.state.value.queueIntentBinding
+        compose.runOnIdle { holder.more("tracks") }
+        await { appendStarted.count == 0L }
+        val row = compose.onNodeWithText("Synthetic song")
+        row.performTouchInput { down(center.copy(x = width * .3f)); moveTo(center.copy(x = width * .6f)) }
+        releaseAppend.countDown()
+        await { holder.state.value.current.sections.getValue("tracks").items.size == 20 }
+        compose.runOnIdle { assertEquals(version, holder.navigationVersion) }
+        row.performTouchInput { moveTo(center.copy(x = width * .8f)); up() }
+        await { controls.pending.size == 1 }
+        compose.runOnIdle {
+            val pending = controls.pending.single()
+            assertEquals(PlaybackListAction.QUEUE_HIGH, pending.action)
+            assertSame(playerKey, pending.key)
+            assertEquals(binding, pending.binding)
+            assertEquals("song", (pending.selection as QueueIntentSelection.Track).track.getValue("id").jsonPrimitive.content)
+            assertTrue("The same source/row gesture remains current through append", pending.current())
+            holder.commitQuery("other", immediate = true)
+            holder.commitQuery("Synthetic", immediate = true)
+            assertFalse("An accepted swipe's source guard also rejects unsampled query ABA", pending.current())
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
+            assertEquals(0, playbackReads.get())
         }
     }
     @Test fun openMoreDoesNotRetargetReplacementOutput() {

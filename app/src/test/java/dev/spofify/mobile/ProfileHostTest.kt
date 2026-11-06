@@ -177,10 +177,14 @@ class ProfileHostTest {
                     "/api/library/revision" -> json("""{"revision":1}""")
                     "/api/me/player" -> json("""{"devices":[],"activeDeviceId":"","epoch":1,"leaseMs":0,"state":null,"stateSeq":0,"stateAgeMs":0,"transfer":null,"directives":[],"commands":[]}""")
                     "/api/library" -> {
-                        val items = if (request.requestUrl?.queryParameter("kind") == "tracks") (0 until 30).joinToString(",") {
+                        val url = checkNotNull(request.requestUrl)
+                        val limit = url.queryParameter("limit")?.toInt() ?: 40
+                        val offset = url.queryParameter("offset")?.toInt() ?: 0
+                        val total = if (url.queryParameter("kind") == "tracks") 30 else 0
+                        val items = (offset until minOf(total, offset + limit)).joinToString(",") {
                             """{"kind":"track","id":"result-$it","name":"Search result $it","hasAudio":false}"""
-                        } else ""
-                        json("""{"items":[$items],"total":${if (items.isEmpty()) 0 else 30},"offset":0,"limit":40,"revision":1}""")
+                        }
+                        json("""{"items":[$items],"total":$total,"offset":$offset,"limit":$limit,"revision":1}""")
                     }
                     else -> json("""{"items":[],"total":0,"offset":0,"limit":40,"revision":1}""")
                 }
@@ -293,6 +297,35 @@ class ProfileHostTest {
         compose.onNodeWithTag("search-query").performTextReplacement("preserved query")
         compose.onNodeWithTag("search-query").performImeAction()
         await { model.catalogHolder()!!.state.value.current.sections.values.let { it.size == 3 && it.all { section -> section.loaded } } }
+        val results = compose.onNodeWithTag("catalog-results")
+        fun trackReads() = requests.filter { it.requestUrl?.let { url ->
+            url.encodedPath == "/api/library" && url.queryParameter("kind") == "tracks"
+        } == true }
+        compose.runOnIdle {
+            val tracks = model.catalogHolder()!!.state.value.current.sections.getValue("tracks")
+            assertEquals(30, tracks.total)
+            assertEquals(10, tracks.items.size)
+            assertEquals(listOf("0"), trackReads().map { it.requestUrl!!.queryParameter("offset") })
+        }
+        // Search now receives real ten-row pages. Reach each actual visible frontier before
+        // exercising the original index-15 navigation/scroll preservation regression.
+        for (loadedCount in listOf(20, 30)) {
+            results.performScrollToIndex(loadedCount - 11)
+            await { model.catalogHolder()!!.state.value.current.sections.getValue("tracks").let {
+                it.items.size == loadedCount && !it.loading
+            } }
+        }
+        results.performScrollToNode(hasText("End of results"))
+        compose.onNodeWithText("Search result 29").assertIsDisplayed()
+        compose.runOnIdle {
+            val tracks = model.catalogHolder()!!.state.value.current.sections.getValue("tracks")
+            assertTrue(tracks.ended)
+            assertFalse(tracks.hasNext)
+            assertEquals((0 until 30).map { "result-$it" }, tracks.items.map { it.id })
+            assertEquals(listOf("0", "10", "20"), trackReads().map { it.requestUrl!!.queryParameter("offset") })
+            assertTrue(trackReads().all { it.requestUrl!!.queryParameter("limit") == "10" &&
+                it.requestUrl!!.queryParameter("q") == "preserved query" })
+        }
         compose.onNode(hasScrollToIndexAction()).performScrollToIndex(15)
         await { model.catalogHolder()!!.state.value.current.scrollIndex > 0 }
         val saved = model.catalogHolder()!!.state.value.current
@@ -315,6 +348,10 @@ class ProfileHostTest {
             .config[SemanticsProperties.EditableText].text)
         assertEquals("", model.catalogHolder()!!.state.value.current.query)
         assertEquals(0, model.catalogHolder()!!.state.value.current.scrollIndex)
+        compose.runOnIdle {
+            assertEquals("End, Profile return and empty explicit reset must not fetch another batch",
+                listOf("0", "10", "20"), trackReads().map { it.requestUrl!!.queryParameter("offset") })
+        }
         assertPlaybackUnchanged(before)
     }
 

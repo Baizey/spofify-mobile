@@ -249,11 +249,8 @@ class NativeUiSmokeTest {
                 assertCompactSearchRows()
                 screenshot("05b-search-songs")
                 assertFourArtistCreditNavigation(fixture)
-                scrollToText("See more songs")
-                compose.onNodeWithText("See more songs").assertIsEnabled().assertHeightIsAtLeast(48.dp).performClick()
-                compose.waitUntil(15_000) { fixture.searchCalls.any { it.query == "Orbit" && it.kind == "tracks" && it.offset == 10 } }
-                scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last()).assertIsDisplayed()
-                screenshot("05bb-search-see-more")
+                scrollSearchToLastSongAutomatically(fixture)
+                screenshot("05bb-search-auto-append")
                 assertSearchEditingContinuity(fixture, "05bd", playing = false)
 
                 search("unmatched-synthetic-query")
@@ -306,9 +303,7 @@ class NativeUiSmokeTest {
                 dismissSearchImeAndAssertEmptyRoot()
                 // Reset a populated, paged and scrolled root on actual nav reselect as well.
                 search("Orbit")
-                scrollToText("See more songs")
-                compose.onNodeWithText("See more songs").performClick()
-                scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last()).assertIsDisplayed()
+                scrollSearchToLastSongAutomatically(fixture)
                 activateSearchAndAssertEmpty(fixture, "06e-paged-root-reselect-keyboard")
                 dismissSearchImeAndAssertEmptyRoot()
                 search("Orbit")
@@ -489,10 +484,8 @@ class NativeUiSmokeTest {
                 assertQueuePreservedFromMini(originalQueue, fixture)
                 val beforeQuerySubmit = capturePlaying(fixture)
                 search("Orbit")
-                scrollToText("See more songs")
-                assertPlayingTransition(beforeQuerySubmit, fixture, "query submission")
-                compose.onNodeWithText("See more songs").performClick()
-                scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last())
+                scrollSearchToLastSongAutomatically(fixture)
+                assertPlayingTransition(beforeQuerySubmit, fixture, "query submission and automatic append")
                 val preparationsBeforeSearchEditing = fixture.playbackPreparations.get()
                 assertQueuePreservedFromMini(originalQueue, fixture)
                 assertSearchEditingContinuity(fixture, "10c", playing = true, expectedQueue = originalQueue)
@@ -1587,6 +1580,37 @@ class NativeUiSmokeTest {
         scrollToCatalogItem(UiFixtureServer.TRACK_NAMES.last()).assertIsDisplayed()
         assertEquals("The appended page must survive without another fetch", requests, fixture.searchCalls.size)
     }
+    /** Real touch movement must drive the next bounded batch; no fetch-more semantics shortcut. */
+    private fun scrollSearchToLastSongAutomatically(fixture: UiFixtureServer) {
+        val last = catalogItem(UiFixtureServer.TRACK_NAMES.last())
+        for (attempt in 0 until 18) {
+            val viewport = compose.onAllNodes(hasScrollToIndexAction()).onFirst().fetchSemanticsNode().boundsInRoot
+            val visible = compose.onAllNodes(last).fetchSemanticsNodes().any {
+                val bounds = it.boundsInRoot
+                bounds.height > 0 && bounds.top >= viewport.top && bounds.bottom <= viewport.bottom
+            }
+            if (visible) break
+            compose.onAllNodes(hasScrollToIndexAction()).onFirst().performTouchInput {
+                swipe(center.copy(y = height * .85f), center.copy(y = height * .2f), durationMillis = 350)
+            }
+            compose.waitForIdle()
+        }
+        compose.onNode(last).assertIsDisplayed()
+        compose.waitUntil(15_000) {
+            fixture.searchCalls.any { it.query == "Orbit" && it.kind == "tracks" && it.offset == 10 && it.limit == 10 }
+        }
+        compose.onAllNodes(hasText("See more songs") or hasText("Show more")).assertCountEquals(0)
+        val requestsAtEnd = fixture.searchCalls.size
+        repeat(2) {
+            compose.onAllNodes(hasScrollToIndexAction()).onFirst().performTouchInput {
+                swipe(center.copy(y = height * .85f), center.copy(y = height * .2f), durationMillis = 350)
+            }
+            compose.waitForIdle()
+        }
+        assertEquals("The true end must stop read demand", requestsAtEnd, fixture.searchCalls.size)
+        compose.onNode(last).assertIsDisplayed()
+    }
+
     private fun scrollToText(text: String) = scrollTo(hasText(text))
     private fun scrollTo(matcher: SemanticsMatcher) {
         // Lazy semantics contain only composed rows. Wait for late response bodies while searching

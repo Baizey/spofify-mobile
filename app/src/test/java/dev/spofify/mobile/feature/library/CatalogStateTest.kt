@@ -41,9 +41,10 @@ class CatalogStateTest {
         }
         override suspend fun revision() = revisionValue
         fun completePending(revision: Long = 1) {
-            reads.filterNot { it.result.isCompleted }.forEach { it.result.complete(LibraryPage(
-                listOf(LibraryItem(it.request.kind.removeSuffix("s"), "${it.request.kind}-${it.request.offset}", "Result")),
-                25, it.request.limit, it.request.offset, revision)) }
+            reads.filterNot { it.result.isCompleted }.forEach { read -> read.result.complete(LibraryPage(
+                List(minOf(read.request.limit, (25 - read.request.offset).coerceAtLeast(0))) { index ->
+                    LibraryItem(read.request.kind.removeSuffix("s"), "${read.request.kind}-${read.request.offset + index}", "Result")
+                }, 25, read.request.limit, read.request.offset, revision)) }
         }
     }
 
@@ -466,6 +467,109 @@ class CatalogStateTest {
         holder.close()
     }
 
+    @Test fun firstSameRevisionDetailFencePreservesActionsButRealRevisionAdvanceRetiresThem() = runTest {
+        for (kind in listOf("track", "album")) {
+            val seed = LibraryItem(kind, "detail", "Detail")
+            val reader = Reader().apply { suspendDetails = true }
+            val holder = CatalogStateHolder(reader, backgroundScope, initialItem = seed)
+            holder.setVisible(true); runCurrent()
+            // Albums can establish a baseline through their child read before detail resolves;
+            // tracks have no child section. Both initial cheap-fence paths must stay benign.
+            reader.completePending(1); runCurrent()
+            val openingVersion = holder.navigationVersion
+            holder.checkRevision(); runCurrent()
+            reader.pendingDetails[0].complete(seed); runCurrent()
+            assertEquals("The initial fence must still validate the detail", 2, reader.pendingDetails.size)
+            assertEquals("Same-baseline revalidation is not a source change", openingVersion, holder.navigationVersion)
+            reader.pendingDetails[1].complete(seed)
+            reader.completePending(1); runCurrent()
+            assertEquals(openingVersion, holder.navigationVersion)
+
+            reader.revisionValue = 2
+            holder.checkRevision(); runCurrent()
+            assertTrue("A genuine source revision must still retire a held action", holder.navigationVersion > openingVersion)
+            reader.pendingDetails[2].complete(seed)
+            reader.completePending(2); runCurrent()
+            holder.close()
+        }
+    }
+
+    @Test fun firstSameRevisionDetailPollCannotRetryFailedChildBatchOrEraseItsFrontier() = runTest {
+        for (append in listOf(false, true)) {
+            val reader = Reader()
+            val seed = LibraryItem("album", "album", "Resolved album")
+            val holder = CatalogStateHolder(reader, backgroundScope, initialItem = seed)
+            holder.setVisible(true); runCurrent()
+            if (append) {
+                reader.reads.single().completeRows(total = 120); runCurrent()
+                holder.more("tracks"); runCurrent()
+            }
+            reader.reads.last().result.completeExceptionally(IOException()); runCurrent()
+            holder.rememberScroll(holder.state.value.current.key, if (append) 35 else 0, 12)
+            val failed = holder.state.value.current.sections.getValue("tracks")
+            val requestsBeforePoll = reader.reads.size
+            val sourceVersion = holder.navigationVersion
+
+            // This first poll must still validate the parent detail, but revision 1 is not
+            // a source reset and cannot turn either an initial or append error into a read.
+            holder.checkRevision(); runCurrent()
+            assertEquals(2, reader.details.size)
+            assertEquals(sourceVersion, holder.navigationVersion)
+            holder.setVisible(false); holder.setVisible(true)
+            repeat(5) { holder.demandMore("tracks"); holder.checkRevision() }
+            runCurrent()
+            assertEquals(requestsBeforePoll, reader.reads.size)
+            assertEquals(failed, holder.state.value.current.sections.getValue("tracks"))
+            assertEquals(12, holder.state.value.current.scrollOffset)
+
+            // Only explicit Retry reserves that exact failed offset, once, retaining rows.
+            holder.retry("tracks"); holder.retry("tracks"); runCurrent()
+            assertEquals(requestsBeforePoll + 1, reader.reads.size)
+            assertEquals(if (append) 40 else 0, reader.reads.last().request.offset)
+            assertEquals(failed.items, holder.state.value.current.sections.getValue("tracks").items)
+            reader.reads.last().completeRows(total = 120); runCurrent()
+            val recovered = holder.state.value.current.sections.getValue("tracks")
+            assertNull(recovered.error)
+            assertEquals(if (append) 80 else 40, recovered.items.size)
+            holder.close()
+        }
+    }
+
+    @Test fun changedResolvedDetailAndWithdrawalRetireActionsEvenAtSamePolledRevision() = runTest {
+        for (change in listOf("metadata", "availability", "identity", "missing")) {
+            val seed = LibraryItem("track", "detail", "Detail", hasAudio = true)
+            val reader = Reader().apply { suspendDetails = true }
+            val holder = CatalogStateHolder(reader, backgroundScope, initialItem = seed)
+            holder.setVisible(true); runCurrent()
+            reader.pendingDetails.single().complete(seed); runCurrent()
+            val openingVersion = holder.navigationVersion
+            if (change == "missing") reader.detailError = ApiException(404, "Missing")
+            // First validation requests a detail read without changing the known revision.
+            holder.checkRevision(); runCurrent()
+            if (change != "missing") {
+                assertEquals(openingVersion, holder.navigationVersion)
+                val changed = when (change) {
+                    "metadata" -> seed.copy(name = "Changed detail")
+                    "availability" -> seed.copy(hasAudio = false)
+                    else -> seed.copy(id = "different-source")
+                }
+                reader.pendingDetails.last().complete(changed); runCurrent()
+            }
+            assertTrue("$change must revoke the previously held detail action", holder.navigationVersion > openingVersion)
+            val current = holder.state.value.current
+            when (change) {
+                "metadata" -> assertEquals("Changed detail", current.item?.name)
+                "availability" -> assertFalse(checkNotNull(current.item).playable)
+                "identity" -> {
+                    assertEquals("detail", current.item?.id)
+                    assertNotNull(current.detailError)
+                }
+                else -> assertTrue(current.detailUnavailable)
+            }
+            holder.close()
+        }
+    }
+
     @Test fun firstParentDetailFenceIsIndependentOfAnEarlierChildListingBaseline() = runTest {
         val reader = Reader().apply { suspendDetails = true; revisionValue = 2 }
         val holder = CatalogStateHolder(reader, backgroundScope, initialItem = LibraryItem("album", "album", "Seed"))
@@ -480,6 +584,149 @@ class CatalogStateTest {
         holder.checkRevision(); runCurrent()
         assertEquals(2, reader.pendingDetails.size)
         holder.close()
+    }
+
+    @Test fun automaticDemandReservesSynchronouslyAndAppendDoesNotRevokeSourceActions() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+        holder.setVisible(true); runCurrent(); reader.reads.single().completeRows(); runCurrent()
+        val before = holder.state.value.current
+        val version = holder.navigationVersion
+        val keys = before.sections.getValue("tracks").items.map { catalogRowKey(before, "tracks", it) }
+        repeat(50) { holder.more("tracks") }
+        assertTrue(holder.state.value.current.sections.getValue("tracks").loading)
+        assertFalse(holder.state.value.current.sections.getValue("tracks").needsReload)
+        assertEquals(version, holder.navigationVersion)
+        runCurrent()
+        assertEquals(listOf(0, 10), reader.reads.map { it.request.offset })
+        reader.reads.last().completeRows(); runCurrent()
+        val after = holder.state.value.current
+        assertEquals(version, holder.navigationVersion)
+        assertEquals(keys, after.sections.getValue("tracks").items.take(10).map { catalogRowKey(after, "tracks", it) })
+        holder.close()
+    }
+
+    @Test fun earlierGroupedExpansionYieldsUntilLaterRowsAreActuallyVisited() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "all", "music")
+        holder.setVisible(true); runCurrent(); reader.completePending(); runCurrent()
+        holder.demandMore("artists"); runCurrent(); reader.completePending(); runCurrent()
+        assertTrue(holder.state.value.current.sections.getValue("artists").demandPaused)
+        repeat(20) { holder.demandMore("artists") }; runCurrent()
+        assertEquals(listOf(0, 10), reader.reads.filter { it.request.kind == "artists" }.map { it.request.offset })
+        val screen = holder.state.value.current
+        holder.visibleSection(screen.key, screen.resultGeneration, "albums")
+        assertFalse(holder.state.value.current.sections.getValue("artists").demandPaused)
+        holder.demandMore("artists"); runCurrent()
+        assertEquals(listOf(0, 10, 20), reader.reads.filter { it.request.kind == "artists" }.map { it.request.offset })
+        reader.completePending(); runCurrent(); holder.close()
+    }
+
+    @Test fun appendFailureIsLatchedAcrossDemandVisibilityAndPollAndRetriesExactBatchOnce() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+        holder.setVisible(true); runCurrent(); reader.reads.single().completeRows(); runCurrent()
+        holder.more("tracks"); runCurrent()
+        reader.reads.last().result.completeExceptionally(IOException()); runCurrent()
+        val failed = holder.state.value.current.sections.getValue("tracks")
+        repeat(20) { holder.more("tracks") }
+        holder.setVisible(false); holder.setVisible(true)
+        holder.checkRevision(); runCurrent()
+        assertEquals(2, reader.reads.size)
+        assertEquals(10, failed.requestedOffset)
+        assertNotNull(failed.error)
+        holder.retry("tracks"); holder.retry("tracks"); runCurrent()
+        assertEquals(listOf(0, 10, 10), reader.reads.map { it.request.offset })
+        assertEquals(failed.items, holder.state.value.current.sections.getValue("tracks").items)
+        reader.reads.last().completeRows(); runCurrent()
+        assertEquals(20, holder.state.value.current.sections.getValue("tracks").items.size)
+        holder.close()
+    }
+
+    @Test fun rawConsumedOffsetsDeduplicateIdentitiesAndEmptyBatchStopsAtTrueFrontier() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+        holder.setVisible(true); runCurrent()
+        val one = LibraryItem("track", "one", "One")
+        val two = LibraryItem("track", "two", "Two")
+        reader.reads.single().result.complete(LibraryPage(listOf(one, one, two), 20, 10, 0, 1)); runCurrent()
+        var section = holder.state.value.current.sections.getValue("tracks")
+        assertEquals(listOf(one, two), section.items)
+        assertEquals(3, section.nextOffset)
+        holder.more("tracks"); runCurrent()
+        assertEquals(3, reader.reads.last().request.offset)
+        reader.reads.last().result.complete(LibraryPage(emptyList(), 20, 10, 3, 1)); runCurrent()
+        section = holder.state.value.current.sections.getValue("tracks")
+        assertEquals(listOf(one, two), section.items)
+        assertTrue(section.ended); assertFalse(section.hasNext)
+        repeat(5) { holder.more("tracks") }; runCurrent()
+        assertEquals(2, reader.reads.size)
+        holder.close()
+    }
+
+    @Test fun repeatedIdentityAndWrongPositionStopWithoutDiscardingOrClaimingEnd() = runTest {
+        for (wrongOffset in listOf(false, true)) {
+            val reader = Reader()
+            val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+            holder.setVisible(true); runCurrent(); reader.reads.single().completeRows(); runCurrent()
+            val prefix = holder.state.value.current.sections.getValue("tracks").items
+            holder.more("tracks"); runCurrent()
+            reader.reads.last().result.complete(LibraryPage(if (wrongOffset) listOf(LibraryItem("track", "new", "New")) else prefix,
+                45, 10, if (wrongOffset) 0 else 10, 1)); runCurrent()
+            val section = holder.state.value.current.sections.getValue("tracks")
+            assertEquals(prefix, section.items)
+            assertNotNull(section.error); assertTrue(section.refreshRequired); assertFalse(section.ended)
+            repeat(5) { holder.more("tracks") }; runCurrent()
+            assertEquals(2, reader.reads.size)
+            holder.close()
+        }
+    }
+
+    @Test fun revisionChangingAppendRetainsPrefixAndExplicitRefreshRebuildsIt() = runTest {
+        val reader = Reader()
+        val holder = CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+        holder.setVisible(true); runCurrent(); reader.reads.single().completeRows(); runCurrent()
+        val prefix = holder.state.value.current.sections.getValue("tracks").items
+        val version = holder.navigationVersion
+        holder.more("tracks"); runCurrent(); reader.reads.last().completeRows(revision = 2); runCurrent()
+        assertEquals(prefix, holder.state.value.current.sections.getValue("tracks").items)
+        assertTrue(holder.state.value.current.sections.getValue("tracks").refreshRequired)
+        assertTrue(holder.navigationVersion > version)
+        holder.retry("tracks"); runCurrent()
+        assertEquals(0, reader.reads.last().request.offset)
+        reader.reads.last().completeRows(revision = 2); runCurrent()
+        assertEquals(2L, holder.state.value.current.sections.getValue("tracks").revision)
+        assertNull(holder.state.value.current.sections.getValue("tracks").error)
+        holder.close()
+    }
+
+    @Test fun queryFilterAndReleaseGroupABARejectCancellationIgnoringAppendAndChangeRowKeys() = runTest {
+        for (change in 0..2) {
+            val reader = Reader().apply { ignoreCancellation = true }
+            val holder = if (change == 2) CatalogStateHolder(reader, backgroundScope,
+                initialItem = LibraryItem("artist", "artist", "Artist"))
+                else CatalogStateHolder(reader, backgroundScope, "tracks", "music")
+            val kind = if (change == 2) "albums" else "tracks"
+            holder.setVisible(true); runCurrent(); reader.reads.single().completeRows(total = 100); runCurrent()
+            val oldScreen = holder.state.value.current
+            val oldKey = catalogRowKey(oldScreen, kind, oldScreen.sections.getValue(kind).items.first())
+            holder.more(kind); runCurrent()
+            val obsolete = reader.reads.last()
+            when (change) {
+                0 -> { holder.commitQuery("other", true); holder.commitQuery("music", true) }
+                1 -> { holder.includeMissing(true); holder.includeMissing(false) }
+                else -> { holder.selectReleaseGroup("singles"); holder.selectReleaseGroup("albums") }
+            }
+            runCurrent()
+            val newest = reader.reads.last()
+            newest.completeRows(total = 100); runCurrent()
+            obsolete.completeRows(total = 100); runCurrent()
+            val current = holder.state.value.current
+            assertEquals(0, current.sections.getValue(kind).offset)
+            assertEquals(if (change == 2) 40 else 10, current.sections.getValue(kind).items.size)
+            assertNotEquals(oldKey, catalogRowKey(current, kind, current.sections.getValue(kind).items.first()))
+            reader.completePending(); runCurrent(); holder.close()
+        }
     }
 
     @Test fun metadataIsConciseAndDoesNotPretendMissingDurationIsZero() {

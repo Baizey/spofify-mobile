@@ -25,6 +25,8 @@ import dev.spofify.mobile.feature.library.MusicRowActionGuard
 import dev.spofify.mobile.feature.library.sourceCurrent as sourceLifetime
 import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.playback.PlaybackListAction
+import dev.spofify.mobile.ui.AutomaticListDemand
+import dev.spofify.mobile.ui.AppendStatus
 import dev.spofify.mobile.core.*
 import dev.spofify.mobile.playback.PlaybackRequests
 import dev.spofify.mobile.playback.queueIntentSelection
@@ -32,17 +34,46 @@ import dev.spofify.mobile.playback.queueIntentSelection
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
+/** Entries have no revision: these checks supplement, never replace, the before/after summaries. */
+internal fun validatePlaylistEntryBatch(page: PersonalEntriesPage, offset: Int, total: Long) {
+    if (page.offset != offset || page.total.toLong() != total || page.limit != 40 ||
+        page.items.size > page.limit || offset.toLong() + page.items.size > total ||
+        (page.items.isEmpty() && offset.toLong() < total) ||
+        page.items.map { it.id }.toSet().size != page.items.size ||
+        page.items.withIndex().any { (index, entry) -> entry.position != offset + index }) throw playlistBrowseChanged()
+}
+
+private fun samePlaylistSnapshot(before: PersonalPlaylistSummary, after: PersonalPlaylistSummary): Boolean =
+    before.id == after.id && before.kind == after.kind && before.revision == after.revision &&
+        before.trackCount == after.trackCount && before.availableCount == after.availableCount
+
+private fun playlistBrowseChanged() = ApiException(409, "Playlist results changed. Refresh before continuing.")
+
+internal fun validatePlaylistEvaluationPrefix(items: List<DerivedEvaluationEntry>, total: Long, nextCursor: String?) {
+    if (items.withIndex().any { (index, entry) -> entry.position != index.toLong() } ||
+        items.map { it.occurrenceId }.toSet().size != items.size || items.size.toLong() > total ||
+        (nextCursor == null && items.size.toLong() != total) ||
+        (nextCursor != null && (items.isEmpty() || items.size.toLong() >= total))) throw playlistBrowseChanged()
+}
+
+/** Compose keys normally use structural equality; equal login DTOs are not the same incarnation. */
+private class PlaylistSessionIdentity(private val session: Session?) {
+    override fun equals(other: Any?): Boolean = other is PlaylistSessionIdentity && session === other.session
+    override fun hashCode(): Int = System.identityHashCode(session)
+}
+
 /** Raw exact source selection; preparation belongs to the selected receiver. */
 typealias PlaylistQueueIntent = (QueueIntentSelection, PlaybackListAction, PlaybackInteractionKey?, QueueIntentBinding?, () -> Boolean) -> Unit
 
 /** Capture at the Play tap, before launching/fetching; a late queue is never a fresh intent. */
-internal class PlaylistPlaybackRequest(private val generation: PlaylistRequestGeneration) {
+internal class PlaylistPlaybackRequest(private val generation: PlaylistRequestGeneration,
+    private val sourceCurrent: () -> Boolean = { true }) {
     private val ticket = generation.invalidate()
     private val playbackEpoch = PlaybackRequests.epoch
 
     /** Success/error publication and queue delivery are synchronous on the Compose main coroutine. */
     fun deliver(action: () -> Unit) {
-        if (generation.accepts(ticket) && playbackEpoch == PlaybackRequests.epoch) action()
+        if (generation.accepts(ticket) && playbackEpoch == PlaybackRequests.epoch && sourceCurrent()) action()
     }
 
     /** Cancellation must still clear busy, but never clear a newer request's busy state. */
@@ -59,6 +90,81 @@ private data class PlaylistRowSelection(val track: LibraryItem, val selectionTok
 private data class PlaylistCollectionSelection(val selection: QueueIntentSelection?, val key: PlaybackInteractionKey?,
     val binding: QueueIntentBinding?, val isCurrent: () -> Boolean,
     val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null)
+
+/** Session-local browse data only. Jobs, requests, gestures and transient editors stay on the host. */
+class PlaylistBrowseMemory {
+    private var owner: SpofifyClient? = null
+    private var session: Session? = null
+    private var seeded = false
+    private var initialId: String? = null
+    internal val selectedId = mutableStateOf<String?>(null)
+    internal val navigationVersion = mutableLongStateOf(0)
+    internal var index = PlaylistIndexBrowseMemory()
+        private set
+    private var detailId: String? = null
+    private var currentDetail: PlaylistDetailBrowseMemory? = null
+
+    /** An explicit Home/external navigation intent, not an instruction to reapply on tab return. */
+    fun openPlaylist(id: String?) {
+        navigationVersion.longValue++
+        if (detailId != id) { detailId = null; currentDetail = null }
+        selectedId.value = id
+    }
+
+    internal fun bind(client: SpofifyClient) {
+        val current = client.currentSession()
+        if (owner != null && (owner !== client || session !== current)) {
+            selectedId.value = null; index = PlaylistIndexBrowseMemory()
+            detailId = null; currentDetail = null; seeded = false; initialId = null
+        }
+        owner = client; session = current
+    }
+
+    internal fun seed(id: String?) {
+        if (!seeded) {
+            seeded = true; initialId = id
+            if (id != null) openPlaylist(id)
+        } else if (initialId != id) {
+            initialId = id; openPlaylist(id)
+        }
+    }
+
+    internal fun detail(id: String, change: Long): PlaylistDetailBrowseMemory {
+        if (detailId != id) {
+            detailId = id; currentDetail = PlaylistDetailBrowseMemory(change)
+        }
+        return checkNotNull(currentDetail)
+    }
+}
+
+internal class PlaylistIndexBrowseMemory {
+    val refresh = mutableIntStateOf(0)
+    val offset = mutableIntStateOf(0)
+    val page = mutableStateOf<PersonalPlaylistPage?>(null)
+    val appendError = mutableStateOf<String?>(null)
+    val failedReset = mutableStateOf(false)
+    val message = mutableStateOf<String?>(null)
+    val baselineChange = mutableLongStateOf(0)
+    val baselineSession = mutableStateOf<Session?>(null, referentialEqualityPolicy())
+}
+
+internal class PlaylistDetailBrowseMemory(change: Long) {
+    val initialized = mutableStateOf(false)
+    val summary = mutableStateOf<PersonalPlaylistSummary?>(null)
+    val entries = mutableStateOf<PersonalEntriesPage?>(null)
+    val evaluation = mutableStateOf<DerivedEvaluationPage?>(null)
+    val manualEntries = mutableStateOf<List<PersonalPlaylistEntry>>(emptyList())
+    val derivedEntries = mutableStateOf<List<DerivedEvaluationEntry>>(emptyList())
+    val offset = mutableIntStateOf(0)
+    val appendError = mutableStateOf<String?>(null)
+    val browseChange = mutableLongStateOf(change)
+    val usedCursors = mutableStateOf<Set<String>>(emptySet())
+    val refresh = mutableIntStateOf(0)
+    val stale = mutableStateOf(true)
+    val blocked = mutableStateOf(false)
+    val message = mutableStateOf<String?>(null)
+    val copyNeedsReview = mutableStateOf(false)
+}
 
 /** Account-local navigation. Browsing never prepares or starts a queue. */
 @Composable
@@ -77,54 +183,124 @@ fun PlaylistsRoute(
     onQueueIntent: PlaylistQueueIntent? = null,
     onUnselectedHigh: ((QueueIntentSelection, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)? = null,
     artwork: @Composable (LibraryItem, Modifier) -> Unit = { _, artModifier -> Icon(Icons.Default.MusicNote, null, artModifier) },
+    browseMemory: PlaylistBrowseMemory? = null,
+    sourceEpoch: Any? = null,
 ) {
-    key(client, client.currentSession()?.accountId) {
-        var selectedId by remember { mutableStateOf(initialPlaylistId) }
-        LaunchedEffect(initialPlaylistId) { selectedId = initialPlaylistId }
+    key(client, PlaylistSessionIdentity(client.currentSession())) {
+        val memory = remember(browseMemory) { browseMemory ?: PlaylistBrowseMemory() }
+        memory.bind(client)
+        memory.seed(initialPlaylistId)
+        val navigation = memory.navigationVersion.longValue
+        var selectedId by memory.selectedId
         var creating by remember { mutableStateOf(false) }
         var newDraft by remember { mutableStateOf(PlaylistEditorDraft()) }
-        var refresh by remember { mutableIntStateOf(0) }
-        var offset by remember { mutableIntStateOf(0) }
-        var page by remember { mutableStateOf<PersonalPlaylistPage?>(null) }
+        val index = memory.index
+        var refresh by index.refresh
+        var offset by index.offset
+        var page by index.page
         var loading by remember { mutableStateOf(false) }
-        var message by remember { mutableStateOf<String?>(null) }
+        var appending by remember { mutableStateOf(false) }
+        var appendError by index.appendError
+        var failedIndexReset by index.failedReset
+        var message by index.message
+        var baselineChange by index.baselineChange
+        var baselineSession by index.baselineSession
+        val changes by client.personalRevision.collectAsState()
         val api = remember(client) { PersonalCollectionsApi(client) }
+        val scope = rememberCoroutineScope()
+        val requests = remember { PlaylistRequestGeneration() }
+        var indexJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+        DisposableEffect(requests) { onDispose { requests.invalidate(); indexJob?.cancel() } }
         val listState = rememberLazyListState()
-        LaunchedEffect(client, offset, refresh) {
-            loading = true
-            try { page = api.playlists(limit = 40, offset = offset); message = null }
-            catch (e: CancellationException) { throw e }
-            catch (_: Exception) { message = "Playlists could not load. Refresh explicitly to try again." }
-            finally { loading = false }
+        fun loadIndex(reset: Boolean = false, retry: Boolean = false) {
+            if (loading || appending) return
+            val requestedOffset = if (reset) 0 else offset
+            val previous = if (reset) null else page
+            val session = client.currentSession()
+            val change = client.personalRevision.value.playlists
+            val ticket = requests.invalidate()
+            if (reset) { loading = true; message = null }
+            else appending = true
+            if (!retry) appendError = null
+            indexJob = scope.launch {
+                try {
+                    if (requestedOffset > 1_000_000) throw playlistBrowseChanged()
+                    val next = api.playlists(limit = 40, offset = requestedOffset)
+                    if (!requests.accepts(ticket) || client.currentSession() !== session ||
+                        memory.navigationVersion.longValue != navigation || selectedId != null || creating) return@launch
+                    if (change != client.personalRevision.value.playlists ||
+                        (previous != null && (baselineChange != change || baselineSession !== session)) || next.offset != requestedOffset ||
+                        next.limit != 40 || next.total < 0 || next.items.size > 40 ||
+                        requestedOffset.toLong() + next.items.size > next.total ||
+                        (next.items.isEmpty() && requestedOffset < next.total) ||
+                        (previous != null && next.total != previous.total) ||
+                        next.items.map { it.id }.toSet().size != next.items.size) throw playlistBrowseChanged()
+                    val old = previous?.items.orEmpty().associateBy { it.id }
+                    if (next.items.any { old[it.id]?.let { retained -> retained != it } == true }) throw playlistBrowseChanged()
+                    val added = next.items.filter { it.id !in old }
+                    if (next.items.isNotEmpty() && added.isEmpty()) throw playlistBrowseChanged()
+                    page = next.copy(items = previous?.items.orEmpty() + added)
+                    offset = requestedOffset + next.items.size // Raw consumed positions, not deduplicated display size.
+                    baselineChange = change; baselineSession = session
+                    message = null; appendError = null
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) {
+                    if (requests.accepts(ticket) && client.currentSession() === session &&
+                        memory.navigationVersion.longValue == navigation && selectedId == null && !creating) {
+                        if (e is ApiException && (e.status in 200..299 || e.status == 409)) {
+                            message = "Playlists changed. Refresh to continue."; appendError = null
+                        } else { appendError = "Playlists could not load."; failedIndexReset = reset }
+                    }
+                } finally {
+                    if (requests.accepts(ticket)) { loading = false; appending = false }
+                }
+            }
         }
+        LaunchedEffect(client, refresh, selectedId, creating, navigation) {
+            if (selectedId == null && !creating && page == null && appendError == null && message == null) loadIndex(reset = true)
+        }
+        // Hidden destinations never drive demand; reads already in flight are also fenced on leaving.
+        DisposableEffect(selectedId, creating, navigation) {
+            onDispose { requests.invalidate(); indexJob?.cancel(); loading = false; appending = false }
+        }
+        val indexChanged = page != null && changes.playlists != baselineChange
+        if (selectedId == null && !creating) AutomaticListDemand(listState, refresh,
+            page?.items.orEmpty().takeLast(3).map { it.id },
+            !loading && !appending && appendError == null && message == null && !indexChanged && offset < (page?.total ?: 0)) { loadIndex() }
         when {
             creating -> PlaylistEditor(client, null, newDraft, onBack = { creating = false }, onSaved = {
                 creating = false; newDraft = PlaylistEditorDraft(); selectedId = it.id; refresh++
             }, modifier = modifier, onDiscard = { newDraft = PlaylistEditorDraft(); creating = false; refresh++ },
                 onMutationPendingChange = onMutationPendingChange)
-            selectedId != null -> PlaylistDetail(client, selectedId!!, onOpenTrack, onPlayQueue, onShowTrackActions,
-                onBack = { selectedId = null; refresh++ }, modifier = modifier, onMutationPendingChange = onMutationPendingChange,
-                playback = playback, onPreparedAction = onPreparedAction,
-                playbackEntryId = playbackEntryId, playbackContext = playbackContext, onQueueIntent = onQueueIntent,
-                onUnselectedHigh = onUnselectedHigh, artwork = artwork)
+            selectedId != null -> key(navigation, selectedId) {
+                val detailId = selectedId!!
+                PlaylistDetail(client, detailId, onOpenTrack, onPlayQueue, onShowTrackActions,
+                    onBack = { selectedId = null }, modifier = modifier, onMutationPendingChange = onMutationPendingChange,
+                    playback = playback, onPreparedAction = onPreparedAction,
+                    playbackEntryId = playbackEntryId, playbackContext = playbackContext, onQueueIntent = onQueueIntent,
+                    onUnselectedHigh = onUnselectedHigh, browse = memory.detail(detailId, changes.playlists),
+                    navigationCurrent = { memory.navigationVersion.longValue == navigation && selectedId == detailId },
+                    sourceEpoch = sourceEpoch, artwork = artwork)
+            }
             else -> LazyColumn(modifier.fillMaxSize(), state = listState,
                 contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item {
                     Row {
                         Button(onClick = { creating = true }) { Text("Create playlist") }
-                        TextButton(onClick = { refresh++ }, enabled = !loading) { Text("Refresh") }
+                        TextButton(onClick = { refresh++; loadIndex(reset = true) }, enabled = !loading && !appending) { Text("Refresh") }
                     }
                     if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
                     message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    if (indexChanged) Text("Playlists changed. Refresh to continue.")
                 }
                 items(page?.items.orEmpty(), key = { it.id }) { playlist ->
-                    PlaylistCard(playlist, onClick = { selectedId = playlist.id })
+                    PlaylistCard(playlist, onClick = { memory.openPlaylist(playlist.id) })
                 }
-                if (offset > 0 || offset + (page?.items?.size ?: 0) < (page?.total ?: 0)) item {
-                    Row {
-                        TextButton(onClick = { offset = (offset - 40).coerceAtLeast(0) }, enabled = offset > 0 && !loading) { Text("Previous") }
-                        TextButton(onClick = { offset += 40 }, enabled = !loading && offset + (page?.items?.size ?: 0) < (page?.total ?: 0)) { Text("Next playlists") }
-                    }
+                item {
+                    AppendStatus(appending, if (loading || appending) null else appendError,
+                        onRetry = { loadIndex(reset = failedIndexReset, retry = true) }, loadingLabel = "Loading more playlists")
+                    if (!loading && page?.total == 0) Text("No playlists yet.")
+                    else if (!loading && message == null && page != null && offset >= page!!.total) Text("All playlists loaded.")
                 }
             }
         }
@@ -172,26 +348,39 @@ private fun PlaylistDetail(
     playbackEntryId: String?, playbackContext: LibraryItem?, onQueueIntent: PlaylistQueueIntent?,
     onUnselectedHigh: ((QueueIntentSelection, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)?,
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
+    browse: PlaylistDetailBrowseMemory,
+    navigationCurrent: () -> Boolean,
+    sourceEpoch: Any?,
 ) {
     val api = remember(client) { PersonalCollectionsApi(client) }
     val derived = remember(client) { DerivedPlaylistsApi(client) }
     val scope = rememberCoroutineScope()
     val generation = remember(id) { PlaylistRequestGeneration() }
-    // Preparing one musical action must not retire its own captured source/More lifetime.
-    val preparationGeneration = remember(id) { PlaylistRequestGeneration() }
-    var summary by remember(id) { mutableStateOf<PersonalPlaylistSummary?>(null) }
-    var entries by remember(id) { mutableStateOf<PersonalEntriesPage?>(null) }
-    var evaluation by remember(id) { mutableStateOf<DerivedEvaluationPage?>(null) }
-    var cursorStack by remember(id) { mutableStateOf(listOf<String?>(null)) }
-    var pageIndex by remember(id) { mutableIntStateOf(0) }
-    var offset by remember(id) { mutableIntStateOf(0) }
-    var refresh by remember(id) { mutableIntStateOf(0) }
+    val playbackRequests = remember(id) { PlaylistRequestGeneration() }
+    var summary by browse.summary
+    var entries by browse.entries
+    var evaluation by browse.evaluation
+    var manualEntries by browse.manualEntries
+    var derivedEntries by browse.derivedEntries
+    var offset by browse.offset
+    var appending by remember(id) { mutableStateOf(false) }
+    var appendError by browse.appendError
+    var browseChange by browse.browseChange
+    val personalChanges by client.personalRevision.collectAsState()
+    var usedCursors by browse.usedCursors
+    val browseRequests = remember(id) { PlaylistRequestGeneration() }
+    var appendJob by remember(id) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    DisposableEffect(browseRequests) {
+        onDispose { browseRequests.invalidate(); playbackRequests.invalidate(); generation.invalidate(); appendJob?.cancel() }
+    }
+    var refresh by browse.refresh
+    val sourceSession = remember(id, refresh) { client.currentSession() }
     var busy by remember(id) { mutableStateOf(false) }
     var mutating by remember(id) { mutableStateOf(false) }
     ReportPlaylistMutationPending(mutating, onMutationPendingChange)
-    var stale by remember(id) { mutableStateOf(true) }
-    var blocked by remember(id) { mutableStateOf(false) }
-    var message by remember(id) { mutableStateOf<String?>(null) }
+    var stale by browse.stale
+    var blocked by browse.blocked
+    var message by browse.message
     var metadata by remember(id) { mutableStateOf(false) }
     var deleting by remember(id) { mutableStateOf(false) }
     var removing by remember(id) { mutableStateOf<PlaylistRowSelection?>(null) }
@@ -206,10 +395,11 @@ private fun PlaylistDetail(
     val outputLifetime = remember(id, client, outputCapture) { dev.spofify.mobile.ui.RowActionLifetime() }
     DisposableEffect(outputLifetime) { onDispose { outputLifetime.invalidate() } }
     val latestInteractionKey by rememberUpdatedState(playback.interactionKey)
+    val latestSourceEpoch = rememberUpdatedState(sourceEpoch)
     var addingTrack by remember(id) { mutableStateOf<LibraryItem?>(null) }
     var editing by remember(id) { mutableStateOf(false) }
     var copying by remember(id) { mutableStateOf(false) }
-    var copyNeedsReview by remember(id) { mutableStateOf(false) }
+    var copyNeedsReview by browse.copyNeedsReview
     var copyReviewed by remember(id) { mutableStateOf(false) }
     var copyReviewMessage by remember(id) { mutableStateOf<String?>(null) }
     var editorDraft by remember(id) { mutableStateOf<PlaylistEditorDraft?>(null) }
@@ -218,10 +408,15 @@ private fun PlaylistDetail(
     var ordered by remember(id) { mutableStateOf<List<PersonalPlaylistEntry>>(emptyList()) }
     val listState = rememberLazyListState()
 
-    fun refreshAll() { generation.invalidate(); stale = true; snapshot = null; offset = 0; pageIndex = 0; cursorStack = listOf(null); refresh++ }
+    fun refreshAll() {
+        generation.invalidate(); browseRequests.invalidate(); appendJob?.cancel(); appending = false
+        stale = true; snapshot = null; offset = 0; appendError = null; usedCursors = emptySet()
+        browse.initialized.value = false; refresh++
+    }
     fun write(onFailure: ((Exception) -> Unit)? = null, action: suspend () -> Unit) {
-        if (busy || blocked) return
-        generation.invalidate(); busy = true; mutating = true; stale = true; onMutationPendingChange(true)
+        if (busy || blocked || !navigationCurrent()) return
+        generation.invalidate(); browseRequests.invalidate(); appendJob?.cancel(); appending = false
+        busy = true; mutating = true; stale = true; onMutationPendingChange(true)
         scope.launch {
             try { action() }
             catch (e: CancellationException) { throw e }
@@ -229,31 +424,124 @@ private fun PlaylistDetail(
             finally { busy = false; mutating = false; onMutationPendingChange(false) }
         }
     }
-    LaunchedEffect(id, offset, pageIndex, refresh) {
+    LaunchedEffect(id, refresh) {
+        if (browse.initialized.value) return@LaunchedEffect
         val ticket = generation.invalidate()
-        busy = true; stale = true
+        val request = browseRequests.invalidate()
+        val session = client.currentSession()
+        val change = client.personalRevision.value.playlists
+        fun current() = navigationCurrent() && generation.accepts(ticket) && browseRequests.accepts(request) && client.currentSession() === session
+        busy = true; stale = true; appendError = null
         try {
             val saved = api.playlist(id)
-            if (generation.accepts(ticket)) summary = saved
-            val manual = if (saved.kind == PlaylistKind.MANUAL) api.entries(id, limit = 40, offset = offset) else null
-            val result = if (saved.kind == PlaylistKind.DERIVED) derived.evaluate(id, limit = 40, cursor = cursorStack[pageIndex]) else null
-            if (result != null && result.revision != saved.revision) throw ApiException(409, "Refresh the changed playlist")
-            if (generation.accepts(ticket)) {
-                summary = saved; entries = manual; evaluation = result; stale = false; blocked = false; message = null
+            if (current()) summary = saved
+            val manual = if (saved.kind == PlaylistKind.MANUAL) api.entries(id, limit = 40, offset = 0) else null
+            if (manual != null) {
+                validatePlaylistEntryBatch(manual, 0, saved.trackCount!!)
+                if (!samePlaylistSnapshot(saved, api.playlist(id))) throw playlistBrowseChanged()
+            }
+            val result = if (saved.kind == PlaylistKind.DERIVED) derived.evaluate(id, limit = 40) else null
+            if (result != null) {
+                if (result.revision != saved.revision || result.limit != 40) throw playlistBrowseChanged()
+                validatePlaylistEvaluationPrefix(result.items, result.total, result.nextCursor)
+            }
+            if (change != client.personalRevision.value.playlists) throw playlistBrowseChanged()
+            if (current()) {
+                summary = saved; entries = manual; evaluation = result
+                manualEntries = manual?.items.orEmpty(); derivedEntries = result?.items.orEmpty()
+                offset = manual?.items?.size ?: 0; browseChange = change
+                stale = false; blocked = false; message = null; browse.initialized.value = true
             }
         } catch (e: CancellationException) { throw e }
-        catch (e: Exception) { if (generation.accepts(ticket)) { message = playlistFailure(e); stale = true } }
+        catch (e: Exception) { if (current()) { message = playlistFailure(e); stale = true; browse.initialized.value = true } }
         finally { if (generation.accepts(ticket)) busy = false }
     }
+    fun append() {
+        val baseline = summary ?: return
+        if (busy || appending || stale || snapshot != null || editing || !navigationCurrent() || client.currentSession() !== sourceSession) return
+        val requestedOffset = offset
+        val requestedCursor = evaluation?.nextCursor
+        if (baseline.kind == PlaylistKind.MANUAL && requestedOffset >= (entries?.total ?: 0) ||
+            baseline.kind == PlaylistKind.DERIVED && requestedCursor == null) return
+        val session = client.currentSession()
+        val change = browseChange
+        val request = browseRequests.invalidate() // Separate from held row/More/play authority.
+        appending = true // Synchronous single-flight reservation; a canceled Retry keeps its latch.
+        appendJob = scope.launch {
+            fun current() = navigationCurrent() && browseRequests.accepts(request) && client.currentSession() === session && !stale && snapshot == null
+            try {
+                if (change != client.personalRevision.value.playlists) throw playlistBrowseChanged()
+                if (baseline.kind == PlaylistKind.MANUAL) {
+                    if (requestedOffset > 1_000_000 || !samePlaylistSnapshot(baseline, api.playlist(id))) throw playlistBrowseChanged()
+                    val next = api.entries(id, limit = 40, offset = requestedOffset)
+                    validatePlaylistEntryBatch(next, requestedOffset, baseline.trackCount!!)
+                    val after = api.playlist(id)
+                    if (!samePlaylistSnapshot(baseline, after) ||
+                        next.items.any { entry -> manualEntries.any { it.id == entry.id } }) throw playlistBrowseChanged()
+                    if (current() && change == client.personalRevision.value.playlists) {
+                        manualEntries = manualEntries + next.items; entries = next
+                        offset = requestedOffset + next.items.size; appendError = null
+                    } else if (current()) throw playlistBrowseChanged()
+                } else {
+                    val retained = evaluation ?: throw playlistBrowseChanged()
+                    val next = derived.evaluate(id, limit = 40, cursor = requestedCursor)
+                    if (next.revision != baseline.revision || next.fence != retained.fence ||
+                        next.total != retained.total || next.availableTotal != retained.availableTotal || next.limit != 40 ||
+                        next.nextCursor == requestedCursor || next.nextCursor in usedCursors ||
+                        next.items.zipWithNext().any { (a, b) -> a.position >= b.position }) throw playlistBrowseChanged()
+                    val old = derivedEntries.associateBy { it.occurrenceId }
+                    if (next.items.any { old[it.occurrenceId]?.let { previous -> previous != it } == true }) throw playlistBrowseChanged()
+                    val added = next.items.filter { it.occurrenceId !in old }
+                    val previousPosition = derivedEntries.lastOrNull()?.position
+                    if ((next.items.isNotEmpty() && added.isEmpty()) ||
+                        (next.items.isEmpty() && next.nextCursor != null) ||
+                        (previousPosition != null && added.firstOrNull()?.position?.let { it != previousPosition + 1 } == true) ||
+                        added.zipWithNext().any { (a, b) -> b.position != a.position + 1 }) throw playlistBrowseChanged()
+                    val combined = derivedEntries + added
+                    validatePlaylistEvaluationPrefix(combined, next.total, next.nextCursor)
+                    if (current() && change == client.personalRevision.value.playlists) {
+                        derivedEntries = combined; evaluation = next; appendError = null
+                        usedCursors = usedCursors + requestedCursor!!
+                    } else if (current()) throw playlistBrowseChanged()
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (current()) {
+                    if (e is ApiException && (e.status == 409 || e.status == 410 || e.status in 200..299)) {
+                        stale = true; generation.invalidate(); message = playlistFailure(e); appendError = null
+                    } else appendError = "More songs could not load."
+                }
+            } finally { if (browseRequests.accepts(request)) appending = false }
+        }
+    }
+    LaunchedEffect(personalChanges.playlists) {
+        if (!stale && personalChanges.playlists != browseChange) {
+            generation.invalidate(); browseRequests.invalidate(); appendJob?.cancel(); appending = false
+            stale = true; message = "Playlists changed. Refresh to continue."
+        }
+    }
+    AutomaticListDemand(listState, refresh,
+        if (summary?.kind == PlaylistKind.DERIVED) derivedEntries.takeLast(3).map { it.occurrenceId }
+        else manualEntries.takeLast(3).map { it.id },
+        !busy && !appending && !stale && appendError == null && snapshot == null && !editing && !copying &&
+            (if (summary?.kind == PlaylistKind.DERIVED) evaluation?.nextCursor != null else offset < (entries?.total ?: 0))) { append() }
     BackHandler {
-        if (!busy) when { editing -> editing = false; copying -> copying = false; snapshot != null -> snapshot = null; else -> onBack() }
+        if (!busy) when { editing -> editing = false; copying -> copying = false; snapshot != null -> refreshAll(); else -> onBack() }
     }
     val saved = summary
     fun captureCurrent(rowCurrent: () -> Boolean = { true }): () -> Boolean {
         val ticket = generation.ticket()
         val rowSource = sourceLifetime(rowCurrent)
+        val session = client.currentSession()
+        val change = client.personalRevision.value.playlists
+        val revision = summary?.revision
+        val fence = evaluation?.fence
+        val capturedEpoch = sourceEpoch
         return MusicRowActionGuard(
-            { rowSource() && actionLifetime.isCurrent() && generation.accepts(ticket) },
+            { latestSourceEpoch.value == capturedEpoch && navigationCurrent() && rowSource() && actionLifetime.isCurrent() && generation.accepts(ticket) &&
+                client.currentSession() === session && session === sourceSession &&
+                client.personalRevision.value.playlists == change && change == browseChange &&
+                summary?.revision == revision && evaluation?.fence == fence },
             { rowCurrent() && outputLifetime.isCurrent() && latestOutputCapture === outputCapture })
     }
     fun exactSelection(track: LibraryItem? = null, occurrenceId: String? = null,
@@ -268,15 +556,19 @@ private fun PlaylistDetail(
         key: PlaybackInteractionKey? = playback.interactionKey, binding: QueueIntentBinding? = playback.queueIntentBinding,
         current: () -> Boolean = actionLifetime::isCurrent,
         origin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null) {
-        if (selection == null || busy || stale || !current() || !actionLifetime.isCurrent()) return
+        if (selection == null || busy || stale || !navigationCurrent() || !current() || !actionLifetime.isCurrent() ||
+            client.currentSession() !== sourceSession || client.personalRevision.value.playlists != browseChange) return
         if (key != null && latestInteractionKey !== key) return
         val epoch = PlaybackRequests.epoch
         val revision = saved?.revision
+        val session = client.currentSession()
+        val change = browseChange
         val sourceTicket = generation.ticket()
         val admittedSource = sourceLifetime(current)
         val live = {
-            admittedSource() && actionLifetime.isCurrent() && generation.accepts(sourceTicket) &&
-                epoch == PlaybackRequests.epoch && !stale && summary?.revision == revision
+            navigationCurrent() && admittedSource() && actionLifetime.isCurrent() && generation.accepts(sourceTicket) &&
+                epoch == PlaybackRequests.epoch && !stale && summary?.revision == revision &&
+                client.currentSession() === session && client.personalRevision.value.playlists == change
         }
         if (action == PlaybackListAction.QUEUE_HIGH && origin != null) onUnselectedHigh?.invoke(selection, origin, live)
         else onQueueIntent?.invoke(selection, action, key, binding, live)
@@ -334,10 +626,11 @@ private fun PlaylistDetail(
 
     fun play(selectionToken: String? = null, trackId: String? = null, entryId: String? = null,
         action: PlaybackListAction? = null, expectedKey: PlaybackInteractionKey? = null, isCurrent: () -> Boolean = { true }) {
-        if (busy || stale || saved == null || !isCurrent()) return
+        if (busy || stale || saved == null || !navigationCurrent() || !isCurrent() || client.currentSession() !== sourceSession ||
+            client.personalRevision.value.playlists != browseChange) return
         if (onQueueIntent != null) {
-            val row = if (selectionToken != null) evaluation?.items?.firstOrNull { it.selectionToken == selectionToken } else null
-            val manual = if (entryId != null) entries?.items?.firstOrNull { it.id == entryId } else null
+            val row = if (selectionToken != null) derivedEntries.firstOrNull { it.selectionToken == selectionToken } else null
+            val manual = if (entryId != null) manualEntries.firstOrNull { it.id == entryId } else null
             submit(exactSelection(row?.track ?: manual?.track, row?.occurrenceId, row?.selectionToken, manual?.id),
                 action ?: PlaybackListAction.PLAY_NOW, expectedKey ?: playback.interactionKey, current = isCurrent)
             return
@@ -346,7 +639,9 @@ private fun PlaylistDetail(
         val result = evaluation
         val sourceTicket = generation.ticket()
         val sourceCurrent = sourceLifetime(captureCurrent(isCurrent))
-        val request = PlaylistPlaybackRequest(preparationGeneration); busy = true
+        val request = PlaylistPlaybackRequest(playbackRequests) {
+            sourceCurrent() && navigationCurrent() && generation.accepts(sourceTicket) && actionLifetime.isCurrent() && client.currentSession() === sourceSession
+        }; busy = true
         scope.launch {
             try {
                 if (saved.kind == PlaylistKind.DERIVED && result != null) {
@@ -474,6 +769,8 @@ private fun PlaylistDetail(
             }
         }, confirmButton = { TextButton(onClick = { collectionActions = null }) { Text("Done") } })
     }
+    val renderedSourceTicket = generation.ticket()
+    val renderedCurrent = captureCurrent()
     LazyColumn(modifier.fillMaxSize(), state = listState,
         contentPadding = PaddingValues(horizontal = MusicListLayout.horizontalPadding, vertical = 16.dp),
         verticalArrangement = MusicListLayout.arrangement) {
@@ -504,7 +801,7 @@ private fun PlaylistDetail(
                     Button(enabled = !busy && !blocked, onClick = { val complete = snapshot!!; write {
                         summary = api.reorder(complete, ordered.map { it.id }); snapshot = null; refreshAll()
                     } }) { Text("Save order") }
-                    TextButton(enabled = !busy, onClick = { snapshot = null }) { Text("Cancel reorder") }
+                    TextButton(enabled = !busy, onClick = { refreshAll() }) { Text("Cancel reorder") }
                 }
             }
         }
@@ -532,52 +829,52 @@ private fun PlaylistDetail(
                 }
             }
         } else if (saved?.kind == PlaylistKind.DERIVED) {
-            items(evaluation?.items.orEmpty(), key = { it.occurrenceId }) { entry ->
-                PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entry.selectionToken, interactionKey = playback.interactionKey, isCurrent = captureCurrent(isCurrent),
+            items(derivedEntries, key = { it.occurrenceId }) { entry ->
+                PlaylistTrackRow(entry.track, onOpenTrack, { track, rowCurrent ->
+                    val current = { renderedCurrent() && rowCurrent() }
+                    if (current()) occurrenceActions = PlaylistRowSelection(track, entry.selectionToken, interactionKey = playback.interactionKey, isCurrent = current,
                         queueSelection = exactSelection(track, entry.occurrenceId, entry.selectionToken), binding = playback.queueIntentBinding,
                         unselectedOrigin = playback.unselectedQueueOrigin) },
                     enabled = !busy && !stale && saved.capabilities.play && entry.selectionToken != null,
                     onPlay = { current -> play(selectionToken = entry.selectionToken, isCurrent = captureCurrent(current)) }, actionsEnabled = !busy,
-                    artwork = artwork, playback = playback, occurrenceBinding = listOf(id, saved.revision, evaluation?.fence, entry),
+                    artwork = artwork, playback = playback, occurrenceBinding = listOf(id, sourceEpoch, renderedSourceTicket, saved.revision, evaluation?.fence, entry),
                     currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.DERIVED, entry.occurrenceId,
                         entry.track.id, playback.trackId, playbackEntryId, playbackContext),
-                    onContextual = if (onQueueIntent != null || onPreparedAction != null) ({ expectedKey, isCurrent -> play(selectionToken = entry.selectionToken,
-                        action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = isCurrent) }) else null,
-                    onUnselectedHigh = if (onUnselectedHigh != null) ({ origin, current ->
+                    onContextual = if (onQueueIntent != null || onPreparedAction != null) ({ expectedKey, rowCurrent -> play(selectionToken = entry.selectionToken,
+                        action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = { renderedCurrent() && rowCurrent() }) }) else null,
+                    onUnselectedHigh = if (onUnselectedHigh != null) ({ origin, rowCurrent ->
                         submit(exactSelection(entry.track, entry.occurrenceId, entry.selectionToken), PlaybackListAction.QUEUE_HIGH,
-                            null, null, captureCurrent(current), origin)
+                            null, null, { renderedCurrent() && rowCurrent() }, origin)
                     }) else null)
             }
             item {
-                Row {
-                    TextButton(enabled = !busy && !stale && pageIndex > 0, onClick = { pageIndex-- }) { Text("Previous page") }
-                    TextButton(enabled = !busy && !stale && evaluation?.nextCursor != null, onClick = {
-                        cursorStack = cursorStack.take(pageIndex + 1) + evaluation!!.nextCursor; pageIndex++
-                    }) { Text("Next page") }
-                }
+                AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
+                if (!busy && !stale && derivedEntries.isEmpty()) Text("No songs match these rules.")
+                else if (!busy && !stale && evaluation?.nextCursor == null) Text("All songs loaded.")
             }
         } else {
-            items(entries?.items.orEmpty(), key = { it.id }) { entry ->
+            items(manualEntries, key = { it.id }) { entry ->
                     PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entryId = entry.id, interactionKey = playback.interactionKey, isCurrent = captureCurrent(isCurrent),
                         queueSelection = exactSelection(track, entryId = entry.id), binding = playback.queueIntentBinding,
                         unselectedOrigin = playback.unselectedQueueOrigin) },
                         enabled = !busy && !stale && saved?.capabilities?.play == true,
                         onPlay = { current -> play(trackId = entry.track.id, entryId = entry.id, isCurrent = captureCurrent(current)) },
                         actionsEnabled = !busy, artwork = artwork, playback = playback,
-                        occurrenceBinding = listOf(id, saved?.revision, entry),
+                        occurrenceBinding = listOf(id, sourceEpoch, renderedSourceTicket, saved?.revision, entry),
                         currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.MANUAL, entry.id,
                             entry.track.id, playback.trackId, playbackEntryId, playbackContext),
-                        onContextual = if (onQueueIntent != null || onPreparedAction != null) ({ expectedKey, isCurrent -> play(trackId = entry.track.id,
-                            entryId = entry.id, action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = isCurrent) }) else null,
-                        onUnselectedHigh = if (onUnselectedHigh != null) ({ origin, current ->
+                        onContextual = if (onQueueIntent != null || onPreparedAction != null) ({ expectedKey, rowCurrent -> play(trackId = entry.track.id,
+                            entryId = entry.id, action = PlaybackListAction.QUEUE_HIGH, expectedKey = expectedKey, isCurrent = { renderedCurrent() && rowCurrent() }) }) else null,
+                        onUnselectedHigh = if (onUnselectedHigh != null) ({ origin, rowCurrent ->
                             submit(exactSelection(entry.track, entryId = entry.id), PlaybackListAction.QUEUE_HIGH,
-                                null, null, captureCurrent(current), origin)
+                                null, null, { renderedCurrent() && rowCurrent() }, origin)
                         }) else null)
             }
-            item { Row {
-                TextButton(enabled = !busy && offset > 0, onClick = { offset = (offset - 40).coerceAtLeast(0) }) { Text("Previous page") }
-                TextButton(enabled = !busy && offset + (entries?.items?.size ?: 0) < (entries?.total ?: 0), onClick = { offset += 40 }) { Text("Next page") }
-            } }
+            item {
+                AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
+                if (!busy && !stale && manualEntries.isEmpty()) Text("No songs yet.")
+                else if (!busy && !stale && offset >= (entries?.total ?: 0)) Text("All songs loaded.")
+            }
         }
     }
 }
