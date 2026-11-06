@@ -39,12 +39,16 @@ jobs:
       ANDROID_BUILD_TOOLS: '37.0.0'
       ANDROID_CMDLINE_TOOLS: '15859902'
       BROKER_SHA256: 425e4bb46efcf1c25e195d92d4d1845ed2389cd35e6ebf9ad8981cd80c2c70f4
-      BROKER_CACHE_DIR: ${{ runner.temp }}/spofify-broker-cache
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/spofify-playwright
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      - name: Set up isolated cache paths
+        run: |
+          {
+            printf 'BROKER_CACHE_DIR=%s/spofify-broker-cache\n' "$RUNNER_TEMP"
+            printf 'PLAYWRIGHT_BROWSERS_PATH=%s/spofify-playwright\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
       # Cache only immutable setup artifacts, never fixture runtimes, sessions,
       # node_modules, credentials, APKs or test results. Only main saves these
       # caches, immediately after successful setup so later test failures do not
