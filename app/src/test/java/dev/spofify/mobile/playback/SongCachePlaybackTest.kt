@@ -31,11 +31,17 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.android.controller.ServiceController
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.OutputStream
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
@@ -194,7 +200,7 @@ class SongCachePlaybackTest {
 
     private inner class Journey(remote: Boolean = false, private val limits: SongCache.Limits = SongCache.Limits(),
         sampleRate: Int = 8000, longCurrent: Boolean = false, longFutureB: Boolean = false,
-        normalTrackSeconds: Int = 12) : AutoCloseable {
+        normalTrackSeconds: Int = 12, openCacheWrite: ((File) -> OutputStream)? = null) : AutoCloseable {
         val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
         val room = Room(remote, sampleRate, longCurrent, longFutureB, normalTrackSeconds)
         val web = MockWebServer().apply { dispatcher = room; start(InetAddress.getByName("127.0.0.1"), 0) }
@@ -214,6 +220,16 @@ class SongCachePlaybackTest {
             app.graph.clear()
             SongCachePlaybackMedia.reset()
             graph = install(AppGraph(app, sessions, Logins(), audioCacheLimits = limits))
+            if (openCacheWrite != null) {
+                // Inject only the constructor's existing disk-I/O seam. Playback, authorization,
+                // cache policy and scheduling remain production; no private state is asserted.
+                graph.songCache.close()
+                graph.songCache.awaitStorageForTest()
+                AppGraph::class.java.getDeclaredField("songCache").apply {
+                    isAccessible = true
+                    set(graph, SongCache(app.cacheDir, limits, openWrite = openCacheWrite))
+                }
+            }
             client = graph.configure(server)
             runBlocking { client.login("listener", "synthetic-password") }
             timeoutDiagnostics = ::diagnostics
@@ -253,6 +269,7 @@ class SongCachePlaybackTest {
             val saved = requireNotNull(sessions.read())
             // Retire old runtime authority without logging out/purging its persistent namespace.
             graph.configure(server)
+            graph.songCache.awaitStorageForTest()
             graph = install(AppGraph(app, Sessions(saved), Logins(), audioCacheLimits = limits))
             client = requireNotNull(graph.client)
             return client
@@ -438,6 +455,7 @@ class SongCachePlaybackTest {
             } }
             cleanup { stopService() }
             graphs.asReversed().forEach { retired -> cleanup { retired.clear() } }
+            graphs.asReversed().forEach { retired -> cleanup { retired.songCache.awaitStorageForTest() } }
             cleanup { pump(100) }
             cleanup { web.shutdown() }
             SongCachePlaybackMedia.reset()
@@ -596,6 +614,94 @@ class SongCachePlaybackTest {
             assertEquals(0, j.foregroundNotificationId())
             assertTrue(j.room.mutations.isEmpty())
             assertTrue(PlaybackService.exportLocalSnapshot().queue.isEmpty())
+            j.assertHealthy()
+        }
+    }
+
+    @Test fun productionPauseCompletesBeforeHeldSpeculativeWriteIsReleased() =
+        assertPauseDuringSpeculativeDisk(holdClose = false)
+
+    @Test fun productionPauseCompletesBeforeHeldSpeculativeCloseCommitIsReleased() =
+        assertPauseDuringSpeculativeDisk(holdClose = true)
+
+    private fun assertPauseDuringSpeculativeDisk(holdClose: Boolean) {
+        val arm = AtomicBoolean()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val timedOut = AtomicBoolean()
+        fun hold() {
+            entered.countDown()
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            var interrupted = false
+            try {
+                while (release.count != 0L) {
+                    val remaining = deadline - System.nanoTime()
+                    if (remaining <= 0) {
+                        timedOut.set(true)
+                        throw IOException("Synthetic storage hold timed out")
+                    }
+                    try { release.await(remaining, TimeUnit.NANOSECONDS) }
+                    catch (_: InterruptedException) { interrupted = true }
+                }
+            } finally { if (interrupted) Thread.currentThread().interrupt() }
+        }
+        Journey(longCurrent = true, openCacheWrite = { file ->
+            val held = arm.compareAndSet(true, false)
+            val output = FileOutputStream(file)
+            object : OutputStream() {
+                override fun write(value: Int) = write(byteArrayOf(value.toByte()), 0, 1)
+                override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                    if (held && !holdClose) hold()
+                    output.write(bytes, offset, length)
+                }
+                override fun close() {
+                    if (held && holdClose) hold()
+                    output.close()
+                }
+            }
+        }).use { j ->
+            try {
+                j.room.onAudioRequest = { if (it.id == "B") arm.set(true) }
+                j.startService()
+                j.play("A", "B", "C")
+                await("speculative B reaches the held disk seam") { entered.count == 0L }
+                assertTrue("Production A consumes its exact PCM marker", consumed("A") > 0)
+                val before = PlaybackService.exportLocalSnapshot()
+                // Real MediaController -> service cancellation -> player Pause. A posted main
+                // marker must also run before disk release, not merely enqueue the command.
+                val mainMarker = AtomicBoolean()
+                val start = System.nanoTime()
+                j.controller!!.pause()
+                android.os.Handler(Looper.getMainLooper()).post { mainMarker.set(true) }
+                await("Pause and following main-thread control complete with disk still held") {
+                    mainMarker.get() && !j.controller!!.isPlaying && !j.controller!!.playWhenReady &&
+                        !PlaybackService.exportLocalSnapshot().playing
+                }
+                assertTrue("Pause/control must not wait for storage", System.nanoTime() - start < TimeUnit.SECONDS.toNanos(2))
+                assertFalse("The disk hold must not time out to unblock controls", timedOut.get())
+                assertEquals(1L, release.count)
+                assertEquals(before.queue, PlaybackService.exportLocalSnapshot().queue)
+                assertEquals(before.position, PlaybackService.exportLocalSnapshot().position)
+                assertEquals(0L, consumed("B"))
+                assertFalse(j.room.fetched().contains("C"))
+                // Resume is also a real successful-play promotion callback on the service
+                // thread. Its demand source and exact A PCM must progress before releasing B.
+                val resumedAt = System.nanoTime()
+                j.resume()
+                assertTrue("Successful Resume/promotion must not wait for storage",
+                    System.nanoTime() - resumedAt < TimeUnit.SECONDS.toNanos(2))
+                assertFalse(timedOut.get())
+                assertEquals(1L, release.count)
+                j.controller!!.pause()
+                await("second Pause still completes before disk release") { !j.controller!!.playWhenReady }
+                assertFalse(timedOut.get())
+            } finally {
+                release.countDown()
+                j.room.onAudioRequest = null
+            }
+            await("cancelled speculative writer eventually releases its pin") {
+                j.graph.songCache.inventory().pinned <= 1 // Long current A may still own a reader/writer.
+            }
             j.assertHealthy()
         }
     }

@@ -14,9 +14,15 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.withLock
 
 /**
  * Audio-only, app-private retention. Construct with Context.cacheDir, never an external directory.
@@ -86,41 +92,104 @@ class SongCache(
     }
 
     private val root = File(cacheDir, "song-cache-v1")
-    private val lock = Any()
+    private val lock = ReentrantLock()
     private val states = LinkedHashMap<String, State>()
-    private var current: SessionCache? = null
-    private var speculation: Cancellation? = null
-    private var speculativeSession: SessionCache? = null
-    private var playbackProtection: Pair<SessionCache, String>? = null
-    private var closed = false
+    @Volatile private var current: SessionCache? = null
+    @Volatile private var speculation: Cancellation? = null
+    @Volatile private var speculativeSession: SessionCache? = null
+    private val playbackProtection = AtomicReference<Pair<SessionCache, String>?>(null)
+    private val promotionSequence = AtomicLong()
+    private val maintenanceQueued = AtomicBoolean()
+    private val maintenanceRequested = AtomicBoolean()
+    private class Retirement(val handle: SessionCache?)
+    private val retirement = AtomicReference<Retirement?>(null)
+    @Volatile private var closed = false
     private var cleanupFailed = false
 
     /** Only validated authentication may call this. A suspended handle is never reauthorized. */
-    fun bind(origin: String, accountId: String): SessionCache = synchronized(lock) {
+    fun bind(origin: String, accountId: String): SessionCache = lock.withLock {
         val scope = opaque("scope", origin, accountId)
         current?.takeIf { it.active && it.state.scope == scope && !it.state.retired && !it.state.disabled }?.let { return it }
         // Fence preserves this inactive handle, so identity switches still retire its released
         // state. Older tracked scopes were already retired by their own identity transition.
-        current?.let { if (it.state.scope != scope) it.retire() else it.suspend() }
+        current?.let {
+            it.fenceForBind()
+            if (it.state.scope != scope || it.retirementRequested) it.state.retired = true
+        }
+        maintenanceRequested.set(false)
+        maintain()
         forgetReclaimedStates()
         root.listFiles()?.filter { it.isDirectory && it.name != scope && it.name !in states }?.forEach(::retireDirectory)
         val state = states[scope]?.takeUnless { it.released } ?: State(scope).also { states[scope] = it }
         SessionCache(state).also { current = it; if (closed) it.suspend() }
     }
 
+    /** Never wait for speculative disk I/O on a playback/control thread. */
+    private inline fun <T> tryStorage(operation: () -> T): T? {
+        if (!lock.tryLock()) return null
+        return try { operation() } finally { lock.unlock() }
+    }
+
+    /** Pins/reservations stay owned until this work actually runs, including failed closes. */
+    private fun deferredStorage(operation: () -> Unit) {
+        if (lock.tryLock()) {
+            try { operation() } finally { lock.unlock() }
+        } else {
+            storageCleanup.execute { lock.withLock { operation() } }
+        }
+    }
+
+    /** One queued maintenance pass, regardless of progress/control callback frequency. */
+    private fun requestMaintenance() {
+        maintenanceRequested.set(true)
+        if (!maintenanceQueued.compareAndSet(false, true)) return
+        storageCleanup.execute {
+            try {
+                lock.withLock { if (maintenanceRequested.getAndSet(false)) maintain() }
+            } finally {
+                maintenanceQueued.set(false)
+                if (maintenanceRequested.get()) requestMaintenance()
+            }
+        }
+    }
+
+    private fun maintain() {
+        states.values.forEach { state ->
+            state.retirementOwner.getAndSet(null)?.let { owner ->
+                // A delayed old incarnation cannot retire a newer handle sharing this state.
+                if (current?.let { it !== owner && it.state === state } != true) state.retired = true
+            }
+        }
+        retirement.getAndSet(null)?.let { request ->
+            if (current === request.handle) {
+                states.values.forEach { it.retired = true }
+                root.listFiles().orEmpty().filter { it.isDirectory && it.name !in states }.forEach(::retireDirectory)
+            }
+        }
+        states.values.forEach { it.persistSafely(); it.finishIfIdle() }
+        forgetReclaimedStates()
+    }
+
+    /** Fixture barrier only: lifecycle callers must never wait for storage on the main thread.
+     * Close/reopen tests call this after stopping all readers/writers, before opening the same
+     * directory with another instance. It is not an authorization or pin-release shortcut.
+     */
+    internal fun awaitStorageForTest() {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        do {
+            storageCleanup.submit {}.get((deadline - System.nanoTime()).coerceAtLeast(1), TimeUnit.NANOSECONDS)
+        } while (maintenanceQueued.get() || maintenanceRequested.get())
+    }
+
     /** Offline restore/configure: fence the live incarnation without touching dormant files. */
-    fun fence() = synchronized(lock) { current?.suspend() }
+    fun fence() { current?.suspend() }
 
     /** Explicit logout/401/server change also retires namespaces not opened in this process. */
-    fun retire() = synchronized(lock) {
-        current?.retire()
-        states.values.forEach { state ->
-            state.retired = true
-            state.persistSafely()
-            state.finishIfIdle()
-        }
-        root.listFiles().orEmpty().filter { it.isDirectory && it.name !in states }.forEach(::retireDirectory)
-        forgetReclaimedStates()
+    fun retire() {
+        val handle = current
+        retirement.set(Retirement(handle))
+        handle?.retire()
+        requestMaintenance()
     }
 
     private fun forgetReclaimedStates() {
@@ -150,6 +219,8 @@ class SongCache(
     inner class SessionCache internal constructor(@Volatile internal var state: State) {
         @Volatile internal var active = true
             private set
+        @Volatile internal var retirementRequested = false
+            private set
 
         fun factory(
             upstream: DataSource.Factory,
@@ -165,40 +236,50 @@ class SongCache(
          * only an eviction exclusion: it creates no entry, changes no FIFO order and holds no
          * file/lifetime pin. The service clears it on pause, authority loss or current replacement.
          */
-        fun protectPlayback(trackId: String?) = synchronized(lock) {
-            if (active && current === this && !closed) {
-                playbackProtection = trackId?.let { this to key(it) }
-            } else if (playbackProtection?.first === this) {
-                playbackProtection = null
+        fun protectPlayback(trackId: String?) {
+            if (trackId != null && active && current === this && !closed) {
+                playbackProtection.set(this to key(trackId))
+            } else {
+                val previous = playbackProtection.get()
+                if (previous?.first === this) playbackProtection.compareAndSet(previous, null)
             }
         }
 
-        /** Explicit successful-play/resume promotion only; reads and fills never call this. */
-        fun promote(trackId: String) = synchronized(lock) {
-            if (!active || state.retired || state.disabled) return@synchronized
-            val key = key(trackId)
-            val entry = state.entries.remove(key) ?: return@synchronized
-            state.entries[key] = entry
-            state.persistSafely()
+        /**
+         * One pending sequence per existing entry, not an unbounded callback queue. Coalescing
+         * repeated plays retains the latest successful order. Eviction/persistence drains these
+         * under the store lock; the service callback itself never waits for disk or that lock.
+         */
+        fun promote(trackId: String) {
+            if (!active || closed) return
+            val entry = state.promotionEntries[key(trackId)] ?: return
+            entry.promotion.accumulateAndGet(promotionSequence.incrementAndGet()) { previous, value -> maxOf(previous, value) }
+            requestMaintenance()
+        }
+
+        internal fun fenceForBind() = fenceNow()
+
+        private fun fenceNow() {
+            active = false
+            protectPlayback(null)
+            if (speculativeSession === this) speculation?.cancel()
         }
 
         /** Fence immediately, retain bytes dormant. Existing reads fail their next guard. */
-        fun suspend() = synchronized(lock) {
-            active = false
-            if (playbackProtection?.first === this) playbackProtection = null
-            if (speculativeSession === this) speculation?.cancel()
-            state.finishIfIdle()
+        fun suspend() {
+            val wasActive = active
+            fenceNow()
+            if (wasActive) requestMaintenance()
         }
 
         /** Fence first; never delete files under a reader/writer or a successor handle. */
-        fun retire() = synchronized(lock) {
-            active = false
-            if (playbackProtection?.first === this) playbackProtection = null
-            if (speculativeSession === this) speculation?.cancel()
-            if (current?.let { it !== this && it.state === state } == true) return@synchronized
-            state.retired = true
-            state.persistSafely()
-            state.finishIfIdle()
+        fun retire() {
+            retirementRequested = true
+            fenceNow()
+            val owner = state
+            if (current?.let { it !== this && (it.state === owner || owner.released) } == true) return
+            owner.retirementOwner.updateAndGet { previous -> if (previous != null && previous === current) previous else this }
+            requestMaintenance()
         }
 
         /** Blocking worker operation. The service owns the single immutable plan and its order. */
@@ -209,7 +290,7 @@ class SongCache(
             authorize: (DataSpec) -> Unit,
             cancellation: Cancellation,
         ): Boolean {
-            synchronized(lock) {
+            lock.withLock {
                 if (!active || state.disabled || state.retired || speculation != null || !cancellation.attach()) return false
                 speculation = cancellation
                 speculativeSession = this
@@ -224,13 +305,13 @@ class SongCache(
                 source.open(spec)
                 val buffer = ByteArray(limits.chunkBytes)
                 while (source.read(buffer, 0, buffer.size) != C.RESULT_END_OF_INPUT) cancellation.check()
-                synchronized(lock) { state.entries[key(trackId)]?.length?.let { it >= 0 } == true }
+                lock.withLock { state.entries[key(trackId)]?.length?.let { it >= 0 } == true }
             } catch (_: IOException) {
                 false
             } finally {
                 try { source.close() } catch (_: IOException) { /* speculative failure is silent */ }
                 timeout.cancel(false)
-                synchronized(lock) {
+                lock.withLock {
                     if (speculation === cancellation) { speculation = null; speculativeSession = null }
                 }
                 cancellation.detach()
@@ -244,7 +325,7 @@ class SongCache(
         }
         internal fun chunkBytes() = limits.chunkBytes
         internal fun key(trackId: String) = opaque("track", state.scope, trackId)
-        internal fun demandNetwork() = synchronized(lock) { speculation?.cancel() }
+        internal fun demandNetwork() { speculation?.cancel() }
         private fun storageState() {
             if (!state.retired && !state.released) return
             // Serialize same-scope ABA: never open a second cache while the retired incarnation
@@ -256,7 +337,7 @@ class SongCache(
             states[state.scope] = successor
             state = successor
         }
-        internal fun pin(trackId: String): Entry? = synchronized(lock) {
+        internal fun pin(trackId: String): Entry? = tryStorage {
             check()
             storageState()
             state.initialize()
@@ -265,24 +346,24 @@ class SongCache(
                 it.pins++
             }
         }
-        internal fun unpin(entry: Entry) = synchronized(lock) {
-            entry.pins--
-            if (entry.pins == 0) entry.pinnedBytes = 0
-            if (entry.pins == 0 && entry.length < 0) state.remove(entry)
-            state.finishIfIdle()
+        internal fun unpin(entry: Entry, invalidate: Boolean = false) {
+            val owner = state
+            deferredStorage {
+                if (invalidate) { entry.length = -1; owner.persistSafely() }
+                entry.pins--
+                if (entry.pins == 0) entry.pinnedBytes = 0
+                if (entry.pins == 0 && entry.length < 0) owner.remove(entry)
+                owner.finishIfIdle()
+            }
         }
-        internal fun invalidate(entry: Entry) = synchronized(lock) {
-            entry.length = -1
-            state.persistSafely()
-        }
-        internal fun file(entry: Entry): File? = synchronized(lock) {
+        internal fun file(entry: Entry): File? = tryStorage {
             try {
                 val spans = state.cache?.getCachedSpans(entry.key).orEmpty()
                 spans.singleOrNull()?.takeIf { it.position == 0L && it.length == entry.length }?.file
                     ?.takeIf { it.isFile && it.length() == entry.length }
             } catch (_: Exception) { null }
         }
-        internal fun writer(trackId: String): Writer? = synchronized(lock) {
+        internal fun writer(trackId: String, speculative: Boolean, authorize: () -> Unit): Writer? = tryStorage {
             check()
             storageState()
             state.initialize()
@@ -294,9 +375,14 @@ class SongCache(
             val entry = Entry(key)
             entry.pins = 1
             state.entries[key] = entry
+            state.promotionEntries[key] = entry
             if (!state.persistSafely()) { entry.pins = 0; state.remove(entry); return null }
             try {
-                Writer(state, entry, openWrite(state.stage(entry))) { active && !closed }
+                val cancellation = if (speculative) speculation else null
+                Writer(state, entry, openWrite(state.stage(entry)), speculative) {
+                    active && !closed && cancellation?.isCancelled != true &&
+                        try { authorize(); true } catch (_: IOException) { false }
+                }
             } catch (_: Exception) {
                 entry.pins = 0
                 state.disabled = true
@@ -313,6 +399,7 @@ class SongCache(
         var artifact: String = "",
         var modifiedAt: Long = 0,
     ) {
+        val promotion = AtomicLong()
         var pins = 0
         // An OS-unlinked open staging inode remains owned until its stream actually closes.
         var openBytes = 0L
@@ -324,12 +411,17 @@ class SongCache(
         private val state: State,
         private val entry: Entry,
         private val output: OutputStream,
+        private val speculative: Boolean,
         private val authorized: () -> Boolean,
     ) {
         private val hash = MessageDigest.getInstance("SHA-256")
         private var written = 0L
         private var stopped = false
-        fun append(bytes: ByteArray, offset: Int, length: Int): Boolean = synchronized(lock) {
+        fun append(bytes: ByteArray, offset: Int, length: Int): Boolean {
+            if (speculative) return lock.withLock { appendLocked(bytes, offset, length) }
+            return tryStorage { appendLocked(bytes, offset, length) } ?: run { abort(); false }
+        }
+        private fun appendLocked(bytes: ByteArray, offset: Int, length: Int): Boolean {
             if (stopped) return false
             if (!authorized() || state.disabled || state.retired || !makeRoom(length.toLong(), false)) {
                 stop(false); return false
@@ -337,7 +429,7 @@ class SongCache(
             // Keep the entire reserved chunk owned if write partially succeeds and close also
             // fails, including an OS-unlinked inode that cannot be found by directory accounting.
             entry.openBytes = written + length
-            try {
+            return try {
                 output.write(bytes, offset, length)
                 val prefixBytes = minOf(length.toLong(), (VERIFY_PREFIX_BYTES - written).coerceAtLeast(0)).toInt()
                 hash.update(bytes, offset, prefixBytes)
@@ -351,8 +443,8 @@ class SongCache(
             }
         }
         /** Completion is supplied only after the response coverage/EOF contract is validated. */
-        fun finish() = synchronized(lock) { stop(true) }
-        fun abort() = synchronized(lock) { stop(false) }
+        fun finish() = deferredStorage { stop(true) }
+        fun abort() = deferredStorage { stop(false) }
         private fun stop(complete: Boolean) {
             if (stopped) return
             stopped = true
@@ -372,10 +464,14 @@ class SongCache(
                         if (!state.persistSafely()) throw IOException("Cache commit unavailable")
                         if (!state.stage(entry).renameTo(target)) throw IOException("Cache commit failed")
                         cache.commitFile(target, written)
-                        entry.length = written
-                        entry.modifiedAt = target.lastModified()
-                        entry.digest = hash.digest()
-                        if (!state.persistSafely()) entry.length = -1
+                        // Cancellation/lease loss can arrive during close/index I/O, including
+                        // after a demand source has returned and deferred its completion.
+                        if (authorized()) {
+                            entry.length = written
+                            entry.modifiedAt = target.lastModified()
+                            entry.digest = hash.digest()
+                            if (!state.persistSafely() || !authorized()) entry.length = -1
+                        }
                     } finally { if (!hole.isCached) cache.releaseHoleSpan(hole) }
                 }
             } catch (_: Exception) {
@@ -397,12 +493,15 @@ class SongCache(
     internal inner class State(val scope: String) {
         val directory = File(root, scope)
         val entries = LinkedHashMap<String, Entry>()
+        // Lock-free callback lookup only; membership changes remain serialized with entries.
+        val promotionEntries = ConcurrentHashMap<String, Entry>()
+        val retirementOwner = AtomicReference<SessionCache?>(null)
         var cache: SimpleCache? = null
         var initialized = false
         var inventoryKnown = false
         var disabled = false
         var retired = false
-        var released = false
+        @Volatile var released = false
         private val manifest = File(directory, "order")
         private val pending = File(directory, "order.new")
         fun stage(entry: Entry) = File(directory, "${entry.key}.part")
@@ -456,7 +555,7 @@ class SongCache(
                     val digest = ByteArray(32).also { input.readFully(it) }
                     val artifact = input.readUTF()
                     if (artifact.isNotEmpty() && !artifact.matches(Regex("media/[0-9]+/[0-9]+\\.[0-9]+\\.[0-9]+\\.v3\\.exo"))) throw IOException("Invalid cache artifact")
-                    entries[key] = Entry(key, length, digest, artifact, modifiedAt)
+                    entries[key] = Entry(key, length, digest, artifact, modifiedAt).also { promotionEntries[key] = it }
                 }
                 if (input.read() != -1) throw IOException("Invalid cache index")
             }
@@ -470,7 +569,17 @@ class SongCache(
             } else { persist(); true }
         } catch (_: Exception) { disabled = true; cleanupFailed = true; false }
 
+        fun applyPromotions() {
+            entries.values.mapNotNull { entry ->
+                entry.promotion.getAndSet(0).takeIf { it != 0L }?.let { it to entry }
+            }.sortedBy { it.first }.forEach { (_, entry) ->
+                entries.remove(entry.key)
+                entries[entry.key] = entry
+            }
+        }
+
         private fun persist() {
+            applyPromotions()
             // This reserve bounds the simultaneous old/new manifest and Media3 index copies.
             val manifestBytes = 9L + entries.values.sumOf { 118L + it.artifact.length }
             if (ownedBytes() > limits.maxBytes - manifestBytes) throw IOException("Cache metadata budget unavailable")
@@ -502,6 +611,7 @@ class SongCache(
             if (files.any { it.exists() && !deleteFile(it) }) { cleanupFailed = true; return false }
             try { cache?.removeResource(entry.key) } catch (_: Exception) { cleanupFailed = true; return false }
             entries.remove(entry.key)
+            promotionEntries.remove(entry.key, entry)
             persistSafely()
             return true
         }
@@ -519,6 +629,7 @@ class SongCache(
                 if (retired) { released = true; if (states[scope] === this) retireDirectory(directory) }
                 return
             }
+            persistSafely()
             try { cache?.release() } catch (_: Exception) { cleanupFailed = true }
             cache = null
             released = true
@@ -529,11 +640,14 @@ class SongCache(
     private fun makeRoom(addBytes: Long, newEntry: Boolean): Boolean {
         fun fits(): Boolean = ownedBytes() <= limits.maxBytes - limits.metadataReserve - addBytes &&
             (!newEntry || entryCount() < limits.maxTracks)
+        // Drain before both new admission and eviction, so a later admission remains newer
+        // than a successful play recorded while disk I/O held the lock.
+        states.values.forEach { it.applyPromotions() }
         if (fits()) return true
         // Insertion order is FIFO; skipping a pin never reorders another track.
         for (state in states.values) {
             for (entry in state.entries.values.toList()) {
-                val protected = playbackProtection?.let { (handle, key) ->
+                val protected = playbackProtection.get()?.let { (handle, key) ->
                     handle.active && handle.state === state && key == entry.key
                 } == true
                 if (entry.pins == 0 && !protected && state.cache != null && state.remove(entry) && fits()) return true
@@ -550,7 +664,7 @@ class SongCache(
         return if (unknown) limits.maxTracks else states.values.filter { !it.released || it.directory.exists() }.sumOf { it.entries.size }
     }
 
-    fun inventory(): Inventory = synchronized(lock) {
+    fun inventory(): Inventory = lock.withLock {
         Inventory(ownedBytes(), entryCount(), states.values.filter { !it.retired }.sumOf { it.entries.values.count { e -> e.length >= 0 } },
             states.values.sumOf { it.entries.values.count { e -> e.pins > 0 } }, cleanupFailed,
             states.values.any { it.disabled })
@@ -593,10 +707,11 @@ class SongCache(
     }
 
     /** App/test teardown, not logout: preserve validated content, fence all old handles. */
-    override fun close() = synchronized(lock) {
+    override fun close() {
         closed = true
         current?.suspend()
-        states.values.forEach { it.finishIfIdle() }
+        speculation?.cancel()
+        requestMaintenance()
     }
 
     companion object {
@@ -617,6 +732,9 @@ class SongCache(
             SongCacheDataSource(cache, upstream, trackId, authorize, onDemandNetworkChange)
         }
 
+        private val storageCleanup = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "song-cache-cleanup").apply { isDaemon = true }
+        }
         private val cancellations = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "song-cache-cancel").apply { isDaemon = true }
         }

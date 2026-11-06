@@ -237,8 +237,9 @@ class PlaybackService : MediaSessionService() {
 
     private fun cancelSongPrefetch() {
         prefetchAllowed = false
-        audioCache?.protectPlayback(null)
         songPrefetch?.cancel()
+        // Control cancellation/protection never waits for speculative storage or its cleanup.
+        audioCache?.protectPlayback(null)
     }
 
     private fun authorizeAudio(spec: DataSpec) {

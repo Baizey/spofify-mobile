@@ -120,7 +120,11 @@ internal class SongCacheDataSource(
         guard()
         val coverage = validateResponse(source, request, length)
         expected = coverage.readLength
-        if (mayRetain && coverage.retain && id != null && session != null) writer = session.writer(id!!)
+        if (mayRetain && coverage.retain && id != null && session != null) {
+            // Capture the immutable request, not mutable source state that close() clears.
+            // Deferred completion still needs the real lease/client/URL guard at publication.
+            writer = session.writer(id!!, speculative) { authorize(request) }
+        }
         if (speculative && writer == null) throw IOException("Audio cache admission unavailable")
         return expected
     }
@@ -214,7 +218,7 @@ internal class SongCacheDataSource(
     private fun discardHit() {
         try { cached?.close() } catch (_: IOException) { /* local I/O failure is a miss */ }
         cached = null
-        pin?.let { session!!.invalidate(it); session.unpin(it) }
+        pin?.let { session!!.unpin(it, invalidate = true) }
         pin = null
     }
 

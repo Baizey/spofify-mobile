@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.Dispatcher
@@ -114,11 +115,13 @@ class SongCacheIntegrationTest {
     }
 
     @After fun teardown() {
-        cache.close()
+        closeCache()
         client.httpClient.dispatcher.cancelAll()
         client.httpClient.connectionPool.evictAll()
         web.shutdown()
     }
+
+    private fun closeCache() { cache.close(); cache.awaitStorageForTest() }
 
     private fun startCache(limits: SongCache.Limits = SongCache.Limits(), delete: (File) -> Boolean = { it.delete() }) {
         cache = SongCache(directory, limits, delete)
@@ -167,7 +170,7 @@ class SongCacheIntegrationTest {
         assertEquals((bytes("A").size + bytes("B").size).toLong(), transferred)
         assertBytes(bytes("B"), fetch("B"))
         assertEquals(transferred, readBytes.get())
-        cache.close()
+        closeCache()
         startCache()
         assertBytes(bytes("A"), fetch("A"))
         assertBytes(bytes("B"), fetch("B"))
@@ -187,17 +190,17 @@ class SongCacheIntegrationTest {
     }
 
     @Test fun readsDoNotPromoteButExplicitSuccessfulPlayOrderPersists() {
-        cache.close(); startCache(SongCache.Limits(maxTracks = 3))
+        closeCache(); startCache(SongCache.Limits(maxTracks = 3))
         listOf("A", "B", "C").forEach { fetch(it) }
         fetch("A") // hit does NOT promote
         fetch("D")
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(2, requests["A"])
-        cache.retire(); cache.close(); requests.clear()
+        cache.retire(); closeCache(); requests.clear()
         startCache(SongCache.Limits(maxTracks = 3))
         listOf("A", "B", "C").forEach { fetch(it) }
         handle.promote("A")
-        cache.close(); startCache(SongCache.Limits(maxTracks = 3))
+        closeCache(); startCache(SongCache.Limits(maxTracks = 3))
         fetch("D")
         fetch("A")
         assertEquals(1, requests["A"])
@@ -220,7 +223,7 @@ class SongCacheIntegrationTest {
     }
 
     @Test fun allPinnedAdmissionStreamsNormallyThenEvictsOldestEligibleWholeTrack() {
-        cache.close(); startCache(SongCache.Limits(maxTracks = 2))
+        closeCache(); startCache(SongCache.Limits(maxTracks = 2))
         fetch("A"); fetch("B")
         val a = source(); a.open(spec("A"))
         val b = source(); b.open(spec("B"))
@@ -237,7 +240,7 @@ class SongCacheIntegrationTest {
     }
 
     @Test fun decodedPlaybackProtectionSkipsOldestWithoutPromotionReservationOrRetirementPin() {
-        cache.close(); startCache(SongCache.Limits(maxTracks = 3))
+        closeCache(); startCache(SongCache.Limits(maxTracks = 3))
         handle.protectPlayback("not-yet-admitted")
         assertEquals(0, cache.inventory().entries)
         listOf("A", "B", "C").forEach { fetch(it) }
@@ -252,7 +255,8 @@ class SongCacheIntegrationTest {
         assertEquals(2, requests["A"])
         handle.protectPlayback("A")
         handle.retire()
-        assertEquals(0L, cache.inventory().ownedBytes) // No I/O pins, so retirement is immediate.
+        cache.awaitStorageForTest()
+        assertEquals(0L, cache.inventory().ownedBytes) // No lifetime pin remains after maintenance.
     }
 
     @Test fun productionConstantsAndHundredAndFirstAdmissionIncludingDuplicateReservation() {
@@ -274,7 +278,7 @@ class SongCacheIntegrationTest {
     }
 
     @Test fun byteBudgetEvictsDuringUnknownLengthFillAndOverlargeDemandStillProgresses() {
-        cache.close(); startCache(SongCache.Limits(maxTracks = 4, maxBytes = 40_000, chunkBytes = 1024))
+        closeCache(); startCache(SongCache.Limits(maxTracks = 4, maxBytes = 40_000, chunkBytes = 1024))
         bytes("A", 12_000); bytes("B", 12_000); bytes("C", 20_000)
         fetch("A"); fetch("B")
         responses["C"] = { MockResponse().setChunkedBody(Buffer().write(bytes("C")), 701) }
@@ -308,7 +312,7 @@ class SongCacheIntegrationTest {
         assertEquals(16 * 1024, SongCache.VERIFY_PREFIX_BYTES)
         bytes("A", 48 * 1024)
         assertBytes(bytes("A"), fetch("A"))
-        cache.close(); startCache()
+        closeCache(); startCache()
         val transferred = readBytes.get()
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(transferred, readBytes.get())
@@ -346,6 +350,7 @@ class SongCacheIntegrationTest {
         assertBytes(bytes("A"), fetch("A"))
         reader.close()
         old.retire() // Late cleanup from the old incarnation must not retire its successor.
+        cache.awaitStorageForTest()
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(1, requests["A"])
         val current = source(); current.open(spec("A"))
@@ -363,11 +368,13 @@ class SongCacheIntegrationTest {
         reader.close()
         assertBytes(bytes("A"), fetch("A")) // Lazy successor can now retain safely.
         old.retire()
+        cache.awaitStorageForTest()
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(3, requests["A"])
-        cache.close()
+        closeCache()
         cache = SongCache(directory)
         cache.retire() // No bind / no validated auth needed to erase a dormant namespace.
+        cache.awaitStorageForTest()
         assertEquals(0L, cache.inventory().ownedBytes)
     }
 
@@ -387,6 +394,7 @@ class SongCacheIntegrationTest {
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(3, requests["A"])
         originalHandle.retire() // Released predecessor no longer owns this same-scope path.
+        cache.awaitStorageForTest()
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(3, requests["A"])
     }
@@ -396,14 +404,15 @@ class SongCacheIntegrationTest {
         cache.fence()
         assertTrue(cache.inventory().ownedBytes > 0)
         cache.retire()
+        cache.awaitStorageForTest()
         assertEquals(0L, cache.inventory().ownedBytes)
-        cache.close(); startCache()
+        closeCache(); startCache()
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(2, requests["A"])
     }
 
     @Test fun failedDeletionRemainsOwnedAndInaccessibleAcrossReopen() {
-        cache.close()
+        closeCache()
         val limits = SongCache.Limits(maxTracks = 1)
         val refuseMedia: (File) -> Boolean = { if (it.name.endsWith(".exo")) false else it.delete() }
         startCache(limits, refuseMedia)
@@ -412,7 +421,7 @@ class SongCacheIntegrationTest {
         assertTrue(cache.inventory().cleanupFailed)
         assertEquals(1, cache.inventory().entries)
         assertTrue(cache.inventory().ownedBytes >= bytes("A").size)
-        cache.close(); startCache(limits, refuseMedia)
+        closeCache(); startCache(limits, refuseMedia)
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(2, requests["A"])
         assertEquals(1, cache.inventory().entries)
@@ -420,7 +429,7 @@ class SongCacheIntegrationTest {
     }
 
     @Test fun unwritableCachePathStreamsUncachedAndNeverDisablesDemand() {
-        cache.close()
+        closeCache()
         val notDirectory = temporary.newFile("not-a-directory")
         cache = SongCache(notDirectory)
         handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
@@ -461,7 +470,7 @@ class SongCacheIntegrationTest {
     }
 
     @Test fun injectedMidWriteFailurePreservesExactDemandAndSkipsFurtherSpeculation() {
-        cache.close()
+        closeCache()
         var writes = 0
         cache = SongCache(directory, SongCache.Limits(maxBytes = 40_000, maxTracks = 4, chunkBytes = 512), openWrite = { file ->
             val output = FileOutputStream(file)
@@ -508,10 +517,220 @@ class SongCacheIntegrationTest {
     @Test fun authorityLossDuringHeldCompletionCloseCannotReturnAnAuthorizedChunk() =
         assertHeldStorageRevocation(holdClose = true, revocation = HeldRevocation.AUTHORITY)
 
+    @Test fun heldSpeculativeWriteCannotDelayDemandAdmissionOrExistingWriterCleanup() =
+        assertSpeculativeDiskContention(holdClose = false)
+
+    @Test fun heldSpeculativeCloseCommitCannotDelayDemandAdmissionOrExistingWriterCleanup() =
+        assertSpeculativeDiskContention(holdClose = true)
+
+    /** Unlike the ordinary drain helper, this intentionally does not take an inventory lock
+     * while disk is held: progress must be actual authorized bytes, not a storage observation.
+     */
+    private fun drainDuringContention(source: DataSource): ByteArray {
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(997)
+        while (true) {
+            val count = source.read(buffer, 0, buffer.size)
+            if (count == C.RESULT_END_OF_INPUT) return output.toByteArray()
+            output.write(buffer, 0, count)
+        }
+    }
+
+    private class HeldStorage(private val holdClose: Boolean) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val arm = AtomicBoolean()
+        fun open(file: File): OutputStream {
+            val hold = arm.compareAndSet(true, false)
+            val output = FileOutputStream(file)
+            return object : OutputStream() {
+                override fun write(value: Int) = write(byteArrayOf(value.toByte()), 0, 1)
+                override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                    if (hold && !holdClose) awaitRelease()
+                    output.write(bytes, offset, length)
+                }
+                override fun close() {
+                    if (hold && holdClose) awaitRelease()
+                    output.close()
+                }
+            }
+        }
+        private fun awaitRelease() {
+            entered.countDown()
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            var interrupted = false
+            try {
+                while (release.count != 0L) {
+                    val remaining = deadline - System.nanoTime()
+                    if (remaining <= 0) throw IOException("Synthetic storage hold timed out")
+                    try { release.await(remaining, TimeUnit.NANOSECONDS) }
+                    catch (_: InterruptedException) { interrupted = true }
+                }
+            } finally { if (interrupted) Thread.currentThread().interrupt() }
+        }
+    }
+
+    private fun assertSpeculativeDiskContention(holdClose: Boolean) {
+        closeCache()
+        val disk = HeldStorage(holdClose)
+        cache = SongCache(directory, SongCache.Limits(maxTracks = 8, maxBytes = 100_000, chunkBytes = 512),
+            openWrite = disk::open)
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        val workers = Executors.newFixedThreadPool(2)
+        val writing = source()
+        val finishing = source()
+        val cached = source()
+        val cancellation = SongCache.Cancellation()
+        try {
+            // Already-admitted demand must bypass contention too, not only fresh open().
+            writing.open(spec("writing"))
+            bytes("finishing", 512)
+            responses["finishing"] = { MockResponse().setChunkedBody(Buffer().write(bytes("finishing")), 512) }
+            finishing.open(spec("finishing"))
+            val prefix = ByteArrayOutputStream()
+            val buffer = ByteArray(512)
+            while (prefix.size() < 512) {
+                val count = finishing.read(buffer, 0, buffer.size)
+                assertTrue(count > 0)
+                prefix.write(buffer, 0, count)
+            }
+            assertBytes(bytes("finishing"), prefix.toByteArray())
+            assertBytes(bytes("cached"), fetch("cached"))
+            cached.open(spec("cached"))
+            // A corrupt active hit exercises invalidate + unpin + upstream range fallback.
+            val span = directory.walkTopDown().single { it.isFile && it.name.endsWith(".exo") }
+            java.io.RandomAccessFile(span, "rw").use { it.setLength(0) }
+            disk.arm.set(true)
+            val speculative = workers.submit<Boolean> {
+                handle.prefetch("speculative", spec("speculative"), upstream, ::authorize, cancellation)
+            }
+            assertTrue(disk.entered.await(3, TimeUnit.SECONDS))
+            val before = readBytes.get()
+            val demand = workers.submit {
+                val fresh = source()
+                try {
+                    fresh.open(spec("fresh"))
+                    assertBytes(bytes("fresh"), drainDuringContention(fresh))
+                    assertBytes(bytes("writing"), drainDuringContention(writing))
+                    assertEquals(C.RESULT_END_OF_INPUT, finishing.read(buffer, 0, buffer.size))
+                    assertBytes(bytes("cached"), drainDuringContention(cached))
+                } finally {
+                    fresh.close(); writing.close(); finishing.close(); cached.close()
+                }
+            }
+            demand.get(2, TimeUnit.SECONDS)
+            assertEquals("Every demanded body byte arrived while disk was still held",
+                (bytes("fresh").size + bytes("writing").size + bytes("cached").size).toLong(), readBytes.get() - before)
+            assertEquals(1L, disk.release.count)
+            assertFalse("Speculative disk has not cooperated with cancellation", speculative.isDone)
+            assertTrue(cancellation.isCancelled)
+            // The demand EOF already queued finish(true). Lease loss before that task runs
+            // must prevent publication even though the cache session itself remains active.
+            authorized = false
+            disk.release.countDown()
+            assertFalse(speculative.get(3, TimeUnit.SECONDS))
+        } finally {
+            disk.release.countDown()
+            cancellation.cancel()
+            workers.shutdownNow()
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS))
+            writing.close(); finishing.close(); cached.close()
+        }
+        // Graceful close drains retained writer pins; never pretend deferred bytes were reclaimed.
+        closeCache()
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (cache.inventory().pinned != 0 && System.nanoTime() < deadline) Thread.yield()
+        val inventory = cache.inventory()
+        assertEquals(0, inventory.pinned)
+        assertEquals("Neither cancelled speculation nor authority-revoked deferred EOF is complete", 0, inventory.complete)
+        authorized = true
+        assertTrue(inventory.ownedBytes <= cache.limits.maxBytes)
+        assertTrue(inventory.entries <= cache.limits.maxTracks)
+        assertFalse(inventory.cleanupFailed)
+    }
+
+    @Test fun idleSuccessfulPlayPersistsWithoutWaitingForAdmissionOrClose() {
+        listOf("A", "B", "C").forEach { fetch(it) }
+        handle.promote("A")
+        cache.awaitStorageForTest()
+        // Observe disk directly: inventory/admission/close must not be the thing flushing it.
+        val order = directory.walkTopDown().single { it.isFile && it.name == "order" }
+            .readBytes().toString(Charsets.ISO_8859_1)
+        val positions = listOf("B", "C", "A").map { order.indexOf(handle.key(it)) }
+        assertTrue(positions.all { it >= 0 })
+        assertEquals(positions.sorted(), positions)
+    }
+
+    @Test fun successfulPlayDuringHeldCommitIsNonblockingAndPersistsBeforeNextEviction() {
+        closeCache()
+        val disk = HeldStorage(holdClose = true)
+        val limits = SongCache.Limits(maxTracks = 4, maxBytes = 100_000, chunkBytes = 512)
+        cache = SongCache(directory, limits, openWrite = disk::open)
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        listOf("A", "B", "C").forEach { fetch(it) }
+        val workers = Executors.newFixedThreadPool(2)
+        val cancellation = SongCache.Cancellation()
+        try {
+            disk.arm.set(true)
+            val speculative = workers.submit<Boolean> { handle.prefetch("D", spec("D"), upstream, ::authorize, cancellation) }
+            assertTrue(disk.entered.await(3, TimeUnit.SECONDS))
+            workers.submit {
+                handle.protectPlayback("A")
+                repeat(1000) { handle.promote("A") } // Bounded coalescing, not a callback queue.
+                handle.protectPlayback(null)
+            }.get(1, TimeUnit.SECONDS)
+            assertEquals(1L, disk.release.count)
+            disk.release.countDown()
+            assertTrue(speculative.get(3, TimeUnit.SECONDS))
+        } finally {
+            disk.release.countDown(); cancellation.cancel()
+            workers.shutdownNow()
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS))
+        }
+        closeCache(); startCache(limits)
+        fetch("E")
+        listOf("A", "C", "D").forEach { assertBytes(bytes(it), fetch(it)); assertEquals(1, requests[it]) }
+        fetch("B")
+        assertEquals("B, not successfully played A, was oldest", 2, requests["B"])
+    }
+
+    @Test fun revocationAndTeardownFenceImmediatelyWhileSpeculativeDiskIsHeld() {
+        closeCache()
+        val disk = HeldStorage(holdClose = false)
+        cache = SongCache(directory, openWrite = disk::open)
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        val workers = Executors.newFixedThreadPool(2)
+        val cancellation = SongCache.Cancellation()
+        try {
+            disk.arm.set(true)
+            val speculative = workers.submit<Boolean> { handle.prefetch("held", spec("held"), upstream, ::authorize, cancellation) }
+            assertTrue(disk.entered.await(3, TimeUnit.SECONDS))
+            workers.submit {
+                cache.fence()
+                cache.retire()
+                cache.close()
+                ioFailure { handle.check() }
+            }.get(1, TimeUnit.SECONDS)
+            assertTrue(cancellation.isCancelled)
+            assertEquals(1L, disk.release.count)
+            assertFalse(speculative.isDone)
+            disk.release.countDown()
+            assertFalse(speculative.get(3, TimeUnit.SECONDS))
+        } finally {
+            disk.release.countDown(); cancellation.cancel()
+            workers.shutdownNow()
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS))
+        }
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (cache.inventory().ownedBytes != 0L && System.nanoTime() < deadline) Thread.yield()
+        assertEquals(0L, cache.inventory().ownedBytes)
+        assertEquals(0, cache.inventory().pinned)
+    }
+
     private enum class HeldRevocation { LOGOUT, SHARED_401, AUTHORITY }
 
     private fun assertHeldStorageRevocation(holdClose: Boolean, revocation: HeldRevocation) {
-        cache.close()
+        closeCache()
         val enteredStorage = CountDownLatch(1)
         val releaseStorage = CountDownLatch(1)
         val authCleared = CountDownLatch(1)
@@ -601,11 +820,12 @@ class SongCacheIntegrationTest {
                 demand.close()
             }
         }
+        cache.awaitStorageForTest()
         if (revocation != HeldRevocation.AUTHORITY) assertEquals(0L, cache.inventory().ownedBytes)
     }
 
     @Test fun osUnlinkedCompletedInodeRemainsOwnedThroughInvalidationUntilReaderCloses() {
-        cache.close(); startCache(SongCache.Limits(maxTracks = 3, maxBytes = 24_000, chunkBytes = 512))
+        closeCache(); startCache(SongCache.Limits(maxTracks = 3, maxBytes = 24_000, chunkBytes = 512))
         bytes("A", 9_000); fetch("A")
         val reader = source(); reader.open(spec("A"))
         fun visibleBytes() = directory.walkTopDown().filter { it.isFile }.sumOf { it.length() }
@@ -620,6 +840,7 @@ class SongCacheIntegrationTest {
             assertBytes(bytes("A"), drain(reader))
             assertEquals(2, requests["A"])
         } finally { reader.close() }
+        cache.awaitStorageForTest()
         assertEquals(visibleBytes(), cache.inventory().ownedBytes)
         assertEquals(0, cache.inventory().pinned)
     }
@@ -633,6 +854,7 @@ class SongCacheIntegrationTest {
         try {
             ioFailure { fetch("denied") }
             assertNull(client.currentSession())
+            cache.awaitStorageForTest()
             assertEquals(0, cache.inventory().complete)
             ioFailure { hit.read(ByteArray(1), 0, 1) }
             ioFailure { fill.read(ByteArray(1), 0, 1) }
@@ -640,6 +862,7 @@ class SongCacheIntegrationTest {
             assertEquals(1, requests["A"])
             assertEquals(1, requests["B"])
         } finally { hit.close(); fill.close() }
+        cache.awaitStorageForTest()
         assertEquals(0L, cache.inventory().ownedBytes)
     }
 
@@ -678,7 +901,7 @@ class SongCacheIntegrationTest {
             assertBytes(bytes("A"), fetch("A"))
             assertEquals(2, requests["A"])
         } finally { old.close() }
-        cache.close() // Leave the second account's completed namespace dormant across restart.
+        closeCache() // Leave the second account's completed namespace dormant across restart.
         val other = MockWebServer().apply { dispatcher = web.dispatcher; start() }
         val nextClient = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${other.port}"), object : SessionStore {
             private var value: StoredSession? = null
