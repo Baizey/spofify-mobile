@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: android-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: validation-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -32,10 +32,29 @@ jobs:
     # Keep the existing job ID for branch-protection rules requiring check.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # Exact Node version also identifies the cached tool installation.
+      NODE_VERSION: '26.13.0'
+      ANDROID_PLATFORM: android-37.0
+      ANDROID_BUILD_TOOLS: '37.0.0'
+      ANDROID_CMDLINE_TOOLS: '15859902'
+      BROKER_SHA256: 425e4bb46efcf1c25e195d92d4d1845ed2389cd35e6ebf9ad8981cd80c2c70f4
+      BROKER_CACHE_DIR: ${{ runner.temp }}/spofify-broker-cache
+      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/spofify-playwright
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      # Cache only immutable setup artifacts, never fixture runtimes, sessions,
+      # node_modules, credentials, APKs or test results. Only main saves these
+      # caches, immediately after successful setup so later test failures do not
+      # discard expensive downloads. PRs may restore but cannot publish them.
+      - name: Restore pinned broker
+        id: broker-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ env.BROKER_CACHE_DIR }}
+          key: broker-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.BROKER_SHA256 }}
       - name: Provision immutable playback broker integration prerequisite
         env:
           GH_TOKEN: ${{ github.token }}
@@ -58,54 +77,130 @@ jobs:
                   raise SystemExit('Insufficient private artifact/runtime bytes or inodes')
           print('Storage preflight complete; user/project quota remains unknown')
           PY
-          owned="$RUNNER_TEMP/spofify-broker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -m 700 "$owned"
-          # curl drops Authorization when following the cross-host asset redirect.
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --max-redirs 3 --connect-timeout 10 --max-time 60 --max-filesize 33554432 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/octet-stream' \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/assets/715407812" \
-            -o "$owned/broker"
-          printf '%s  %s\n' '425e4bb46efcf1c25e195d92d4d1845ed2389cd35e6ebf9ad8981cd80c2c70f4' "$owned/broker" | sha256sum --check --status
-          chmod 500 "$owned/broker"
+          mkdir -p -m 700 "$BROKER_CACHE_DIR"
+          broker="$BROKER_CACHE_DIR/broker"
+          if [[ ! -f "$broker" ]]; then
+            # curl drops Authorization when following the cross-host asset redirect.
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --max-redirs 3 --connect-timeout 10 --max-time 60 --max-filesize 33554432 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/octet-stream' \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/assets/715407812" \
+              -o "$broker"
+          fi
+          # Revalidate bytes even on an exact cache hit. A corrupt cache fails closed.
+          printf '%s  %s\n' "$BROKER_SHA256" "$broker" | sha256sum --check --status
+          chmod 500 "$broker"
           {
-            printf 'SPOFIFY_TEST_GO_BROKER_BINARY=%s\n' "$owned/broker"
+            printf 'SPOFIFY_TEST_GO_BROKER_BINARY=%s\n' "$broker"
             printf 'SPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT=%s/fixtures\n' "$scratch"
             printf 'SPOFIFY_TEST_WEBSITE_RUNTIME_ROOT=%s/fixtures\n' "$scratch"
             printf 'TMPDIR=%s/jvm\n' "$scratch"
             # JAVA_TOOL_OPTIONS also reaches forked test JVMs, not just Gradle.
             printf 'JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=%s/jvm\n' "$scratch"
           } >> "$GITHUB_ENV"
+      - name: Save verified broker
+        if: steps.broker-cache.outputs.cache-hit != 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ env.BROKER_CACHE_DIR }}
+          key: ${{ steps.broker-cache.outputs.cache-primary-key }}
       - uses: actions/setup-java@v6.2.0
         with:
           distribution: temurin
           # Match gradle/gradle-daemon-jvm.properties; compile targets remain Java 17.
           java-version: '25'
           check-latest: true
+          cache-jdk: true
+          # Gradle owns its own dependency cache below; do not enable a second one here.
+      - name: Locate runner Android SDK
+        id: sdk-path
+        run: printf 'root=%s\n' "${ANDROID_SDK_ROOT:?Missing runner Android SDK}" >> "$GITHUB_OUTPUT"
+      - name: Restore Android SDK packages
+        id: sdk-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          # Only requested versioned packages, not the runner's entire large SDK.
+          path: |
+            ${{ steps.sdk-path.outputs.root }}/cmdline-tools/22.0
+            ${{ steps.sdk-path.outputs.root }}/platforms/${{ env.ANDROID_PLATFORM }}
+            ${{ steps.sdk-path.outputs.root }}/build-tools/${{ env.ANDROID_BUILD_TOOLS }}
+          key: android-sdk-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ env.ANDROID_CMDLINE_TOOLS }}-${{ env.ANDROID_PLATFORM }}-${{ env.ANDROID_BUILD_TOOLS }}
       - uses: android-actions/setup-android@v4.0.4
+        with:
+          cmdline-tools-version: ${{ env.ANDROID_CMDLINE_TOOLS }}
       - uses: gradle/actions/setup-gradle@v6.4.1
         with:
-          # Keep caching on GitHub Actions rather than the v6 enhanced service.
+          # This action alone owns Gradle distributions/dependencies/build caches,
+          # including wrapper validation and read-only caching away from main.
           cache-provider: basic
+          cache-read-only: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install pinned Android SDK packages
-        # Match the app's compile SDK; use the latest stable build tools.
-        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+        timeout-minutes: 5
+        # Always run sdkmanager so a partial cache cannot hide missing packages.
+        run: sdkmanager "platforms;$ANDROID_PLATFORM" "build-tools;$ANDROID_BUILD_TOOLS"
+      - name: Save installed Android SDK packages
+        if: steps.sdk-cache.outputs.cache-hit != 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: |
+            ${{ steps.sdk-path.outputs.root }}/cmdline-tools/22.0
+            ${{ steps.sdk-path.outputs.root }}/platforms/${{ env.ANDROID_PLATFORM }}
+            ${{ steps.sdk-path.outputs.root }}/build-tools/${{ env.ANDROID_BUILD_TOOLS }}
+          key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
+      - name: Restore Node and npm downloads
+        id: node-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: |
+            ${{ runner.tool_cache }}/node/${{ env.NODE_VERSION }}
+            ~/.npm/_cacache
+          key: node-npm-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ env.NODE_VERSION }}-${{ hashFiles('tools/ci/package-lock.json') }}
+          # npm's content-addressed downloads can be reused across lockfile changes;
+          # npm ci still checks integrity and installs the exact current lockfile.
+          restore-keys: node-npm-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ env.NODE_VERSION }}-
       - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '26'
-          check-latest: true
-          cache: npm
-          cache-dependency-path: tools/ci/package-lock.json
-      - name: Explicitly provision pinned website-receiver browser
+          node-version: ${{ env.NODE_VERSION }}
+          # Node and npm downloads have one explicit cache owner above/below.
+          package-manager-cache: false
+      - name: Install locked browser tooling
+        timeout-minutes: 5
+        run: npm ci --prefix tools/ci --ignore-scripts --no-audit --no-fund --prefer-offline
+      - name: Save Node and npm downloads
+        if: steps.node-cache.outputs.cache-hit != 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: |
+            ${{ runner.tool_cache }}/node/${{ env.NODE_VERSION }}
+            ~/.npm/_cacache
+          key: ${{ steps.node-cache.outputs.cache-primary-key }}
+      - name: Restore pinned Chromium
+        id: browser-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ hashFiles('tools/ci/package-lock.json') }}
+      - name: Install Chromium system dependencies
+        timeout-minutes: 5
+        # Browser caches cannot provide OS libraries. Install them on every fresh runner.
+        run: tools/ci/node_modules/.bin/playwright install-deps chromium
+      - name: Download or verify pinned Chromium
+        timeout-minutes: 5
+        env:
+          PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: '60000'
+          # Show download completion, extraction and installer-child exit separately.
+          DEBUG: pw:install
+        # This is a no-op for already installed, matching browser revisions, but
+        # also repairs a partial browser cache. Use the locked CLI, never npx.
+        run: tools/ci/node_modules/.bin/playwright install chromium
+      - name: Verify browser and media prerequisites
         shell: bash
         run: |
           set -euo pipefail
-          npm ci --prefix tools/ci --ignore-scripts --no-audit --no-fund
-          # Use the locked CLI, not npx (which could download an unpinned package).
-          tools/ci/node_modules/.bin/playwright install --with-deps chromium
           command -v ffmpeg
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libmp3lame'
+          # Drain the complete producer output; grep -q can cause SIGPIPE under pipefail.
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libmp3lame' > /dev/null
           node <<'JS'
           const fs = require('node:fs');
           const path = require('node:path');
@@ -115,6 +210,27 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_ENV,
             `SPOFIFY_TEST_PLAYWRIGHT_MODULE=${modulePath}\nSPOFIFY_TEST_CHROMIUM_PATH=${chromiumPath}\n`);
           JS
+      - name: Save pinned Chromium
+        if: steps.browser-cache.outputs.cache-hit != 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: ${{ steps.browser-cache.outputs.cache-primary-key }}
+      - name: Report setup cache reuse
+        env:
+          BROKER_HIT: ${{ steps.broker-cache.outputs.cache-hit }}
+          SDK_HIT: ${{ steps.sdk-cache.outputs.cache-hit }}
+          NODE_HIT: ${{ steps.node-cache.outputs.cache-hit }}
+          BROWSER_HIT: ${{ steps.browser-cache.outputs.cache-hit }}
+        run: |
+          {
+            printf '## Setup cache hits\n\n| Cache | Exact hit |\n| --- | --- |\n'
+            printf '| Pinned broker | %s |\n' "$BROKER_HIT"
+            printf '| Android SDK | %s |\n' "$SDK_HIT"
+            printf '| Node/npm downloads | %s |\n' "$NODE_HIT"
+            printf '| Chromium | %s |\n' "$BROWSER_HIT"
+            printf '\nJDK and Gradle cache details are in their setup-action logs.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Full gate including mandatory real-broker and website integration
         run: >-
           ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug
