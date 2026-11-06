@@ -36,6 +36,7 @@ internal object PlaybackMedia {
         return MediaItem.Builder()
             .setMediaId(item.id)
             .setUri(client.audioUrl(item))
+            .setCustomCacheKey(item.id) // In-memory identity only; retained keys are opaque hashes.
             .setMediaMetadata(MediaMetadata.Builder()
                 .setTitle(item.name)
                 .setArtist(item.artists.joinToString(", ") { it.name })

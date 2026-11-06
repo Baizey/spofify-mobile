@@ -12,6 +12,9 @@ import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.core.Session
 import dev.spofify.mobile.core.SessionStore
 import dev.spofify.mobile.core.SessionStoreOwner
+import dev.spofify.mobile.core.AuthenticationChange
+import dev.spofify.mobile.core.AuthenticationChangeKind
+import dev.spofify.mobile.playback.cache.SongCache
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import dev.spofify.mobile.playback.PlaybackService
@@ -39,13 +42,14 @@ class SpofifyApplication : Application() {
 }
 
 class AppGraph(private val context: Context, store: SessionStore = EncryptedSessionStore(context),
-    private val logins: LoginStore = EncryptedLoginStore(context)) {
+    private val logins: LoginStore = EncryptedLoginStore(context),
+    audioCacheLimits: SongCache.Limits = SongCache.Limits()) {
     private val sessions = SessionStoreOwner(store)
     private val restoreMutex = Mutex()
     private val preferences = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
     private val expired = MutableStateFlow(false)
     val sessionExpired = expired.asStateFlow()
-    var client: SpofifyClient? = null
+    @Volatile var client: SpofifyClient? = null
         private set
     var imageLoader: ImageLoader? = null
         private set
@@ -55,6 +59,68 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     private var retiringDisposal: Job? = null
     // Process-local rate limit only; never persistent device/session authority.
     private val registrationPacing = PlaybackRegistrationPacing()
+
+    // Audio bytes confer no authority. Construction is dormant: only a server-validated
+    // authentication event can bind the origin/account namespace to a live session.
+    internal val songCache = SongCache(context.cacheDir, audioCacheLimits)
+    @Volatile private var audioCache: SongCache.SessionCache? = null
+    private val cacheAuthenticationLock = Any()
+    @Volatile private var cacheSource: SpofifyClient? = null
+    private var authenticationRevision = -1L
+
+    // Never borrow the graph monitor: configure/clear hold it while releasing Media3,
+    // whose loading thread can synchronously observe cookie expiry during a read.
+    private fun authenticationChanged(source: SpofifyClient, change: AuthenticationChange) = synchronized(cacheAuthenticationLock) {
+        if (cacheSource !== source || client !== source || change.revision <= authenticationRevision) return@synchronized
+        authenticationRevision = change.revision
+        when (change.kind) {
+            AuthenticationChangeKind.VALIDATED -> {
+                val identity = change.identity ?: return@synchronized
+                if (source.validatedSessionIdentity() != identity) return@synchronized
+                audioCache = runCatching { songCache.bind(identity.origin, identity.accountId) }.getOrNull()
+            }
+            AuthenticationChangeKind.DORMANT -> {
+                audioCache?.suspend()
+                audioCache = null
+                songCache.fence()
+            }
+            AuthenticationChangeKind.RESET -> {
+                // A cold explicit sign-in has no prior runtime authority. Leave dormant
+                // bytes alone until its immutable identity has been validated.
+                audioCache?.retire()
+                audioCache = null
+            }
+            AuthenticationChangeKind.INVALIDATED, AuthenticationChangeKind.EXPIRED -> {
+                audioCache = null
+                songCache.retire()
+                if (change.kind == AuthenticationChangeKind.EXPIRED) {
+                    source.httpClient.dispatcher.cancelAll()
+                    revokePlayback(source)
+                }
+            }
+        }
+    }
+
+    private fun revokePlayback(source: SpofifyClient) {
+        // Expiry is observed on audio/cache reads as well as API responses. Fence pending
+        // starts synchronously; only player mutation is posted. The 401 callback must not
+        // cancel its own call before the existing API error classifier sees the response.
+        // onUnauthorized runs under the client's auth-generation lock: do not borrow
+        // the cache lock here (cache authentication fencing also reads client authority).
+        if (client !== source || source.currentSession() != null) return
+        PlaybackRequests.invalidate()
+        Handler(Looper.getMainLooper()).post {
+            if (client === source && source.currentSession() == null) {
+                playbackCoordinator?.authLost()
+                PlaybackService.stopActivePlayback()
+                context.stopService(Intent(context, PlaybackService::class.java))
+                expired.value = true
+            }
+        }
+    }
+
+    internal fun audioCache(source: SpofifyClient, expected: Session): SongCache.SessionCache? =
+        if (client === source && source.hasValidSession(expected)) audioCache else null
 
     private fun endCoordination(): Job? {
         PlaybackService.onServiceActiveChanged = null
@@ -105,6 +171,14 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
 
     @Synchronized
     fun configure(server: ServerAddress): SpofifyClient {
+        client?.onAuthenticationChanged = null
+        synchronized(cacheAuthenticationLock) {
+            cacheSource = null
+            audioCache?.suspend()
+            audioCache = null
+            songCache.fence()
+            if (lastServer.isNotEmpty() && lastServer != server.origin) songCache.retire()
+        }
         val predecessorDisposal = endCoordination()
         PlaybackService.stopActivePlayback()
         context.stopService(Intent(context, PlaybackService::class.java))
@@ -115,22 +189,15 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         client?.clearSession()
         expired.value = false
         val next = SpofifyClient(server, lease)
-        next.onUnauthorized = {
-            // Invalidate pending continuations synchronously on the auth callback thread.
-            // Player mutation remains confined to its main looper below.
-            if (client === next && next.currentSession() == null) PlaybackRequests.invalidate()
-            // Range/image requests can fail without an Activity. Stop buffered audio too;
-            // stopService alone cannot destroy a still-bound MediaSessionService.
-            Handler(Looper.getMainLooper()).post {
-                if (client === next && next.currentSession() == null) {
-                    playbackCoordinator?.authLost()
-                    PlaybackService.stopActivePlayback()
-                    context.stopService(Intent(context, PlaybackService::class.java))
-                    expired.value = true
-                }
-            }
+        next.onAuthenticationChanged = { authenticationChanged(next, it) }
+        // Range/image requests can fail without an Activity or a player request. Stop
+        // buffered audio too; stopService alone cannot destroy a still-bound service.
+        next.onUnauthorized = { revokePlayback(next) }
+        synchronized(cacheAuthenticationLock) {
+            client = next
+            cacheSource = next
+            authenticationRevision = -1L
         }
-        client = next
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         val coordinator = PlaybackCoordinator(PlaybackDevicesApi(next), Media3PlaybackEndpoint(), scope,
             identity = { next.currentSession()?.let { PlaybackDeviceIdentityStore(context, next.server, it.accountId) } },
@@ -161,6 +228,12 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     @Synchronized
     fun clear(expected: SpofifyClient? = client) {
         if (client !== expected) return
+        client?.onAuthenticationChanged = null
+        synchronized(cacheAuthenticationLock) {
+            cacheSource = null
+            audioCache = null
+            songCache.retire()
+        }
         endCoordination()
         PlaybackService.stopActivePlayback()
         context.stopService(Intent(context, PlaybackService::class.java))
