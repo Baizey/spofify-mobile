@@ -4,7 +4,11 @@ import android.app.ActivityManager
 import android.media.AudioManager
 import android.os.Bundle
 import android.os.Looper
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.TransferListener
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.MediaSession
@@ -59,7 +63,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = SpofifyApplication::class,
-    shadows = [SongCachePlaybackMedia::class], instrumentedPackages = ["androidx.media3.exoplayer"])
+    shadows = [SongCachePlaybackMedia::class, SongCachePlaybackMedia.LoaderRelease::class], instrumentedPackages = ["androidx.media3.exoplayer"])
 @LooperMode(LooperMode.Mode.PAUSED)
 @androidx.annotation.OptIn(UnstableApi::class)
 class SongCachePlaybackTest {
@@ -93,6 +97,8 @@ class SongCachePlaybackTest {
         val history = AtomicInteger()
         val mutations = CopyOnWriteArrayList<String>()
         @Volatile var restoreStatus = 200
+        @Volatile var audioFailureStatus: Int? = null
+        @Volatile var malformedAudio = false
         @Volatile var delayedTrack: String? = null
         @Volatile var snapshot = if (remote) PlaybackSnapshot(queue = listOf(
             PlaybackTrack("R", "Remote song", emptyList(), "", "", 12.0, key = 1, order = 0)),
@@ -135,6 +141,11 @@ class SongCachePlaybackTest {
             if (path.size == 5 && path.take(3) == listOf("api", "library", "tracks") && path[4] == "audio") {
                 val id = path[3]
                 check(id.length == 1 && id[0] in 'A'..'Z')
+                audioFailureStatus?.let {
+                    audio += Audio(id, request.method!!, request.getHeader("Range"), 0)
+                    return MockResponse().setResponseCode(it)
+                }
+                if (malformedAudio) return MockResponse().setHeader("Content-Type", "audio/wav").setBody("not an audio container")
                 val wav = wav(id, sampleRate, (durationMillis(id) / 1000).toInt())
                 val range = request.getHeader("Range")
                 val start = range?.removePrefix("bytes=")?.substringBefore('-')?.toIntOrNull() ?: 0
@@ -443,6 +454,15 @@ class SongCachePlaybackTest {
             assertEquals("unchanged", detail.playback)
             awaitLocalPublication(action.toString())
         }
+        var playNowResult: PlaybackActionResult? = null
+            private set
+        fun beginPlayNow(id: String) {
+            awaitLocalPublication("before PLAY_NOW")
+            playNowResult = null
+            PlaybackService.performPreparedAction(dev.spofify.mobile.core.PlaybackQueue(listOf(track(id, "$id-recent")), total = 1),
+                client, PlaybackListAction.PLAY_NOW, requireNotNull(PlaybackService.interactionKey()),
+                null, null, null) { playNowResult = it }
+        }
         private fun diagnostics(): String {
             val live = PlaybackService.exportLocalSnapshot()
             val owner = graph.playbackCoordinator?.state?.value
@@ -453,7 +473,8 @@ class SongCachePlaybackTest {
             return "live={${summary(live)}}; accepted={${summary(accepted)}}; " +
                 "owner connected=${owner?.connected},exclusive=${owner?.exclusiveOwner},canQueue=${owner?.canQueueIntent}," +
                 "unconfirmed=${owner?.selectionUnconfirmed},message=${owner?.message}; " +
-                "controller playing=${controller?.isPlaying},repeat=${controller?.repeatMode},shuffle=${controller?.shuffleModeEnabled}; " +
+                "controller playing=${controller?.isPlaying},repeat=${controller?.repeatMode},shuffle=${controller?.shuffleModeEnabled}," +
+                "failure=${controller?.playerError?.let(::playbackFailureDiagnostic)}; " +
                 "inventory=${runCatching { graph.songCache.inventory() }.getOrNull()}; " +
                 "audio=${room.audio.takeLast(32).map { "${it.method}:${it.id}:${it.range}" }}"
         }
@@ -594,6 +615,183 @@ class SongCachePlaybackTest {
             assertEquals(paused.occurrence?.eventId, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
             assertEquals(1, j.room.registrations.get())
             assertTrue(j.room.mutations.isEmpty())
+        }
+    }
+
+    @Test fun freshPlayAndOutOfBufferRangeConsumeActualAuthenticatedWav() {
+        Journey(longCurrent = true).use { j ->
+            j.startService()
+            j.play("A")
+            val pcm = consumed("A")
+            j.controller!!.seekTo(90_000)
+            await("real seek reopens authenticated HTTP range and consumes WAV samples") {
+                j.controller!!.isPlaying && j.controller!!.currentPosition > 90_050 && consumed("A") > pcm &&
+                    j.room.audio.any { it.id == "A" && it.range != null }
+            }
+            j.pause()
+            j.resume()
+            j.assertHealthy()
+        }
+    }
+
+    @Test fun malformedAudioIsAParsingFailureNotAConnectionDiagnosisAndNeverStarts() {
+        Journey(longCurrent = true).use { j ->
+            j.startService()
+            j.play("A")
+            val errors = CopyOnWriteArrayList<PlaybackException>()
+            j.controller!!.addListener(object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) { errors += error }
+            })
+            val bPcm = consumed("B")
+            j.room.malformedAudio = true
+            j.beginPlayNow("B")
+            await("actual production extractor rejects malformed HTTP audio") { errors.isNotEmpty() }
+            assertTrue(playbackFailureDiagnostic(errors.last()),
+                playbackFailureDiagnostic(errors.last()).startsWith("category=parsing "))
+            assertEquals(bPcm, consumed("B"))
+            assertFalse(j.controller!!.isPlaying)
+            assertFalse(PlaybackService.exportLocalSnapshot().playing)
+            val samples = SongCachePlaybackMedia.samples.get()
+            pump(200)
+            assertEquals("A rejected source must not replay itself", samples, SongCachePlaybackMedia.samples.get())
+            j.room.malformedAudio = false
+            // The same cached B object remains invalid; a backend response change is not
+            // permission to invalidate media or replay it. Choose a new valid source explicitly.
+            j.play("C")
+            j.assertHealthy()
+        }
+    }
+
+    @Test fun recentPlayNowHttpReadHeldAcrossPauseDoesNotBecomeConnectionError() =
+        assertPlayNowReadAcrossPause(warm = false)
+
+    @Test fun recentPlayNowCacheReadHeldAcrossPauseDoesNotBecomeConnectionError() =
+        assertPlayNowReadAcrossPause(warm = true)
+
+    private fun assertPlayNowReadAcrossPause(warm: Boolean) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val sourceClosed = CountDownLatch(1)
+        val releaseRequested = CountDownLatch(1)
+        val loaderReleased = CountDownLatch(1)
+        val loaderReleases = AtomicInteger()
+        val held = AtomicBoolean()
+        val heldSource = AtomicReference<DataSource>()
+        val network = AtomicReference<Boolean>()
+        Journey(longCurrent = true).use { j ->
+            try {
+                j.startService()
+                if (warm) {
+                    j.play("A", "B")
+                    await("B is a whole cached object before the recent-row action") { j.assertBounded().complete == 1 }
+                } else j.play("A")
+                val errors = CopyOnWriteArrayList<PlaybackException>()
+                j.controller!!.addListener(object : Player.Listener {
+                    override fun onPlayerError(error: PlaybackException) { errors += error }
+                })
+                val requests = j.room.audio.filter { it.id == "B" }
+                SongCachePlaybackMedia.transferListener = object : TransferListener {
+                    override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+                    override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+                    override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                        if (source === heldSource.get()) sourceClosed.countDown()
+                    }
+                    override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+                        if (dataSpec.key != "B" || !held.compareAndSet(false, true)) return
+                        heldSource.set(source)
+                        network.set(isNetwork)
+                        entered.countDown()
+                        // Intentionally outlive Loader cancellation. Release the actual read only
+                        // after Pause, so the production post-read authorization guard executes.
+                        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                        while (release.count != 0L) {
+                            val remaining = deadline - System.nanoTime()
+                            check(remaining > 0) { "Held authorized read was not released" }
+                            try { release.await(remaining, TimeUnit.NANOSECONDS) }
+                            catch (_: InterruptedException) { /* Cancellation is the race under test. */ }
+                        }
+                    }
+                }
+                j.beginPlayNow("B")
+                await("real ${if (warm) "file" else "HTTP"} B read is held") { entered.count == 0L }
+                assertEquals(!warm, network.get())
+                // B is now the sole active period; arm only after its real read is held,
+                // excluding the preceding A period's already-requested release.
+                SongCachePlaybackMedia.onLoaderRelease = {
+                    loaderReleases.incrementAndGet()
+                    releaseRequested.countDown()
+                    val completed = { loaderReleased.countDown() }
+                    completed
+                }
+                val beforePause = PlaybackService.exportLocalSnapshot()
+                assertEquals("B", beforePause.queue[beforePause.position].id)
+                assertNotEquals(Player.STATE_IDLE, j.session.player.playbackState)
+                j.controller!!.pause() // Do not wait behind the deliberately held Play start.
+                await("service output has executed Pause/stop while the original read is held") {
+                    // Read the service's player, not optimistic MediaController transport flags.
+                    j.session.player.playbackState == Player.STATE_IDLE && !j.session.player.playWhenReady &&
+                        !j.session.player.isPlaying && !PlaybackService.exportLocalSnapshot().playing &&
+                        releaseRequested.count == 0L
+                }
+                assertEquals(1L, release.count)
+                assertEquals(1L, sourceClosed.count)
+                assertEquals(1L, loaderReleased.count)
+                assertEquals("Only the held B loader is being released", 1, loaderReleases.get())
+                release.countDown()
+                await("original held source closed and Loader executor released before Resume") {
+                    // The release callback runs on the original executor AFTER its load exits.
+                    // onLoadCanceled alone cannot prove that when released=true.
+                    sourceClosed.count == 0L && loaderReleased.count == 0L
+                }
+                assertEquals("The completed release belongs to the held B loader", 1, loaderReleases.get())
+                SongCachePlaybackMedia.transferListener = null
+                SongCachePlaybackMedia.onLoaderRelease = null
+                assertTrue("Intentional Pause must not emit a media/connection error", errors.isEmpty())
+                assertNull(j.controller!!.playerError)
+                val paused = PlaybackService.exportLocalSnapshot()
+                assertFalse(paused.playing)
+                assertEquals(beforePause.queue, paused.queue)
+                assertEquals(beforePause.position, paused.position)
+                assertEquals(beforePause.occurrence?.eventId, paused.occurrence?.eventId)
+                assertEquals("", paused.error)
+                j.awaitLocalPublication("held read cancelled by Pause")
+                if (warm) j.room.audioFailureStatus = 503 // Audio unavailable; coordination stays healthy.
+                j.resume()
+                if (warm) {
+                    assertEquals("Whole warm B Resume needs no new GET/HEAD", requests, j.room.audio.filter { it.id == "B" })
+                }
+                assertTrue("No late cancelled-read error may leak after Resume", errors.isEmpty())
+                j.assertHealthy()
+            } finally {
+                release.countDown()
+                SongCachePlaybackMedia.transferListener = null
+                SongCachePlaybackMedia.onLoaderRelease = null
+            }
+        }
+    }
+
+    @Test fun genuineAudioHttpFailureWithHealthyCoordinationRemainsAnError() {
+        Journey(longCurrent = true).use { j ->
+            j.startService()
+            j.play("A")
+            val logStart = org.robolectric.shadows.ShadowLog.getLogsForTag("SpofifyPlayback").size
+            j.room.audioFailureStatus = 404
+            j.beginPlayNow("B")
+            await("actual HTTP404 is retained as a sanitized load diagnostic and failed start") {
+                PlaybackService.exportLocalSnapshot().error == "media" &&
+                    org.robolectric.shadows.ShadowLog.getLogsForTag("SpofifyPlayback").drop(logStart)
+                        .any { it.msg.contains("http=404") }
+            }
+            assertTrue(j.room.audio.any { it.id == "B" && it.method == "GET" })
+            assertFalse(j.controller!!.isPlaying)
+            assertFalse(PlaybackService.exportLocalSnapshot().playing)
+            assertEquals(0L, consumed("B"))
+            assertTrue(j.graph.playbackCoordinator!!.state.value.connected)
+            await("failed Play now has its definitive terminal receipt before another command") { j.playNowResult != null }
+            j.awaitLocalPublication("definitively failed HTTP Play now")
+            j.room.audioFailureStatus = null
+            j.play("C") // One fresh explicit command, never automatic retry/skip of missing B.
+            j.assertHealthy()
         }
     }
 

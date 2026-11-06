@@ -575,6 +575,20 @@ class PlaybackService : MediaSessionService() {
             .setWakeMode(C.WAKE_MODE_LOCAL)
             .build()
         player = exo
+        // A bounded start can time out before Media3 exhausts loader retries. Keep the real
+        // transport cause diagnostic even when no terminal onPlayerError reaches a controller.
+        exo.addAnalyticsListener(object : androidx.media3.exoplayer.analytics.AnalyticsListener {
+            override fun onLoadError(
+                eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                loadEventInfo: androidx.media3.exoplayer.source.LoadEventInfo,
+                mediaLoadData: androidx.media3.exoplayer.source.MediaLoadData,
+                error: IOException,
+                wasCanceled: Boolean,
+            ) {
+                val failure = PlaybackException(null, error, PlaybackException.ERROR_CODE_IO_UNSPECIFIED)
+                android.util.Log.w("SpofifyPlayback", "load canceled=$wasCanceled ${playbackFailureDiagnostic(failure)}")
+            }
+        })
         audioFocus = PlaybackAudioFocus(getSystemService(AudioManager::class.java), ::interruptForSystemPause)
         ContextCompat.registerReceiver(this, noisyReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
             ContextCompat.RECEIVER_NOT_EXPORTED)
@@ -671,6 +685,7 @@ class PlaybackService : MediaSessionService() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                android.util.Log.w("SpofifyPlayback", playbackFailureDiagnostic(error))
                 // No retry or automatic skip, retained focus or foreground exemption.
                 settleTerminalOutput()
             }

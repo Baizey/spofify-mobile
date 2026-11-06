@@ -899,14 +899,59 @@ class NativePlayerTest {
         compose.onNodeWithContentDescription("Saving like").assertIsNotEnabled()
     }
 
-    @Test fun playbackNoticeIsStableAlongsideTransportAndError() {
+    @Test fun playbackErrorAndMixedNoticeStayInternalAlongsideHonestTransport() {
         val controls = RecordingControls()
         setNowPlaying(PlaybackState(item = track, notice = "Showing the first 1000 songs",
             error = "Playback unavailable"), controls)
         compose.onNodeWithContentDescription("Play").assertIsDisplayed().assertIsEnabled()
-        compose.onNodeWithText("Playback unavailable").assertIsDisplayed()
+        compose.onNodeWithText("Playback unavailable").assertDoesNotExist()
         compose.onNodeWithContentDescription("Now Playing actions").performClick()
-        compose.onNodeWithText("Showing the first 1000 songs").assertExists()
+        compose.onNodeWithText("Playback unavailable").assertDoesNotExist()
+        compose.onNodeWithText("Showing the first 1000 songs").assertDoesNotExist()
+        compose.runOnIdle { controls.assertNoCommands() }
+    }
+
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Test fun errorsAndErrorLikeNoticesNeverReplaceMetadataAcrossPlayerSizesOrMore() {
+        val controls = RecordingControls()
+        data class Viewport(val width: Int, val height: Int, val font: Float = 1f, val mini: Boolean = false)
+        val cases = listOf(Viewport(320, 72, mini = true), Viewport(400, 850),
+            Viewport(600, 320), Viewport(320, 320, 2f))
+        val viewport = mutableStateOf(cases.first())
+        val state = mutableStateOf(PlaybackState(item = track, error = "Playback unavailable",
+            notice = "Queue update failed"))
+        compose.setContent {
+            androidx.compose.runtime.key(viewport.value) {
+                val density = LocalDensity.current
+                CompositionLocalProvider(LocalDensity provides Density(density.density, viewport.value.font)) {
+                    MaterialTheme {
+                        Box(Modifier.size(viewport.value.width.dp, viewport.value.height.dp)) {
+                            if (viewport.value.mini) NativeMiniPlayer(state.value, controls, {},
+                                artwork = { _, modifier -> Box(modifier) })
+                            else NativeNowPlaying(state.value, controls, false, false, false, {}, {}, {}, {},
+                                artwork = { _, modifier -> Box(modifier) })
+                        }
+                    }
+                }
+            }
+        }
+        for (case in cases) {
+            compose.runOnIdle { viewport.value = case }
+            for (error in listOf("Playback unavailable", null)) {
+                compose.runOnIdle { state.value = state.value.copy(error = error) }
+                compose.onNodeWithText("Playback unavailable").assertDoesNotExist()
+                compose.onNodeWithText("Queue update failed").assertDoesNotExist()
+                compose.onNodeWithText(track.name).assertIsDisplayed()
+                compose.onNodeWithText("Artist credit").assertIsDisplayed()
+                compose.onNodeWithContentDescription("Play").assertIsDisplayed()
+            }
+            if (!case.mini) {
+                compose.onNodeWithContentDescription("Now Playing actions").performClick()
+                compose.onNodeWithText("Playback unavailable").assertDoesNotExist()
+                compose.onNodeWithText("Queue update failed").assertDoesNotExist()
+            }
+        }
+        compose.runOnIdle { controls.assertNoCommands() }
     }
 
     @Test fun duplicateQueueTracksUseOccurrenceActionsAndUpcomingPositionsNotTimelineIndices() {
@@ -1157,7 +1202,7 @@ class NativePlayerTest {
     }
 
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
-    @Test fun shortLargeFontDisclosureKeepsFailuresVisibleAndBackDismissesQueueBeforePlayer() {
+    @Test fun shortLargeFontDisclosureHidesErrorsAndBackDismissesQueueBeforePlayer() {
         val controls = RecordingControls()
         val presentation = NowPlayingPresentationState()
         val snapshot = mutableStateOf(PlaybackState(item = track, error = "Playback unavailable", durationMs = 600_000))
@@ -1176,11 +1221,11 @@ class NativePlayerTest {
         }
         val initialControls = compose.onNodeWithTag("now-playing-controls").fetchSemanticsNode().boundsInRoot
         val initialSeek = compose.onNodeWithContentDescription("Playback position").fetchSemanticsNode().boundsInRoot
-        compose.onNodeWithText("Playback unavailable").assertIsDisplayed()
+        compose.onNodeWithText("Playback unavailable").assertDoesNotExist()
         compose.onNodeWithTag("now-playing-queue").assertDoesNotExist()
         captureComponent(Triple(320, 320, 2f), "-error")
         compose.onNodeWithTag("now-playing-show-queue").performClick()
-        compose.onNodeWithText("Playback unavailable").assertIsDisplayed()
+        compose.onNodeWithText("Playback unavailable").assertDoesNotExist()
         compose.onNodeWithText("No upcoming songs").assertIsDisplayed()
         compose.onNodeWithContentDescription("Play").assertIsDisplayed().assertHeightIsEqualTo(48.dp)
         captureComponent(Triple(320, 320, 2f), "-queue-empty-error")
@@ -1188,9 +1233,9 @@ class NativePlayerTest {
         // actual native Back/window dispatch remains a future working-AVD gate.
         compose.runOnIdle { org.junit.Assert.assertTrue(presentation.dismissQueue()) }
         compose.onNodeWithTag("now-playing-main-view").assertIsDisplayed()
-        compose.onNodeWithText("Playback unavailable").assertIsDisplayed()
+        compose.onNodeWithText("Playback unavailable").assertDoesNotExist()
         compose.runOnIdle { snapshot.value = snapshot.value.copy(error = null, notice = "Queue update failed") }
-        compose.onNodeWithText("Queue update failed").assertIsDisplayed()
+        compose.onNodeWithText("Queue update failed").assertDoesNotExist()
         assertEquals("Failure/notice swaps do not move transport", initialControls,
             compose.onNodeWithTag("now-playing-controls").fetchSemanticsNode().boundsInRoot)
         assertEquals("Failure/notice swaps do not move seek", initialSeek,

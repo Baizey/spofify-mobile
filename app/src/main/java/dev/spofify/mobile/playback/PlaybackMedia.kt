@@ -76,6 +76,29 @@ internal object PlaybackMedia {
         id.isNotBlank() && id != "." && id != ".." && id.none { it.isISOControl() }
 }
 
+/** Bounded diagnostic only: never attach a Throwable/message, URL, headers or track metadata. */
+@androidx.annotation.OptIn(UnstableApi::class)
+internal fun playbackFailureDiagnostic(error: PlaybackException): String {
+    val category = when (error.errorCode) {
+        in 2000..2999 -> "io"
+        in 3000..3999 -> "parsing"
+        in 4000..4999 -> "decoder"
+        in 5000..5999 -> "audio-output"
+        in 6000..6999 -> "drm"
+        else -> "player"
+    }
+    val causes = mutableListOf<String>()
+    var cause: Throwable? = error
+    repeat(12) {
+        val current = cause ?: return@repeat
+        // Class names, numeric codes only; raw exception messages can contain credentials.
+        causes += current.javaClass.simpleName.take(80)
+        if (current is HttpDataSource.InvalidResponseCodeException) causes += "http=${current.responseCode}"
+        cause = current.cause
+    }
+    return "category=$category code=${error.errorCode} causes=${causes.joinToString(">")}"
+}
+
 /** Never surface server bodies, URLs, credentials, or raw ExoPlayer exception messages. */
 @androidx.annotation.OptIn(UnstableApi::class)
 internal fun playbackErrorMessage(error: PlaybackException): String {

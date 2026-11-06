@@ -4,6 +4,8 @@ import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.TransferListener
 import androidx.media3.decoder.DecoderInputBuffer
 import androidx.media3.exoplayer.BaseRenderer
 import androidx.media3.exoplayer.ExoPlayer
@@ -11,9 +13,11 @@ import androidx.media3.exoplayer.RendererCapabilities
 import androidx.media3.exoplayer.RenderersFactory
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.upstream.Loader
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.annotation.RealObject
+import org.robolectric.util.reflector.Accessor
 import org.robolectric.util.reflector.Direct
 import org.robolectric.util.reflector.ForType
 import org.robolectric.util.reflector.Reflector.reflector
@@ -33,17 +37,51 @@ class SongCachePlaybackMedia {
     @Implementation
     fun setMediaSourceFactory(factory: MediaSource.Factory): ExoPlayer.Builder {
         check(factory is DefaultMediaSourceFactory) { "Cache regression must exercise the production source factory" }
+        // Attach only an optional transfer observer to the actual production DataSource.
+        // This can hold a real file/HTTP read without replacing authorization, bytes or errors.
+        val sources = reflector(FactoryFields::class.java, factory).getDataSourceFactory()
+        factory.setDataSourceFactory(DataSource.Factory {
+            sources.createDataSource().also { source -> transferListener?.let(source::addTransferListener) }
+        })
         val direct = reflector(BuilderDirect::class.java, builder)
+
         direct.setMediaSourceFactory(factory) // Identity, not a delegating/test source.
         direct.setRenderersFactory(RenderersFactory { _, _, _, _, _ -> arrayOf(PcmSink()) })
         factories.incrementAndGet()
         return builder
     }
 
+    @ForType(DefaultMediaSourceFactory::class)
+    interface FactoryFields {
+        @Accessor("dataSourceFactory") fun getDataSourceFactory(): DataSource.Factory
+    }
+
     @ForType(ExoPlayer.Builder::class)
     interface BuilderDirect {
         @Direct fun setMediaSourceFactory(factory: MediaSource.Factory): ExoPlayer.Builder
         @Direct fun setRenderersFactory(factory: RenderersFactory): ExoPlayer.Builder
+    }
+
+    /** Observe the real executor's release completion, not onLoadCanceled: released=true
+     * cancellation can notify before a blocking load actually exits. No load is replaced. */
+    @Implements(value = Loader::class, isInAndroidSdk = false)
+    class LoaderRelease {
+        @RealObject private lateinit var loader: Loader
+
+        @Implementation
+        fun release(callback: Loader.ReleaseCallback?) {
+            val completed = onLoaderRelease?.invoke()
+            val direct = reflector(LoaderDirect::class.java, loader)
+            if (completed == null) direct.release(callback)
+            else direct.release(Loader.ReleaseCallback {
+                try { callback?.onLoaderReleased() } finally { completed() }
+            })
+        }
+
+        @ForType(Loader::class)
+        interface LoaderDirect {
+            @Direct fun release(callback: Loader.ReleaseCallback?)
+        }
     }
 
     class PcmSink : BaseRenderer(C.TRACK_TYPE_AUDIO) {
@@ -104,6 +142,8 @@ class SongCachePlaybackMedia {
     }
 
     companion object {
+        @Volatile var transferListener: TransferListener? = null
+        @Volatile var onLoaderRelease: (() -> (() -> Unit))? = null
         val factories = AtomicLong()
         val samples = AtomicLong()
         val starts = AtomicLong()
@@ -112,6 +152,8 @@ class SongCachePlaybackMedia {
         val consumed = ConcurrentHashMap<Int, AtomicLong>()
         fun bytes(marker: Int) = consumed[marker]?.get() ?: 0L
         fun reset() {
+            transferListener = null
+            onLoaderRelease = null
             factories.set(0); samples.set(0); starts.set(0); enables.set(0); resets.set(0)
             consumed.clear()
         }

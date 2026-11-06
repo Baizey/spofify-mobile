@@ -54,11 +54,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
-import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
-import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -157,11 +155,8 @@ fun NativeMiniPlayer(
                     Column(Modifier.weight(1f).padding(start = 12.dp)) {
                         Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
                             style = MaterialTheme.typography.titleSmall)
-                        val feedback = state.error ?: state.notice
-                        Text(feedback ?: item.subtitle, maxLines = if (feedback == null) 1 else 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.semantics { if (feedback != null) liveRegion = LiveRegionMode.Polite },
-                            color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                        Text(item.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurface,
                             style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -235,7 +230,6 @@ fun NativeNowPlaying(
         val cramped = !landscape && maxHeight < 360.dp
         val showArtwork = maxHeight >= 560.dp && LocalDensity.current.fontScale < 1.8f
         LaunchedEffect(cramped) { if (!cramped) presentation.dismissQueue() }
-        val feedback = state.error ?: state.notice
         val identity: @Composable () -> Unit = {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).heightIn(min = 48.dp)
@@ -243,11 +237,9 @@ fun NativeNowPlaying(
                     .padding(horizontal = 8.dp, vertical = if (cramped) 0.dp else 4.dp)) {
                     Text(item.name, style = MaterialTheme.typography.titleMedium,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    // In the shortest view feedback replaces the credit line rather than adding
-                    // height or hiding current playback failures behind the queue disclosure.
-                    Text(if (cramped) feedback ?: item.subtitle else item.subtitle,
-                        modifier = Modifier.semantics { if (cramped && feedback != null) liveRegion = LiveRegionMode.Polite },
-                        color = if (cramped && state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                    // Mixed control/diagnostic notices stay internal, never replace music credits.
+                    Text(item.subtitle,
+                        color = MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 LikeButton(liked, likePending, likeFailed, onToggleLike, onRetryLike)
@@ -292,11 +284,9 @@ fun NativeNowPlaying(
         if (cramped) {
             if (presentation.queueOpen) {
                 Column(Modifier.fillMaxSize().testTag("now-playing-queue-view")) {
-                    // A stable full-width status/identity slot remains visible in both views.
-                    Text(feedback ?: item.name, Modifier.fillMaxWidth().semantics {
-                        if (feedback != null) liveRegion = LiveRegionMode.Polite
-                    }, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                    Text(item.name, Modifier.fillMaxWidth(),
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        color = MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.bodySmall)
                     NativeUpcomingQueue(state, controls, onOpenItem, artwork, compact = true,
                         showStatus = false, onClose = { presentation.dismissQueue() })
@@ -322,12 +312,14 @@ fun NativeNowPlaying(
         } else if (landscape) {
             Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) { pinned() }
-                Column(Modifier.weight(1f).fillMaxHeight()) { NativeUpcomingQueue(state, controls, onOpenItem, artwork) }
+                Column(Modifier.weight(1f).fillMaxHeight()) {
+                    NativeUpcomingQueue(state, controls, onOpenItem, artwork, showStatus = false)
+                }
             }
         } else {
             Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                 pinned()
-                NativeUpcomingQueue(state, controls, onOpenItem, artwork)
+                NativeUpcomingQueue(state, controls, onOpenItem, artwork, showStatus = false)
             }
         }
     }
@@ -374,8 +366,6 @@ private fun PlayerMore(
             DropdownMenuItem(text = { Text("Repeat: $repeat") },
                 leadingIcon = { Icon(if (state.repeatMode == Player.REPEAT_MODE_ONE) Icons.Default.RepeatOne else Icons.Default.Repeat, null) },
                 onClick = { controls.cycleRepeat() })
-            state.notice?.let { Text(it, Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
-            state.error?.let { Text(it, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.error) }
         }
     }
 }
