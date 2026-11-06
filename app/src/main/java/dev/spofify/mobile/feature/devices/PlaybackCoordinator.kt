@@ -1507,9 +1507,10 @@ class PlaybackCoordinator(
         if (previous != null && changed && view.directives.none { it.type == "activate" }) recoverPaused = true
         val directiveRevision = actionVersion
         val closeVersion = finalCloseVersion
+        val leadership = view.leadership
         if (grantAuthority) for (directive in view.directives) {
             runDirective(directive, startsAllowed && !lostLead &&
-                (view.leadership == null || view.leadership.names(id)) && directiveRevision == actionVersion)
+                (leadership == null || leadership.names(id)) && directiveRevision == actionVersion)
             if (closeVersion != finalCloseVersion) return // Never execute directives after a final close.
         }
         // Arm while the lease is still valid so cache reads cannot race the deadline timer.
