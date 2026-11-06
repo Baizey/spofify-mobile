@@ -3,6 +3,7 @@ package dev.spofify.mobile.feature.devices
 import dev.spofify.mobile.core.*
 import dev.spofify.mobile.playback.remoteSkipCapabilities
 import dev.spofify.mobile.playback.PlaybackQueueOrigin
+import dev.spofify.mobile.playback.PlaybackQueueIntents
 import dev.spofify.mobile.playback.queueOriginIdentity
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
@@ -144,6 +145,9 @@ class PlaybackCoordinator(
     private val authorityPermit = AtomicReference<AuthorityPermit?>(null)
     private var released = false
     private var activatedEpoch = 0L
+    // Prior actual activation lost to a failed exchange, not a pristine/server-display queue.
+    // Eligibility only: fresh own authority and exact live preparation are still required.
+    private var retainedPreparedEpoch = 0L
     private var activating = false
     private var recoverPaused = true
     private var uncertainConnection = false
@@ -384,6 +388,7 @@ class PlaybackCoordinator(
             return
         }
         serviceActive = active
+        retainedPreparedEpoch = 0L
         if (active) {
             // Binding is not a user cancellation: preserve a genuine pre-bind Play request.
             fenceLocal(invalidateActions = false)
@@ -436,6 +441,7 @@ class PlaybackCoordinator(
         if (!preserveHandoff) retireHandoff()
         queueExecution = null
         generation++; leaseDeadline = 0; released = true; activatedEpoch = 0; recoverPaused = true
+        retainedPreparedEpoch = 0L
         revokeAuthority()
         if (invalidateActions) {
             abandonAdmission()
@@ -533,6 +539,7 @@ class PlaybackCoordinator(
             message("That player is unavailable. Open Spofify on it and choose again."); return
         }
         abandonAdmission()
+        retainedPreparedEpoch = 0L
         val pendingHandoffActivation = activating && handoffWitness?.phase == HandoffPhase.AWAITING_ACTIVATION
         retireHandoff() // Same-target selection and A -> B -> A also retire the old request.
         val selection = Selection(targetDeviceId, ++selectionVersion)
@@ -895,10 +902,14 @@ class PlaybackCoordinator(
                                 } else if (activatedEpoch != epoch) {
                                     val expected = command?.takeIf { it.type == "queueIntent" }?.json?.get("expected")
                                         ?.let { QueueIntentBinding.fromJson(it as kotlinx.serialization.json.JsonObject) }
-                                    if (!acceptedEmptyQueueIntentBinding(expected)) return@endpointAction null
-                                    // Exact empty native state already exists under this lease;
-                                    // this admits its first transaction without activate/import.
-                                    activatedEpoch = epoch
+                                    if (acceptedEmptyQueueIntentBinding(expected)) {
+                                        // Exact empty native state already exists under this lease;
+                                        // this admits its first transaction without activate/import.
+                                        activatedEpoch = epoch
+                                    } else if (!activateRetainedPrepared(authority, expected, isCurrent)) {
+                                        message("The prepared playback could not be verified. Choose music or an available output, then try again.")
+                                        return@endpointAction null
+                                    }
                                 }
                                 if (!authority.isValid() || !isCurrent()) return@endpointAction null
                                 if (action != null) action(authority) else {
@@ -1110,6 +1121,45 @@ class PlaybackCoordinator(
             accepted.repeat == live.repeat && accepted.truncated == live.truncated && accepted.notice == live.notice
     }
 
+    /** Readiness only. A fresh own poll may confirm this exact live receiver without
+     * activating it. Old requests/keys remain fenced; server display is never imported. */
+    private fun acceptedRetainedPrepared(expected: QueueIntentBinding?,
+        view: PlaybackDevicesView? = state.value.view, localDeviceId: String = state.value.deviceId): PlaybackSnapshot? {
+        if (!receiverRegistered || expected == null || view == null || retainedPreparedEpoch != view.epoch ||
+            view.activeDeviceId != localDeviceId || expected.outputDeviceId != localDeviceId || view.queueIntents?.binding != expected ||
+            view.transfer != null || view.quarantineMs != 0L || view.directives.isNotEmpty() ||
+            view.commands.any { it.status == "pending" } ||
+            view.devices.none { it.deviceId == localDeviceId && it.available }) return null
+        val accepted = view.state ?: return null
+        val live = endpoint.exportSnapshot().validated()
+        val current = live.queue.getOrNull(live.position) ?: return null
+        if (live.playing || live.waiting || live.loading || expected.currentKey != current.key ||
+            expected.currentEventId != live.occurrence?.eventId) return null
+        val metadata = endpoint.exportQueueIntentState()?.validated(live) ?: return null
+        if (metadata != view.queueIntents?.state || metadata.receiverId != expected.receiverId ||
+            metadata.revision != expected.revision ||
+            PlaybackQueueIntents.semanticSnapshot(accepted) != PlaybackQueueIntents.semanticSnapshot(live)) return null
+        return live
+    }
+
+    /** NEW serialized prepared action only; never called by consume/poll or a directive.
+     * Reaccept the exact live paused queue under verified authority, without import/seek/start.
+     * The action and endpoint retain their independent session/service/origin fences. */
+    private suspend fun activateRetainedPrepared(authority: PlaybackAuthority, expected: QueueIntentBinding?,
+        isCurrent: () -> Boolean): Boolean {
+        if (uncertainConnection || state.value.recovery != PlaybackConnectionRecovery.NONE ||
+            !authority.isValid() || !isCurrent()) return false
+        val live = acceptedRetainedPrepared(expected ?: state.value.queueIntentBinding) ?: return false
+        val result = endpoint.activatePreparedResume(live, authority)
+        if (result.status != "ok" || !authority.isValid() || !isCurrent()) return false
+        require(result.snapshot == live && result.queueIntentState == state.value.view?.queueIntents?.state) {
+            "Retained preparation must preserve exact live state and metadata"
+        }
+        activatedEpoch = epoch
+        retainedPreparedEpoch = 0L
+        return true
+    }
+
     private fun currentPublication(status: String): PlaybackEndpointResult {
         val snapshot = endpoint.exportSnapshot().validated()
         val metadata = if (receiverRegistered) requireNotNull(endpoint.exportQueueIntentState()).validated(snapshot) else null
@@ -1198,6 +1248,7 @@ class PlaybackCoordinator(
         val previous = state.value.view
         val changed = view.epoch != epoch
         val ownerChanged = previous?.activeDeviceId != view.activeDeviceId
+        if (registration || changed || ownerChanged) retainedPreparedEpoch = 0L
         val priorMetadata = previous?.queueIntents?.state
         val nextMetadata = view.queueIntents?.state
         if (!changed && !ownerChanged && priorMetadata != null && nextMetadata != null && nextMetadata.receiverId == priorMetadata.receiverId)
@@ -1292,7 +1343,9 @@ class PlaybackCoordinator(
             queueIntentBinding = view.queueIntents?.binding,
             canQueueIntent = grantAuthority && serviceActive && view.queueIntents?.binding != null &&
                 (view.activeDeviceId != id || receiverRegistered && (activatedEpoch == epoch ||
-                    !released && clockMs() < leaseDeadline && acceptedEmptyQueueIntentBinding(view.queueIntents?.binding, view, id))) &&
+                    !released && clockMs() < leaseDeadline &&
+                        (acceptedEmptyQueueIntentBinding(view.queueIntents?.binding, view, id) ||
+                            acceptedRetainedPrepared(view.queueIntents?.binding, view, id) != null))) &&
                 view.devices.any { it.deviceId == view.activeDeviceId && it.available } &&
                 view.transfer == null && view.quarantineMs == 0L)
         publishAuthority()
@@ -1367,7 +1420,7 @@ class PlaybackCoordinator(
                 val metadata = if (!receiverRegistered) null else if (activatedEpoch == epoch)
                     requireNotNull(endpoint.exportQueueIntentState()) else state.value.view?.queueIntents?.state
                 generation++; actionVersion++; revokeAuthority(); endpointJob?.cancel()
-                endpoint.suspendOutput(); released = true; activatedEpoch = 0
+                endpoint.suspendOutput(); released = true; activatedEpoch = 0; retainedPreparedEpoch = 0
                 PlaybackEndpointResult("ok", final, queueIntentState = metadata)
             }
             "activate" -> {
@@ -1548,9 +1601,14 @@ class PlaybackCoordinator(
         catch (error: Exception) { if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch, missingSelf) }
     }
     private suspend fun failed(error: Exception, feedbackAtDispatch: Long?, missingSelf: Boolean = true) {
+        // Remember only a previously activated same-epoch output, never an initial display.
+        // This cannot authorize output or replay work; lifecycle/owner/epoch/selection retire it.
+        val retained = if (state.value.deviceId.isNotEmpty() && state.value.activeDeviceId == state.value.deviceId &&
+            (activatedEpoch == epoch || retainedPreparedEpoch == epoch)) epoch else 0L
         // Unknown writes are NOT replayed. Stop buffered output immediately, not merely remote UI state.
         uncertainConnection = true
         fenceLocal(); acks.clear(); ackState = null; ackQueueIntentState = null; pendingCommand = null
+        retainedPreparedEpoch = retained
         clearSelectionFeedback(feedbackAtDispatch)
         mutableState.value = state.value.copy(connected = false, connecting = false, exclusiveOwner = false,
             messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE,
@@ -1564,7 +1622,8 @@ class PlaybackCoordinator(
             // Its 404 cannot invalidate this live service's issuer registration. A later
             // self poll will independently establish whether our own exact ID expired.
             if (missingSelf) {
-                lifecycle++; clearSelectionFeedback(); mutableState.value = state.value.copy(deviceId = "")
+                lifecycle++; retainedPreparedEpoch = 0L
+                clearSelectionFeedback(); mutableState.value = state.value.copy(deviceId = "")
             }
             return
         }
