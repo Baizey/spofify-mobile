@@ -33,6 +33,7 @@ internal class EditorPreviewState(
     private var rules: JsonObject? = null
     private var target: PersonalPlaylistSummary? = null
     private var sourceRevision = 0L
+    private var sourceLikes = 0L
     private var editVersion = 0L
     private var session: Session? = null
     private var job: Job? = null
@@ -45,7 +46,7 @@ internal class EditorPreviewState(
     fun checkInputs(value: JsonObject, derived: Boolean, saved: PersonalPlaylistSummary?, version: Long = 0L,
         revision: Long = client.personalRevision.value.playlists) {
         if (rules != null && (editVersion != version || rules != value || !derived || target != saved ||
-                session !== client.currentSession() || sourceRevision != revision)) invalidate()
+                session !== client.currentSession() || sourceRevision != revision || sourceLikes != client.personalRevision.value.likes)) invalidate()
     }
 
     fun invalidate() {
@@ -58,6 +59,7 @@ internal class EditorPreviewState(
         if (pending || !derived || recipeValidationError(value) != null) return
         invalidate()
         rules = value; target = saved; sourceRevision = client.personalRevision.value.playlists
+        sourceLikes = client.personalRevision.value.likes
         editVersion = version; session = client.currentSession()
         page = null; entries = emptyList(); cursors.clear()
         request(null)
@@ -69,9 +71,10 @@ internal class EditorPreviewState(
     private fun request(cursor: String?) {
         val candidate = rules ?: return
         if (session !== client.currentSession() || editVersion != currentEditVersion() ||
-            sourceRevision != client.personalRevision.value.playlists) { invalidate(); return }
+            sourceRevision != client.personalRevision.value.playlists || sourceLikes != client.personalRevision.value.likes) { invalidate(); return }
         val capturedSession = session
         val capturedRevision = sourceRevision
+        val capturedLikes = sourceLikes
         val capturedTarget = target
         val ticket = identity
         val before = page
@@ -84,11 +87,12 @@ internal class EditorPreviewState(
                 // Do not send an obsolete cursor while waiting for the composition-time fence.
                 if (identity !== ticket) return@launch
                 if (capturedSession !== client.currentSession() || editVersion != currentEditVersion() ||
-                    capturedRevision != client.personalRevision.value.playlists) { invalidate(); return@launch }
+                    capturedRevision != client.personalRevision.value.playlists || capturedLikes != client.personalRevision.value.likes) { invalidate(); return@launch }
                 val result = api.preview(candidate, capturedTarget?.id, capturedTarget?.revision, limit = 40, cursor = cursor)
                 if (identity !== ticket) return@launch
                 if (editVersion != currentEditVersion()) { invalidate(); return@launch }
-                check(capturedSession === client.currentSession() && capturedRevision == client.personalRevision.value.playlists)
+                check(capturedSession === client.currentSession() && capturedRevision == client.personalRevision.value.playlists &&
+                    capturedLikes == client.personalRevision.value.likes)
                 check(result.limit == 40)
                 if (before != null) check(result.revision == before.revision && result.fence == before.fence &&
                     result.total == before.total && result.availableTotal == before.availableTotal)

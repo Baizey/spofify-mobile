@@ -49,6 +49,7 @@ class HomeStateHolder(private val reader: HomeReader, private val scope: Corouti
     private var visible = false
     private val dirty = mutableSetOf("recent", "likes", "playlists")
     private val failedShelves = mutableSetOf<String>()
+    private val shelfVersions = mutableMapOf<String, Long>()
     private var generation = 0L
     private var knownCatalogRevision: Long? = null
 
@@ -75,7 +76,8 @@ class HomeStateHolder(private val reader: HomeReader, private val scope: Corouti
     fun setVisible(value: Boolean) {
         if (visible == value) return
         visible = value
-        if (value) (dirty + failedShelves).toList().forEach(::refresh)
+        // Returning to Home reads maintained counts once, even without a catalog revision change.
+        if (value) (dirty + failedShelves + "playlists").toList().forEach(::refresh)
         else {
             generation++
             dirty.addAll(jobs.keys)
@@ -84,14 +86,19 @@ class HomeStateHolder(private val reader: HomeReader, private val scope: Corouti
         }
     }
     fun invalidate(vararg shelves: String) {
-        dirty.addAll(shelves)
-        if (visible) shelves.forEach(::refresh)
+        // Likes may feed a rules playlist. Coalesce with an explicit playlist invalidation.
+        val affected = shelves.toSet() + if ("likes" in shelves) setOf("playlists") else emptySet()
+        affected.forEach { shelfVersions[it] = (shelfVersions[it] ?: 0L) + 1 }
+        dirty.addAll(affected)
+        if (visible) affected.forEach(::refresh)
     }
     fun refresh(shelf: String) {
         if (!visible) { dirty.add(shelf); return }
         if (jobs[shelf]?.isActive == true) { dirty.add(shelf); return }
         dirty.remove(shelf)
         val token = generation
+        val version = shelfVersions[shelf] ?: 0L
+        fun current() = token == generation && version == (shelfVersions[shelf] ?: 0L)
         mutable.value = mutable.value.let { when (shelf) {
             "recent" -> it.copy(recent = it.recent.copy(loading = true, error = null))
             "likes" -> it.copy(likedCount = it.likedCount.copy(loading = true, error = null))
@@ -100,14 +107,14 @@ class HomeStateHolder(private val reader: HomeReader, private val scope: Corouti
         val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             try {
                 when (shelf) {
-                    "recent" -> { val result = reader.recent().take(8); if (token == generation) mutable.value = mutable.value.copy(recent = HomeShelf(result)) }
-                    "likes" -> { val result = reader.likedCount(); if (token == generation) mutable.value = mutable.value.copy(likedCount = HomeShelf(result)) }
-                    else -> { val result = reader.playlists().take(6); if (token == generation) mutable.value = mutable.value.copy(playlists = HomeShelf(result)) }
+                    "recent" -> { val result = reader.recent().take(8); if (current()) mutable.value = mutable.value.copy(recent = HomeShelf(result)) }
+                    "likes" -> { val result = reader.likedCount(); if (current()) mutable.value = mutable.value.copy(likedCount = HomeShelf(result)) }
+                    else -> { val result = reader.playlists().take(6); if (current()) mutable.value = mutable.value.copy(playlists = HomeShelf(result)) }
                 }
-                if (token == generation) failedShelves.remove(shelf)
+                if (current()) failedShelves.remove(shelf)
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                if (token == generation) {
+                if (current()) {
                     failedShelves.add(shelf)
                     mutable.value = mutable.value.let { when (shelf) {
                         "recent" -> it.copy(recent = it.recent.copy(loading = false, error = catalogError(error)))
@@ -190,7 +197,7 @@ fun LibraryHome(
             ElevatedCard(onClick = { onOpenPlaylists(playlist.id) }, modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
                 Column(Modifier.padding(16.dp)) {
                     Text(playlist.name, style = MaterialTheme.typography.titleMedium)
-                    Text(if (playlist.kind == PlaylistKind.DERIVED) "Rules playlist" else "${playlist.trackCount} songs", style = MaterialTheme.typography.bodySmall)
+                    Text(dev.spofify.mobile.feature.playlists.playlistCountLabel(playlist), style = MaterialTheme.typography.bodySmall)
                 }
             }
         }

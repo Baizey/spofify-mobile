@@ -134,11 +134,18 @@ data class DerivedEvaluationPage(
     val revision: Long?,
     val fence: String,
     val complete: Boolean,
+    val evaluationState: PlaylistEvaluationState? = null,
+    val evaluationErrorCode: String? = null,
 ) {
+    /** Legacy complete pages and explicit unsaved previews retain their existing contract. */
+    val current: Boolean get() = complete && (evaluationState == null || evaluationState == PlaylistEvaluationState.READY)
+
     init {
-        require(complete && total >= 0 && availableTotal in 0..total && limit in 1..100 && items.size <= limit)
+        require(total >= 0 && availableTotal in 0..total && limit in 1..100 && items.size <= limit)
         require(revision == null || revision > 0)
-        require(fence.isNotEmpty() && (nextCursor == null || nextCursor.isNotEmpty()))
+        require(complete == (evaluationState == null || evaluationState == PlaylistEvaluationState.READY))
+        if (current) require(fence.isNotEmpty() && (nextCursor == null || nextCursor.isNotEmpty()))
+        else require(fence.isEmpty() && nextCursor == null && items.all { it.selectionToken == null })
         require(items.all { it.position >= 0 && it.position < total && it.occurrenceId.isNotEmpty() })
         require(items.map { it.occurrenceId }.toSet().size == items.size)
     }
@@ -214,11 +221,19 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
         }, emptyMap()))
     }
 
-    suspend fun evaluate(id: String, limit: Int? = 40, cursor: String? = null): DerivedEvaluationPage {
+    /** Normal saved-playlist read: the server owns maintenance and its bounded wait. */
+    suspend fun entries(id: String, limit: Int? = 40, cursor: String? = null): DerivedEvaluationPage =
+        savedPage(id, "entries", limit, cursor)
+
+    /** Compatibility alias; this read never requests a client-owned evaluation job. */
+    suspend fun evaluate(id: String, limit: Int? = 40, cursor: String? = null): DerivedEvaluationPage =
+        savedPage(id, "evaluation", limit, cursor)
+
+    private suspend fun savedPage(id: String, action: String, limit: Int?, cursor: String?): DerivedEvaluationPage {
         val query = linkedMapOf<String, String>()
         limit?.let { require(it in 1..100); query["limit"] = it.toString() }
         cursor?.let { requireOpaqueToken(it, 4096); query["cursor"] = it }
-        return checkedPage(transport.get(derivedPath(id, "evaluation"), query), preview = false)
+        return checkedPage(transport.get(derivedPath(id, action), query), preview = false)
     }
 
     suspend fun preview(
@@ -290,9 +305,11 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
 
     private fun checkedPage(value: JsonObject, preview: Boolean): DerivedEvaluationPage {
         val page: DerivedEvaluationPage = personalDecode(value)
-        if ((!preview && page.revision == null) || page.items.any { (it.selectionToken == null) != preview }) throw incompatiblePersonalResponse()
+        if (preview) {
+            if (!page.current || page.evaluationState != null || page.items.any { it.selectionToken != null }) throw incompatiblePersonalResponse()
+        } else if (page.revision == null || page.items.any { (it.selectionToken != null) != page.current }) throw incompatiblePersonalResponse()
         try {
-            requireOpaqueToken(page.fence, 4096)
+            if (page.current) requireOpaqueToken(page.fence, 4096)
             page.nextCursor?.let { requireOpaqueToken(it, 4096) }
             page.items.forEach {
                 requireOpaqueToken(it.occurrenceId, 4096)

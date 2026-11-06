@@ -46,21 +46,24 @@ class PlaylistMoreHostTest {
     @Test fun derivedCollectionMoreCannotReviveAfterOutputReplacementABA() = check(derived = true, collection = true, stale = true)
     private fun check(derived: Boolean, collection: Boolean = false, stale: Boolean = false) {
         val preparations = AtomicInteger()
+        val evaluations = AtomicInteger()
         val kind = if (derived) "derived" else "manual"
-        val summary = """{"id":"fixture","kind":"$kind","name":"Playlist fixture","description":"","countState":"${if (derived) "unevaluated" else "exact"}","trackCount":${if (derived) "null" else "1"},"availableCount":${if (derived) "null" else "1"},"revision":5,"capabilities":{"play":true,"editMetadata":false,"editEntries":false,"editDefinition":false,"delete":false,"copyToManual":false,"addTracks":false}}"""
+        val summary = """{"id":"fixture","kind":"$kind","name":"Playlist fixture","description":"","countState":"exact","trackCount":1,"availableCount":1,"evaluationState":${if (derived) "\"ready\"" else "null"},"revision":5,"capabilities":{"play":true,"editMetadata":false,"editEntries":false,"editDefinition":false,"delete":false,"copyToManual":false,"addTracks":false}}"""
         val track = """{"kind":"track","id":"same","name":"Fixture song","hasAudio":true}"""
         MockWebServer().use { web ->
             web.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse {
                     val path = request.requestUrl!!.encodedPath
                     if (path.endsWith("/playback")) preparations.incrementAndGet()
+                    if (path.endsWith("/evaluation")) evaluations.incrementAndGet()
                     return when (path) {
                         "/api/auth/login" -> json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
                             .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
                         "/api/me/playlists" -> json("""{"items":[$summary],"total":1,"offset":0,"limit":40}""")
                         "/api/me/playlists/fixture" -> json(summary)
-                        "/api/me/playlists/fixture/entries" -> json("""{"items":[{"id":"exact-entry","position":0,"track":$track}],"total":1,"offset":0,"limit":40}""")
-                        "/api/me/playlists/fixture/evaluation" -> json("""{"items":[{"occurrenceId":"exact-path","selectionToken":"opaque.signature","position":0,"track":$track}],"total":1,"availableTotal":1,"limit":40,"nextCursor":null,"revision":5,"fence":"exact-fence","complete":true}""")
+                        "/api/me/playlists/fixture/entries" -> if (derived) {
+                            json("""{"items":[{"occurrenceId":"exact-path","selectionToken":"opaque.signature","position":0,"track":$track}],"total":1,"availableTotal":1,"limit":40,"nextCursor":null,"revision":5,"fence":"exact-fence","complete":true,"evaluationState":"ready"}""")
+                        } else json("""{"items":[{"id":"exact-entry","position":0,"track":$track}],"total":1,"offset":0,"limit":40}""")
                         "/api/me/likes/status" -> json("""{"items":[{"trackId":"same","liked":false}]}""")
                         else -> MockResponse().setResponseCode(404)
                     }
@@ -142,6 +145,7 @@ class PlaylistMoreHostTest {
                             }
                         }
                         assertEquals("Receiver resolves the complete bounded context", 0, preparations.get())
+                        assertEquals("Saved playlists use normal entries, never an Evaluate workflow", 0, evaluations.get())
                     }
                 }
             } finally {
@@ -173,8 +177,8 @@ class PlaylistMoreHostTest {
                         path == "/api/auth/login" -> json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
                             .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
                         path == "/api/me/playlists" -> json("""{"items":[${summary("fixture")}],"total":1,"offset":0,"limit":40}""")
-                        path.endsWith("/entries") -> json("""{"items":[{"id":"first-entry","position":0,"track":$track},{"id":"second-entry","position":1,"track":$track}],"total":2,"offset":0,"limit":40}""")
-                        path.endsWith("/evaluation") -> json("""{"items":[{"occurrenceId":"first-path","selectionToken":"opaque.first","position":0,"track":$track},{"occurrenceId":"second-path","selectionToken":"opaque.second","position":1,"track":$track}],"total":2,"availableTotal":2,"limit":40,"nextCursor":null,"revision":5,"fence":"fence","complete":true}""")
+                        path.endsWith("/entries") -> if (derived) json("""{"items":[{"occurrenceId":"first-path","selectionToken":"opaque.first","position":0,"track":$track},{"occurrenceId":"second-path","selectionToken":"opaque.second","position":1,"track":$track}],"total":2,"availableTotal":2,"limit":40,"nextCursor":null,"revision":5,"fence":"fence","complete":true,"evaluationState":"ready"}""")
+                            else json("""{"items":[{"id":"first-entry","position":0,"track":$track},{"id":"second-entry","position":1,"track":$track}],"total":2,"offset":0,"limit":40}""")
                         path.endsWith("/playback") -> {
                             preparations.incrementAndGet()
                             check(release.await(10, TimeUnit.SECONDS)) { "Owned preparation hold timed out" }
