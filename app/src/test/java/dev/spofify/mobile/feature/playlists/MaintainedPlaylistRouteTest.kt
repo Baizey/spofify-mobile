@@ -153,6 +153,64 @@ class MaintainedPlaylistRouteTest {
         } finally { f.releaseRead.countDown() }
     }
 
+    @Test fun uncertainMutationStaysBlockedAfterFailedVerificationAndPassiveRefreshUntilExplicitSuccess() = fixture { f ->
+        makeMetadataWriteUncertain(f)
+        f.failSummaryReads = true
+        compose.onNodeWithText("Verify saved playlist").performClick()
+        awaitText(readFailure)
+        assertWriteControlsBlocked(f)
+        compose.onNodeWithText("Song 0").performScrollTo().assertExists()
+
+        // A successful passive Like refresh may update display rows, not reconcile the write.
+        f.failSummaryReads = false
+        f.likes.incrementAndGet()
+        compose.runOnIdle { f.client.notifyPersonalChange(PersonalCollection.LIKES) }
+        awaitText("Song 1")
+        assertWriteControlsBlocked(f)
+        assertEquals(1, f.mutations.get())
+
+        compose.onNodeWithText("Refresh").performScrollTo().performClick()
+        compose.waitUntil(5_000) {
+            compose.waitForIdle()
+            compose.onAllNodesWithText(readFailure).fetchSemanticsNodes().isEmpty()
+        }
+        compose.onNodeWithText("Edit details").performScrollTo().assertIsEnabled()
+        assertEquals("Reconciliation is read-only; the uncertain write is never replayed", 1, f.mutations.get())
+    }
+
+    @Test fun cancelledExplicitVerificationCannotPassWriteUnlockToItsPassiveSuccessor() = fixture { f ->
+        makeMetadataWriteUncertain(f)
+        f.holdRead = f.entries.get() + 1
+        compose.onNodeWithText("Verify saved playlist").performClick()
+        compose.waitUntil(5_000) { compose.waitForIdle(); f.readStarted.count == 0L }
+        try {
+            f.likes.incrementAndGet()
+            compose.runOnIdle { f.client.notifyPersonalChange(PersonalCollection.LIKES) }
+            awaitText("Song 1")
+            f.releaseRead.countDown()
+            compose.waitForIdle()
+            assertWriteControlsBlocked(f)
+        } finally { f.releaseRead.countDown() }
+    }
+
+    private fun makeMetadataWriteUncertain(f: Fixture) {
+        awaitText("Song 0")
+        compose.onNodeWithText("Edit details").performScrollTo().performClick()
+        compose.onNodeWithText("Save").performClick()
+        awaitText("Verify saved playlist")
+        assertEquals(1, f.mutations.get())
+    }
+
+    private fun assertWriteControlsBlocked(f: Fixture) {
+        compose.onNodeWithText("Edit details").performScrollTo().assertIsNotEnabled().performClick()
+        compose.onNodeWithText("Delete").performScrollTo().assertIsNotEnabled().performClick()
+        compose.onNodeWithText("Edit rules").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Make editable copy").performScrollTo().assertIsNotEnabled()
+        compose.onAllNodesWithText("Save").assertCountEquals(0)
+        assertEquals("Failed/cancelled verification cannot admit a second mutation", 1, f.mutations.get())
+    }
+
+    private val readFailure = "The request could not finish. Refresh explicitly; no partial result is current."
     private fun more(song: String) = compose.onNodeWithContentDescription("More actions for $song").performScrollTo().performClick()
     private fun awaitText(text: String) {
         compose.waitUntil(5_000) { compose.waitForIdle(); compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty() }
@@ -163,12 +221,14 @@ class MaintainedPlaylistRouteTest {
         val entries = AtomicInteger()
         val likes = AtomicInteger()
         val copies = AtomicInteger()
+        val mutations = AtomicInteger()
         val paths = CopyOnWriteArrayList<String>()
         val copyBodies = CopyOnWriteArrayList<String>()
         val actions = mutableListOf<Action>()
         val shown = mutableStateOf(true)
         lateinit var client: SpofifyClient
         @Volatile var resultState = "ready"
+        @Volatile var failSummaryReads = false
         @Volatile var holdRead = -1
         val readStarted = CountDownLatch(1)
         val releaseRead = CountDownLatch(1)
@@ -193,7 +253,14 @@ class MaintainedPlaylistRouteTest {
                     if (request.getHeader("Cookie") != "spofify_session=fixture-session") return MockResponse().setResponseCode(401)
                     return when (path) {
                         "/api/me/playlists" -> json("""{"items":[${if (request.requestUrl!!.queryParameter("kind") == "manual") manual else f.summary()}],"total":1,"limit":40,"offset":0}""")
-                        "/api/me/playlists/rules" -> json(f.summary())
+                        "/api/me/playlists/rules" -> when (request.method) {
+                            "PUT" -> {
+                                f.mutations.incrementAndGet()
+                                json("""{"error":{"code":"UNAVAILABLE","message":"Synthetic uncertain response"}}""").setResponseCode(503)
+                            }
+                            "GET" -> if (f.failSummaryReads) MockResponse().setResponseCode(503) else json(f.summary())
+                            else -> { f.mutations.incrementAndGet(); MockResponse().setResponseCode(405) }
+                        }
                         "/api/me/playlists/rules/entries" -> {
                             val read = f.entries.incrementAndGet()
                             val result = f.page()

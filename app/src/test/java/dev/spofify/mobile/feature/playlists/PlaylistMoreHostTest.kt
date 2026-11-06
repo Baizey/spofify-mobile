@@ -41,21 +41,24 @@ class PlaylistMoreHostTest {
     @Test fun derivedOpenMoreCannotRebindAfterOutputReplacement() = check(derived = true, stale = true)
     private fun check(derived: Boolean, collection: Boolean = false, stale: Boolean = false) {
         val preparations = AtomicInteger()
+        val evaluations = AtomicInteger()
         val kind = if (derived) "derived" else "manual"
-        val summary = """{"id":"fixture","kind":"$kind","name":"Playlist fixture","description":"","countState":"${if (derived) "unevaluated" else "exact"}","trackCount":${if (derived) "null" else "1"},"availableCount":${if (derived) "null" else "1"},"revision":5,"capabilities":{"play":true,"editMetadata":false,"editEntries":false,"editDefinition":false,"delete":false,"copyToManual":false,"addTracks":false}}"""
+        val summary = """{"id":"fixture","kind":"$kind","name":"Playlist fixture","description":"","countState":"exact","trackCount":${if (derived) 1002 else 1},"availableCount":${if (derived) 1002 else 1},"evaluationState":${if (derived) "\"ready\"" else "null"},"revision":5,"capabilities":{"play":true,"editMetadata":false,"editEntries":false,"editDefinition":false,"delete":false,"copyToManual":false,"addTracks":false}}"""
         val track = """{"kind":"track","id":"same","name":"Fixture song","hasAudio":true}"""
         MockWebServer().use { web ->
             web.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse {
                     val path = request.requestUrl!!.encodedPath
                     if (path.endsWith("/playback")) preparations.incrementAndGet()
+                    if (path.endsWith("/evaluation")) evaluations.incrementAndGet()
                     return when (path) {
                         "/api/auth/login" -> json("""{"accountId":"account","username":"listener","role":"user","csrfToken":"synthetic"}""")
                             .setHeader("Set-Cookie", "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600")
                         "/api/me/playlists" -> json("""{"items":[$summary],"total":1,"offset":0,"limit":40}""")
                         "/api/me/playlists/fixture" -> json(summary)
-                        "/api/me/playlists/fixture/entries" -> json("""{"items":[{"id":"exact-entry","position":0,"track":$track}],"total":1,"offset":0,"limit":40}""")
-                        "/api/me/playlists/fixture/evaluation" -> json("""{"items":[{"occurrenceId":"exact-path","selectionToken":"opaque.signature","position":1001,"track":$track}],"total":1002,"availableTotal":1002,"limit":40,"nextCursor":null,"revision":5,"fence":"exact-fence","complete":true}""")
+                        "/api/me/playlists/fixture/entries" -> if (derived) {
+                            json("""{"items":[{"occurrenceId":"exact-path","selectionToken":"opaque.signature","position":1001,"track":$track}],"total":1002,"availableTotal":1002,"limit":40,"nextCursor":null,"revision":5,"fence":"exact-fence","complete":true,"evaluationState":"ready"}""")
+                        } else json("""{"items":[{"id":"exact-entry","position":0,"track":$track}],"total":1,"offset":0,"limit":40}""")
                         "/api/me/likes/status" -> json("""{"items":[{"trackId":"same","liked":false}]}""")
                         else -> MockResponse().setResponseCode(404)
                     }
@@ -122,6 +125,7 @@ class PlaylistMoreHostTest {
                             }
                         }
                         assertEquals("Receiver resolves the complete bounded context", 0, preparations.get())
+                        assertEquals("Saved playlists use normal entries, never an Evaluate workflow", 0, evaluations.get())
                     }
                 }
             } finally {

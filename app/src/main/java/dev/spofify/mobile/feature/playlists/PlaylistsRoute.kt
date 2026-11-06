@@ -201,6 +201,7 @@ private fun PlaylistDetail(
     ReportPlaylistMutationPending(mutating, onMutationPendingChange)
     var stale by remember(id) { mutableStateOf(true) }
     var blocked by remember(id) { mutableStateOf(false) }
+    var reconcileOnNextRead by remember(id) { mutableStateOf(false) }
     var message by remember(id) { mutableStateOf<String?>(null) }
     var metadata by remember(id) { mutableStateOf(false) }
     var deleting by remember(id) { mutableStateOf(false) }
@@ -223,7 +224,11 @@ private fun PlaylistDetail(
     var ordered by remember(id) { mutableStateOf<List<PersonalPlaylistEntry>>(emptyList()) }
     val listState = rememberLazyListState()
 
-    fun refreshAll() { generation.invalidate(); stale = true; blocked = false; snapshot = null; offset = 0; pageIndex = 0; cursorStack = listOf(null); refresh++ }
+    fun refreshAll(verifyBlocked: Boolean = false) {
+        generation.invalidate(); stale = true
+        reconcileOnNextRead = verifyBlocked && blocked
+        snapshot = null; offset = 0; pageIndex = 0; cursorStack = listOf(null); refresh++
+    }
     fun write(onFailure: ((Exception) -> Unit)? = null, action: suspend () -> Unit) {
         if (busy || blocked) return
         generation.invalidate(); busy = true; mutating = true; stale = true; onMutationPendingChange(true)
@@ -236,6 +241,10 @@ private fun PlaylistDetail(
     }
     LaunchedEffect(id, offset, pageIndex, refresh, personal.playlists, personal.likes) {
         val ticket = generation.invalidate()
+        // Consume explicit reconciliation once. Failed/cancelled reads cannot pass this permission
+        // to a later passive Like/source refresh, nor unlock writes before verification succeeds.
+        val reconcilesBlockedWrite = reconcileOnNextRead
+        reconcileOnNextRead = false
         val source = PlaylistSourceStamp(client)
         fun current() = generation.accepts(ticket) && source.isCurrent() && actionLifetime.isCurrent()
         busy = true; stale = true
@@ -253,6 +262,7 @@ private fun PlaylistDetail(
                         else displayedDerivedRows.map { it.copy(selectionToken = null) }
                 }
                 stale = result?.current == false
+                if (reconcilesBlockedWrite && !stale) blocked = false
                 if (!blocked) message = null
             }
         } catch (e: CancellationException) { throw e }
@@ -307,7 +317,7 @@ private fun PlaylistDetail(
     }
     if (metadata && saved != null) PlaylistMetadataDialog("Edit playlist", saved.name, saved.description,
         busy = busy, blocked = blocked, message = message, onDismiss = { if (!busy) metadata = false },
-        onVerify = { metadata = false; refreshAll() }, onSave = { name, description -> write {
+        onVerify = { metadata = false; refreshAll(verifyBlocked = true) }, onSave = { name, description -> write {
             summary = api.updatePlaylist(id, name, description, saved.revision); metadata = false; refreshAll()
         } })
     if (copying && saved != null) PlaylistMetadataDialog("Make editable copy", "${saved.name} (copy)", saved.description,
@@ -423,7 +433,7 @@ private fun PlaylistDetail(
     }
     LazyColumn(modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
-            Row { TextButton(onClick = { refreshAll() }, enabled = !busy) { Text("Refresh") }
+            Row { TextButton(onClick = { refreshAll(verifyBlocked = true) }, enabled = !busy) { Text("Refresh") }
                 if (onQueueIntent != null) IconButton(onClick = { exactSelection()?.let { collectionActions = PlaylistCollectionSelection(it, playback.interactionKey, playback.queueIntentBinding, captureCurrent(), playback.unselectedQueueOrigin) } }, modifier = Modifier.size(48.dp)) {
                     Icon(Icons.Default.MoreVert, "More actions for ${saved?.name ?: "playlist"}")
                 }
