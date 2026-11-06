@@ -81,7 +81,8 @@ jobs:
                   raise SystemExit('Insufficient private artifact/runtime bytes or inodes')
           print('Storage preflight complete; user/project quota remains unknown')
           PY
-          mkdir -p -m 700 "$BROKER_CACHE_DIR"
+          mkdir -p "$BROKER_CACHE_DIR"
+          chmod 700 "$BROKER_CACHE_DIR"
           broker="$BROKER_CACHE_DIR/broker"
           if [[ ! -f "$broker" ]]; then
             # curl drops Authorization when following the cross-host asset redirect.
@@ -185,10 +186,14 @@ jobs:
         with:
           path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
           key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ hashFiles('tools/ci/package-lock.json') }}
-      - name: Install Chromium system dependencies
+      - name: Install browser and media system dependencies
         timeout-minutes: 5
-        # Browser caches cannot provide OS libraries. Install them on every fresh runner.
-        run: tools/ci/node_modules/.bin/playwright install-deps chromium
+        # Browser caches cannot provide OS packages. install-deps refreshes apt
+        # metadata and installs browser libraries, but not the system FFmpeg
+        # executable/libmp3lame encoder used to generate the broker's test audio.
+        run: |
+          tools/ci/node_modules/.bin/playwright install-deps chromium
+          sudo apt-get install --yes --no-install-recommends ffmpeg
       - name: Download or verify pinned Chromium
         timeout-minutes: 5
         env:
@@ -198,19 +203,13 @@ jobs:
         # This is a no-op for already installed, matching browser revisions, but
         # also repairs a partial browser cache. Use the locked CLI, never npx.
         run: tools/ci/node_modules/.bin/playwright install chromium
-      - name: Verify browser and media prerequisites
-        shell: bash
+      - name: Configure browser fixture paths
         run: |
-          set -euo pipefail
-          command -v ffmpeg
-          # Drain the complete producer output; grep -q can cause SIGPIPE under pipefail.
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libmp3lame' > /dev/null
           node <<'JS'
           const fs = require('node:fs');
           const path = require('node:path');
           const modulePath = path.resolve('tools/ci/node_modules/playwright');
           const chromiumPath = require(modulePath).chromium.executablePath();
-          fs.accessSync(chromiumPath, fs.constants.X_OK);
           fs.appendFileSync(process.env.GITHUB_ENV,
             `SPOFIFY_TEST_PLAYWRIGHT_MODULE=${modulePath}\nSPOFIFY_TEST_CHROMIUM_PATH=${chromiumPath}\n`);
           JS
