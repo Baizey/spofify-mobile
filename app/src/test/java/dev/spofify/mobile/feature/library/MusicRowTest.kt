@@ -26,7 +26,9 @@ import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.ui.theme.AppTypography
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -382,6 +384,68 @@ class MusicRowTest {
         assertFalse(actions().any { it.label == "Like song" || it.label == "Unlike song" })
         assertEquals(before, compose.onNodeWithTag("row").bounds())
         compose.onAllNodes(hasClickAction()).assertCountEquals(2)
+    }
+
+    @Test fun occurrenceHostMoreAndRetainedAccessibilityCallbacksRespectIdentityDisposalAndLatestEnablement() {
+        val identity = mutableStateOf("entry-A")
+        val shown = mutableStateOf(true)
+        val enabled = mutableStateOf(true)
+        val key = PlaybackInteractionKey()
+        val feedback = mutableStateOf(CatalogPlaybackFeedback(interactionKey = key))
+        var more = 0
+        var play = 0
+        var high = 0
+        var current: (() -> Boolean)? = null
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                if (shown.value) MusicRow(track, {}, { _, _ -> fail("Use scoped Play") }, { fail("Use scoped More") }, {},
+                    artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(320.dp),
+                    rowIdentity = identity.value, currentOccurrence = false,
+                    playbackEnabled = enabled.value, actionsEnabled = enabled.value,
+                    playback = feedback.value.copy(onContextual = { _, captured, guard ->
+                        assertSame(key, captured); assertTrue(guard()); high++
+                    }), onShowScopedActions = { _, guard -> more++; current = guard },
+                    onPlayScoped = { _, guard -> assertTrue(guard()); play++ })
+            }
+        }
+        fun actions() = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+            .fetchSemanticsNode().config[SemanticsActions.CustomActions]
+        val retained = actions()
+        compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
+        compose.runOnIdle { assertTrue(current!!.invoke()); feedback.value = feedback.value.copy(buffering = true) }
+        compose.runOnIdle {
+            assertTrue("Benign buffering keeps the occurrence lifetime", current!!.invoke())
+            retained.single { it.label == "Queue High" }.action()
+            assertEquals(1, high)
+            enabled.value = false
+        }
+        compose.onNodeWithContentDescription("More actions for ${track.name}").assertIsNotEnabled()
+        compose.runOnIdle {
+            retained.forEach { it.action() }
+            assertEquals(1, more); assertEquals(0, play); assertEquals(1, high)
+            enabled.value = true; feedback.value = feedback.value.copy(interactionKey = PlaybackInteractionKey())
+        }
+        compose.runOnIdle {
+            assertFalse("Output replacement retires open More", current!!.invoke())
+            retained.forEach { it.action() }
+            assertEquals(1, more); assertEquals(0, play); assertEquals(1, high)
+            feedback.value = feedback.value.copy(interactionKey = key)
+        }
+        compose.runOnIdle {
+            assertFalse("Returning to output A cannot revive old More", current!!.invoke())
+            retained.forEach { it.action() }
+            assertEquals(1, more); assertEquals(0, play); assertEquals(1, high)
+        }
+        compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
+        compose.runOnIdle { assertTrue(current!!.invoke()); identity.value = "entry-B" }
+        compose.runOnIdle {
+            assertFalse("Replacing a duplicate entry retires open More", current!!.invoke())
+            retained.forEach { it.action() }
+            assertEquals(2, more); assertEquals(0, play); assertEquals(1, high)
+        }
+        compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
+        compose.runOnIdle { assertTrue(current!!.invoke()); shown.value = false }
+        compose.runOnIdle { assertFalse("Disposal retires the new row too", current!!.invoke()) }
     }
 
     @Test fun intentionalCreditsRetainDistinctOpaqueIdsAndMissingIdsStayPlainText() {
