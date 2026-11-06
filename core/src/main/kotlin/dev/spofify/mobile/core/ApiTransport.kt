@@ -49,6 +49,7 @@ class ApiTransport(val client: SpofifyClient) {
         val request = Request.Builder().url(url).header("Accept", "application/json").apply {
             if (playbackExtensions) header("X-Spofify-Playback-Extensions", "queue-intents-v1")
             if (playbackRegistration) header("X-Spofify-Playback-Registration", "installation-v1")
+            if (deviceRequest) header("X-Spofify-Playback-Leadership", "last-requested-v1")
         }.method(method, payload).build()
         return client.response(request, errorFactory = { safeApiError(it, deviceRequest, playbackExtensions, playbackRegistration) }) { response ->
             if (response.code == 204) null

@@ -818,6 +818,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
     }
 
     private fun send(command: PlaybackDeviceCommand) {
+        if (!hasRemoteOutput() && PlaybackService.cachedTransport(command)) return
         val owner = coordinator
         connectionError = if (owner == null) "Playback is unavailable. Sign in and reconnect." else null
         owner?.remoteCommand(command)

@@ -22,6 +22,7 @@ internal class SongCacheDataSource(
     private val authorize: (DataSpec) -> Unit,
     private val onDemandNetworkChange: (Boolean) -> Unit,
     private val speculative: Boolean = false,
+    private val authorizeNetwork: (DataSpec) -> Unit = authorize,
 ) : DataSource {
     private val listeners = mutableListOf<TransferListener>()
     private var spec: DataSpec? = null
@@ -112,18 +113,20 @@ internal class SongCacheDataSource(
 
     private fun openNetwork(request: DataSpec, mayRetain: Boolean): Long {
         guard()
+        authorizeNetwork(request)
         val source = upstream.createDataSource()
         network = source
         listeners.forEach(source::addTransferListener)
         // Do not catch upstream errors: redirects/auth/media failures retain ordinary semantics.
         val length = demandOperation { source.open(request) }
         guard()
+        authorizeNetwork(request)
         val coverage = validateResponse(source, request, length)
         expected = coverage.readLength
         if (mayRetain && coverage.retain && id != null && session != null) {
             // Capture the immutable request, not mutable source state that close() clears.
             // Deferred completion still needs the real lease/client/URL guard at publication.
-            writer = session.writer(id!!, speculative) { authorize(request) }
+            writer = session.writer(id!!, speculative) { authorize(request); authorizeNetwork(request) }
         }
         if (speculative && writer == null) throw IOException("Audio cache admission unavailable")
         return expected
@@ -169,12 +172,14 @@ internal class SongCacheDataSource(
         } else {
             // Bounded tee chunks reserve actual bytes before each unbuffered disk write.
             val chunk = minOf(length, session?.chunkBytes() ?: 16 * 1024)
+            authorizeNetwork(spec!!)
             count = try { demandOperation { network!!.read(buffer, offset, chunk) } } catch (error: IOException) {
                 writer?.abort(); writer = null
                 throw error
             }
         }
         guard()
+        if (local == null) authorizeNetwork(spec!!)
         if (count == C.RESULT_END_OF_INPUT) {
             if (expected != C.LENGTH_UNSET.toLong() && consumed != expected) {
                 writer?.abort(); writer = null

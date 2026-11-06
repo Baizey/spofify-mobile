@@ -7,6 +7,22 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlaybackProgressTest {
+    @Test fun cachedProgressDefersReportingUntilNewLiveProgressWithoutReplayingUncertainEvents() {
+        val gate = PlaybackProgress()
+        assertFalse(gate.sample(0, 0, true, allowReport = false))
+        assertFalse(gate.sample(2000, 2000, true, allowReport = false))
+        assertEquals(PlaybackProgress.Snapshot(2000, false), gate.snapshot())
+        gate.discontinuity()
+        assertFalse(gate.sample(2000, 3000, false))
+        assertFalse(gate.sample(2000, 4000, true))
+        assertTrue(gate.sample(2100, 4100, true))
+        val sentOrUncertain = gate.snapshot()
+        assertTrue(sentOrUncertain.recorded)
+        gate.restore(sentOrUncertain)
+        assertFalse(gate.sample(2100, 5000, true, allowReport = false))
+        assertFalse(gate.sample(4100, 7000, true))
+    }
+
     @Test fun recordsOnceAfterOneSecondOfActualProgress() {
         val gate = PlaybackProgress()
         assertFalse(gate.sample(0, 0, true))

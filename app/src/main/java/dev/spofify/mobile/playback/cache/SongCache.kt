@@ -727,9 +727,10 @@ class SongCache(
             upstream: DataSource.Factory,
             trackId: (DataSpec) -> String?,
             authorize: (DataSpec) -> Unit,
+            authorizeNetwork: (DataSpec) -> Unit = authorize,
             onDemandNetworkChange: (Boolean) -> Unit = {},
         ): DataSource.Factory = DataSource.Factory {
-            SongCacheDataSource(cache, upstream, trackId, authorize, onDemandNetworkChange)
+            SongCacheDataSource(cache, upstream, trackId, authorize, onDemandNetworkChange, authorizeNetwork = authorizeNetwork)
         }
 
         private val storageCleanup = Executors.newSingleThreadExecutor { runnable ->

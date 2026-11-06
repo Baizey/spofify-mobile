@@ -47,9 +47,9 @@ internal object PlaybackRawJson {
             else -> "snapshot"
         } else role
         val allowed = when (actualRole) {
-            "view" -> names("deviceId", "devices", "activeDeviceId", "epoch", "leaseMs", "quarantineMs", "state", "stateSeq", "stateAgeMs", "transfer", "directives", "commands", "error", "queueIntents")
+            "view" -> names("deviceId", "devices", "activeDeviceId", "epoch", "leaseMs", "quarantineMs", "state", "stateSeq", "stateAgeMs", "transfer", "directives", "commands", "error", "queueIntents", "registration", "leadership")
             "request" -> when (n.string("action")) {
-                "register" -> names("action", "name", "queueIntentsVersion")
+                "register" -> names("action", "name", "queueIntentsVersion", "registration")
                 "poll" -> names("action", "deviceId", "epoch", "stateSeq", "state", "queueIntentState", "acks")
                 "command" -> names("action", "deviceId", "epoch", "commandId", "command")
                 "rename" -> names("action", "deviceId", "name")
@@ -63,7 +63,9 @@ internal object PlaybackRawJson {
             "artists" -> names("id", "name")
             "context", "playbackContext" -> names("kind", "id", "name", "revision", "fence")
             "occurrence" -> names("key", "trackId", "eventId", "progress", "reported")
-            "devices" -> names("deviceId", "name", "available")
+            "devices" -> if ("receiverId" in n.fields) names("deviceId", "receiverId", "registrationGeneration") else names("deviceId", "name", "available")
+            "leadership" -> names("version", "revision", "state", "deviceId", "acceptedRevision")
+            "registration" -> names("version", "generation", "admissionToken", "devices", "deviceId", "receiverId", "attemptId", "expectedGeneration")
             "transfer" -> names("commandId", "sourceDeviceId", "targetDeviceId", "phase")
             "directives" -> if ("type" in n.fields) names("deliveryId", "epoch", "type", "commandId", "command", "state") else names("deliveryId", "state")
             "commands" -> names("commandId", "status")
@@ -95,13 +97,15 @@ internal object PlaybackRawJson {
             }
             else -> throw IllegalArgumentException("Unknown player object")
         }
-        require(n.fields.keys.all { it in allowed }) { "Unknown player field" }
+        val registrationFields = if (actualRole == "request") setOf("registrationGeneration", "targetRegistrationGeneration") else emptySet()
+        require(n.fields.keys.all { it in allowed || it in registrationFields }) { "Unknown player field" }
         n.fields.forEach { (key, child) ->
             if (child is Atom && !child.value.isString && child.value != JsonNull && key !in setOf("duration", "elapsed", "progress", "value") && child.value.booleanOrNull == null) {
                 require(child.value.content.matches(Regex("-?(0|[1-9][0-9]*)")))
                 require(child.value.longOrNull?.let { it in -9007199254740991L..9007199254740991L } == true)
             }
             val next = when {
+                key == "state" && actualRole == "leadership" -> "leadState"
                 key == "state" && (actualRole == "queueIntents" || actualRole == "directives" && "type" !in n.fields) -> "metadata"
                 key == "state" -> "snapshot"
                 key == "track" && actualRole == "selection" -> "unkeyedTrack"

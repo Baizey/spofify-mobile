@@ -163,6 +163,41 @@ class SongCacheIntegrationTest {
         try { action(); fail("Expected authorization/protocol IOException") } catch (_: IOException) { }
     }
 
+    @Test fun cachedOnlyContinuationRepeatsWarmCurrentAndNextButFirstMissNeverTouchesNetwork() {
+        assertBytes(bytes("A"), fetch("A"))
+        assertBytes(bytes("B"), fetch("B"))
+        val networkBytes = readBytes.get()
+        val factory = SongCache.authorizedFactory(handle, upstream,
+            { it.uri.pathSegments.let { parts -> parts[parts.size - 2] } }, ::authorize,
+            authorizeNetwork = { throw IOException("Cached music only") })
+        fun cached(id: String): ByteArray {
+            val source = factory.createDataSource()
+            try { source.open(spec(id)); return drain(source) } finally { source.close() }
+        }
+        // Same Media3 read seam for automatic next and repeat; no new cache implementation.
+        for (id in listOf("A", "B", "A", "B")) assertBytes(bytes(id), cached(id))
+        ioFailure { cached("C") }
+        assertNull(requests["C"])
+        assertEquals(networkBytes, readBytes.get())
+        authorized = false
+        ioFailure { cached("A") }
+        assertEquals(networkBytes, readBytes.get())
+    }
+
+    @Test fun cachedOnlyTransitionFencesAnAlreadyOpenNetworkRead() {
+        var live = true
+        val factory = SongCache.authorizedFactory(handle, upstream,
+            { it.uri.pathSegments.let { parts -> parts[parts.size - 2] } }, ::authorize,
+            authorizeNetwork = { if (!live) throw IOException("Lease expired") })
+        val source = factory.createDataSource()
+        try {
+            source.open(spec("uncached"))
+            live = false
+            ioFailure { source.read(ByteArray(128), 0, 128) }
+            assertEquals(0L, readBytes.get())
+        } finally { source.close() }
+    }
+
     @Test fun authenticatedWarmPrefetchReuseAndRestartHaveNoFreshnessRequest() {
         assertBytes(bytes("A"), fetch("A"))
         assertTrue(handle.prefetch("B", spec("B"), upstream, ::authorize, SongCache.Cancellation()))

@@ -14,6 +14,11 @@ import dev.spofify.mobile.core.QueueIntentResult
  */
 interface NativePlaybackEndpoint {
     /** False until exact queue/history import AND generation fencing are implemented. No fake capability registration. */
+    /** Install only over already-running exact local output; never starts or imports. */
+    fun retainCachedOutput(permission: CachedPlaybackPermission): Boolean = false
+    /** Rebind a genuinely renewed existing receiver lease to THIS continuing output only.
+     * Synchronous acknowledgement; never import, prepare, start, seek or reset history. */
+    fun renewContinuingOutput(permission: CachedPlaybackPermission, authority: PlaybackAuthority): Boolean = false
     val supportsExactHandoff: Boolean
     /** Advertise only after complete authoritative queue/provenance/result support. */
     val supportsQueueIntents: Boolean get() = false
@@ -46,6 +51,11 @@ interface NativePlaybackEndpoint {
     /** Origin lifetime is a transaction guard, never part of durable audible lease authority. */
     suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority, isCurrent: () -> Boolean): PlaybackEndpointResult =
         if (isCurrent()) execute(command, authority) else PlaybackEndpointResult("rejected", exportSnapshot())
+}
+
+/** Cache-only local continuation, deliberately not receiver/lease authority. */
+class CachedPlaybackPermission internal constructor(private val check: () -> Boolean) {
+    fun isValid(): Boolean = check()
 }
 
 class PlaybackAuthority internal constructor(val epoch: Long, val generation: Long, private val check: () -> Boolean) {

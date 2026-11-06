@@ -95,6 +95,7 @@ class PlaybackService : MediaSessionService() {
         /** Deliberate in-app Resume only. System transport never enters conditional admission. */
         fun resumePrepared(isCurrent: () -> Boolean, admissionIsCurrent: () -> Boolean = isCurrent): String? {
             val service = active.get() ?: return "Playback is unavailable. Choose music again."
+            if (service.dispatchCachedTransport(PlaybackDeviceCommand.transport("resume"), isCurrent)) return null
             return service.requestPreparedResume(isCurrent, admissionIsCurrent)
         }
         fun enqueuePrepared(items: List<LibraryItem>, client: SpofifyClient, first: Boolean): String? {
@@ -166,6 +167,12 @@ class PlaybackService : MediaSessionService() {
             active.get()?.importSnapshot(snapshot, authority, queueIntentState = queueIntentState)
                 ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
         fun suspendLocalOutput() { active.get()?.suspendBufferedOutput() }
+        fun cachedTransport(command: PlaybackDeviceCommand, isCurrent: () -> Boolean = { true }): Boolean =
+            active.get()?.dispatchCachedTransport(command, isCurrent) == true
+        fun retainCachedOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Boolean =
+            active.get()?.retainCachedPlayback(permission) == true
+        fun renewContinuingOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission,
+            authority: PlaybackAuthority): Boolean = active.get()?.renewContinuingPlayback(permission, authority) == true
         fun interruptLocalQueueIntentStart(): Boolean = active.get()?.interruptQueueIntentStart() == true
         suspend fun activateSnapshot(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult =
             active.get()?.importSnapshot(snapshot, authority) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
@@ -203,6 +210,9 @@ class PlaybackService : MediaSessionService() {
     private var client: SpofifyClient? = null
     private val handler = Handler(Looper.getMainLooper())
     private val historyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    @Volatile private var cachedPermission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission? = null
+    @Volatile private var cachedRequestEpoch = -1L
+    @Volatile private var cachedQueueEpoch = -1L
     @Volatile private var authority: PlaybackAuthority? = null
     @Volatile private var authorityRequestEpoch = -1L
     private var authenticatedSession: Session? = null
@@ -247,10 +257,15 @@ class PlaybackService : MediaSessionService() {
         val login = authenticatedSession
         val id = spec.key
         if (source == null || login == null || source !== (application as SpofifyApplication).graph.client ||
-            !source.hasValidSession(login) || !hasAuthority() || spec.uri.toString() !in allowedAudioUrls ||
+            !source.hasValidSession(login) || !hasOutputPermission() || spec.uri.toString() !in allowedAudioUrls ||
             id == null || source.audioUrl(LibraryItem("track", id, "", hasAudio = true)) != spec.uri.toString()) {
             throw IOException("Playback source is not in the authorized queue")
         }
+    }
+
+    private fun authorizeNetworkAudio(spec: DataSpec) {
+        authorizeAudio(spec)
+        if (!hasAuthority()) throw IOException("Required music is not cached. Playback stopped.")
     }
 
     private fun reconcileSongPrefetch() {
@@ -282,7 +297,7 @@ class PlaybackService : MediaSessionService() {
 
     private fun promoteSuccessfulPlayback(startSucceeded: Boolean = false) {
         if (promotionPending == null || (!startSucceeded && promotionPending === startAttempt) ||
-            player?.isPlaying != true || !hasAuthority() || audioFocus?.isGranted != true) return
+            player?.isPlaying != true || !hasOutputPermission() || audioFocus?.isGranted != true) return
         promotionPending = null
         player?.currentMediaItem?.mediaId?.let {
             audioCache?.protectPlayback(it)
@@ -312,7 +327,7 @@ class PlaybackService : MediaSessionService() {
 
     private fun canSkip(forward: Boolean): Boolean {
         val devices = (application as SpofifyApplication).graph.playbackCoordinator?.state?.value ?: return false
-        if (!devices.connected || devices.selectionUnconfirmed || devices.view?.transfer != null || devices.quarantineMs != 0L ||
+        if ((!devices.connected && !hasCachedPermission()) || devices.selectionUnconfirmed || devices.view?.transfer != null || devices.quarantineMs != 0L ||
             devices.deviceId.isEmpty() || devices.deviceId != devices.activeDeviceId ||
             devices.devices.none { it.deviceId == devices.activeDeviceId && it.available } || currentInteractionKey() == null) return false
         val directions = skipCapabilities()
@@ -347,7 +362,10 @@ class PlaybackService : MediaSessionService() {
                 intentRevision.receiverId, intentRevision.revision))
         }
         val permit = authority
-        val identity = if (permit != null && hasAuthority()) InteractionIdentity(
+        val identity = if (!hasAuthority() && hasCachedPermission()) listOf(PlaybackReference(requireNotNull(cachedPermission)),
+            PlaybackRequests.epoch, PlaybackRequests.queueEpoch, currentId(), traversalIds(), wireContext,
+            intentRevision.receiverId, intentRevision.revision, semantic.occurrence?.eventId)
+        else if (permit != null && hasAuthority()) InteractionIdentity(
             PlaybackReference(requireNotNull(client)), PlaybackReference(requireNotNull(authenticatedSession)), permit.epoch, permit.generation,
             PlaybackRequests.epoch, PlaybackRequests.queueEpoch, currentId(), traversalIds(), wireContext,
             intentRevision.receiverId, intentRevision.revision, semantic.occurrence?.eventId,
@@ -355,6 +373,7 @@ class PlaybackService : MediaSessionService() {
         return interactionKeys.current(identity)
     }
     private var explicitBackgroundPermit: PlaybackAuthority? = null
+    private var pendingStart: Any? = null
     private var startAttempt: Any? = null // Actual resource/cleanup owner until drained or explicit successor takeover.
     private var startAttemptValidity: Any? = null // Semantic cancellation does NOT transfer resource ownership.
     private data class StartHistoryObservation(
@@ -494,7 +513,7 @@ class PlaybackService : MediaSessionService() {
                 shutdownPlayback()
                 return
             }
-            if (!hasAuthority()) {
+            if (!hasOutputPermission()) {
                 if (current.playWhenReady || current.isPlaying) suspendBufferedOutput()
                 else cancelSongPrefetch()
             }
@@ -531,9 +550,9 @@ class PlaybackService : MediaSessionService() {
             val storeCancellation = SongCache.Cancellation()
             cancellation.onCancel { storeCancellation.cancel() }
             cancellation.ensureActive()
-            audioCache?.prefetch(request.trackId, request.spec, upstream, ::authorizeAudio, storeCancellation)
+            audioCache?.prefetch(request.trackId, request.spec, upstream, ::authorizeNetworkAudio, storeCancellation)
         }
-        val dataSources = SongCache.authorizedFactory(audioCache, upstream, { it.key }, ::authorizeAudio) { active ->
+        val dataSources = SongCache.authorizedFactory(audioCache, upstream, { it.key }, ::authorizeAudio, ::authorizeNetworkAudio) { active ->
             demandAudioOperations.addAndGet(if (active) 1 else -1)
             // Prioritize actual opens/reads, not an idle stream held by Media3's load control.
             // Aggregate concurrent operations and coalesce read completions to one main task;
@@ -595,7 +614,7 @@ class PlaybackService : MediaSessionService() {
                 // Retire consumed/skipped manual occurrences at every transition, including
                 // A -> manual -> A before a deferred prune or another planner can sample it.
                 manualTier.prune(traversalIds(), PlaybackMedia.occurrence(mediaItem))
-                if (!hasAuthority() && exo.playWhenReady) suspendBufferedOutput()
+                if (!hasOutputPermission() && exo.playWhenReady) suspendBufferedOutput()
                 // Repeat/returning is a new traversal; playlist moves are not.
                 if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED ||
                     PlaybackMedia.occurrence(mediaItem) !in history) {
@@ -611,7 +630,7 @@ class PlaybackService : MediaSessionService() {
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (importing) return
-                if (isPlaying && !hasAuthority()) { suspendBufferedOutput(); return }
+                if (isPlaying && !hasOutputPermission()) { suspendBufferedOutput(); return }
                 if (isPlaying) promoteSuccessfulPlayback()
                 scheduleCachePlan()
                 // Close out the genuinely playing interval before pausing/buffering.
@@ -745,7 +764,7 @@ class PlaybackService : MediaSessionService() {
         val track = if (remote != null) remotePlaybackState(remote).item else current?.currentMediaItem?.let(PlaybackMedia::libraryItem)
         // Buffering retains Pause/ongoing only for a valid, error-free remote playback intent.
         val playing = if (remote != null) track != null && remote.error.isEmpty() && remote.playing
-            else hasAuthority() && current?.playWhenReady == true
+            else hasOutputPermission() && current?.playWhenReady == true
         // Remote display/control state may update metadata, never promote local output/FGS.
         foreground?.update(mediaSession, track, playing, currentTransportNotice())
         return Futures.immediateFuture(null)
@@ -822,7 +841,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun sampleHistory(media: MediaItem?, position: Long, playing: Boolean) {
-        if (importing || !hasAuthority()) return
+        if (importing || !hasOutputPermission()) return
         val current = media ?: return
         val eventId = PlaybackMedia.occurrence(current) ?: return
         val sharedClient = client ?: return
@@ -834,7 +853,7 @@ class PlaybackService : MediaSessionService() {
             it.token === startAttempt && it.token === startAttemptValidity && it.current == eventId && it.before.occurrence == null &&
                 it.revision == intentRevision.revision
         }?.createdEventId = nonce
-        if (gate.sample(position, SystemClock.elapsedRealtime(), playing, player?.playbackParameters?.speed ?: 1f)) {
+        if (gate.sample(position, SystemClock.elapsedRealtime(), playing, player?.playbackParameters?.speed ?: 1f, allowReport = hasAuthority())) {
             val permitted = authority
             val requestEpoch = authorityRequestEpoch
             historyScope.launch {
@@ -864,6 +883,7 @@ class PlaybackService : MediaSessionService() {
 
     private fun interruptForSystemPause() {
         if (active.get() !== this) return
+        if (!hasAuthority() && cachedPermission != null) { PlaybackRequests.invalidate(); suspendBufferedOutput(); return }
         val owner = (application as SpofifyApplication).graph.playbackCoordinator
         // Both focus loss and noisy events cancel pending preparation as well as audible audio.
         // There is deliberately NO focus-gain path back into playback.
@@ -885,6 +905,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun suspendBufferedOutput() {
+        cachedPermission = null; cachedRequestEpoch = -1L; cachedQueueEpoch = -1L
         cancelSongPrefetch()
         promotionPending = null
         startAttempt = null
@@ -975,8 +996,8 @@ class PlaybackService : MediaSessionService() {
             elapsed = importedElapsed?.takeIf { current.currentPosition == importedPositionMs }
                 ?: (current.currentPosition.coerceAtLeast(0) / 1000.0),
             duration = if (current.duration == C.TIME_UNSET) importedDuration ?: (duration.coerceAtLeast(0) / 1000.0) else duration.coerceAtLeast(0) / 1000.0,
-            playing = hasAuthority() && current.playWhenReady && current.playbackState != Player.STATE_ENDED && current.playerError == null && outputError.isEmpty(),
-            waiting = hasAuthority() && current.playbackState == Player.STATE_BUFFERING,
+            playing = hasOutputPermission() && current.playWhenReady && current.playbackState != Player.STATE_ENDED && current.playerError == null && outputError.isEmpty(),
+            waiting = hasOutputPermission() && current.playbackState == Player.STATE_BUFFERING,
             // A newer owned start failure must match its terminal ACK even if ExoPlayer
             // retains the old media error until a permitted prepare can clear it.
             error = outputError.ifEmpty { if (current.playerError != null) "media" else "" }, occurrence = occurrence,
@@ -984,6 +1005,46 @@ class PlaybackService : MediaSessionService() {
             notice = queueNoticeCode,
         ).validated().also { observePreparedSemantics(it); scheduleCachePlan() }
     }
+
+    private fun retainCachedPlayback(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Boolean {
+        if (cachedPermission === permission && hasCachedPermission()) return true
+        val current = player ?: return false
+        // Never turn preparation, an unfinished start or a paused/restored queue into admission.
+        if (!permission.isValid() || pendingStart != null || current.currentMediaItem == null || !current.isPlaying ||
+            audioFocus?.isGranted != true || current.playerError != null ||
+            client !== (application as SpofifyApplication).graph.client ||
+            authenticatedSession?.let { client?.hasValidSession(it) } != true) return false
+        cachedRequestEpoch = PlaybackRequests.epoch
+        cachedQueueEpoch = PlaybackRequests.queueEpoch
+        cachedPermission = permission
+        // Live receiver authority stays separate and expires normally.
+        // Own the already-running output before cancelling predecessor work: old cleanup
+        // must never stop this continuation after its authority predicate becomes false.
+        startAttempt = null; startAttemptValidity = null; startHistoryObservation = null
+        if (!hasAuthority()) cancelSongPrefetch()
+        return true
+    }
+
+    private fun hasCachedPermission(): Boolean = cachedPermission?.isValid() == true &&
+        cachedRequestEpoch == PlaybackRequests.epoch && cachedQueueEpoch == PlaybackRequests.queueEpoch && active.get() === this &&
+        client === (application as SpofifyApplication).graph.client &&
+        authenticatedSession?.let { client?.hasValidSession(it) } == true
+
+    private fun renewContinuingPlayback(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission,
+        value: PlaybackAuthority): Boolean {
+        if (cachedPermission !== permission || !hasCachedPermission() || pendingStart != null ||
+            !value.isValid() || player?.currentMediaItem == null) return false
+        // This exact service/request/queue/session already owns the continuation. Restoring
+        // its REAL lease changes neither musical state nor stopped intent.
+        val request = cachedRequestEpoch
+        val queue = cachedQueueEpoch
+        if (!acceptAuthority(value)) return false
+        cachedRequestEpoch = request; cachedQueueEpoch = queue; cachedPermission = permission
+        return hasAuthority() && hasCachedPermission()
+    }
+
+    /** Output/read-only state only. Never use for wire execution, publication or history POST. */
+    private fun hasOutputPermission(): Boolean = hasAuthority() || hasCachedPermission()
 
     private fun hasAuthority(): Boolean = authority?.isValid() == true &&
         authorityRequestEpoch == PlaybackRequests.epoch && client != null &&
@@ -996,6 +1057,11 @@ class PlaybackService : MediaSessionService() {
         // Merely accepting authority over an empty queue does not establish replacement
         // playback: a queued action may still reject. Keep the close cleanup obligation.
         if (player?.mediaItemCount != 0) cancelCloseDisposal()
+        // Ordinary same-owner transport must not detach an armed continuation. A new
+        // authority incarnation/import cannot inherit it; the coordinator must re-arm.
+        val preserveCached = hasCachedPermission() && authority?.epoch == value.epoch &&
+            authority?.generation == value.generation
+        if (!preserveCached) { cachedPermission = null; cachedRequestEpoch = -1L; cachedQueueEpoch = -1L }
         authority = value
         authorityRequestEpoch = PlaybackRequests.epoch
         return hasAuthority()
@@ -1019,7 +1085,7 @@ class PlaybackService : MediaSessionService() {
             val track = if (remote != null) remotePlaybackState(remote).item
                 else player?.currentMediaItem?.let(PlaybackMedia::libraryItem)
             val playing = if (remote != null) remote.playing && remote.error.isEmpty()
-                else hasAuthority() && player?.playWhenReady == true
+                else hasOutputPermission() && player?.playWhenReady == true
             foreground?.update(mediaSession, track, playing, currentTransportNotice())
         }
     }
@@ -1049,6 +1115,7 @@ class PlaybackService : MediaSessionService() {
                 (if (pause) now.first == version.first && now.third == version.third
                     else request == PlaybackRequests.epoch && now == version)
         }
+        if (dispatchCachedTransport(command, isCurrent)) return
         val intended = exportPrepared()
         if (userInteraction) transportNotice = null
         if (userInteraction && !pause) {
@@ -1083,6 +1150,66 @@ class PlaybackService : MediaSessionService() {
             }
         } else if (userInteraction) owner.preparedTransportCommand(command, isCurrent = isCurrent)
         else owner.remoteCommand(command, isCurrent = isCurrent)
+    }
+
+    private fun dispatchCachedTransport(command: PlaybackDeviceCommand, isCurrent: () -> Boolean): Boolean {
+        if (hasAuthority() || !hasCachedPermission()) return false
+        if (command.type !in setOf("pause", "close", "resume", "retry", "seek", "next", "previous", "jump", "repeat")) return true
+        if (!isCurrent()) return true
+        if (command.type == "pause") {
+            val permission = cachedPermission
+            val request = cachedRequestEpoch
+            val queue = cachedQueueEpoch
+            // Pause is synchronous and retains only this already-admitted local queue.
+            suspendBufferedOutput()
+            cachedRequestEpoch = request; cachedQueueEpoch = queue; cachedPermission = permission
+        } else if (command.type == "close") {
+            PlaybackRequests.invalidate(); suspendBufferedOutput()
+            player?.clearMediaItems()
+        } else historyScope.launch { executeCachedTransport(command, isCurrent) }
+        return true
+    }
+
+    private suspend fun executeCachedTransport(command: PlaybackDeviceCommand, isCurrent: () -> Boolean) {
+        if (!isCurrent() || !hasCachedPermission()) return
+        val permission = cachedPermission
+        val request = PlaybackRequests.epoch
+        val queue = PlaybackRequests.queueEpoch
+        val current = player ?: return
+        fun valid() = isCurrent() && hasCachedPermission() && cachedPermission === permission &&
+            request == PlaybackRequests.epoch && queue == PlaybackRequests.queueEpoch && player === current
+        when (command.type) {
+            "seek" -> {
+                current.seekTo((command.json.getValue("value").jsonPrimitive.double * 1000).toLong())
+                resetHistoryAnchor(current.currentMediaItem)
+                return
+            }
+            "repeat" -> {
+                current.repeatMode = when (current.repeatMode) {
+                    Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                    Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                    else -> Player.REPEAT_MODE_OFF
+                }
+                return
+            }
+            "next" -> if (current.hasNextMediaItem()) current.seekToNextMediaItem() else return
+            "previous" -> {
+                if (current.currentPosition > current.maxSeekToPreviousPosition || !current.hasPreviousMediaItem()) restartTraversal()
+                current.seekToPrevious()
+            }
+            "jump" -> {
+                val key = command.json.getValue("key").jsonPrimitive.long
+                val id = wireKeys.entries.firstOrNull { it.value == key }?.key ?: return
+                val index = physicalIds().indexOf(id)
+                if (index < 0) return
+                current.seekToDefaultPosition(index)
+            }
+            "resume", "retry" -> if (current.currentMediaItem == null) return
+            else -> return
+        }
+        if (!valid()) return
+        // No wire authority, import, remote command, history replay or background exemption.
+        startOutput(true, ::valid, mayStart = { mayStartForegroundPlayback(null) })
     }
 
     private fun routeSessionCommand(command: PlaybackDeviceCommand) {
@@ -1224,6 +1351,14 @@ class PlaybackService : MediaSessionService() {
         isCurrent: () -> Boolean = { true }): PlaybackEndpointResult {
         val current = player ?: return frozenResult("rejected", snapshot = PlaybackSnapshot())
         if (!isCurrent() || !acceptAuthority(value)) return frozenResult("rejected")
+        val request = authorityRequestEpoch
+        return startOutput(play, isCurrent = { isCurrent() && authority === value && authorityRequestEpoch == request && hasAuthority() },
+            mayStart = { mayStartForegroundPlayback(value) })
+    }
+
+    private suspend fun startOutput(play: Boolean, isCurrent: () -> Boolean, mayStart: () -> Boolean): PlaybackEndpointResult {
+        val current = player ?: return frozenResult("rejected", snapshot = PlaybackSnapshot())
+        if (!isCurrent()) return frozenResult("rejected")
         transportNotice = null // A newly admitted start retires earlier refusal presentation.
         // Observe the accepted installation before allocating the attempt cleanup token, but
         // do NOT manufacture a traversal for generic foreground/focus/media-denied starts.
@@ -1232,17 +1367,16 @@ class PlaybackService : MediaSessionService() {
         val installed = exportPrepared()
         if (play) cancelSongPrefetch()
         val attempt = Any()
+        pendingStart = attempt
         startAttempt = attempt
         startAttemptValidity = attempt
         if (play) promotionPending = attempt
-        val requestEpoch = authorityRequestEpoch
         val occurrence = currentId()
         startHistoryObservation = if (play && installed.occurrence == null)
             StartHistoryObservation(attempt, occurrence, installed, intentMetadata(installed), intentRevision.revision)
         else null
         fun sameAttempt() = active.get() === this && player === current && startAttempt === attempt
-        fun owned() = sameAttempt() && startAttemptValidity === attempt && authority === value &&
-            authorityRequestEpoch == requestEpoch && currentId() == occurrence && isCurrent() && hasAuthority()
+        fun owned() = sameAttempt() && startAttemptValidity === attempt && currentId() == occurrence && isCurrent()
         fun valid() = owned() && audioFocus?.isGranted == true
         fun silenceAttempt() {
             // A rejected predicate is not just a paused copy of a possibly still-playing
@@ -1284,7 +1418,7 @@ class PlaybackService : MediaSessionService() {
             if (!owned()) return rejected()
             outputError = ""
             if (!play) { completed = true; return frozenResult("ok", snapshot = exportPrepared().paused()) }
-            if (!mayStartForegroundPlayback(value) || session?.let { foreground?.promote(it, current.currentMediaItem?.let(PlaybackMedia::libraryItem), true) } != true)
+            if (!mayStart() || session?.let { foreground?.promote(it, current.currentMediaItem?.let(PlaybackMedia::libraryItem), true) } != true)
                 return failure("blocked")
             if (audioFocus?.requestForExplicitStart() != true) return failure("blocked")
             if (!valid()) return rejected()
@@ -1315,15 +1449,16 @@ class PlaybackService : MediaSessionService() {
         } finally {
             // Covers caller disposal, cancellation and thrown platform errors as well as every
             // early rejected return. A newer import/start/service changes the attempt identity.
+            if (pendingStart === attempt) pendingStart = null
             if (!completed) silenceAttempt()
         }
     }
 
-    private fun mayStartForegroundPlayback(value: PlaybackAuthority): Boolean {
+    private fun mayStartForegroundPlayback(value: PlaybackAuthority?): Boolean {
         // No claim to wake a killed/restricted app. A running FGS may continue; a visible app
         // can begin playback. A background-only idle receiver reports Needs a tap instead.
         if (foreground?.foregroundConfirmed == true) return true
-        if (explicitBackgroundPermit === value && value.isValid()) return true
+        if (value != null && explicitBackgroundPermit === value && value.isValid()) return true
         val info = android.app.ActivityManager.RunningAppProcessInfo()
         android.app.ActivityManager.getMyMemoryState(info)
         return info.importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
@@ -1481,6 +1616,10 @@ class PlaybackService : MediaSessionService() {
 
     private fun guardedSkip(expectedKey: PlaybackInteractionKey, forward: Boolean, originCurrent: () -> Boolean): Boolean {
         if (Looper.myLooper() != Looper.getMainLooper()) return false
+        if (!hasAuthority() && hasCachedPermission()) {
+            if (!originCurrent() || currentInteractionKey() !== expectedKey || !canSkip(forward)) return false
+            return dispatchCachedTransport(PlaybackDeviceCommand.transport(if (forward) "next" else "previous"), originCurrent)
+        }
         val graph = (application as SpofifyApplication).graph
         val owner = graph.playbackCoordinator ?: return false
         val devices = owner.state.value

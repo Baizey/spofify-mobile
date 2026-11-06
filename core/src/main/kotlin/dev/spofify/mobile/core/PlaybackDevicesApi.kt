@@ -73,7 +73,7 @@ private fun requireSnapshotShape(value: JsonObject) {
 }
 internal fun libraryId(s: String) = s.isNotEmpty() && s.trim() == s && text(s, 512)
 private fun optionalId(s: String) = s.isEmpty() || libraryId(s)
-private val wireNumbers = setOf("version", "position", "elapsed", "duration", "key", "order", "revision", "progress", "epoch", "leaseMs", "quarantineMs", "stateSeq", "stateAgeMs", "value", "acceptedCount", "currentKey", "commitRevision", "playbackKey", "queueIntentsVersion")
+private val wireNumbers = setOf("version", "position", "elapsed", "duration", "key", "order", "revision", "progress", "epoch", "leaseMs", "quarantineMs", "stateSeq", "stateAgeMs", "acceptedRevision", "value", "acceptedCount", "currentKey", "commitRevision", "playbackKey", "queueIntentsVersion")
 private val wireBooleans = setOf("shuffle", "playing", "waiting", "loading", "truncated", "reported", "available", "first")
 private val wireStrings = setOf("id", "name", "albumName", "albumId", "entryId", "targetId", "occurrenceId", "selectionToken", "kind", "fence", "repeat", "error", "notice", "trackId", "eventId", "deviceId", "activeDeviceId", "commandId", "sourceDeviceId", "targetDeviceId", "phase", "deliveryId", "type", "status", "direction", "receiverId", "outputDeviceId", "currentEventId", "intent", "provenance", "outcome", "placement", "playback", "generation", "admissionToken", "registrationGeneration", "targetRegistrationGeneration", "attemptId", "expectedGeneration")
 internal fun requireWireTypes(value: JsonElement, depth: Int = 0) {
@@ -198,6 +198,7 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
     val leaseMs: Long, val quarantineMs: Long = 0, val state: PlaybackSnapshot?, val stateSeq: Long,
     val stateAgeMs: Long, val transfer: PlaybackTransfer?, val directives: List<PlaybackDirective>, val commands: List<PlaybackOutcome>, val error: String = "", val queueIntents: QueueIntentsView? = null,
     val registration: PlaybackRegistrationView? = null,
+    val leadership: PlaybackLeadership? = null,
 ) {
     fun validated() = apply {
         require(epoch in 1..MAX_SAFE && stateSeq in 0..MAX_SAFE && leaseMs in 0..8000 && quarantineMs in 0..8000 && stateAgeMs in 0..MAX_SAFE)
@@ -209,11 +210,12 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
         transfer?.let { require(validPlaybackProtocolId(it.commandId) && validPlaybackProtocolId(it.targetDeviceId) && (it.sourceDeviceId.isEmpty() || validPlaybackProtocolId(it.sourceDeviceId)) && it.phase in setOf("waiting", "preparing", "releasing", "activating")) }
         directives.forEach { require(validPlaybackProtocolId(it.deliveryId) && it.epoch == epoch && it.type in setOf("prepare", "release", "activate", "command")); it.state?.validated(); it.command?.let(PlaybackDeviceCommand::fromJson) }
         commands.forEach { require(validPlaybackProtocolId(it.commandId) && it.status in setOf("pending", "ok", "blocked", "media", "rejected", "timeout", "cancelled")) }
+        leadership?.validated()
         registration?.validated(this)
         queueIntents?.validated(this)
         if (queueIntents == null) require(directives.none { it.command?.get("type")?.jsonPrimitive?.content == "queueIntent" })
     }
-    fun toJson(): JsonObject = JsonObject(playbackJson.encodeToJsonElement(serializer(), validated()).jsonObject.filterKeys { (it != "queueIntents" || queueIntents != null) && (it != "registration" || registration != null) })
+    fun toJson(): JsonObject = JsonObject(playbackJson.encodeToJsonElement(serializer(), validated()).jsonObject.filterKeys { (it != "queueIntents" || queueIntents != null) && (it != "registration" || registration != null) && (it != "leadership" || leadership != null) })
     companion object {
         fun fromRawJson(raw: String, allowQueueIntents: Boolean = false, allowRegistration: Boolean = false): PlaybackDevicesView = fromJson(PlaybackRawJson.parse(raw), allowQueueIntents, allowRegistration)
         fun fromJson(value: JsonObject): PlaybackDevicesView = fromJson(value, allowQueueIntents = true, allowRegistration = true)
@@ -272,6 +274,7 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
     @Volatile private var probed = false
     @Volatile private var receiverCapable = false
     @Volatile private var registrationSupported = false
+    private var leadershipSupported = false
     private var observedRegistration: PlaybackRegistrationView? = null
     private var ownRegistration: PlaybackRegistrationDevice? = null
     private data class PendingRegistration(val name: String, val queueVersion: Int?, val attempt: PlaybackRegistrationAttempt)
@@ -280,6 +283,8 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
     override suspend fun probeQueueIntents(): PlaybackDevicesView = withTimeout(4000) {
         val view = PlaybackDevicesView.fromJson(transport.send("GET", path, playbackExtensions = true, playbackRegistration = true)!!, true, true)
         check(!registrationSupported || view.registration != null) { "Negotiated registration metadata is missing" }
+        check(!leadershipSupported || view.leadership != null) { "Negotiated leadership metadata is missing" }
+        leadershipSupported = view.leadership != null
         extensions = view.queueIntents != null; probed = true
         registrationSupported = view.registration != null
         observedRegistration = view.registration
@@ -303,6 +308,7 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
         decodeView(requireNotNull(transport.send("POST", path, body, playbackExtensions = extensions, playbackRegistration = registrationSupported)))
     }
     private fun decodeView(json: JsonObject): PlaybackDevicesView = PlaybackDevicesView.fromJson(json, extensions, registrationSupported).also {
+        require(!leadershipSupported || it.leadership != null) { "Negotiated leadership metadata is missing" }
         require(!extensions || it.queueIntents != null) { "Negotiated queue metadata is missing" }
         require(!registrationSupported || it.registration != null) { "Negotiated registration metadata is missing" }
         observedRegistration = it.registration

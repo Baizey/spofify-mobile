@@ -16,6 +16,10 @@ import dev.spofify.mobile.SpofifyApplication
 import dev.spofify.mobile.core.*
 import dev.spofify.mobile.playback.cache.SongCache
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CoroutineScope
+import dev.spofify.mobile.feature.devices.PlaybackCoordinator
+import dev.spofify.mobile.feature.devices.PlaybackDeviceIdentityStore
+import javax.crypto.spec.SecretKeySpec
 import kotlinx.serialization.json.*
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -76,7 +80,7 @@ class SongCachePlaybackTest {
      */
     private class Room(private val remote: Boolean = false, private val sampleRate: Int = 8000,
         private val longCurrent: Boolean = false, private val longFutureB: Boolean = false,
-        private val normalTrackSeconds: Int = 12) : Dispatcher() {
+        private val normalTrackSeconds: Int = 12, private val managedContinuation: Boolean = false) : Dispatcher() {
         /** Bytes scheduled at dispatch, not bytes written to a socket or read by a client.
          * A delayed/cancelled response can schedule its full body but transmit less or nothing.
          */
@@ -96,8 +100,12 @@ class SongCachePlaybackTest {
         private var metadata: QueueIntentState? = null
         private var sequence = 0L
         private var phone = ""
+        private var receiver = ""
+        @Volatile var coordinationOutage = false
+        @Volatile var receiverExpired = false
+        val controlTrace = CopyOnWriteArrayList<String>()
         private fun view(): PlaybackDevicesView {
-            val selected = if (remote) "remote" else phone
+            val selected = if (remote) "remote" else if (receiverExpired) "" else phone
             return PlaybackDevicesView(phone,
                 (if (phone.isEmpty()) emptyList() else listOf(PlaybackDevice(phone, "Phone", true))) +
                     if (remote) listOf(PlaybackDevice("remote", "Remote", true)) else emptyList(),
@@ -108,7 +116,11 @@ class SongCachePlaybackTest {
                     if (remote || phone.isEmpty()) null else metadata?.let {
                         QueueIntentBinding(phone, it.receiverId, it.revision,
                             snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId)
-                    }, if (remote) null else metadata, emptyList(), emptyList()))
+                    }, if (remote) null else metadata, emptyList(), emptyList()),
+                registration = if (!managedContinuation) null else PlaybackRegistrationView(1, "admission-generation", "admission-token",
+                    if (phone.isEmpty()) emptyList() else listOf(PlaybackRegistrationDevice(phone, receiver, "registration-generation"))),
+                leadership = if (!managedContinuation) null else PlaybackLeadership(1, if (phone.isEmpty()) 0 else 1,
+                    if (phone.isEmpty()) "unset" else "installation", phone))
         }
         private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
         override fun dispatch(request: RecordedRequest): MockResponse {
@@ -149,17 +161,28 @@ class SongCachePlaybackTest {
                 unexpected += "${request.method} ${request.requestUrl!!.encodedPath}"
                 return MockResponse().setResponseCode(404)
             }
+            if (coordinationOutage) return MockResponse().setResponseCode(503)
             synchronized(this) {
-                if (request.method == "GET") return json(view().toJson().toString())
+                if (request.method == "GET") {
+                    controlTrace += "GET"
+                    return json(view().toJson().toString())
+                }
                 check(request.getHeader("X-CSRF-Token") == "cache-csrf")
                 val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
                 when (val action = body.getValue("action").jsonPrimitive.content) {
                     "register" -> {
-                        phone = "phone-${registrations.incrementAndGet()}"
+                        registrations.incrementAndGet()
+                        phone = if (managedContinuation) {
+                            val registration = body.getValue("registration").jsonObject
+                            receiver = registration.getValue("receiverId").jsonPrimitive.content
+                            registration.getValue("deviceId").jsonPrimitive.content
+                        } else "phone-${registrations.get()}"
                         if (!remote) { snapshot = PlaybackSnapshot(); metadata = null; sequence = 0 }
                     }
                     "poll" -> {
                         polls.incrementAndGet()
+                        controlTrace += if ("state" in body) "poll:publication" else "poll:renewal"
+                        if (managedContinuation && "state" !in body) check(body["acks"]?.jsonArray.isNullOrEmpty())
                         body["state"]?.let {
                             check(!remote) { "A controller must never publish local output over selected remote" }
                             snapshot = PlaybackSnapshot.fromJson(it.jsonObject)
@@ -200,9 +223,9 @@ class SongCachePlaybackTest {
 
     private inner class Journey(remote: Boolean = false, private val limits: SongCache.Limits = SongCache.Limits(),
         sampleRate: Int = 8000, longCurrent: Boolean = false, longFutureB: Boolean = false,
-        normalTrackSeconds: Int = 12, openCacheWrite: ((File) -> OutputStream)? = null) : AutoCloseable {
+        normalTrackSeconds: Int = 12, managedContinuation: Boolean = false, openCacheWrite: ((File) -> OutputStream)? = null) : AutoCloseable {
         val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        val room = Room(remote, sampleRate, longCurrent, longFutureB, normalTrackSeconds)
+        val room = Room(remote, sampleRate, longCurrent, longFutureB, normalTrackSeconds, managedContinuation)
         val web = MockWebServer().apply { dispatcher = room; start(InetAddress.getByName("127.0.0.1"), 0) }
         val server = ServerAddress.parse("http://127.0.0.1:${web.port}")
         val sessions = Sessions()
@@ -232,6 +255,21 @@ class SongCachePlaybackTest {
             }
             client = graph.configure(server)
             runBlocking { client.login("listener", "synthetic-password") }
+            if (managedContinuation) {
+                // Inject only stable-identity storage/key material through its existing test
+                // constructor. The real coordinator/API/endpoint/service/audio remain intact.
+                graph.playbackCoordinator!!.close()
+                val scope = AppGraph::class.java.getDeclaredField("coordinationScope").apply { isAccessible = true }
+                    .get(graph) as CoroutineScope
+                val identity = PlaybackDeviceIdentityStore(app.getSharedPreferences("continuation-${web.port}", 0),
+                    { SecretKeySpec(ByteArray(16) { 7 }, "AES") }, server, "cache-account")
+                val coordinator = PlaybackCoordinator(PlaybackDevicesApi(client), Media3PlaybackEndpoint(), scope,
+                    identity = { identity })
+                AppGraph::class.java.getDeclaredField("playbackCoordinator").apply { isAccessible = true; set(graph, coordinator) }
+                PlaybackService.onServiceActiveChanged = { active ->
+                    if (graph.playbackCoordinator === coordinator) coordinator.setServiceActive(active)
+                }
+            }
             timeoutDiagnostics = ::diagnostics
         }
         private fun install(value: AppGraph): AppGraph {
@@ -461,6 +499,101 @@ class SongCachePlaybackTest {
             SongCachePlaybackMedia.reset()
             timeoutDiagnostics = null
             failure?.let { throw it }
+        }
+    }
+
+    @Test fun liveSeekRepeatAndSkipKeepActualServiceContinuationArmedAcrossOutage() {
+        Journey(managedContinuation = true, normalTrackSeconds = 30).use { j ->
+            j.startService()
+            j.play("A", "B", "C", "D", "E", "F", "G")
+            j.awaitFetched("A", "B", "C", "D", "E", "F")
+            await("warm whole current and next objects") { j.assertBounded().complete >= 6 }
+            j.controller!!.seekTo(1000)
+            j.awaitLocalPublication("live Seek")
+            j.repeat(Player.REPEAT_MODE_ALL, "all")
+            j.controller!!.seekToNextMediaItem()
+            await("real live Skip to B") { j.controller!!.currentMediaItem?.mediaId == "B" && j.controller!!.isPlaying }
+            j.awaitLocalPublication("live Skip")
+            val before = PlaybackService.exportLocalSnapshot()
+            val pcm = consumed("B")
+            j.room.coordinationOutage = true
+            await("coordinator enters cached-only continuation") { !j.graph.playbackCoordinator!!.state.value.connected }
+            // Beyond the old conservative six-second lease, through the real endpoint,
+            // service history tick and production cache DataSource, not a fake Output.
+            pump(6500)
+            val after = PlaybackService.exportLocalSnapshot()
+            assertTrue(j.controller!!.isPlaying)
+            assertTrue(consumed("B") > pcm)
+            assertEquals(before.queue, after.queue)
+            assertEquals(before.occurrence?.eventId, after.occurrence?.eventId)
+            assertTrue(after.elapsed > before.elapsed)
+            assertTrue(j.room.mutations.isEmpty())
+        }
+    }
+
+    @Test fun sameLeadReadThenGenuineReceiverRenewalRestoresUncachedAudioWithoutRestartOrImport() {
+        Journey(managedContinuation = true, normalTrackSeconds = 30).use { j ->
+            j.startService()
+            j.play("A", "B", "C", "D", "E", "F", "G")
+            j.awaitFetched("A", "B", "C", "D", "E", "F")
+            await("whole warm A through F") { j.assertBounded().complete >= 6 }
+            assertFalse(j.room.fetched().contains("G"))
+            val before = PlaybackService.exportLocalSnapshot()
+            val starts = SongCachePlaybackMedia.starts.get()
+            j.room.coordinationOutage = true
+            await("outage retains actual playing output") { !j.graph.playbackCoordinator!!.state.value.connected }
+            assertTrue(j.controller!!.isPlaying)
+            j.room.controlTrace.clear()
+            j.room.coordinationOutage = false
+            j.awaitLocalPublication("same-lead genuine renewal")
+            val after = PlaybackService.exportLocalSnapshot()
+            assertEquals("GET", j.room.controlTrace.first())
+            assertEquals("poll:renewal", j.room.controlTrace[1])
+            assertEquals(starts, SongCachePlaybackMedia.starts.get())
+            assertEquals(before.queue, after.queue)
+            assertEquals(before.occurrence?.eventId, after.occurrence?.eventId)
+            assertTrue(after.elapsed >= before.elapsed)
+            assertEquals(1, j.room.registrations.get())
+            assertTrue(j.room.mutations.isEmpty())
+            assertFalse(j.room.fetched().contains("G"))
+            // G was outside current+next5. A fresh normal live skip must now perform the
+            // production exact-origin authenticated read, not remain permanently cache-only.
+            j.controller!!.seekToDefaultPosition(6)
+            await("first previously uncached G really renders after lease renewal") {
+                j.controller!!.currentMediaItem?.mediaId == "G" && j.controller!!.isPlaying && consumed("G") > 0
+            }
+            assertTrue(j.room.fetched().contains("G"))
+            assertNull(j.controller!!.playerError)
+        }
+    }
+
+    @Test fun failedReceiverValidationRemainsCachedOnlyAndRenewalNeverRestartsPausedOutput() {
+        Journey(managedContinuation = true, normalTrackSeconds = 30).use { j ->
+            j.startService()
+            j.play("A")
+            await("whole A") { j.assertBounded().complete == 1 }
+            j.room.coordinationOutage = true
+            await("cached continuation") { !j.graph.playbackCoordinator!!.state.value.connected }
+            j.room.receiverExpired = true
+            val polls = j.room.polls.get()
+            j.room.coordinationOutage = false
+            pump(1300)
+            assertFalse(j.graph.playbackCoordinator!!.state.value.connected)
+            assertEquals(polls, j.room.polls.get())
+            assertTrue(j.controller!!.isPlaying)
+            j.controller!!.pause()
+            await("explicit cached Pause drains actual output") { !j.controller!!.isPlaying && !PlaybackService.exportLocalSnapshot().playing }
+            val paused = PlaybackService.exportLocalSnapshot()
+            val starts = SongCachePlaybackMedia.starts.get()
+            j.room.receiverExpired = false
+            j.awaitLocalPublication("paused genuine receiver renewal")
+            assertEquals(starts, SongCachePlaybackMedia.starts.get())
+            assertFalse(j.controller!!.isPlaying)
+            assertFalse(PlaybackService.exportLocalSnapshot().playing)
+            assertEquals(paused.queue, PlaybackService.exportLocalSnapshot().queue)
+            assertEquals(paused.occurrence?.eventId, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
+            assertEquals(1, j.room.registrations.get())
+            assertTrue(j.room.mutations.isEmpty())
         }
     }
 

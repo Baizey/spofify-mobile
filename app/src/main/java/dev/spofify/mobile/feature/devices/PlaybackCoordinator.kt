@@ -142,6 +142,66 @@ class PlaybackCoordinator(
             interactionChangedUptime = mediaEventUptimeMs()
         }
     }
+    private val cachedPermission = AtomicReference<CachedPlaybackPermission?>(null)
+    private var lastLeadRevision = -1L
+    private var cachedOnly = false
+    /** Cache-only mode never polls/publishes receiver state or consumes directives. */
+    private fun retainCachedPlayback(): Boolean {
+        if (cachedOnly && cachedPermission.get()?.isValid() == true) return true
+        if (!armCachedPlayback()) return false
+        cachedOnly = true
+        revokeAuthority()
+        generation++; actionVersion++; activatedEpoch = 0; leaseDeadline = 0; released = true
+        queueExecution = null
+        abandonAdmission(); finishCommandResult(null, "cancelled")
+        endpointJob?.cancel(); commandJob?.cancel()
+        acks.clear(); ackState = null; ackQueueIntentState = null; pendingCommand = null
+        leaseTimer?.cancel()
+        uncertainConnection = true
+        mutableState.value = state.value.copy(connected = false, exclusiveOwner = false, canQueueIntent = false,
+            recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED,
+            message = "Cached-only playback. Connection is unverified.",
+            messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
+        return true
+    }
+    private fun armCachedPlayback(): Boolean {
+        cachedPermission.get()?.takeIf { it.isValid() }?.let { existing ->
+            // The coordinator token alone says nothing about the current service owner.
+            if (endpoint.retainCachedOutput(existing)) return true
+            cachedPermission.compareAndSet(existing, null)
+        }
+        val view = state.value.view ?: return false
+        if (activatedEpoch != epoch || view.leadership?.names(state.value.deviceId) != true ||
+            (view.leadership?.revision ?: -1L) < lastLeadRevision ||
+            !serviceActive || closed || !work.isActive) return false
+        val life = lifecycle
+        lateinit var permission: CachedPlaybackPermission
+        permission = CachedPlaybackPermission {
+            cachedPermission.get() === permission && lifecycle == life && work.isActive
+        }
+        cachedPermission.set(permission)
+        if (!endpoint.retainCachedOutput(permission)) { cachedPermission.set(null); return false }
+        return true
+    }
+    private fun reconcileCachedLeadership(view: PlaybackDevicesView): Boolean {
+        val lead = view.leadership
+        val current = lead != null && lead.revision >= lastLeadRevision
+        if (!current && lastLeadRevision >= 0 && !cachedOnly) {
+            fenceLocal()
+            mutableState.value = state.value.copy(connected = false, exclusiveOwner = false, canQueueIntent = false,
+                message = "Playback leadership could not be verified. Playback stopped.")
+            return true
+        }
+        if (current) lastLeadRevision = lead!!.revision
+        if (!cachedOnly) return false
+        if (!current || lead?.names(state.value.deviceId) != true) {
+            fenceLocal()
+            mutableState.value = state.value.copy(connected = false, exclusiveOwner = false,
+                canQueueIntent = false, message = "Playback lead changed. Cached playback stopped.")
+        } else mutableState.value = state.value.copy(
+            message = "Cached-only playback. This phone remains the last requested output.")
+        return true
+    }
     private var leaseDeadline = 0L
     private data class AuthorityPermit(val lifecycle: Long, val epoch: Long, val generation: Long, val deadlineMs: Long)
     private val authorityPermit = AtomicReference<AuthorityPermit?>(null)
@@ -442,6 +502,7 @@ class PlaybackCoordinator(
     }
 
     private fun fenceLocal(invalidateActions: Boolean = true, preserveHandoff: Boolean = false) {
+        cachedPermission.set(null); cachedOnly = false
         if (!preserveHandoff) retireHandoff()
         queueExecution = null
         generation++; leaseDeadline = 0; released = true; activatedEpoch = 0; recoverPaused = true
@@ -463,6 +524,7 @@ class PlaybackCoordinator(
 
     /** Must run before waiting for transport, even during registration or an output switch. */
     private fun interruptLocal(preserveQueueReceipt: Boolean = false): Boolean {
+        cachedPermission.set(null); cachedOnly = false
         retireHandoff() // Before the queue-receipt early return or any transport suspension.
         abandonAdmission()
         val queue = queueExecution
@@ -538,6 +600,7 @@ class PlaybackCoordinator(
 
     /** Always responsive: one in-flight selection plus ONLY the latest unsent choice. */
     fun select(targetDeviceId: String) {
+        if (cachedOnly) { message("Cached-only playback cannot select another output. Stop and reconnect first."); return }
         if (!serviceActive || closed || state.value.deviceId.isEmpty()) return
         if (state.value.devices.none { it.deviceId == targetDeviceId && it.available }) {
             message("That player is unavailable. Open Spofify on it and choose again."); return
@@ -600,6 +663,7 @@ class PlaybackCoordinator(
     }
 
     fun rename(deviceId: String, name: String) {
+        if (cachedOnly) { message("Reconnect live playback before changing player settings."); return }
         if (closed) return
         if (!validPlaybackDeviceName(name.trim())) { message("Use a device name of 1–64 characters."); return }
         if (!validPlaybackProtocolId(deviceId)) return
@@ -1059,6 +1123,15 @@ class PlaybackCoordinator(
         }
     }
     private suspend fun poll(): Unit = verifyConnection {
+        if (cachedOnly) {
+            val life = lifecycle
+            val observed = withTimeout(4000) { api.view() }.validated()
+            if (life == lifecycle && !closed && serviceActive && work.isActive) {
+                reconcileCachedLeadership(observed)
+                if (cachedOnly) recoverExistingReceiver(observed, life)
+            }
+            return@verifyConnection
+        }
         val id = state.value.deviceId
         if (id.isEmpty()) return@verifyConnection
         playAdmission?.takeIf { admissionCurrent(it) && it.activatedEpoch == epoch && it.stagedVersion != it.payloadVersion }?.let { admission ->
@@ -1116,6 +1189,58 @@ class PlaybackCoordinator(
         if (queue?.deliveryId != null && pending.any { it.deliveryId == queue.deliveryId } && queueExecution === queue)
             queueExecution = null
     }
+    /** Read leadership FIRST, then renew only an existing exact receiver. Neither request
+     * carries state/ACKs or selection intent. Uncertain old publications remain discarded. */
+    private suspend fun recoverExistingReceiver(observed: PlaybackDevicesView, life: Long) {
+        val permission = cachedPermission.get() ?: return
+        val own = ownRegistration ?: return // Legacy/unknown receiver cannot prove this seam.
+        val id = state.value.deviceId
+        val e = epoch; val g = generation; val revision = actionVersion
+        fun current() = life == lifecycle && cachedOnly && !closed && serviceActive && work.isActive &&
+            cachedPermission.get() === permission && permission.isValid() &&
+            generation == g && epoch == e && actionVersion == revision
+        fun exactReceiver(view: PlaybackDevicesView) =
+            view.leadership?.names(id) == true && (view.leadership?.revision ?: -1L) >= lastLeadRevision &&
+                view.registration?.devices?.singleOrNull { it.deviceId == id } == own &&
+                view.activeDeviceId == id && view.epoch == e && view.transfer == null &&
+                view.quarantineMs == 0L && view.directives.isEmpty() &&
+                view.devices.any { it.deviceId == id && it.available }
+        if (!current() || !exactReceiver(observed)) return
+        val sent = clockMs()
+        val renewed = try {
+            withTimeout(4000) { api.poll(id, e, null, null, emptyList(), null) }.validated()
+        } catch (error: Exception) {
+            if (error is CancellationException && error !is TimeoutCancellationException) throw error
+            if (error is ApiException && error.status == 401) throw error
+            return // Failed renewal is not a new grant or revocation of cached permission.
+        }
+        if (!current()) return
+        // A newer preference wins even if the old receiver's poll itself succeeded.
+        reconcileCachedLeadership(renewed)
+        if (!current() || !exactReceiver(renewed)) return
+        val deadline = sent + (renewed.leaseMs - 2000).coerceAtLeast(0)
+        if (clockMs() >= deadline) return
+        val before = state.value
+        leaseDeadline = deadline; released = false; activatedEpoch = e
+        sequence = maxOf(sequence, renewed.stateSeq)
+        // The genuine poll is the sole source of this lease. The native endpoint must
+        // acknowledge its exact continuing output before we resume ordinary publication.
+        mutableState.value = before.copy(view = renewed, connected = true, exclusiveOwner = true,
+            recovery = PlaybackConnectionRecovery.NONE, canQueueIntent = false, queueIntentBinding = null,
+            message = "", messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
+        val authority = executionAuthority()
+        val accepted = authority != null && endpoint.renewContinuingOutput(permission, authority)
+        if (!accepted) {
+            revokeAuthority(); leaseDeadline = 0; released = true; activatedEpoch = 0
+            mutableState.value = before
+            return
+        }
+        cachedOnly = false; uncertainConnection = false; recoverPaused = false
+        // No activation/import/start or old ACK replay. The next normal poll publishes
+        // the ACTUAL continuing local queue/history, never the stale server snapshot.
+        scheduleLeaseExpiry(renewed, id)
+    }
+
     /** Pristine idle ownership needs no import. Accept only the exact EMPTY native
      * incarnation already acknowledged by the broker, never a retained nonempty display. */
     private fun acceptedEmptyQueueIntentBinding(expected: QueueIntentBinding?,
@@ -1252,6 +1377,8 @@ class PlaybackCoordinator(
         admissionPublication: Pair<String, Long>? = null,
         handoffReconciliation: HandoffWitness? = null,
     ) {
+        // Leadership precedes registration checks, state imports and directives.
+        if (reconcileCachedLeadership(view)) return
         if (registration) {
             ownRegistration = view.registration?.devices?.singleOrNull { it.deviceId == view.deviceId }
             require(view.registration == null || ownRegistration?.receiverId == registrationReceiverId)
@@ -1267,6 +1394,8 @@ class PlaybackCoordinator(
         val id = if (registration) view.deviceId else state.value.deviceId
         require(validPlaybackProtocolId(id) && view.devices.any { it.deviceId == id })
         val previous = state.value.view
+        val lostLead = previous?.leadership?.names(id) == true && view.leadership?.names(id) != true
+        if (lostLead) fenceLocal()
         val changed = view.epoch != epoch
         val ownerChanged = previous?.activeDeviceId != view.activeDeviceId
         if (registration || changed || ownerChanged) retainedPreparedEpoch = 0L
@@ -1373,26 +1502,18 @@ class PlaybackCoordinator(
         if (terminal) finishCommandResult(completedCommand, outcome?.status ?: "cancelled",
             view.queueIntents?.results?.find { it.commandId == completedCommand }?.result)
         leaseTimer?.cancel()
-        val feedbackAtLease = selectionFeedback?.presentation?.token
-        if (grantAuthority && view.activeDeviceId == id) leaseTimer = work.launch {
-            while (clockMs() < leaseDeadline) delay((leaseDeadline - clockMs()).coerceAtLeast(1))
-            if (epoch == view.epoch && state.value.activeDeviceId == id) {
-                uncertainConnection = true
-                fenceLocal()
-                clearSelectionFeedback(feedbackAtLease)
-                mutableState.value = state.value.copy(connected = false, recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED,
-                    message = "Playback permission expired. Reconnect and press Play explicitly.",
-                    messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
-            }
-        }
+        if (grantAuthority && view.activeDeviceId == id) scheduleLeaseExpiry(view, id)
         // A non-directive recovery NEVER imports playing state. It stays silent until explicit Play.
         if (previous != null && changed && view.directives.none { it.type == "activate" }) recoverPaused = true
         val directiveRevision = actionVersion
         val closeVersion = finalCloseVersion
         if (grantAuthority) for (directive in view.directives) {
-            runDirective(directive, startsAllowed && directiveRevision == actionVersion)
+            runDirective(directive, startsAllowed && !lostLead &&
+                (view.leadership == null || view.leadership.names(id)) && directiveRevision == actionVersion)
             if (closeVersion != finalCloseVersion) return // Never execute directives after a final close.
         }
+        // Arm while the lease is still valid so cache reads cannot race the deadline timer.
+        if (currentAuthority()?.isValid() == true) armCachedPlayback()
         playAdmission?.let { pending ->
             if (pending.claimEpoch != null && pending.activationAckSent &&
                 view.commands.any { it.commandId == pending.id && it.status == "ok" } &&
@@ -1402,6 +1523,23 @@ class PlaybackCoordinator(
                 admissionCurrent(pending)) pending.accepted.complete(true)
         }
     }
+    private fun scheduleLeaseExpiry(view: PlaybackDevicesView, id: String) {
+        leaseTimer?.cancel()
+        val feedbackAtLease = selectionFeedback?.presentation?.token
+        leaseTimer = work.launch {
+            while (clockMs() < leaseDeadline) delay((leaseDeadline - clockMs()).coerceAtLeast(1))
+            if (epoch == view.epoch && state.value.activeDeviceId == id) {
+                uncertainConnection = true
+                if (retainCachedPlayback()) return@launch
+                fenceLocal()
+                clearSelectionFeedback(feedbackAtLease)
+                mutableState.value = state.value.copy(connected = false, recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED,
+                    message = "Playback permission expired. Reconnect and press Play explicitly.",
+                    messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
+            }
+        }
+    }
+
     private fun authorizedFor(id: String, view: PlaybackDevicesView) = view.activeDeviceId == id && !released && clockMs() < leaseDeadline && activatedEpoch == view.epoch
 
     private suspend fun runDirective(d: PlaybackDirective, startsAllowed: Boolean) {
@@ -1622,6 +1760,15 @@ class PlaybackCoordinator(
         catch (error: Exception) { if (life == lifecycle && !closed && serviceActive) failed(error, feedbackAtDispatch, missingSelf) }
     }
     private suspend fun failed(error: Exception, feedbackAtDispatch: Long?, missingSelf: Boolean = true) {
+        if (error is ApiException && error.status == 401) { authLost(); return }
+        // Network uncertainty is not authenticated revocation. Expired registration is
+        // reconciled through leadership-only GET, never by replaying the failed request.
+        val uncertain = error is java.io.IOException || error is TimeoutCancellationException ||
+            error is ApiException && (error.status >= 500 || error.status == 404)
+        if (uncertain && retainCachedPlayback()) {
+            clearSelectionFeedback(feedbackAtDispatch)
+            return
+        }
         // Remember only a previously activated same-epoch output, never an initial display.
         // This cannot authorize output or replay work; lifecycle/owner/epoch/selection retire it.
         val retained = if (state.value.deviceId.isNotEmpty() && state.value.activeDeviceId == state.value.deviceId &&

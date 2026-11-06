@@ -32,7 +32,7 @@ internal class PlaybackProgress(private val thresholdMs: Long = 1_000) {
      * Imported progress is credit toward the threshold, never itself permission to report:
      * paused samples, the initial anchor and seeks must not emit a transferred history event.
      */
-    fun sample(positionMs: Long, realtimeMs: Long, isPlaying: Boolean, speed: Float = 1f): Boolean {
+    fun sample(positionMs: Long, realtimeMs: Long, isPlaying: Boolean, speed: Float = 1f, allowReport: Boolean = true): Boolean {
         val previous = position
         var addedMs = 0L
         if (!recorded && previous != null && wasPlaying && isPlaying) {
@@ -47,7 +47,7 @@ internal class PlaybackProgress(private val thresholdMs: Long = 1_000) {
         position = positionMs
         realtime = realtimeMs
         wasPlaying = isPlaying
-        if (!recorded && addedMs > 0 && accumulatedMs >= thresholdMs) {
+        if (allowReport && !recorded && addedMs > 0 && accumulatedMs >= thresholdMs) {
             recorded = true
             return true
         }

@@ -10,6 +10,15 @@ import dev.spofify.mobile.feature.devices.PlaybackEndpointResult
 
 /** Same-process bridge to the single service output. Preparation is a pure exact-import plan. */
 class Media3PlaybackEndpoint : NativePlaybackEndpoint {
+    override fun retainCachedOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Boolean {
+        checkMain()
+        return PlaybackService.retainCachedOutput(permission)
+    }
+    override fun renewContinuingOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission,
+        authority: PlaybackAuthority): Boolean {
+        checkMain()
+        return PlaybackService.renewContinuingOutput(permission, authority)
+    }
     override val supportsExactHandoff: Boolean = true
     override val supportsQueueIntents: Boolean = true
 
