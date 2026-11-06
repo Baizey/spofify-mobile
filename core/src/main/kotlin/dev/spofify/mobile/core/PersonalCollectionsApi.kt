@@ -14,7 +14,16 @@ import kotlinx.serialization.json.putJsonArray
 enum class PlaylistKind { @SerialName("manual") MANUAL, @SerialName("derived") DERIVED }
 
 @Serializable
-enum class PlaylistCountState { @SerialName("exact") EXACT, @SerialName("unevaluated") UNEVALUATED }
+enum class PlaylistCountState {
+    @SerialName("exact") EXACT, @SerialName("unevaluated") UNEVALUATED,
+    @SerialName("pending") PENDING, @SerialName("stale") STALE,
+}
+
+@Serializable
+enum class PlaylistEvaluationState {
+    @SerialName("ready") READY, @SerialName("pending") PENDING,
+    @SerialName("stale") STALE, @SerialName("error") ERROR,
+}
 
 @Serializable
 data class PlaylistCapabilities(
@@ -27,7 +36,7 @@ data class PlaylistCapabilities(
     val addTracks: Boolean = true,
 )
 
-/** Unevaluated rules never masquerade as an empty manual playlist. */
+/** Maintained counts are display data, never signed playback/copy authority. */
 @Serializable
 data class PersonalPlaylistSummary(
     val id: String,
@@ -41,13 +50,28 @@ data class PersonalPlaylistSummary(
     val revision: Long,
     val createdAt: String = "",
     val updatedAt: String = "",
+    val evaluationState: PlaylistEvaluationState? = null,
+    val evaluationErrorCode: String? = null,
 ) {
     init {
         require(revision > 0)
         when (kind) {
             PlaylistKind.MANUAL -> require(countState == PlaylistCountState.EXACT && trackCount != null &&
                 availableCount != null && trackCount >= 0 && availableCount in 0..trackCount)
-            PlaylistKind.DERIVED -> require(countState == PlaylistCountState.UNEVALUATED && trackCount == null && availableCount == null)
+            PlaylistKind.DERIVED -> {
+                val hasCounts = trackCount != null && availableCount != null
+                require((trackCount == null) == (availableCount == null))
+                if (hasCounts) {
+                    val total = requireNotNull(trackCount)
+                    require(total >= 0 && requireNotNull(availableCount) in 0..total)
+                }
+                when (evaluationState) {
+                    PlaylistEvaluationState.READY -> require(countState == PlaylistCountState.EXACT && hasCounts)
+                    PlaylistEvaluationState.PENDING, PlaylistEvaluationState.STALE, PlaylistEvaluationState.ERROR ->
+                        require(if (hasCounts) countState == PlaylistCountState.STALE else countState == PlaylistCountState.PENDING)
+                    null -> require(countState == PlaylistCountState.UNEVALUATED && !hasCounts) // Legacy server.
+                }
+            }
         }
     }
 }

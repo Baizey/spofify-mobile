@@ -47,6 +47,8 @@ internal fun PlaylistEditor(
     var pageIndex by remember { mutableIntStateOf(0) }
     var job by remember { mutableStateOf<Job?>(null) }
     val generation = remember { PlaylistRequestGeneration() }
+    var previewSource by remember { mutableStateOf<PlaylistSourceStamp?>(null) }
+    val personal = client.personalRevision.collectAsState().value
     val metadataError = playlistMetadataError(draft.name, draft.description)
     val rulesError = if (draft.derived) recipeValidationError(draft.rules) else null
     BackHandler { if (!saving) onBack() }
@@ -57,28 +59,36 @@ internal fun PlaylistEditor(
         catch (_: Exception) { sourceFailed = true }
     }
     fun invalidatePreview() {
-        generation.invalidate(); job?.cancel(); job = null
+        generation.invalidate(); job?.cancel(); job = null; previewSource = null
         previewPending = false; previewStale = true; cursors = listOf(null); pageIndex = 0
         previewMessage = "Not current — rules changed. Your draft is retained. Refresh preview explicitly."
     }
+    LaunchedEffect(personal.likes, personal.playlists) {
+        // Observe confirmed rule inputs without automatically evaluating an unsaved draft.
+        if (previewSource?.isCurrent() == false) invalidatePreview()
+    }
     fun loadPreview(index: Int) {
         if (previewPending || saving || draft.blocked || rulesError != null) return
+        if (index > 0 && previewSource?.isCurrent() != true) { invalidatePreview(); return }
         val candidate = draft.rules
+        val source = PlaylistSourceStamp(client)
+        previewSource = source
         val ticket = generation.invalidate()
         previewPending = true; previewStale = true
         previewMessage = "Evaluating the complete result… Previous rows are not current."
         val cursor = if (index == 0) null else cursors[index]
         job = scope.launch {
             try {
+                if (!source.isCurrent()) return@launch
                 val result = derived.preview(candidate, target?.id, target?.revision, limit = 40, cursor = cursor)
-                if (generation.accepts(ticket)) {
+                if (generation.accepts(ticket) && source.isCurrent()) {
                     preview = result; previewStale = false; pageIndex = index
                     cursors = cursors.take(index + 1) + listOfNotNull(result.nextCursor)
-                    previewMessage = "${result.total} matches · ${result.availableTotal} with recorded audio. Complete result evaluated; ${result.items.size} shown. Save, then explicitly evaluate the saved playlist before playing or copying."
+                    previewMessage = "${result.total} matches · ${result.availableTotal} with recorded audio. Complete result evaluated; ${result.items.size} shown. Save to use this playlist. Saved contents update automatically."
                 }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
-                if (generation.accepts(ticket)) {
+                if (generation.accepts(ticket) && source.isCurrent()) {
                     previewStale = true
                     previewMessage = if (e is ApiException && e.status == 409) "Inputs changed or this preview expired. Draft retained; refresh preview explicitly."
                     else "Preview could not finish. No partial result is current. Your draft is retained; refresh explicitly."

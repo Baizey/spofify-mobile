@@ -39,13 +39,14 @@ import kotlinx.coroutines.launch
 typealias PlaylistQueueIntent = (QueueIntentSelection, PlaybackListAction, PlaybackInteractionKey?, QueueIntentBinding?, () -> Boolean) -> Unit
 
 /** Capture at the Play tap, before launching/fetching; a late queue is never a fresh intent. */
-internal class PlaylistPlaybackRequest(private val generation: PlaylistRequestGeneration) {
+internal class PlaylistPlaybackRequest(private val generation: PlaylistRequestGeneration,
+    private val sourceCurrent: () -> Boolean = { true }) {
     private val ticket = generation.invalidate()
     private val playbackEpoch = PlaybackRequests.epoch
 
     /** Success/error publication and queue delivery are synchronous on the Compose main coroutine. */
     fun deliver(action: () -> Unit) {
-        if (generation.accepts(ticket) && playbackEpoch == PlaybackRequests.epoch) action()
+        if (generation.accepts(ticket) && playbackEpoch == PlaybackRequests.epoch && sourceCurrent()) action()
     }
 
     /** Cancellation must still clear busy, but never clear a newer request's busy state. */
@@ -92,11 +93,16 @@ fun PlaylistsRoute(
         var message by remember { mutableStateOf<String?>(null) }
         val api = remember(client) { PersonalCollectionsApi(client) }
         val listState = rememberLazyListState()
-        LaunchedEffect(client, offset, refresh) {
+        val personal = client.personalRevision.collectAsState().value
+        LaunchedEffect(client, offset, refresh, personal.playlists, personal.likes) {
+            val source = PlaylistSourceStamp(client)
             loading = true
-            try { page = api.playlists(limit = 40, offset = offset); message = null }
+            try {
+                val result = api.playlists(limit = 40, offset = offset)
+                if (source.isCurrent()) { page = result; message = null }
+            }
             catch (e: CancellationException) { throw e }
-            catch (_: Exception) { message = "Playlists could not load. Refresh explicitly to try again." }
+            catch (_: Exception) { if (source.isCurrent()) message = "Playlists could not load. Refresh explicitly to try again." }
             finally { loading = false }
         }
         when {
@@ -142,7 +148,7 @@ private fun PlaylistCard(playlist: PersonalPlaylistSummary, onClick: () -> Unit)
                 modifier = Modifier.background(MaterialTheme.colorScheme.secondaryContainer).padding(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(playlist.name, style = MaterialTheme.typography.titleLarge)
-                Text(if (playlist.kind == PlaylistKind.DERIVED) "Rules · not evaluated" else "${playlist.trackCount} tracks · ${playlist.availableCount} with audio")
+                Text(playlistCountLabel(playlist))
                 if (playlist.description.isNotBlank()) Text(playlist.description, maxLines = 3)
             }
         }
@@ -157,7 +163,7 @@ private fun playlistFailure(error: Exception, mutation: Boolean = false): String
     error is ApiException && error.code == "RECIPE_LIMIT_EXCEEDED" -> "The recipe exceeds supported graph or condition limits. Simplify it."
     error is ApiException && error.code == "OCCURRENCE_UNAVAILABLE" -> "This occurrence has no recorded audio. No queue was replaced."
     error is ApiException && error.status == 409 -> "The playlist or its inputs changed. Refresh and review before trying again. Nothing was resubmitted."
-    error is ApiException && error.status == 429 -> "Evaluation is busy. Refresh explicitly in a moment."
+    error is ApiException && error.status == 429 -> "Playlist is updating. Try again in a moment."
     error is ApiException && error.status == 422 -> "The request could not be accepted. Check the rules and limits. Copies require at most 1,000 complete occurrences; referenced playlists cannot be deleted."
     error is ApiException && error.status == 404 -> "This playlist or a referenced collection is unavailable."
     mutation && playlistWriteUncertain(error) -> "The response was lost. This change may already be saved. Verify saved playlists before making another change; nothing was resubmitted."
@@ -178,12 +184,17 @@ private fun PlaylistDetail(
     val derived = remember(client) { DerivedPlaylistsApi(client) }
     val scope = rememberCoroutineScope()
     val generation = remember(id) { PlaylistRequestGeneration() }
+    val preparationGeneration = remember(id) { PlaylistRequestGeneration() }
+    val personal = client.personalRevision.collectAsState().value
+    var readSource by remember(id) { mutableStateOf<PlaylistSourceStamp?>(null) }
     var summary by remember(id) { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var entries by remember(id) { mutableStateOf<PersonalEntriesPage?>(null) }
     var evaluation by remember(id) { mutableStateOf<DerivedEvaluationPage?>(null) }
-    var cursorStack by remember(id) { mutableStateOf(listOf<String?>(null)) }
-    var pageIndex by remember(id) { mutableIntStateOf(0) }
-    var offset by remember(id) { mutableIntStateOf(0) }
+    var displayedDerivedRows by remember(id) { mutableStateOf<List<DerivedEvaluationEntry>>(emptyList()) }
+    // Confirmed mutations restart browsing, not evaluation. Retain the displayed rows meanwhile.
+    var cursorStack by remember(id, personal.playlists, personal.likes) { mutableStateOf(listOf<String?>(null)) }
+    var pageIndex by remember(id, personal.playlists, personal.likes) { mutableIntStateOf(0) }
+    var offset by remember(id, personal.playlists, personal.likes) { mutableIntStateOf(0) }
     var refresh by remember(id) { mutableIntStateOf(0) }
     var busy by remember(id) { mutableStateOf(false) }
     var mutating by remember(id) { mutableStateOf(false) }
@@ -202,6 +213,7 @@ private fun PlaylistDetail(
     var addingTrack by remember(id) { mutableStateOf<LibraryItem?>(null) }
     var editing by remember(id) { mutableStateOf(false) }
     var copying by remember(id) { mutableStateOf(false) }
+    var copySource by remember(id) { mutableStateOf<PlaylistCopySource?>(null) }
     var copyNeedsReview by remember(id) { mutableStateOf(false) }
     var copyReviewed by remember(id) { mutableStateOf(false) }
     var copyReviewMessage by remember(id) { mutableStateOf<String?>(null) }
@@ -211,7 +223,7 @@ private fun PlaylistDetail(
     var ordered by remember(id) { mutableStateOf<List<PersonalPlaylistEntry>>(emptyList()) }
     val listState = rememberLazyListState()
 
-    fun refreshAll() { generation.invalidate(); stale = true; snapshot = null; offset = 0; pageIndex = 0; cursorStack = listOf(null); refresh++ }
+    fun refreshAll() { generation.invalidate(); stale = true; blocked = false; snapshot = null; offset = 0; pageIndex = 0; cursorStack = listOf(null); refresh++ }
     fun write(onFailure: ((Exception) -> Unit)? = null, action: suspend () -> Unit) {
         if (busy || blocked) return
         generation.invalidate(); busy = true; mutating = true; stale = true; onMutationPendingChange(true)
@@ -222,20 +234,29 @@ private fun PlaylistDetail(
             finally { busy = false; mutating = false; onMutationPendingChange(false) }
         }
     }
-    LaunchedEffect(id, offset, pageIndex, refresh) {
+    LaunchedEffect(id, offset, pageIndex, refresh, personal.playlists, personal.likes) {
         val ticket = generation.invalidate()
+        val source = PlaylistSourceStamp(client)
+        fun current() = generation.accepts(ticket) && source.isCurrent() && actionLifetime.isCurrent()
         busy = true; stale = true
         try {
             val saved = api.playlist(id)
-            if (generation.accepts(ticket)) summary = saved
+            if (!current()) return@LaunchedEffect
             val manual = if (saved.kind == PlaylistKind.MANUAL) api.entries(id, limit = 40, offset = offset) else null
-            val result = if (saved.kind == PlaylistKind.DERIVED) derived.evaluate(id, limit = 40, cursor = cursorStack[pageIndex]) else null
+            val result = if (saved.kind == PlaylistKind.DERIVED) derived.entries(id, limit = 40, cursor = cursorStack[pageIndex]) else null
             if (result != null && result.revision != saved.revision) throw ApiException(409, "Refresh the changed playlist")
-            if (generation.accepts(ticket)) {
-                summary = saved; entries = manual; evaluation = result; stale = false; blocked = false; message = null
+            if (current()) {
+                readSource = source
+                summary = saved; entries = manual; evaluation = result
+                if (result != null) {
+                    displayedDerivedRows = if (result.current || result.items.isNotEmpty()) result.items
+                        else displayedDerivedRows.map { it.copy(selectionToken = null) }
+                }
+                stale = result?.current == false
+                if (!blocked) message = null
             }
         } catch (e: CancellationException) { throw e }
-        catch (e: Exception) { if (generation.accepts(ticket)) { message = playlistFailure(e); stale = true } }
+        catch (e: Exception) { if (current()) { message = playlistFailure(e); stale = true } }
         finally { if (generation.accepts(ticket)) busy = false }
     }
     BackHandler {
@@ -244,11 +265,14 @@ private fun PlaylistDetail(
     val saved = summary
     fun captureCurrent(rowCurrent: () -> Boolean = { true }): () -> Boolean {
         val ticket = generation.ticket()
-        return { rowCurrent() && actionLifetime.isCurrent() && generation.accepts(ticket) }
+        val source = readSource
+        return { rowCurrent() && actionLifetime.isCurrent() && generation.accepts(ticket) && source?.isCurrent() == true }
     }
     fun exactSelection(track: LibraryItem? = null, occurrenceId: String? = null,
         token: String? = null, entryId: String? = null): QueueIntentSelection? {
         val current = saved ?: return null
+        if (stale || readSource?.isCurrent() != true || track?.playable == false ||
+            current.kind == PlaylistKind.DERIVED && evaluation?.current != true) return null
         val context = PlaybackContext(if (current.kind == PlaylistKind.DERIVED) "derived" else "playlist",
             id, current.name, current.revision, if (current.kind == PlaylistKind.DERIVED) evaluation?.fence ?: return null else "")
         return if (track == null) QueueIntentSelection.Collection(context)
@@ -258,23 +282,24 @@ private fun PlaylistDetail(
         key: PlaybackInteractionKey? = playback.interactionKey, binding: QueueIntentBinding? = playback.queueIntentBinding,
         current: () -> Boolean = actionLifetime::isCurrent,
         origin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null) {
-        if (selection == null || busy || stale || !current() || !actionLifetime.isCurrent()) return
+        if (selection == null || busy || stale || readSource?.isCurrent() != true || !current() || !actionLifetime.isCurrent()) return
         if (key != null && latestInteractionKey !== key) return
         val epoch = PlaybackRequests.epoch
         val revision = saved?.revision
         val sourceTicket = generation.ticket()
+        val source = readSource
         val live = {
-            current() && actionLifetime.isCurrent() && generation.accepts(sourceTicket) &&
+            current() && source?.isCurrent() == true && actionLifetime.isCurrent() && generation.accepts(sourceTicket) &&
                 epoch == PlaybackRequests.epoch && !stale && summary?.revision == revision
         }
         if (action == PlaybackListAction.QUEUE_HIGH && origin != null) onUnselectedHigh?.invoke(selection, origin, live)
         else onQueueIntent?.invoke(selection, action, key, binding, live)
     }
     addingTrack?.let { track -> AddToPlaylistSheet(client, track, onDismiss = {
-        addingTrack = null; stale = true; generation.invalidate()
+        addingTrack = null
     }) }
     if (editing && saved != null && editorDraft != null) {
-        PlaylistEditor(client, editorTarget ?: saved, editorDraft!!, onBack = { editing = false; stale = true; generation.invalidate() }, onSaved = {
+        PlaylistEditor(client, editorTarget ?: saved, editorDraft!!, onBack = { editing = false }, onSaved = {
             editing = false; editorDraft = null; editorTarget = null; refreshAll()
         }, modifier = modifier, onDiscard = { editing = false; editorDraft = null; editorTarget = null; refreshAll() },
             onMutationPendingChange = onMutationPendingChange)
@@ -286,7 +311,8 @@ private fun PlaylistDetail(
             summary = api.updatePlaylist(id, name, description, saved.revision); metadata = false; refreshAll()
         } })
     if (copying && saved != null) PlaylistMetadataDialog("Make editable copy", "${saved.name} (copy)", saved.description,
-        busy = busy, blocked = blocked || copyNeedsReview, message = copyReviewMessage ?: message,
+        busy = busy, blocked = blocked || copyNeedsReview || copySource?.isCurrent?.invoke() != true,
+        message = copyReviewMessage ?: if (copySource?.isCurrent?.invoke() != true) "Playlist changed. Close and choose Make editable copy again after it is current." else message,
         explanation = "Copies the complete result, including unavailable tracks and duplicates (maximum 1,000), not just this page. Original rules stay unchanged.",
         onDismiss = { if (!busy) copying = false }, onVerify = {
             busy = true
@@ -300,11 +326,11 @@ private fun PlaylistDetail(
                 finally { busy = false }
             }
         }, onSave = { name, description ->
-            val result = evaluation
-            if (result != null && !stale && !copyNeedsReview) write(onFailure = { error ->
+            val captured = copySource
+            if (captured != null && captured.isCurrent() && !stale && !copyNeedsReview) write(onFailure = { error ->
                 if (playlistWriteUncertain(error)) { copyNeedsReview = true; copyReviewed = false }
             }) {
-                val copy = derived.copy(id, name, description, saved.revision, result.fence)
+                val copy = derived.copy(id, name, description, captured.revision, captured.fence)
                 copying = false; message = "Created editable playlist: ${copy.name}. Original rules are unchanged."; refreshAll()
             }
         })
@@ -320,17 +346,19 @@ private fun PlaylistDetail(
 
     fun play(selectionToken: String? = null, trackId: String? = null, entryId: String? = null,
         action: PlaybackListAction? = null, expectedKey: PlaybackInteractionKey? = null, isCurrent: () -> Boolean = { true }) {
-        if (busy || stale || saved == null || !isCurrent()) return
+        if (busy || stale || saved == null || readSource?.isCurrent() != true || !isCurrent()) return
         if (onQueueIntent != null) {
             val row = if (selectionToken != null) evaluation?.items?.firstOrNull { it.selectionToken == selectionToken } else null
             val manual = if (entryId != null) entries?.items?.firstOrNull { it.id == entryId } else null
+            if (selectionToken != null && row == null || entryId != null && manual == null) return
             submit(exactSelection(row?.track ?: manual?.track, row?.occurrenceId, row?.selectionToken, manual?.id),
                 action ?: PlaybackListAction.PLAY_NOW, expectedKey ?: playback.interactionKey, current = isCurrent)
             return
         }
         if (action != null && (onPreparedAction == null || expectedKey == null || latestInteractionKey !== expectedKey)) return
         val result = evaluation
-        val request = PlaylistPlaybackRequest(generation); busy = true
+        val sourceTicket = generation.ticket()
+        val request = PlaylistPlaybackRequest(preparationGeneration, captureCurrent(isCurrent)); busy = true
         scope.launch {
             try {
                 if (saved.kind == PlaylistKind.DERIVED && result != null) {
@@ -354,7 +382,7 @@ private fun PlaylistDetail(
                 }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { request.deliver { if (isCurrent()) { message = playlistFailure(e); stale = true } } }
-            finally { request.finish { busy = false } }
+            finally { request.finish { if (generation.accepts(sourceTicket)) busy = false } }
         }
     }
     occurrenceActions?.let { selection ->
@@ -372,7 +400,8 @@ private fun PlaylistDetail(
             onDismiss = { occurrenceActions = null },
             onOpen = { occurrenceActions = null; onOpenTrack(selection.track) },
             onAdd = { occurrenceActions = null; addingTrack = selection.track },
-            onPersonalChange = { stale = true; generation.invalidate() },
+            // Successful Like publishes personalRevision; the single bounded read above consumes it.
+            onPersonalChange = {},
             playbackEnabled = playable, contextualLabel = playback.contextualLabel,
             onPlayNow = { perform() },
             onContextual = if (preparedEnabled) ({ perform(PlaybackListAction.QUEUE_HIGH) }) else null,
@@ -402,8 +431,14 @@ private fun PlaylistDetail(
             Text(saved?.name ?: "Playlist", style = MaterialTheme.typography.headlineMedium)
             saved?.let {
                 Text(it.description)
-                Text(if (it.kind == PlaylistKind.DERIVED) "Rules playlist · live inputs" else "${it.trackCount} tracks · ${it.availableCount} with audio")
-                if (it.kind == PlaylistKind.DERIVED) Text(if (stale) "Result not current. Refresh explicitly before playing or copying." else "${evaluation?.total} matches · ${evaluation?.availableTotal} with audio. Complete result evaluated.")
+                Text(playlistCountLabel(it, evaluation))
+                if (it.kind == PlaylistKind.DERIVED) {
+                    Text("Songs are managed by rules. Edit the rules to change membership and order.")
+                    if (evaluation?.current == false && evaluation?.items.isNullOrEmpty() && displayedDerivedRows.isNotEmpty()) {
+                        Text("Previous songs are shown. Refresh to check current state.")
+                    }
+                    if (stale && evaluation?.current != false) Text(if (busy) "Updating playlist…" else "Playlist could not update. Previous songs are shown; try Refresh.")
+                }
                 Row {
                     if (it.capabilities.play) Button(onClick = { play() }, enabled = !busy && !stale) { Text("Play") }
                     if (it.capabilities.editMetadata) TextButton(onClick = { metadata = true }, enabled = !busy && !blocked) { Text("Edit details") }
@@ -412,10 +447,13 @@ private fun PlaylistDetail(
                 if (it.kind == PlaylistKind.DERIVED) {
                     Row {
                         if (it.capabilities.editDefinition) TextButton(enabled = !busy && !blocked, onClick = {
+                            val source = PlaylistSourceStamp(client)
+                            val ticket = generation.ticket()
                             busy = true
                             scope.launch {
                                 try {
                                     val rules = derived.definition(id)
+                                    if (!source.isCurrent() || !generation.accepts(ticket) || !actionLifetime.isCurrent()) return@launch
                                     if (rules.revision != it.revision) { stale = true; message = "Playlist changed. Refresh before editing rules." }
                                     else {
                                         if (editorDraft == null) { editorDraft = PlaylistEditorDraft(it, rules.definition); editorTarget = it }
@@ -423,14 +461,20 @@ private fun PlaylistDetail(
                                             editorDraft!!.blocked = true
                                             editorDraft!!.message = "The saved revision changed while this draft was retained. It has not been rebased or resubmitted. Discard the draft to reload current rules, or keep it for review."
                                         }
-                                        stale = true; generation.invalidate(); editing = true
+                                        editing = true
                                     }
                                 } catch (e: CancellationException) { throw e }
-                                catch (e: Exception) { message = playlistFailure(e) }
-                                finally { busy = false }
+                                catch (e: Exception) { if (source.isCurrent() && generation.accepts(ticket)) message = playlistFailure(e) }
+                                finally { if (generation.accepts(ticket)) busy = false }
                             }
                         }) { Text("Edit rules") }
-                        if (it.capabilities.copyToManual) TextButton(onClick = { copying = true; copyReviewMessage = null }, enabled = !busy && !stale && !blocked && !copyNeedsReview) { Text("Make editable copy") }
+                        if (it.capabilities.copyToManual) TextButton(onClick = {
+                            val result = evaluation
+                            if (result?.current == true) {
+                                copySource = PlaylistCopySource(it.revision, result.fence, captureCurrent())
+                                copying = true; copyReviewMessage = null
+                            }
+                        }, enabled = !busy && !stale && !blocked && !copyNeedsReview) { Text("Make editable copy") }
                     }
                     if (copyNeedsReview) {
                         Text("A previous copy may already exist. Refreshing the source cannot verify whether a copy was created.")
@@ -489,12 +533,13 @@ private fun PlaylistDetail(
                 }
             }
         } else if (saved?.kind == PlaylistKind.DERIVED) {
-            items(evaluation?.items.orEmpty(), key = { it.occurrenceId }) { entry ->
+            items(displayedDerivedRows, key = { it.occurrenceId }) { entry ->
+                val rowSource = captureCurrent()
                 PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entry.selectionToken, interactionKey = playback.interactionKey, isCurrent = captureCurrent(isCurrent),
                         queueSelection = exactSelection(track, entry.occurrenceId, entry.selectionToken), binding = playback.queueIntentBinding,
                         unselectedOrigin = playback.unselectedQueueOrigin) },
                     enabled = !busy && !stale && saved.capabilities.play && entry.selectionToken != null,
-                    onPlay = { play(selectionToken = entry.selectionToken) }, actionsEnabled = !busy,
+                    onPlay = { play(selectionToken = entry.selectionToken, isCurrent = rowSource) }, actionsEnabled = !busy,
                     playback = playback, occurrenceBinding = listOf(id, saved.revision, evaluation?.fence, entry),
                     currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.DERIVED, entry.occurrenceId,
                         entry.track.id, playback.trackId, playbackEntryId, playbackContext),
@@ -515,12 +560,13 @@ private fun PlaylistDetail(
             }
         } else {
             items(entries?.items.orEmpty(), key = { it.id }) { entry ->
+                val rowSource = captureCurrent()
                 Column {
                     PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entryId = entry.id, interactionKey = playback.interactionKey, isCurrent = captureCurrent(isCurrent),
                         queueSelection = exactSelection(track, entryId = entry.id), binding = playback.queueIntentBinding,
                         unselectedOrigin = playback.unselectedQueueOrigin) },
                         enabled = !busy && !stale && saved?.capabilities?.play == true,
-                        onPlay = { play(trackId = entry.track.id, entryId = entry.id) }, playback = playback,
+                        onPlay = { play(trackId = entry.track.id, entryId = entry.id, isCurrent = rowSource) }, playback = playback,
                         occurrenceBinding = listOf(id, saved?.revision, entry),
                         currentOccurrence = playlistOccurrenceIsCurrent(id, PlaylistKind.MANUAL, entry.id,
                             entry.track.id, playback.trackId, playbackEntryId, playbackContext),

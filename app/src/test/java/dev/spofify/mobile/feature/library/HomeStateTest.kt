@@ -67,6 +67,31 @@ class HomeStateTest {
         holder.setVisible(false)
     }
 
+    @Test fun likesFenceOldPlaylistCountsAndReturningHomePerformsOneBoundedRead() = runTest {
+        val old = PersonalPlaylistSummary("rules", "Old", trackCount = 1, availableCount = 1, revision = 1)
+        val latest = old.copy(name = "Latest", trackCount = 2, availableCount = 2)
+        val reader = Reader().apply {
+            recentResult.complete(emptyList()); likesResult.complete(1)
+            playlistsResult.complete(listOf(old))
+        }
+        val holder = HomeStateHolder(reader, backgroundScope)
+        holder.setVisible(true); runCurrent()
+        reader.playlistsResult = CompletableDeferred()
+        holder.invalidate("likes"); runCurrent()
+        assertEquals(2, reader.playlistCalls)
+        val staleRead = reader.playlistsResult
+        reader.playlistsResult = CompletableDeferred()
+        holder.invalidate("likes"); holder.invalidate("likes"); runCurrent()
+        staleRead.complete(listOf(old.copy(name = "Obsolete"))); runCurrent()
+        assertEquals("Old", holder.state.value.playlists.value?.single()?.name)
+        assertEquals(3, reader.playlistCalls) // One coalesced trailing read, not evaluation polling.
+        reader.playlistsResult.complete(listOf(latest)); runCurrent()
+        assertEquals("Latest", holder.state.value.playlists.value?.single()?.name)
+        holder.setVisible(false); holder.setVisible(true); runCurrent()
+        assertEquals(4, reader.playlistCalls)
+        holder.setVisible(false)
+    }
+
     @Test fun targetedInvalidationRetainsUsableContentAndQueuesOnlyOneTrailingRead() = runTest {
         val reader = Reader().apply {
             recentResult.complete(listOf(LibraryItem("track", "first", "First")))
