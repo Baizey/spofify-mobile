@@ -771,7 +771,8 @@ class PreparedTransportAppGraphTest {
                     assertEquals("unchanged", detail.playback); assertNull(detail.playbackKey)
                     assertEquals("Track queued", result.userMessage)
                     assertEquals("Old refusal cannot mask a fresh real ViewModel Queued receipt",
-                        result.userMessage, model.state.value.notice)
+                        "Track queued", model.state.value.feedback?.message)
+                    assertNull(model.state.value.notice)
                     val successor = PlaybackService.exportLocalSnapshot()
                     assertEquals(paused.queue, successor.queue.dropLast(1))
                     assertEquals(paused.position, successor.position); assertEquals(paused.elapsed, successor.elapsed, 0.0)
@@ -792,7 +793,8 @@ class PreparedTransportAppGraphTest {
                         Thread.sleep(5)
                         assertNotEquals(oldFeedback, PlaybackService.queueNotice())
                         assertNotEquals(oldFeedback, connected.state.value.notice)
-                        assertEquals(result.userMessage, model.state.value.notice)
+                        assertEquals("Track queued", model.state.value.feedback?.message)
+                        assertNull(model.state.value.notice)
                     }
                     return
                 }

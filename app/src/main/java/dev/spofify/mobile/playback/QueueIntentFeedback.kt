@@ -16,6 +16,26 @@ internal fun queueIntentActionResult(detail: QueueIntentResult?, action: Playbac
         else -> PlaybackActionStatus.UNAVAILABLE
     }, acceptedCount = detail?.acceptedCount ?: 0, queueIntentResult = detail, requestedAction = action)
 
+/** Queue acceptance is separate from playback start, including an initial queue that starts audio.
+ * A retained terminal receipt supplies the count; never sample the current player/queue. */
+internal fun queueAcceptanceMessage(result: PlaybackActionResult, action: PlaybackListAction?): String? {
+    if (action !in setOf(PlaybackListAction.ADD_TO_QUEUE, PlaybackListAction.PLAY_NEXT,
+            PlaybackListAction.QUEUE_LOW, PlaybackListAction.QUEUE_HIGH)) return null
+    val receipt = result.queueIntentResult
+    val count = if (receipt != null) {
+        // A committed queue mutation still succeeded when only playback was blocked or failed.
+        if (receipt.outcome !in setOf("playing", "queued", "limited", "blocked", "media") ||
+            receipt.commitRevision == null || receipt.placement == "none") return null
+        receipt.acceptedCount
+    } else {
+        // Legacy mutation results prove acceptance only for these terminal statuses.
+        if (result.status !in setOf(PlaybackActionStatus.ADDED, PlaybackActionStatus.LIMITED)) return null
+        result.acceptedCount
+    }
+    if (count <= 0) return null
+    return if (count == 1) "Track queued" else "$count tracks queued"
+}
+
 /** Safe static facts: even a real started key is not assumed to be the requested row/album.
  * Historical retained receipts must never be relabelled by looking up today's queue. */
 internal fun queueIntentMessage(result: QueueIntentResult, action: PlaybackListAction?): String {

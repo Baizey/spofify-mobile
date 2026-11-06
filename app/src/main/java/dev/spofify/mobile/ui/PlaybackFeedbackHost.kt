@@ -13,7 +13,6 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.playback.PlaybackFeedback
-import dev.spofify.mobile.playback.PlaybackFeedbackKind
 import dev.spofify.mobile.playback.nextPlaybackFeedback
 import kotlinx.coroutines.delay
 
@@ -35,9 +34,7 @@ internal class PlaybackFeedbackPresentation {
         current = nextPlaybackFeedback(current, event)
     }
     fun consume(id: Long) { if (current?.id == id) current = null }
-    fun discardSuccess() {
-        if (current?.kind == PlaybackFeedbackKind.SUCCESS) current = null
-    }
+    fun discardSuccess() { current = null }
 }
 
 @Composable
@@ -46,9 +43,7 @@ internal fun PlaybackFeedbackTimer(presentation: PlaybackFeedbackPresentation, v
     val event = presentation.current
     val accessibility = LocalAccessibilityManager.current
     val consume by rememberUpdatedState(onConsumed)
-    // An ordinary error/action snackbar has priority. Hidden time cannot consume an unread
-    // event; when revealed, it receives the full recommended readable duration. The owner
-    // retains only its current event (latest success, or protected guidance), never a backlog.
+    // One timer belongs to the presentation, not the root/expanded host mount.
     LaunchedEffect(event?.id, visible) {
         if (!visible) return@LaunchedEffect
         event ?: return@LaunchedEffect
@@ -69,18 +64,11 @@ internal fun PlaybackFeedbackHost(event: PlaybackFeedback?, modifier: Modifier =
     val status = Modifier.semantics { if (announce) liveRegion = LiveRegionMode.Polite }
     key(event.id) {
         Box(modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
-            if (event.kind == PlaybackFeedbackKind.SUCCESS) {
-                Surface(Modifier.widthIn(max = 320.dp).then(status),
-                    shape = RoundedCornerShape(12.dp), color = Color(0xFF1A211D).copy(alpha = .90f),
-                    contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 0.dp) {
-                    Text(event.message, Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        style = MaterialTheme.typography.bodyMedium)
-                }
-            } else {
-                // Recovery facts retain a readable timeout and a growing, opaque surface.
-                Snackbar(status) {
-                    Text(event.message, style = MaterialTheme.typography.bodyMedium)
-                }
+            Surface(Modifier.widthIn(max = 320.dp).then(status),
+                shape = RoundedCornerShape(12.dp), color = Color(0xFF1A211D).copy(alpha = .90f),
+                contentColor = Color.White, tonalElevation = 0.dp, shadowElevation = 0.dp) {
+                Text(event.message, Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.bodyMedium)
             }
         }
     }

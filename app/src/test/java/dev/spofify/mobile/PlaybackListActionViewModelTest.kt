@@ -140,7 +140,8 @@ class PlaybackListActionViewModelTest {
     @Test fun fourRawIntentsPreserveOriginalBindingAndDoNotPrepareOnController() = fixture { f ->
         for (action in listOf(PlaybackListAction.QUEUE_LOW, PlaybackListAction.QUEUE_HIGH,
             PlaybackListAction.PLAY_NEXT, PlaybackListAction.PLAY_NOW)) {
-            f.model.clearNotice(); val count = f.controls.pending.size + 1
+            f.model.clearNotice(); f.model.state.value.feedback?.let { f.model.consumeFeedback(it.id) }
+            val count = f.controls.pending.size + 1
             f.submit(action); until { f.controls.pending.size == count }
             val pending = f.controls.pending.last()
             assertEquals(action, pending.action); assertSame(f.controls.key, pending.key)
@@ -149,7 +150,9 @@ class PlaybackListActionViewModelTest {
             assertTrue(f.model.state.value.preparing); assertNull(f.model.state.value.notice)
             pending.complete(queueIntentActionResult(QueueIntentResult("queued", 1, 6, "high", "unchanged", null, ""), action))
             until { !f.model.state.value.preparing }
-            assertEquals(if (action == PlaybackListAction.PLAY_NOW) "Selection accepted" else "Track queued", f.model.state.value.notice)
+            assertNull(f.model.state.value.notice)
+            if (action == PlaybackListAction.PLAY_NOW) assertNull(f.model.state.value.feedback)
+            else assertEquals("Track queued", f.model.state.value.feedback?.message)
         }
         assertEquals(0, f.playbackReads.get())
     }
@@ -164,20 +167,24 @@ class PlaybackListActionViewModelTest {
         assertNotEquals(first.id, second.id)
         f.model.consumeFeedback(first.id)
         assertEquals(second.id, f.model.state.value.feedback?.id)
-        assertEquals("Track queued", f.model.state.value.notice)
+        assertEquals("Track queued", f.model.state.value.feedback?.message)
+        assertNull(f.model.state.value.notice)
         f.model.consumeFeedback(second.id)
         assertNull(f.model.state.value.feedback)
         assertNull(f.model.state.value.notice)
     }
 
-    @Test fun unreadGuidanceIsNotShortenedByLaterRoutineAcceptance() = fixture { f ->
-        f.submit(); runCurrent()
-        f.controls.pending.last().complete(PlaybackActionResult(PlaybackActionStatus.FULL)); runCurrent()
-        val guidance = requireNotNull(f.model.state.value.feedback)
+    @Test fun blockedAndGuidanceNeverCreateEventsAndQueueAcceptanceStillWorks() = fixture { f ->
+        for (status in listOf(PlaybackActionStatus.FULL, PlaybackActionStatus.BLOCKED,
+            PlaybackActionStatus.UNAVAILABLE, PlaybackActionStatus.UNSUPPORTED, PlaybackActionStatus.NO_OP)) {
+            f.submit(); runCurrent()
+            f.controls.pending.last().complete(PlaybackActionResult(status)); runCurrent()
+            assertNull("No popup for $status", f.model.state.value.feedback)
+        }
         f.submit(); runCurrent()
         f.controls.pending.last().complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1)); runCurrent()
-        assertEquals(guidance.id, f.model.state.value.feedback?.id)
-        assertEquals(guidance.message, f.model.state.value.notice)
+        assertEquals("Track queued", f.model.state.value.feedback?.message)
+        assertNull(f.model.state.value.notice)
     }
 
     @Test fun rowHighIsOneTrackButAlbumHighIsWholeBoundedContext() = fixture { f ->
@@ -229,7 +236,8 @@ class PlaybackListActionViewModelTest {
         runCurrent(); val pending = f.controls.pending.single()
         val result = QueueIntentResult("queued", 2, 6, "low", "unchanged", null, "")
         pending.complete(queueIntentActionResult(result, pending.action)); runCurrent()
-        assertEquals("2 tracks queued", f.model.state.value.notice)
+        assertEquals("2 tracks queued", f.model.state.value.feedback?.message)
+        assertNull(f.model.state.value.notice)
         assertFalse(f.controls.state.value.isPlaying)
         assertNull(result.playbackKey)
     }
@@ -244,8 +252,7 @@ class PlaybackListActionViewModelTest {
             val count = f.controls.pending.size
             pending.complete(result); runCurrent()
             assertEquals(count, f.controls.pending.size)
-            assertTrue(f.model.state.value.notice!!.contains("accepted"))
-            assertFalse(f.model.state.value.notice!!.contains("Playback started"))
+            assertNull("PlayNow never produces a popup, even with accepted music", f.model.state.value.feedback)
         }
     }
     @Test fun unknownControlsFailClosedInsteadOfLegacyFallback() = fixture { f ->
@@ -441,15 +448,16 @@ class PlaybackListActionViewModelTest {
             assertTrue(addition.dispatchIfCurrent())
             addition.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
             until { !f.model.state.value.preparing }
-            val acceptedNotice = f.model.state.value.notice
-            assertEquals("Track queued", acceptedNotice)
+            val acceptedFeedback = f.model.state.value.feedback
+            assertEquals("Track queued", acceptedFeedback?.message)
+            assertNull(f.model.state.value.notice)
             gate.release.countDown()
             assertTrue(gate.responded.await(5, TimeUnit.SECONDS))
             until { f.client.httpClient.dispatcher.runningCallsCount() == 0 }
             runCurrent()
             assertEquals("Late old Play must not replace accepted additions", 0, f.controls.replacementPlays)
             assertEquals(1, f.controls.pending.size + f.controls.preparedPending.size)
-            assertEquals(acceptedNotice, f.model.state.value.notice)
+            assertEquals(acceptedFeedback, f.model.state.value.feedback)
             assertFalse(f.model.state.value.preparing)
         }
     }
@@ -540,7 +548,8 @@ class PlaybackListActionViewModelTest {
             assertNull("Preparing/submitting a manual duplicate is not acceptance", f.model.state.value.notice)
             held.complete(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
             until { !f.model.state.value.preparing }
-            assertEquals("Track queued", f.model.state.value.notice)
+            assertEquals("Track queued", f.model.state.value.feedback?.message)
+            assertNull(f.model.state.value.notice)
         }
         assertEquals(0, f.playbackReads.get())
     }
@@ -556,7 +565,8 @@ class PlaybackListActionViewModelTest {
         assertNull(f.model.state.value.notice)
         val accepted = PlaybackActionResult(PlaybackActionStatus.LIMITED, 1)
         held.complete(accepted); until { !f.model.state.value.preparing }
-        assertEquals(accepted.userMessage, f.model.state.value.notice)
+        assertEquals("Track queued", f.model.state.value.feedback?.message)
+        assertNull(f.model.state.value.notice)
     }
     @Test fun rawHeldReceiverPreparationKeepsOriginalBindingAfterOutputReplacement() = fixture { f ->
         f.submit(); f.submit(item = f.row.copy(id = "Y")); runCurrent()
@@ -590,12 +600,21 @@ class PlaybackListActionViewModelTest {
     private fun allTypedResultsWaitForTerminalCallback(prepared: Boolean) = fixture { f ->
         for (status in PlaybackActionStatus.entries) {
             f.model.clearNotice()
+            f.model.state.value.feedback?.let { f.model.consumeFeedback(it.id) }
             val held = admit(f, prepared)
             assertTrue(held.dispatchIfCurrent()); assertTrue(f.model.state.value.preparing)
             assertNull("No optimistic acceptance for $status", f.model.state.value.notice)
             val result = PlaybackActionResult(status, if (status == PlaybackActionStatus.LIMITED) 1 else 0)
             held.complete(result); until { !f.model.state.value.preparing }
-            assertEquals(result.userMessage, f.model.state.value.notice)
+            if (status == PlaybackActionStatus.LIMITED) {
+                assertEquals("Track queued", f.model.state.value.feedback?.message)
+                assertNull(f.model.state.value.notice)
+            } else {
+                assertNull("No popup for $status", f.model.state.value.feedback)
+                if (status in setOf(PlaybackActionStatus.PLAYING, PlaybackActionStatus.ADDED))
+                    assertNull(f.model.state.value.notice)
+                else assertEquals(result.userMessage, f.model.state.value.notice)
+            }
         }
     }
     @Test fun everyRawTypedResultWaitsForTerminalCallback() = allTypedResultsWaitForTerminalCallback(false)

@@ -295,19 +295,62 @@ class CatalogMoreHostTest {
         compose.onNodeWithText("2 tracks queued").assertExists()
         compose.runOnIdle { assertFalse(controls.state.value.isPlaying) }
     }
-    @Test fun blockedAndMediaAndSupersededReceiptsKeepPositiveAcceptance() {
+    @Test fun playNowBlockedMediaAndSupersededReceiptsNeverCreatePopups() {
         for (playback in listOf("blocked", "media", "superseded")) {
             openMore(); val pending = choose("Play now")
             val receipt = QueueIntentResult(if (playback == "superseded") "queued" else playback, 2, 8,
                 "replace", playback, if (playback == "superseded") null else 22, "")
             compose.runOnIdle { pending.complete(queueIntentActionResult(receipt, pending.action)) }
-            await { model.state.value.notice?.contains("accepted") == true }
-            compose.runOnIdle {
-                assertFalse(model.state.value.notice!!.contains("Playing"))
-                assertFalse(model.state.value.notice!!.contains("Playback started"))
-            }
+            await { !model.state.value.preparing }
+            compose.runOnIdle { assertNull(model.state.value.feedback) }
+            compose.onNodeWithText(queueIntentActionResult(receipt, pending.action).userMessage).assertDoesNotExist()
         }
     }
+    @Test fun rootHasNoLegacyNoticeFallback() = queueOnlyFeedbackInWindow(false)
+    @Test fun expandedHasNoLegacyNoticeFallbackOrDuplicateHost() = queueOnlyFeedbackInWindow(true)
+
+    private fun queueOnlyFeedbackInWindow(expanded: Boolean) {
+        val item = LibraryItem("track", "song", "Synthetic song", hasAudio = true)
+        compose.runOnIdle { controls.state.value = controls.state.value.copy(item = item) }
+        if (expanded) {
+            compose.onNodeWithTag("mini-player-identity").performClick()
+            compose.onNodeWithTag("now-playing").assertExists()
+        }
+        // Ordinary transport never enters the list-action feedback channel.
+        if (expanded) compose.onNode(hasContentDescription("Play") and hasAnyAncestor(hasTestTag("now-playing"))).performClick()
+        else compose.onNodeWithContentDescription("Play").performClick()
+        compose.runOnIdle { assertNull(model.state.value.feedback); assertNull(controls.state.value.feedback) }
+        compose.onNodeWithText("Playing track").assertDoesNotExist()
+        fun complete(action: PlaybackListAction, result: PlaybackActionResult) {
+            val count = controls.pending.size + 1
+            compose.runOnIdle { model.queueIntentFrom(checkNotNull(graph.client), item, action) }
+            await { controls.pending.size == count }
+            compose.runOnIdle { controls.pending.last().complete(result) }
+            await { !model.state.value.preparing }
+        }
+        // These still carry contextual diagnostics, but must never be collected as snackbars.
+        for (status in listOf(PlaybackActionStatus.FULL, PlaybackActionStatus.BLOCKED,
+            PlaybackActionStatus.UNSUPPORTED, PlaybackActionStatus.UNAVAILABLE)) {
+            val result = PlaybackActionResult(status)
+            complete(PlaybackListAction.QUEUE_HIGH, result)
+            compose.runOnIdle {
+                assertEquals(result.userMessage, model.state.value.notice)
+                assertNull(model.state.value.feedback)
+            }
+            compose.onNodeWithText(result.userMessage).assertDoesNotExist()
+        }
+        for (effect in listOf("started", "resumed")) {
+            complete(PlaybackListAction.PLAY_NOW, queueIntentActionResult(
+                QueueIntentResult("playing", 2, 8, "replace", effect, 22, ""), PlaybackListAction.PLAY_NOW))
+            compose.runOnIdle { assertNull(model.state.value.feedback); assertNull(model.state.value.notice) }
+            compose.onNodeWithText("Playing · 2 tracks queued").assertDoesNotExist()
+        }
+        complete(PlaybackListAction.QUEUE_HIGH, queueIntentActionResult(
+            QueueIntentResult("playing", 1, 8, "high", "started", 22, ""), PlaybackListAction.QUEUE_HIGH))
+        compose.onAllNodesWithText("Track queued").assertCountEquals(1)
+        compose.runOnIdle { assertNull(model.state.value.notice) }
+    }
+
     @Test fun unsampledInnerRouteABAWhileMoreIsStillOpenCannotDispatchOrRebind() {
         compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song", "Synthetic song", hasAudio = true))) }
         openMore()

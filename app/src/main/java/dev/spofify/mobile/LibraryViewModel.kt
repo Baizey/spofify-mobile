@@ -21,6 +21,7 @@ import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.playback.PlaybackListAction
 import dev.spofify.mobile.playback.PlaybackActionResult
 import dev.spofify.mobile.playback.PlaybackFeedback
+import dev.spofify.mobile.playback.PlaybackActionStatus
 import dev.spofify.mobile.playback.nextPlaybackFeedback
 import dev.spofify.mobile.playback.PlaybackListActionTickets
 import dev.spofify.mobile.feature.library.CatalogStateHolder
@@ -740,10 +741,14 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                         isCurrent = live, onResult = complete)
                 }
                 if (isCurrent() && feedbackRequest == actionFeedbackSerial) {
-                    val feedback = PlaybackFeedback.from(result, ::isCurrent)
+                    val feedback = PlaybackFeedback.from(result, ::isCurrent, action)
                     mutable.update {
-                        val next = nextPlaybackFeedback(it.feedback, feedback)
-                        it.copy(notice = next.message, feedback = next)
+                        // Contextual diagnostics have no transient collector. Never persist success copy.
+                        val diagnostic = result.userMessage.takeUnless {
+                            feedback != null || result.status in setOf(
+                                PlaybackActionStatus.PLAYING, PlaybackActionStatus.ADDED, PlaybackActionStatus.LIMITED)
+                        }
+                        it.copy(notice = diagnostic, feedback = nextPlaybackFeedback(it.feedback, feedback))
                     }
                 }
             } catch (error: Exception) {
@@ -841,8 +846,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     /** A completed timer must never consume a newer identical action. */
     fun consumeFeedback(id: Long) {
         mutable.update { state ->
-            if (state.feedback?.id != id) state else state.copy(feedback = null,
-                notice = state.notice.takeUnless { it == state.feedback.message })
+            if (state.feedback?.id != id) state else state.copy(feedback = null)
         }
     }
 

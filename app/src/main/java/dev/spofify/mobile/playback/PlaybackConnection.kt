@@ -507,10 +507,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         val feedbackRequest = ++feedbackRequestSerial
         queueIntent(QueueIntentSelection.Occurrence(key), client, action, expectedKey, binding, isCurrent) { result ->
             if (isCurrent() && feedbackRequest == feedbackRequestSerial) {
-                val incoming = PlaybackFeedback.from(result, isCurrent)
-                val next = nextPlaybackFeedback(actionNotice, incoming)
-                if (next === incoming) actionNoticeIsCurrent = isCurrent
-                actionNotice = next
+                val incoming = PlaybackFeedback.from(result, isCurrent, action)
+                if (incoming != null) {
+                    actionNoticeIsCurrent = isCurrent
+                    actionNotice = incoming
+                }
                 publish(refreshQueue = true)
             }
             onResult(result)
@@ -556,7 +557,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                 if (valid && publishNotice && feedbackRequest == feedbackRequestSerial) {
                     val incoming = PlaybackFeedback.from(actual, ::authorityCurrent)
                     val next = nextPlaybackFeedback(actionNotice, incoming)
-                    if (next === incoming) actionNoticeIsCurrent = ::authorityCurrent
+                    if (incoming != null) actionNoticeIsCurrent = ::authorityCurrent
                     actionNotice = next
                     publish(refreshQueue = true)
                 }

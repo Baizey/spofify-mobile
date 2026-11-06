@@ -3,12 +3,8 @@ package dev.spofify.mobile.ui
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.SnackbarDuration
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.AccessibilityManager
 import androidx.compose.ui.platform.LocalAccessibilityManager
@@ -24,9 +20,8 @@ import dev.spofify.mobile.listeningColorScheme
 import dev.spofify.mobile.playback.PlaybackActionResult
 import dev.spofify.mobile.playback.PlaybackActionStatus
 import dev.spofify.mobile.playback.PlaybackFeedback
+import dev.spofify.mobile.playback.PlaybackListAction
 import dev.spofify.mobile.ui.theme.AppTypography
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.launch
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -38,7 +33,8 @@ import org.robolectric.annotation.Config
 @Config(sdk = [35], qualifiers = "w320dp-h640dp-xhdpi")
 class PlaybackFeedbackHostTest {
     @get:Rule val compose = createComposeRule()
-    private fun success() = PlaybackFeedback.from(PlaybackActionResult(PlaybackActionStatus.ADDED, 1))
+    private fun success() = requireNotNull(PlaybackFeedback.from(
+        PlaybackActionResult(PlaybackActionStatus.ADDED, 1), action = PlaybackListAction.QUEUE_HIGH))
 
     @Test fun baseTimeoutAndIdenticalReplacementCannotBeClearedByOldTimer() {
         compose.mainClock.autoAdvance = false
@@ -68,7 +64,7 @@ class PlaybackFeedbackHostTest {
         }
     }
 
-    @Test fun accessibilityExtensionUsesTruthfulFlagsAndGuidanceKeepsLongPolicy() {
+    @Test fun accessibilityExtensionUsesTruthfulFlags() {
         compose.mainClock.autoAdvance = false
         val presentation = PlaybackFeedbackPresentation()
         val calls = mutableListOf<Long>()
@@ -93,10 +89,6 @@ class PlaybackFeedbackHostTest {
         compose.runOnIdle { assertNotNull(presentation.current); assertEquals(listOf(1500L), calls) }
         compose.mainClock.advanceTimeBy(1600)
         compose.runOnIdle { assertNull(presentation.current) }
-        val guidance = PlaybackFeedback.guidance("Choose a device and retry explicitly.")
-        compose.runOnIdle { presentation.offer(guidance); presentation.offer(success()) }
-        compose.mainClock.advanceTimeBy(3100)
-        compose.runOnIdle { assertEquals(guidance.id, presentation.current?.id); assertEquals(10000L, calls.last()) }
     }
 
     @Test fun windowRemountDoesNotRestartTimerOrRepeatAnnouncementAndLargeTextGrows() {
@@ -130,68 +122,32 @@ class PlaybackFeedbackHostTest {
         compose.runOnIdle { assertNull(presentation.current) }
     }
 
-    @Test fun rootSuccessWaitsForBusySnackbarAndKeepsOnlyLatest() = busySnackbarCase(false, false)
-    @Test fun expandedSuccessWaitsForBusySnackbarAndKeepsOnlyLatest() = busySnackbarCase(true, false)
-    @Test fun rootGuidanceReceivesVisibleLongDurationAfterBusySnackbar() = busySnackbarCase(false, true)
-    @Test fun expandedGuidanceReceivesVisibleLongDurationAfterBusySnackbar() = busySnackbarCase(true, true)
+    @Test fun rootShowsOnlyQueueAcceptance() = queueOnlyWindow(false)
+    @Test fun expandedShowsOnlyQueueAcceptance() = queueOnlyWindow(true)
 
-    private fun busySnackbarCase(expanded: Boolean, guidance: Boolean) {
-        compose.mainClock.autoAdvance = false
+    private fun queueOnlyWindow(expanded: Boolean) {
         val presentation = PlaybackFeedbackPresentation()
-        val snackbar = SnackbarHostState()
-        lateinit var scope: CoroutineScope
-        val consumed = mutableListOf<Long>()
         val windowTag = if (expanded) "expanded-feedback-window" else "root-feedback-window"
         compose.setContent {
-            scope = rememberCoroutineScope()
-            CompositionLocalProvider(LocalAccessibilityManager provides null) {
-                PlaybackFeedbackTimer(presentation, visible = snackbar.currentSnackbarData == null) {
-                    consumed.add(it)
-                }
-                // Same priority and single visible-window routing as SpofifyApp.
-                if (expanded) {
-                    Box(Modifier.testTag("expanded-feedback-window")) {
-                        if (snackbar.currentSnackbarData != null) SnackbarHost(snackbar)
-                        else PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
-                    }
-                } else {
-                    Box(Modifier.testTag("root-feedback-window")) {
-                        if (snackbar.currentSnackbarData != null) SnackbarHost(snackbar)
-                        else PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
-                    }
-                }
+            Box(Modifier.testTag(windowTag)) {
+                PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
             }
         }
-        compose.runOnIdle {
-            scope.launch { snackbar.showSnackbar("Resolve this error first", duration = SnackbarDuration.Indefinite) }
+        // Silent outcomes cannot create a popup in either window.
+        for (status in PlaybackActionStatus.entries) {
+            compose.runOnIdle {
+                PlaybackFeedback.from(PlaybackActionResult(status), action = PlaybackListAction.PLAY_NOW)
+                    ?.let(presentation::offer)
+                PlaybackFeedback.from(PlaybackActionResult(status), action = PlaybackListAction.QUEUE_HIGH)
+                    ?.let(presentation::offer)
+            }
         }
-        compose.mainClock.advanceTimeByFrame()
-        val first = if (guidance) PlaybackFeedback.guidance("Choose an output and retry.") else success()
-        val latest = success()
-        compose.runOnIdle {
-            presentation.offer(first)
-            presentation.offer(latest)
-        }
-        val expected = if (guidance) first else latest
-        // Longer than both policies: a hidden event must not expire, announce or displace error.
-        compose.mainClock.advanceTimeBy(12_000)
-        compose.onNodeWithText("Resolve this error first").assertIsDisplayed()
-        compose.runOnIdle {
-            assertEquals(expected.id, presentation.current?.id)
-            assertTrue(consumed.isEmpty())
-            snackbar.currentSnackbarData!!.dismiss()
-        }
-        compose.mainClock.advanceTimeByFrame()
-        compose.mainClock.advanceTimeByFrame()
+        compose.runOnIdle { assertNull(presentation.current) }
+        compose.onNodeWithText("Playing track").assertDoesNotExist()
+        compose.onNodeWithText("Track queued").assertDoesNotExist()
+        compose.runOnIdle { presentation.offer(success()) }
         compose.onNodeWithTag(windowTag).assertIsDisplayed()
-        compose.onNodeWithText(expected.message).assertIsDisplayed()
-        compose.mainClock.advanceTimeBy(expected.baseTimeoutMillis - 100)
-        compose.runOnIdle { assertEquals(expected.id, presentation.current?.id) }
-        compose.mainClock.advanceTimeBy(200)
-        compose.runOnIdle {
-            assertNull(presentation.current)
-            assertEquals(listOf(expected.id), consumed)
-        }
+        compose.onNodeWithText("Track queued").assertIsDisplayed()
     }
 
     @Test fun discardedOrInvalidEventsDoNotResurface() {
@@ -201,7 +157,8 @@ class PlaybackFeedbackHostTest {
         presentation.discardSuccess()
         presentation.offer(event)
         assertNull(presentation.current)
-        val invalid = PlaybackFeedback.from(PlaybackActionResult(PlaybackActionStatus.PLAYING)) { false }
+        val invalid = requireNotNull(PlaybackFeedback.from(PlaybackActionResult(PlaybackActionStatus.ADDED, 1),
+            isCurrent = { false }, action = PlaybackListAction.QUEUE_HIGH))
         presentation.offer(invalid)
         assertNull(presentation.current)
     }

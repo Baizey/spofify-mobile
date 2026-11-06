@@ -164,7 +164,8 @@ class LibraryViewModelTest {
                     val result = PlaybackActionResult(PlaybackActionStatus.LIMITED, acceptedCount = 1)
                     playback.actionResults.removeFirst().invoke(result)
                     until { !model.state.value.preparing }
-                    assertEquals(result.userMessage, model.state.value.notice)
+                    assertEquals("Track queued", model.state.value.feedback?.message)
+                    assertNull(model.state.value.notice)
                 } else {
                     assertTrue(playback.listActions.isEmpty())
                     assertEquals("This queue is limited to 1,000 available songs.", model.state.value.notice)

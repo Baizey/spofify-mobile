@@ -101,11 +101,6 @@ internal fun SpofifyApp(model: LibraryViewModel) {
     val state by model.state.collectAsStateWithLifecycle()
     val player by model.playback.state.collectAsStateWithLifecycle()
     var expanded by rememberSaveable { mutableStateOf(false) }
-    val snackbar = remember { SnackbarHostState() }
-    val ordinaryNotice = state.notice?.takeUnless { it == state.feedback?.message }
-    LaunchedEffect(ordinaryNotice) {
-        ordinaryNotice?.let { snackbar.showSnackbar(it, duration = SnackbarDuration.Long); model.clearNotice() }
-    }
     LaunchedEffect(state.session) { if (state.session == null) expanded = false }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     BackHandler(state.canGoBack && !expanded && state.session != null && !imeVisible) { model.back() }
@@ -156,8 +151,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                 else consumeFeedback(event.id)
             }
         }
-        PlaybackFeedbackTimer(presentation, visible = snackbar.currentSnackbarData == null,
-            onConsumed = consumeFeedback)
+        PlaybackFeedbackTimer(presentation, onConsumed = consumeFeedback)
         DisposableEffect(lifecycle, presentation) {
             val observer = LifecycleEventObserver { _, event ->
                 if (event == Lifecycle.Event.ON_STOP) {
@@ -239,8 +233,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             chromeHidden = hideListeningChrome(searchPage, searchEditing.value, imeVisible),
             snackbarHost = {
                 if (!expanded || player.item == null) {
-                    if (snackbar.currentSnackbarData != null) SnackbarHost(snackbar)
-                    else PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
+                    PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
                 }
             },
             connectionActions = null,
@@ -349,8 +342,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                         deviceSheet()
                         Box(Modifier.align(Alignment.BottomCenter)
                             .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime))) {
-                            if (snackbar.currentSnackbarData != null) SnackbarHost(snackbar)
-                            else PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
+                            PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
                         }
                     }
                 }
