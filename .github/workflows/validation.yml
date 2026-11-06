@@ -1,0 +1,167 @@
+name: Validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  repository-checks:
+    name: Repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check fixture cleanup and handoff choreography without a browser
+        run: |
+          python3 -B tools/testing/prepared-transport-broker/website_supervisor_test.py
+          python3 -B tools/testing/prepared-transport-broker/handoff_barrier_test.py
+
+  check:
+    # Keep the existing job ID for branch-protection rules requiring check.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Provision immutable playback broker integration prerequisite
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ci-broker-b6eb54f is a CI-only release in this private repository.
+          # Pin its asset ID and checksum; no repository variables, live backend,
+          # rebuild, or unverified latest-release fallback is involved.
+          scratch="/tmp/spofify/github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p /tmp/spofify
+          mkdir -m 700 "$scratch"
+          mkdir -m 700 "$scratch/fixtures" "$scratch/jvm"
+          export SPOFIFY_CI_SCRATCH="$scratch"
+          python3 - <<'PY'
+          import os
+          for path in (os.environ['RUNNER_TEMP'], os.environ['SPOFIFY_CI_SCRATCH']):
+              fs = os.statvfs(path)
+              if fs.f_bavail * fs.f_frsize < 3 * 1024**3 or fs.f_files and fs.f_favail < 10000:
+                  raise SystemExit('Insufficient private artifact/runtime bytes or inodes')
+          print('Storage preflight complete; user/project quota remains unknown')
+          PY
+          owned="$RUNNER_TEMP/spofify-broker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 700 "$owned"
+          # curl drops Authorization when following the cross-host asset redirect.
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --max-redirs 3 --connect-timeout 10 --max-time 60 --max-filesize 33554432 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/octet-stream' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/assets/715407812" \
+            -o "$owned/broker"
+          printf '%s  %s\n' '425e4bb46efcf1c25e195d92d4d1845ed2389cd35e6ebf9ad8981cd80c2c70f4' "$owned/broker" | sha256sum --check --status
+          chmod 500 "$owned/broker"
+          {
+            printf 'SPOFIFY_TEST_GO_BROKER_BINARY=%s\n' "$owned/broker"
+            printf 'SPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT=%s/fixtures\n' "$scratch"
+            printf 'SPOFIFY_TEST_WEBSITE_RUNTIME_ROOT=%s/fixtures\n' "$scratch"
+            printf 'TMPDIR=%s/jvm\n' "$scratch"
+            # JAVA_TOOL_OPTIONS also reaches forked test JVMs, not just Gradle.
+            printf 'JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=%s/jvm\n' "$scratch"
+          } >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v6.2.0
+        with:
+          distribution: temurin
+          # Match gradle/gradle-daemon-jvm.properties; compile targets remain Java 17.
+          java-version: '25'
+          check-latest: true
+      - uses: android-actions/setup-android@v4.0.4
+      - uses: gradle/actions/setup-gradle@v6.4.1
+        with:
+          # Keep caching on GitHub Actions rather than the v6 enhanced service.
+          cache-provider: basic
+      - name: Install pinned Android SDK packages
+        # Match the app's compile SDK; use the latest stable build tools.
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '26'
+          check-latest: true
+          cache: npm
+          cache-dependency-path: tools/ci/package-lock.json
+      - name: Explicitly provision pinned website-receiver browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix tools/ci --ignore-scripts --no-audit --no-fund
+          # Use the locked CLI, not npx (which could download an unpinned package).
+          tools/ci/node_modules/.bin/playwright install --with-deps chromium
+          command -v ffmpeg
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libmp3lame'
+          node <<'JS'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const modulePath = path.resolve('tools/ci/node_modules/playwright');
+          const chromiumPath = require(modulePath).chromium.executablePath();
+          fs.accessSync(chromiumPath, fs.constants.X_OK);
+          fs.appendFileSync(process.env.GITHUB_ENV,
+            `SPOFIFY_TEST_PLAYWRIGHT_MODULE=${modulePath}\nSPOFIFY_TEST_CHROMIUM_PATH=${chromiumPath}\n`);
+          JS
+      - name: Full gate including mandatory real-broker and website integration
+        run: >-
+          ./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug
+          :app:assembleDebugAndroidTest :app:lintDebug
+          -Pspofify.realBrokerIntegration=true --no-daemon --console=plain
+      - name: Verify integration fixtures cleaned their owned runtimes
+        if: always() && env.SPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT != ''
+        run: |
+          # Never sweep a nonempty root or kill unknown children after failed/cancelled tests.
+          # Each fixture must await its own child and remove only its unique runtime.
+          rmdir -- "$SPOFIFY_TEST_GO_BROKER_RUNTIME_ROOT"
+      - name: Upload test and lint reports even on failure
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: android-validation-reports
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            core/build/test-results/
+            core/build/reports/tests/
+            app/build/test-results/
+            app/build/reports/tests/
+            app/build/reports/lint-results-debug.*
+      - name: Upload debug and instrumentation APKs
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: spofify-debug
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/intermediates/apk/debug/*.apk
+            app/build/outputs/apk/androidTest/debug/*.apk
+            app/build/intermediates/apk/androidTest/debug/*.apk
+
+  validation:
+    name: PR validation
+    needs: [repository-checks, check]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          REPOSITORY_RESULT: ${{ needs.repository-checks.result }}
+          ANDROID_RESULT: ${{ needs.check.result }}
+        run: |
+          test "$REPOSITORY_RESULT" = success
+          test "$ANDROID_RESULT" = success
