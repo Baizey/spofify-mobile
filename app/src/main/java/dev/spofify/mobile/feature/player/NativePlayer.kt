@@ -1,13 +1,15 @@
 package dev.spofify.mobile.feature.player
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
@@ -40,7 +43,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,7 +52,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
@@ -66,6 +69,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.media3.common.Player
+import kotlin.math.roundToInt
 import dev.spofify.mobile.LikeButton
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.playback.PlaybackControls
@@ -202,10 +206,7 @@ fun NativeNowPlayingDialog(onCollapse: () -> Unit, content: @Composable (NowPlay
     )) { content(presentation) }
 }
 
-/**
- * Fixed viewport content: only Up next scrolls. The fullscreen host owns system Back; expanding,
- * layout changes, artwork completion and progress publication never issue playback commands.
- */
+/** Finite artwork-first viewport. Only genuine overflow scrolls; queue is a separate window. */
 @Composable
 fun NativeNowPlaying(
     state: PlaybackState,
@@ -221,105 +222,141 @@ fun NativeNowPlaying(
     modifier: Modifier = Modifier,
     presentation: NowPlayingPresentationState = remember { NowPlayingPresentationState() },
     onPlaybackDevices: (() -> Unit)? = null,
+    selectedOutputLabel: String = "No output selected",
+    queueFeedback: @Composable () -> Unit = {},
 ) {
     val item = state.item ?: return
     BoxWithConstraints(modifier.fillMaxSize().testTag("now-playing")
-        .semantics { paneTitle = "Now Playing" }.padding(8.dp)) {
-        val landscape = maxWidth >= 480.dp && maxHeight < 420.dp
-        val short = maxHeight < 480.dp
-        val cramped = !landscape && maxHeight < 360.dp
-        val showArtwork = maxHeight >= 560.dp && LocalDensity.current.fontScale < 1.8f
-        LaunchedEffect(cramped) { if (!cramped) presentation.dismissQueue() }
-        val identity: @Composable () -> Unit = {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f).heightIn(min = 48.dp)
-                    .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(item) }
-                    .padding(horizontal = 8.dp, vertical = if (cramped) 0.dp else 4.dp)) {
-                    Text(item.name, style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    // Mixed control/diagnostic notices stay internal, never replace music credits.
-                    Text(item.subtitle,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                LikeButton(liked, likePending, likeFailed, onToggleLike, onRetryLike)
-                PlayerMore(state, controls, onAddToPlaylist, onOpenItem)
-            }
-        }
-        val transport: @Composable () -> Unit = {
-            // Musical direction and the requested physical-left Devices placement do not mirror.
-            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                Row(Modifier.then(if (cramped) Modifier.fillMaxWidth() else Modifier).testTag("now-playing-controls"),
-                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceEvenly) {
-                    IconButton(onClick = controls::previous, modifier = Modifier.size(48.dp)) {
-                        Icon(Icons.Default.SkipPrevious, "Previous song")
+        .semantics { paneTitle = "Now Playing" }.padding(horizontal = 16.dp, vertical = 8.dp)) {
+        // The host, not artwork, progress or queue length, supplies this finite height.
+        val viewport = maxHeight
+        val scroll = rememberScrollState()
+        Layout(
+            modifier = Modifier.fillMaxSize().verticalScroll(scroll).testTag("now-playing-main-view"),
+            content = {
+                Text(state.context?.let { "Playing from ${it.name}" } ?: "Now Playing",
+                    Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Box(Modifier.testTag("now-playing-artwork").playerSwipe(PlayerSwipeArea.COVER) { action ->
+                    when (action) {
+                        PlayerSwipeAction.NEXT -> controls.next()
+                        PlayerSwipeAction.PREVIOUS -> controls.previous()
+                        else -> Unit
                     }
-                    PlaybackDevicesButton(onPlaybackDevices)
-                    PlayPauseButton(state, controls::toggle, large = !short)
-                    IconButton(onClick = controls::next, modifier = Modifier.size(48.dp)) {
-                        Icon(Icons.Default.SkipNext, "Next song")
-                    }
-                }
-            }
-        }
-        val pinned: @Composable ColumnScope.() -> Unit = {
-            identity()
-            if (showArtwork) {
-                BoxWithConstraints(Modifier.fillMaxWidth().weight(0.8f), contentAlignment = Alignment.Center) {
-                    val side = minOf(maxWidth, maxHeight, 360.dp)
-                    Box(Modifier.size(side).playerSwipe(PlayerSwipeArea.COVER) { action ->
-                        when (action) {
-                            PlayerSwipeAction.NEXT -> controls.next()
-                            PlayerSwipeAction.PREVIOUS -> controls.previous()
-                            else -> Unit
+                }) { artwork(item, Modifier.fillMaxSize()) }
+                Column(Modifier.fillMaxWidth().testTag("now-playing-essential")) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f).heightIn(min = 48.dp)
+                            .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(item) }
+                            .padding(vertical = 4.dp)) {
+                            Text(item.name, style = MaterialTheme.typography.titleMedium,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(item.subtitle, color = MaterialTheme.colorScheme.onSurface,
+                                style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         }
-                    }) { artwork(item, Modifier.matchParentSize()) }
-                }
-            }
-            // Seek gets its own full-width line: four independent transport targets must not
-            // squeeze it out in short/narrow or landscape panes.
-            PlaybackSeekBar(state, controls)
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { transport() }
-        }
-        if (cramped) {
-            if (presentation.queueOpen) {
-                Column(Modifier.fillMaxSize().testTag("now-playing-queue-view")) {
-                    Text(item.name, Modifier.fillMaxWidth(),
-                        maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        style = MaterialTheme.typography.bodySmall)
-                    NativeUpcomingQueue(state, controls, onOpenItem, artwork, compact = true,
-                        showStatus = false, onClose = { presentation.dismissQueue() })
-                    transport()
-                    LinearProgressIndicator(
-                        progress = { if (state.durationMs > 0) (state.positionMs.toFloat() / state.durationMs).coerceIn(0f, 1f) else 0f },
-                        modifier = Modifier.fillMaxWidth().height(2.dp).semantics { contentDescription = "Queue playback progress" },
-                        strokeCap = StrokeCap.Butt, gapSize = 0.dp, drawStopIndicator = {},
-                    )
-                }
-            } else {
-                Column(Modifier.fillMaxSize().testTag("now-playing-main-view")) {
-                    identity()
+                        LikeButton(liked, likePending, likeFailed, onToggleLike, onRetryLike)
+                        PlayerMore(state, controls, onAddToPlaylist, onOpenItem)
+                    }
                     PlaybackSeekBar(state, controls)
-                    Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { transport() }
-                    TextButton(onClick = presentation::openQueue, contentPadding = PaddingValues(horizontal = 8.dp),
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("now-playing-show-queue")) {
-                        Text("Up next · ${state.upcoming.size}", maxLines = 1,
-                            style = MaterialTheme.typography.titleSmall)
+                    CenteredTransport(state, controls)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Row(Modifier.weight(1f).heightIn(min = 48.dp)
+                            .semantics { contentDescription = "Playback devices" }
+                            .then(if (onPlaybackDevices != null) Modifier.clickable(
+                                role = Role.Button, onClickLabel = "Choose playback output", onClick = onPlaybackDevices
+                            ) else Modifier)
+                            .padding(end = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Devices, null, Modifier.size(24.dp))
+                            Text(selectedOutputLabel, Modifier.padding(start = 8.dp),
+                                style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                        IconButton(onClick = presentation::openQueue,
+                            modifier = Modifier.size(48.dp).testTag("now-playing-show-queue")) {
+                            Icon(Icons.AutoMirrored.Filled.QueueMusic, "Queue")
+                        }
                     }
                 }
+            },
+        ) { children, constraints ->
+            val width = constraints.maxWidth
+            val unbounded = Constraints(minWidth = width, maxWidth = width)
+            val heading = children[0].measure(unbounded)
+            val essential = children[2].measure(unbounded)
+            val available = (viewport.roundToPx() - heading.height - essential.height - 24.dp.roundToPx()).coerceAtLeast(0)
+            val side = minOf(width, 360.dp.roundToPx(), available).let { if (it < 64.dp.roundToPx()) 0 else it }
+            val cover = children[1].measure(Constraints.fixed(side, side))
+            val height = maxOf(viewport.roundToPx(), heading.height + side + essential.height)
+            layout(width, height) {
+                heading.placeRelative(0, 0)
+                cover.placeRelative((width - side) / 2, heading.height)
+                essential.placeRelative(0, height - essential.height)
             }
-        } else if (landscape) {
-            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) { pinned() }
-                Column(Modifier.weight(1f).fillMaxHeight()) {
+        }
+    }
+    if (presentation.queueOpen) {
+        Dialog(onDismissRequest = { presentation.dismissQueue() }, properties = DialogProperties(
+            usePlatformDefaultWidth = false, decorFitsSystemWindows = false,
+        )) {
+            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
+                    .padding(horizontal = 8.dp, vertical = 8.dp).testTag("now-playing-queue-view")
+                    .semantics { paneTitle = "Queue" }) {
+                    // Existing queue owns occurrence actions, reorder/removal/Undo and its sole scroller.
                     NativeUpcomingQueue(state, controls, onOpenItem, artwork, showStatus = false)
+                    // Same presentation owner/timer as the player; never hide queue action results
+                    // behind this opaque window or cover the last occurrence's controls.
+                    queueFeedback()
                 }
             }
-        } else {
-            Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-                pinned()
-                NativeUpcomingQueue(state, controls, onOpenItem, artwork, showStatus = false)
+        }
+    }
+}
+
+/** Five equal cells make Play/Pause the geometric center, including RTL and narrow layouts. */
+@Composable
+private fun CenteredTransport(state: PlaybackState, controls: PlaybackControls) {
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        Layout(modifier = Modifier.fillMaxWidth().testTag("now-playing-controls"), content = {
+            val buttons: List<@Composable () -> Unit> = listOf(
+                {
+                    IconButton(onClick = controls::toggleShuffle, modifier = Modifier.size(48.dp)
+                        .semantics { stateDescription = if (state.shuffle) "On" else "Off" }) {
+                        Icon(Icons.Default.Shuffle, "Shuffle",
+                            tint = if (state.shuffle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                    }
+                },
+                { IconButton(onClick = controls::previous, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.SkipPrevious, "Previous song") } },
+                { PlayPauseButton(state, controls::toggle, large = true) },
+                { IconButton(onClick = controls::next, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.SkipNext, "Next song") } },
+                {
+                    val repeat = when (state.repeatMode) {
+                        Player.REPEAT_MODE_ONE -> "One song"
+                        Player.REPEAT_MODE_ALL -> "All songs"
+                        else -> "Off"
+                    }
+                    IconButton(onClick = controls::cycleRepeat, modifier = Modifier.size(48.dp)
+                        .semantics { stateDescription = repeat }) {
+                        Icon(if (state.repeatMode == Player.REPEAT_MODE_ONE) Icons.Default.RepeatOne else Icons.Default.Repeat,
+                            "Repeat", tint = if (state.repeatMode != Player.REPEAT_MODE_OFF)
+                                MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                    }
+                },
+            )
+            buttons.forEach { button -> Box(contentAlignment = Alignment.Center) { button() } }
+        }) { children, constraints ->
+            val width = constraints.maxWidth
+            // Preserve an even, circular 64dp Play target, rather than constraining it to an
+            // odd rounded cell width. At 320dp the five centers remain disjoint (56dp minimum
+            // center distance needed between the 64dp center and its 48dp neighbors).
+            val measured = children.map { it.measure(Constraints(maxWidth = 64.dp.roundToPx(), maxHeight = 64.dp.roundToPx())) }
+            val height = measured.maxOf { it.height }
+            layout(width, height) {
+                measured.forEachIndexed { index, child ->
+                    // Round positions from the complete row, not cumulative rounded cell widths.
+                    val center = width * (index + .5f) / 5f
+                    child.place((center - child.width / 2f).roundToInt(), (height - child.height) / 2)
+                }
             }
         }
     }

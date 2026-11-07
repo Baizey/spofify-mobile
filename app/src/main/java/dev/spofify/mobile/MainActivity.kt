@@ -41,6 +41,7 @@ import dev.spofify.mobile.feature.devices.PlaybackDevicesSheet
 import dev.spofify.mobile.feature.player.NativeMiniPlayer
 import dev.spofify.mobile.feature.player.NativeNowPlaying
 import dev.spofify.mobile.feature.player.NativeNowPlayingDialog
+import dev.spofify.mobile.feature.player.selectedOutputLabel
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
 import dev.spofify.mobile.ui.PlaybackFeedbackPresentation
@@ -169,6 +170,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         }
         val pages = rememberSaveableStateHolder()
         val deviceCoordinator = model.graph.playbackCoordinator
+        val observedOutput = deviceCoordinator?.state?.collectAsStateWithLifecycle()?.value
         var devices by remember(deviceCoordinator) { mutableStateOf(false) }
         val openDevices: (() -> Unit)? = deviceCoordinator?.let { { devices = true } }
         val deviceSheet: @Composable () -> Unit = {
@@ -356,8 +358,8 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         if (expanded && player.item != null) {
             val item = player.item!!
             LaunchedEffect(item.id) { model.checkLike(item) }
-            // No draggable sheet/nested-scroll anchors: the player has stable window bounds and
-            // only its queue scrolls. Dialog Back dismisses presentation, never playback.
+            // Finite player window with one stable overflow body. Queue and Devices own native
+            // overlays above it; Back dismisses the top window without touching the detail route.
             NativeNowPlayingDialog(onCollapse = { expanded = false }) { playerPresentation ->
                 Surface(Modifier.fillMaxSize(), color = Background) {
                     Box(Modifier.fillMaxSize()) {
@@ -365,12 +367,16 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                             item.id in state.failedLikeStatus, { model.toggleLike(item) }, { model.checkLike(item) },
                             onAddToPlaylist = { expanded = false; addToPlaylist = it }, onOpenItem = openExternal,
                             artwork = art, modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
-                            presentation = playerPresentation, onPlaybackDevices = openDevices)
+                            presentation = playerPresentation, onPlaybackDevices = openDevices,
+                            selectedOutputLabel = selectedOutputLabel(observedOutput),
+                            queueFeedback = { PlaybackFeedbackHost(presentation.current, announcementOwner = presentation) })
                         // One picker and one feedback host in the visible player window.
                         deviceSheet()
-                        Box(Modifier.align(Alignment.BottomCenter)
-                            .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime))) {
-                            PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
+                        if (!playerPresentation.queueOpen) {
+                            Box(Modifier.align(Alignment.BottomCenter)
+                                .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime))) {
+                                PlaybackFeedbackHost(presentation.current, announcementOwner = presentation)
+                            }
                         }
                     }
                 }
