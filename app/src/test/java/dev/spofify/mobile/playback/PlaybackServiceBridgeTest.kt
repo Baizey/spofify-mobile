@@ -251,13 +251,14 @@ class PlaybackServiceBridgeTest {
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test fun revisionSyncActualServiceCaptureReusesStructureAndFenceAcrossQuietPolls() = runBlocking {
         println("revision-capture java.io.tmpdir=${System.getProperty("java.io.tmpdir")}")
-        for (count in listOf(1, 40, 1000)) {
+        for (count in listOf(1, 40, 1000, 5000)) {
             val tracks = (1..count).map { n -> PlaybackTrack("track-$n", "Song", emptyList(), "Album", "album", 120.0,
                 key = n.toLong(), order = n.toLong()) }
             val source = PlaybackSnapshot(queue = tracks, position = 0, duration = 120.0,
                 occurrence = PlaybackOccurrence(1, "track-1", "event-$count", 0.0, false))
             assertEquals("ok", endpoint.activate(source, authority()).status)
             val first = requireNotNull(endpoint.captureRevisionSync())
+            PlaybackQueueIntents.publication(first.snapshot(), requireNotNull(first.metadata))
             repeat(8) {
                 val next = requireNotNull(endpoint.captureRevisionSync())
                 assertSame("Actual production cached structure for $count entries", first.structure, next.structure)
@@ -297,13 +298,14 @@ class PlaybackServiceBridgeTest {
         }
         player.addListener(observer)
         try {
-            for (count in listOf(1, 40, 1000)) {
+            for (count in listOf(1, 40, 1000, 5000)) {
                 val tracks = (1..count).map { n -> PlaybackTrack("track-$n", "Song", emptyList(), "Album", "album", 120.0,
                     key = n.toLong(), order = n.toLong()) }
                 val source = PlaybackSnapshot(queue = tracks, position = 0, duration = 37.0,
                     occurrence = PlaybackOccurrence(1, "track-1", "duration-event-$count", 0.0, false))
                 assertEquals("ok",endpoint.activate(source,authority()).status)
                 val first = requireNotNull(endpoint.captureRevisionSync())
+                PlaybackQueueIntents.publication(first.snapshot(), requireNotNull(first.metadata))
                 assertEquals(37.0,first.live.duration,0.0)
                 reasons.clear()
                 val service = requireNotNull(controller).get()

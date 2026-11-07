@@ -73,7 +73,7 @@ class PlaybackRevisionSyncTest {
     }
     @Test fun quietBidirectionalBytesAndQueueWorkAreIndependentOfQueueLength() {
         val uploadSizes = mutableListOf<Int>(); val downloadSizes = mutableListOf<Int>()
-        for (count in listOf(1,40,1000)) {
+        for (count in listOf(1,40,1000,5000)) {
             val s = state(count); val queue = CountingQueue(s.queue)
             val full = view(s.copy(queue = queue)).validated().also { it.syncSnapshotReference = PlaybackSyncReference("room",4) }
             val sync = PlaybackRevisionSync(); sync.probe(snapshot(4, s)); sync.accept(full)
@@ -88,19 +88,22 @@ class PlaybackRevisionSyncTest {
                 put("base",PlaybackSyncReference("room",4).toJson()); put("live",PlaybackSyncLive.from(s).toJson()); put("acks",JsonArray(emptyList())) }
             val up = upload.toString().toByteArray().size; val down = tick.toString().toByteArray().size
             uploadSizes += up; downloadSizes += down
-            println("revision-v1 queue=$count uploadBytes=$up downloadBytes=$down fullSnapshotBytes=${snapshot(4,s).toString().toByteArray().size} queueReadsPerPoll=1 fullExportsPerPoll=0")
+            val fullBytes = snapshot(4,s).toString().toByteArray().size
+            assertTrue("The complete $count-entry fixture fits the independent full-body budget", fullBytes < MAX_PLAYBACK_BODY_BYTES)
+            println("revision-v1 queue=$count uploadBytes=$up downloadBytes=$down fullSnapshotBytes=$fullBytes queueReadsPerPoll=1 fullExportsPerPoll=0")
         }
         assertEquals(1,uploadSizes.distinct().size); assertEquals(1,downloadSizes.distinct().size)
     }
 
     @Test fun quietNegotiatedReceiverReusesValidatedSidecarAndDoesNotRevalidateOrigins() {
-        val s = state(1000); val queue = CountingQueue(s.queue)
+        val s = state(5000); val queue = CountingQueue(s.queue)
         var originReads = 0
         val origins = object : AbstractList<QueueIntentOrigin>() {
-            override val size = 1000
+            override val size = s.queue.size
             override fun get(index: Int): QueueIntentOrigin { originReads++; return QueueIntentOrigin(index + 1L, "low") }
         }
         val metadata = QueueIntentState("receiver",9,"tracked",origins,emptyList())
+        PlaybackPublication.validatePoll("phone",2,1,s,emptyList(),metadata)
         val binding = QueueIntentBinding("phone","receiver",9,1,"event")
         val extension = QueueIntentsView(1,listOf(QueueIntentReceiver("phone",1)),binding,metadata,emptyList(),emptyList())
         val full = view(s.copy(queue = queue)).copy(queueIntents = extension).validated().also { it.syncSnapshotReference = PlaybackSyncReference("room",4) }
