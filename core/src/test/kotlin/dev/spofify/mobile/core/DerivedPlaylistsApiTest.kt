@@ -131,7 +131,8 @@ class DerivedPlaylistsApiTest {
     @Test fun fencedPlaybackPreservesBothDuplicateOccurrencesAndExactStart() = runBlocking {
         authenticate()
         val initial = client.personalRevision.value
-        web.enqueue(jsonResponse(playbackBody("[${flatTrack("occ-1", "token-1")},${flatTrack("occ-2", "token-2")}]", 2, "occ-2")))
+        web.enqueue(jsonResponse(playbackBody("[${flatTrack("occ-1", "token-1")},${flatTrack("occ-2", "token-2")}]", 2, "occ-2")
+            .replace("\"limit\":2", "\"limit\":1000")))
         val result = api.playback("rules", 5, "f1_fence", "signed-click")
         val request = web.takeRequest()
         assertEquals("POST", request.method)

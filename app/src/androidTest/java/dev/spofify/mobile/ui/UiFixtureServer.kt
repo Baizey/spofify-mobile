@@ -719,7 +719,7 @@ class UiFixtureServer : AutoCloseable {
         }
     }
     private fun playback(items: List<JSONObject>, kind: String, id: String, name: String) = JSONObject()
-        .put("items", JSONArray(items)).put("total", items.size).put("limit", items.size).put("truncated", false)
+        .put("items", JSONArray(items)).put("total", items.size).put("limit", 1000).put("truncated", false)
         .put("revision", 7).put("context", JSONObject().put("kind", kind).put("id", id).put("name", name))
     private fun page(items: List<JSONObject>, limit: Int, offset: Int) = JSONObject()
         .put("items", JSONArray(items.drop(offset).take(limit))).put("total", items.size).put("limit", limit).put("offset", offset).put("revision", 7)

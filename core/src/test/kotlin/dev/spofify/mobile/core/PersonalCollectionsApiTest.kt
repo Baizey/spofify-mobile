@@ -130,7 +130,7 @@ class PersonalCollectionsApiTest {
     }
 
     @Test fun manualPlaybackKeepsFlatDuplicateEntryIdentityAndContext() = runBlocking {
-        web.enqueue(jsonResponse("""{"context":{"kind":"playlist","id":"p","name":"Mix"},"items":[${flatTrack("e1")},${flatTrack("e2")}],"total":2,"limit":2,"truncated":false}"""))
+        web.enqueue(jsonResponse("""{"context":{"kind":"playlist","id":"p","name":"Mix"},"items":[${flatTrack("e1")},${flatTrack("e2")}],"total":2,"limit":1000,"truncated":false}"""))
         val result = api.playback("p")
         assertEquals("/api/me/playlists/p/playback", web.takeRequest().path)
         assertEquals("playlist", result.context.kind)
@@ -142,7 +142,7 @@ class PersonalCollectionsApiTest {
     }
 
     @Test fun manualQueueConversionRetainsEnvelopeOrContextRevisionWhenProvided() = runBlocking {
-        web.enqueue(jsonResponse("""{"context":{"kind":"playlist","id":"p","name":"Mix"},"items":[],"total":0,"limit":0,"truncated":false,"revision":7}"""))
+        web.enqueue(jsonResponse("""{"context":{"kind":"playlist","id":"p","name":"Mix"},"items":[],"total":0,"limit":1000,"truncated":false,"revision":7}"""))
         val result = api.playback("p")
         assertEquals(7L, result.queue.revision)
         assertEquals(LibraryPlaybackContext("playlist", "p", "Mix"), result.queue.context)

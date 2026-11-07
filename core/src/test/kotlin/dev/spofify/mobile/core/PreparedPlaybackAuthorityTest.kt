@@ -211,7 +211,7 @@ class PreparedPlaybackAuthorityTest {
             {"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-1","selectionToken":"returned-token-1"},
             {"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-2","selectionToken":"returned-token-2"}
         ],
-        "total":2,"limit":2,"truncated":false,"revision":5,"fence":"f1_fence",
+        "total":2,"limit":1000,"truncated":false,"revision":5,"fence":"f1_fence",
         "startOccurrenceId":"$start","notice":null
     }"""
 

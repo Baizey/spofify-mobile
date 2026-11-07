@@ -69,7 +69,7 @@ data class PlaybackQueue(
     @Transient val selectionAuthority: PreparedPlaybackAuthority? = null,
 ) {
     init {
-        require(total == items.size && limit == items.size && !truncated) { "Incomplete playback collection" }
+        require(total == items.size && limit >= total && !truncated) { "Incomplete playback collection" }
     }
 }
 

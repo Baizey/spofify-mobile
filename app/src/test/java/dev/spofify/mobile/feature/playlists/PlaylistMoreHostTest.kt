@@ -186,8 +186,8 @@ class PlaylistMoreHostTest {
                             if (derived) {
                                 val body = ApiJson.parseToJsonElement(request.body.readUtf8()).toString()
                                 assertTrue(body.contains("\"selectionToken\":\"opaque.second\""))
-                                json("""{"context":$context,"items":[${track.dropLast(1)},"occurrenceId":"first-path","selectionToken":"opaque.first"},${track.dropLast(1)},"occurrenceId":"second-path","selectionToken":"opaque.second"}],"total":2,"limit":2,"truncated":false,"revision":5,"fence":"fence","startOccurrenceId":"second-path","notice":null}""")
-                            } else json("""{"context":$context,"items":[${track.dropLast(1)},"entryId":"first-entry"},${track.dropLast(1)},"entryId":"second-entry"}],"total":2,"limit":2,"truncated":false,"revision":5}""")
+                                json("""{"context":$context,"items":[${track.dropLast(1)},"occurrenceId":"first-path","selectionToken":"opaque.first"},${track.dropLast(1)},"occurrenceId":"second-path","selectionToken":"opaque.second"}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"fence","startOccurrenceId":"second-path","notice":null}""")
+                            } else json("""{"context":$context,"items":[${track.dropLast(1)},"entryId":"first-entry"},${track.dropLast(1)},"entryId":"second-entry"}],"total":2,"limit":1000,"truncated":false,"revision":5}""")
                         }
                         path == "/api/me/playlists/$id" -> json(summary(id))
                         else -> MockResponse().setResponseCode(404)

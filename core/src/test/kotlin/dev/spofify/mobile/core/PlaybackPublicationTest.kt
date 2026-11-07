@@ -30,6 +30,21 @@ class PlaybackPublicationTest {
         assertEquals("original-event", state.occurrence!!.eventId)
     }
 
+    @Test fun typedCollectionsKeepLegacyCompleteLimitsButRejectEveryPartialShape() {
+        val items = (1..3).map { LibraryItem("track", "t$it", "Song", hasAudio = true) }
+        assertEquals(items, PlaybackQueue(items, total = 3, limit = 1000).items)
+        assertEquals(items, PersonalPlayback(PersonalPlaybackContext("playlist", "manual", "Mix"),
+            items, 3, 1000, false).queue.items)
+        for ((total, limit, truncated) in listOf(Triple(4, 1000, false), Triple(3, 2, false),
+            Triple(3, -1, false), Triple(3, 1000, true), Triple(-1, 1000, false))) {
+            assertThrows(IllegalArgumentException::class.java) { PlaybackQueue(items, total, limit, truncated) }
+            assertThrows(IllegalArgumentException::class.java) { PersonalPlayback(
+                PersonalPlaybackContext("playlist", "manual", "Mix"), items, total.toLong(), limit, truncated) }
+        }
+        assertTrue(PlaybackQueue(emptyList(), total = 0, limit = 0).items.isEmpty())
+        assertTrue(PlaybackQueue(emptyList(), total = 0, limit = 1000).items.isEmpty())
+    }
+
     @Test fun compactLargeQueuePublishesEveryDuplicateOriginHighKeyAndReceipt() {
         for (size in listOf(1001, 5000)) {
             val queue = (1..size).map { PlaybackTrack("same", "Song", emptyList(), "", "", 120.0,

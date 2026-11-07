@@ -283,6 +283,22 @@ class PlaybackCommandResolverTest {
         assertEquals(2, web.requestCount)
     }
 
+    @Test fun legacyCompleteLimitDoesNotForcePrefixPolicyForAnyOrdinaryCollection() = runBlocking {
+        for (kind in listOf("artist", "album", "likes", "playlist")) {
+            val id = if (kind == "likes") "likes" else "collection"
+            val context = PlaybackContext(kind, id, "Collection")
+            val body = queue(kind, id, listOf(track("a", "e1"), track("b", "e2")))
+                .replace("\"limit\":2", "\"limit\":1000")
+            web.enqueue(response(body))
+            val result = resolve(PlaybackDeviceCommand.musical("playCollection", context = context,
+                trackId = "b", entryId = if (kind == "playlist") "e2" else null))
+            assertEquals(listOf("a", "b"), result.tracks.map { it.id })
+            assertEquals(1, result.startIndex)
+            assertFalse(result.truncated)
+        }
+        assertEquals(4, web.requestCount)
+    }
+
     @Test fun completeLargeCollectionsSelectLastDuplicateWithoutPrefixOrExtraFetch() = runBlocking {
         for (size in listOf(1001, 5000)) {
             val items = (0 until size).map { track(entry = "e$it") }

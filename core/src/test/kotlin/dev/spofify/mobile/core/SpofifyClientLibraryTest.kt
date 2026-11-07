@@ -90,7 +90,7 @@ class SpofifyClientLibraryTest {
     }
 
     @Test fun playbackEndpointsAndStandaloneTrackBehavior() = runBlocking {
-        val queue = """{"context":{"kind":"album","id":"a"},"items":[$track],"total":1,"limit":1,"truncated":false,"revision":1}"""
+        val queue = """{"context":{"kind":"album","id":"a"},"items":[$track],"total":1,"limit":1000,"truncated":false,"revision":1}"""
         web.enqueue(jsonResponse(queue))
         val album = LibraryItem("album", "album/a%", "Album")
         val prepared = client.playback(album)

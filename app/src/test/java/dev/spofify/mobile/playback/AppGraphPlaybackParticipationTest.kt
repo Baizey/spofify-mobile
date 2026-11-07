@@ -113,7 +113,7 @@ class AppGraphPlaybackParticipationTest {
                         put("kind", "track"); put("id", id); put("name", id); put("artists", JsonArray(emptyList()))
                         put("durationMs", 120000); put("hasAudio", true)
                     } }))
-                    put("total", additions.size); put("limit", additions.size); put("truncated", false); put("revision", 7)
+                    put("total", additions.size); put("limit", 1000); put("truncated", false); put("revision", 7)
                 }.toString())
             }
             if (request.path != "/api/me/player") {

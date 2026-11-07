@@ -160,7 +160,7 @@ internal object PlaybackCommandResolver {
             require(if (hasSelection) loaded.startOccurrenceId == selectedOccurrence else start == 0) { "Mismatched derived selection" }
             require(selectedTrack == null || chosen.id == selectedTrack) { "Mismatched selected track" }
             require(selectedEntry == null || chosen.entryId == selectedEntry) { "Mismatched selected entry" }
-            require(!loaded.truncated && loaded.notice == null && loaded.total == items.size.toLong() && loaded.limit == items.size) {
+            require(!loaded.truncated && loaded.notice == null && loaded.total == items.size.toLong() && loaded.limit.toLong() >= loaded.total) {
                 "Incomplete derived playback collection"
             }
             val tracks = items.mapIndexed { index, item ->
@@ -199,7 +199,7 @@ internal object PlaybackCommandResolver {
             else -> throw IllegalArgumentException("Unsupported playback context")
         }
         currentCoroutineContext().ensureActive()
-        require(!loaded.truncated && loaded.limit == loaded.items.size && loaded.total == loaded.items.size.toLong()) { "Incomplete playback collection" }
+        require(!loaded.truncated && loaded.limit.toLong() >= loaded.total && loaded.total == loaded.items.size.toLong()) { "Incomplete playback collection" }
         val available = loaded.items.filter { it.kind == "track" && it.playable }
         require(available.isNotEmpty()) { "No available music in this collection" }
         val identities = available.map { if (context.kind == "playlist") it.entryId.orEmpty() else it.id }
