@@ -339,7 +339,7 @@ class RootCopyHostTest {
         assertEquals(listOf(0, 0, 0, 40), indexOffsets())
     }
 
-    @Test fun playlistIndexProfileReturnRetainsPrefixAndFailedRawOffsetUntilRetry() {
+    @Test fun playlistIndexSettingsReturnRetainsPrefixAndFailedRawOffsetUntilRetry() {
         val appendAttempts = java.util.concurrent.atomic.AtomicInteger()
         val retryGate = hold()
         fun offsets() = requests.filter {
@@ -369,20 +369,20 @@ class RootCopyHostTest {
         waitText("Retry")
         assertEquals(listOf(0, 40), offsets())
         compose.onNodeWithText("Retry").performScrollTo()
-        val beforeProfile = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
-        tab("Profile")
-        await { model.state.value.page == Page.Profile }
+        val beforeSettings = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        tab("Settings")
+        await { model.state.value.page == Page.Settings }
         tab("Playlists")
         waitText("Retry")
-        val afterProfile = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
-        assertEquals("Index row top survives Profile return", beforeProfile.top, afterProfile.top, 1f)
-        assertEquals("Index row bottom survives Profile return", beforeProfile.bottom, afterProfile.bottom, 1f)
+        val afterSettings = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        assertEquals("Index row top survives Settings return", beforeSettings.top, afterSettings.top, 1f)
+        assertEquals("Index row bottom survives Settings return", beforeSettings.bottom, afterSettings.bottom, 1f)
         assertEquals("Actual tab return cannot reset the prefix or retry the failed batch", listOf(0, 40), offsets())
         compose.onNodeWithText("Retry").performScrollTo().performClick()
         await { offsets() == listOf(0, 40, 40) }
         val beforeCanceledRetryReturn = compose.onNodeWithText("Mix 39").assertIsDisplayed().fetchSemanticsNode().boundsInRoot
-        tab("Profile") // Cancel the explicitly retried read before its response exists.
-        await { model.state.value.page == Page.Profile }
+        tab("Settings") // Cancel the explicitly retried read before its response exists.
+        await { model.state.value.page == Page.Settings }
         retryGate.countDown()
         tab("Playlists")
         waitText("Retry")

@@ -40,7 +40,6 @@ class ProfileLayoutTest {
                 MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                     Box(Modifier.requiredSize(320.dp, 640.dp)) {
                         ProfileScreen(username, origin, busy = false,
-                            onCredits = { actions += "credits" },
                             onSignOut = { actions += "sign-out" })
                     }
                 }
@@ -59,11 +58,10 @@ class ProfileLayoutTest {
             assertTrue("Essential identity must remain complete", (0 until layout.lineCount).none(layout::isLineEllipsized))
         }
         compose.onNodeWithText("Playback devices").assertDoesNotExist()
-        listOf("Credits", "Sign out").forEach { label ->
-            scrollTo(label).assertIsDisplayed().assertIsEnabled()
-                .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
-        }
-        assertEquals(listOf("credits", "sign-out"), actions)
+        compose.onNodeWithText("Credits").assertDoesNotExist()
+        scrollTo("Sign out").assertIsDisplayed().assertIsEnabled()
+            .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
+        assertEquals(listOf("sign-out"), actions)
         scrollTo("Username").assertIsDisplayed() // The long content also remains reachable again.
     }
 

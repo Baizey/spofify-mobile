@@ -692,7 +692,7 @@ class LikedSongsHostTest {
         compose.runOnIdle {
             assertTrue("Accepted/dismissed action remains current through another append", pending.current())
             // No Compose/collector sample between the two route changes.
-            model.switchTab(Tab.PROFILE); model.switchTab(Tab.HOME)
+            model.switchTab(Tab.SETTINGS); model.switchTab(Tab.HOME)
             assertEquals(Page.Likes, model.state.value.page)
             assertFalse("Returning to Likes must not revive the original action", pending.current())
             pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))

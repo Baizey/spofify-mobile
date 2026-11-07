@@ -294,7 +294,7 @@ class SearchNavigationHostTest {
         compose.onNodeWithText("Synthetic song").assertIsDisplayed()
         systemBack()
         assertText("preserved query")
-        for (tab in listOf(Tab.HOME, Tab.PLAYLISTS, Tab.PROFILE)) {
+        for (tab in listOf(Tab.HOME, Tab.PLAYLISTS, Tab.SETTINGS)) {
             compose.runOnIdle { model.switchTab(tab) }
             compose.waitForIdle()
             compose.runOnIdle { model.switchTab(Tab.SEARCH) }
@@ -369,10 +369,10 @@ class SearchNavigationHostTest {
         compose.runOnIdle {
             model.activateSearch()
             pending = checkNotNull(model.state.value.searchActivationId)
-            model.switchTab(Tab.PROFILE)
+            model.switchTab(Tab.SETTINGS)
         }
         compose.waitForIdle()
-        compose.onNodeWithTag("profile-screen").assertIsDisplayed()
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
         assertNull(model.state.value.searchActivationId)
         assertEquals(0, keyboard.shows)
         compose.runOnIdle {

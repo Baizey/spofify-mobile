@@ -19,7 +19,6 @@ internal fun ProfileScreen(
     username: String,
     origin: String,
     busy: Boolean,
-    onCredits: () -> Unit,
     onSignOut: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -27,6 +26,7 @@ internal fun ProfileScreen(
         modifier.testTag("profile-screen"), contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item { Text("Account and server", style = MaterialTheme.typography.headlineMedium) }
         item {
             Text("Username", style = MaterialTheme.typography.labelMedium)
             Text(username, style = MaterialTheme.typography.titleMedium, modifier = Modifier.fillMaxWidth())
@@ -35,7 +35,6 @@ internal fun ProfileScreen(
             Text("Server", style = MaterialTheme.typography.labelMedium)
             Text(origin, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.fillMaxWidth())
         }
-        item { ProfileAction("Credits", onClick = onCredits) }
         item { ProfileAction("Sign out", enabled = !busy, onClick = onSignOut) }
     }
 }

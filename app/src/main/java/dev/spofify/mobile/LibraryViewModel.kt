@@ -48,13 +48,14 @@ sealed interface Page {
     data class Search(val query: String = "") : Page
     data object Likes : Page
     data object Playlists : Page
+    data object Settings : Page
     data object Profile : Page
     data object Credits : Page
     data class Detail(val item: LibraryItem, val navigationId: Long = 0) : Page
     data class Playlist(val playlist: PlaylistSummary) : Page
 }
 
-enum class Tab { HOME, SEARCH, PLAYLISTS, PROFILE }
+enum class Tab { HOME, SEARCH, PLAYLISTS, SETTINGS }
 
 data class LibraryState(
     val restoring: Boolean = true,
@@ -409,7 +410,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             Tab.HOME -> Page.Home
             Tab.SEARCH -> Page.Search()
             Tab.PLAYLISTS -> Page.Playlists
-            Tab.PROFILE -> Page.Profile
+            Tab.SETTINGS -> Page.Settings
         }
         stack.addAll(tabStacks[tab] ?: listOf(page))
         mutable.update { it.copy(tab = tab, searchActivationId = null) }

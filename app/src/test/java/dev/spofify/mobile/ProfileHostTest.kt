@@ -149,7 +149,10 @@ class ProfileHostTest {
     private fun back() { compose.runOnIdle { backInput.completeBack() }; compose.waitForIdle() }
     private fun profileAction(label: String) = compose.onNodeWithTag("profile-screen")
         .performScrollToNode(hasText(label)).let { compose.onNodeWithText(label) }
-    private fun openCredits() { profileAction("Credits").performClick(); compose.onNodeWithTag("credits-screen").assertIsDisplayed() }
+    private fun settingsAction(label: String) = compose.onNodeWithTag("settings-screen")
+        .performScrollToNode(hasText(label)).let { compose.onNodeWithText(label) }
+    private fun openAccount() { settingsAction("Account and server").performClick(); compose.onNodeWithTag("profile-screen").assertIsDisplayed() }
+    private fun openCredits() { settingsAction("Credits").performClick(); compose.onNodeWithTag("credits-screen").assertIsDisplayed() }
     private fun openLicense() = compose.onNodeWithText("View full font license").performScrollTo().performClick()
     private fun dismissDialogWithBack() {
         val dialog = compose.runOnIdle {
@@ -223,15 +226,30 @@ class ProfileHostTest {
         } finally { web.shutdown() }
     }
 
-    @Test fun profileIsAnOrdinaryIdentityRootWithoutPopupSavedControlsOrSyntheticBack() {
+    @Test fun settingsIsAnOrdinaryRootAndAccountIsNestedWithoutPopupSavedControlsOrSyntheticBack() {
         val before = playback.state.value
-        mount(); tab("profile")
-        compose.onNodeWithTag("profile-screen").assertIsDisplayed()
+        mount(); tab("settings")
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
+        compose.onNodeWithTag("settings-query").assertIsDisplayed()
+        settingsAction("Account and server").assertHasClickAction()
+        settingsAction("Credits").assertHasClickAction()
+        compose.onNodeWithText("Sign out").assertDoesNotExist()
+        compose.onNodeWithTag("profile-screen").assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals(Page.Settings, model.state.value.page)
+            assertFalse(model.state.value.canGoBack)
+            assertFalse("Settings root must leave Back to the host fallback", backInput.hasEnabledHandlers)
+        }
+        back()
+        assertEquals(1, rootBacks)
+        assertEquals(Page.Settings, model.state.value.page)
+        openAccount()
         compose.onNodeWithText("Username").assertIsDisplayed()
         compose.onNodeWithText(username).assertIsDisplayed()
         profileAction("Server").assertIsDisplayed()
         compose.onNodeWithText(client.server.origin).assertIsDisplayed()
-        listOf("Credits", "Sign out").forEach { profileAction(it).assertHasClickAction() }
+        profileAction("Sign out").assertHasClickAction()
+        compose.onNodeWithText("Credits").assertDoesNotExist()
         compose.onNodeWithText("Playback devices").assertDoesNotExist()
         compose.onNodeWithContentDescription("Playback devices").assertIsDisplayed()
         listOf("Your connection", "Font license", "View full font license", "Use saved login", "Forget saved login",
@@ -243,18 +261,81 @@ class ProfileHostTest {
         compose.onNodeWithTag("mini-player-identity").assertIsDisplayed()
         compose.runOnIdle {
             assertEquals(Page.Profile, model.state.value.page)
-            assertFalse(model.state.value.canGoBack)
-            assertFalse("Profile root must leave Back to the host fallback", backInput.hasEnabledHandlers)
+            assertTrue(model.state.value.canGoBack)
+            assertTrue("Account must register nested Back", backInput.hasEnabledHandlers)
         }
         back()
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
         assertEquals(1, rootBacks)
-        assertEquals(Page.Profile, model.state.value.page)
+        assertEquals(Page.Settings, model.state.value.page)
+        back()
+        assertEquals(2, rootBacks)
+        assertEquals(Page.Settings, model.state.value.page)
         assertPlaybackUnchanged(before)
+    }
+
+    @Test fun settingsSearchIsLocalAndRetainedAcrossRoutesButNotReplacementSessions() {
+        mount(); tab("settings")
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
+        await { !model.state.value.loading && client.httpClient.dispatcher.runningCallsCount() == 0 &&
+            client.httpClient.dispatcher.queuedCallsCount() == 0 }
+        val requestPaths = requests.map { "${it.method} ${it.path}" }
+        val requestCount = web.requestCount
+        val beforeNavigation = model.state.value
+        val beforePlayback = playback.state.value
+        fun assertRows(accountVisible: Boolean, creditsVisible: Boolean) {
+            compose.onAllNodesWithText("Account and server").assertCountEquals(if (accountVisible) 1 else 0)
+            compose.onAllNodesWithText("Credits").assertCountEquals(if (creditsVisible) 1 else 0)
+            compose.onNodeWithText("Sign out").assertDoesNotExist()
+            compose.onNodeWithTag("profile-screen").assertDoesNotExist()
+            compose.onNodeWithTag("catalog-results").assertDoesNotExist()
+        }
+        fun assertLocalSearchOnly() {
+            compose.waitForIdle()
+            assertEquals("Settings search must not issue catalog/library/player or other requests", requestPaths,
+                requests.map { "${it.method} ${it.path}" })
+            assertEquals("No hidden local-search requests", requestCount, web.requestCount)
+            compose.runOnIdle { assertEquals("Filtering must not navigate", beforeNavigation, model.state.value) }
+            assertPlaybackUnchanged(beforePlayback)
+        }
+        assertRows(accountVisible = true, creditsVisible = true)
+        listOf("font" to false, "account" to true, "server" to true).forEach { (query, accountVisible) ->
+            compose.onNodeWithTag("settings-query").performTextReplacement(query)
+            assertRows(accountVisible, creditsVisible = !accountVisible)
+            assertLocalSearchOnly()
+            compose.onNodeWithContentDescription("Clear settings search").performClick()
+            assertRows(accountVisible = true, creditsVisible = true)
+            assertLocalSearchOnly()
+        }
+        compose.onNodeWithTag("settings-query").performTextReplacement("server")
+        assertLocalSearchOnly()
+        openAccount()
+        assertEquals(Page.Profile, model.state.value.page)
+        back()
+        compose.onNodeWithTag("settings-query").assertTextContains("server")
+        assertRows(accountVisible = true, creditsVisible = false)
+        assertLocalSearchOnly()
+        tab("playlists"); tab("settings")
+        compose.onNodeWithTag("settings-query").assertTextContains("server")
+        assertRows(accountVisible = true, creditsVisible = false)
+        assertEquals(Page.Settings, model.state.value.page)
+        assertPlaybackUnchanged(beforePlayback)
+
+        // Authentication deliberately replaces the client and its private saveable-state owner.
+        account = "replacement-search-account"
+        username = "Replacement search listener"
+        compose.runOnIdle { model.signIn("http://127.0.0.1:${web.port}", "listener", "synthetic-password") }
+        await { model.state.value.session?.accountId == account && !model.state.value.busy }
+        tab("settings")
+        assertEquals("", compose.onNodeWithTag("settings-query").fetchSemanticsNode()
+            .config[SemanticsProperties.EditableText].text)
+        assertRows(accountVisible = true, creditsVisible = true)
+        compose.onNodeWithText(username).assertExists()
     }
 
     @Test fun offlineCreditsFullNoticeDismissesBeforeNestedBackAndRetainsItsTabStack() {
         val before = playback.state.value
-        mount(); tab("profile")
+        mount(); tab("settings")
         offline = true // Attribution must not need a working server or an external viewer.
         openCredits()
         compose.onNodeWithText("JetBrains Mono").assertIsDisplayed()
@@ -272,7 +353,7 @@ class ProfileHostTest {
         openLicense()
         compose.onNodeWithText("Done").performClick()
         compose.onNodeWithText("JetBrains Mono font license").assertDoesNotExist()
-        tab("playlists"); tab("profile")
+        tab("playlists"); tab("settings")
         compose.onNodeWithTag("credits-screen").assertIsDisplayed()
         compose.runOnIdle {
             assertTrue("Credits must enable nested Back: ${model.state.value}", model.state.value.canGoBack)
@@ -281,9 +362,9 @@ class ProfileHostTest {
         back()
         compose.runOnIdle {
             assertEquals("Nested Back must pop Credits; rootBacks=$rootBacks, clientSession=${client.currentSession() != null}",
-                Page.Profile, model.state.value.page)
+                Page.Settings, model.state.value.page)
         }
-        compose.onNodeWithTag("profile-screen").assertIsDisplayed()
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
         assertEquals(0, rootBacks)
         back()
         assertEquals(1, rootBacks)
@@ -291,7 +372,7 @@ class ProfileHostTest {
         assertTrue("The local notice must not fetch a license", requests.none { it.path?.contains("license") == true })
     }
 
-    @Test fun profileReturnPreservesSearchQueryAndRealScrollButExplicitActivationResets() {
+    @Test fun settingsReturnPreservesSearchQueryAndRealScrollButExplicitActivationResets() {
         val before = playback.state.value
         mount(); tab("search")
         compose.onNodeWithTag("search-query").performTextReplacement("preserved query")
@@ -329,7 +410,7 @@ class ProfileHostTest {
         compose.onNode(hasScrollToIndexAction()).performScrollToIndex(15)
         await { model.catalogHolder()!!.state.value.current.scrollIndex > 0 }
         val saved = model.catalogHolder()!!.state.value.current
-        tab("profile"); openCredits()
+        tab("settings"); openCredits()
         compose.runOnIdle { model.switchTab(Tab.SEARCH) }
         compose.onNodeWithTag("search-query").assertTextContains("preserved query").assertIsNotFocused()
         await { model.catalogHolder()!!.state.value.current.scrollIndex == saved.scrollIndex }
@@ -340,7 +421,7 @@ class ProfileHostTest {
             assertEquals(saved.scrollOffset, restored.scrollOffset)
             assertNull(model.state.value.searchActivationId)
         }
-        tab("profile") // Its nested Credits route is retained independently.
+        tab("settings") // Its nested Credits route is retained independently.
         compose.onNodeWithTag("credits-screen").assertIsDisplayed()
         tab("search")
         compose.onNodeWithTag("search-query").assertIsFocused()
@@ -349,18 +430,18 @@ class ProfileHostTest {
         assertEquals("", model.catalogHolder()!!.state.value.current.query)
         assertEquals(0, model.catalogHolder()!!.state.value.current.scrollIndex)
         compose.runOnIdle {
-            assertEquals("End, Profile return and empty explicit reset must not fetch another batch",
+            assertEquals("End, Settings return and empty explicit reset must not fetch another batch",
                 listOf("0", "10", "20"), trackReads().map { it.requestUrl!!.queryParameter("offset") })
         }
         assertPlaybackUnchanged(before)
     }
 
-    @Test fun profileAndCreditsCancelPendingSearchFocusBeforeFieldAttachment() {
+    @Test fun settingsAndCreditsCancelPendingSearchFocusBeforeFieldAttachment() {
         mount()
         compose.runOnIdle {
             model.activateSearch()
             assertNotNull(model.state.value.searchActivationId)
-            model.switchTab(Tab.PROFILE)
+            model.switchTab(Tab.SETTINGS)
             model.open(Page.Credits)
         }
         compose.onNodeWithTag("credits-screen").assertIsDisplayed()
@@ -377,13 +458,13 @@ class ProfileHostTest {
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun fourNavigationTargetsAndLongProfileValuesRemainReachableAt320Font2() {
         fontScale.value = 2f
-        mount(); tab("profile")
-        val bounds = listOf("home", "search", "playlists", "profile").map {
+        mount(); tab("settings")
+        val bounds = listOf("home", "search", "playlists", "settings").map {
             compose.onNodeWithTag("nav-$it").assertIsDisplayed()
                 .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).getUnclippedBoundsInRoot()
         }
         bounds.zipWithNext().forEach { (left, right) -> assertTrue(left.right <= right.left) }
-        listOf("Home", "Search", "Playlists", "Profile").forEach { label ->
+        listOf("Home", "Search", "Playlists", "Settings").forEach { label ->
             val layouts = mutableListOf<TextLayoutResult>()
             compose.onNode(hasText(label) and hasAnyAncestor(hasTestTag("primary-navigation")), useUnmergedTree = true)
                 .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action -> assertTrue(action(layouts)) }
@@ -405,15 +486,20 @@ class ProfileHostTest {
                     textBounds.top >= target.top && textBounds.bottom <= target.bottom)
             assertTrue("Navigation labels must not ellipsize: $label", (0 until layout.lineCount).none(layout::isLineEllipsized))
         }
-        listOf(username, client.server.origin, "Credits", "Sign out").forEach {
+        openAccount()
+        listOf(username, client.server.origin, "Sign out").forEach {
             profileAction(it).assertIsDisplayed()
         }
+        back()
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
         openCredits()
         compose.onNodeWithText("View full font license").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         openLicense()
         compose.onNodeWithText("Done").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         dismissDialogWithBack()
         back()
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
+        openAccount()
         profileAction("Sign out").assertIsDisplayed()
         assertTrue(playback.commands.isEmpty())
     }
@@ -465,9 +551,10 @@ class ProfileHostTest {
     }
 
     @Test fun logoutWhileNoticeIsOpenCannotLeakPrivateProfileRouteIntoReplacementSession() {
-        mount(); tab("profile"); openCredits(); openLicense()
+        mount(); tab("settings"); openCredits(); openLicense()
         compose.runOnIdle { model.logout() }
         await { model.state.value.session == null && !model.state.value.busy }
+        compose.onNodeWithTag("settings-screen").assertDoesNotExist()
         compose.onNodeWithTag("profile-screen").assertDoesNotExist()
         compose.onNodeWithTag("credits-screen").assertDoesNotExist()
         compose.onNodeWithText("JetBrains Mono font license").assertDoesNotExist()
@@ -477,11 +564,17 @@ class ProfileHostTest {
         compose.runOnIdle { model.signIn("http://127.0.0.1:${web.port}", "listener", "synthetic-password") }
         await { model.state.value.session?.accountId == account && !model.state.value.busy }
         assertEquals(Page.Home, model.state.value.page)
-        tab("profile")
-        compose.onNodeWithTag("profile-screen").assertIsDisplayed()
+        tab("settings")
+        compose.onNodeWithTag("settings-screen").assertIsDisplayed()
+        compose.onNodeWithTag("profile-screen").assertDoesNotExist()
+        assertEquals(Page.Settings, model.state.value.page)
+        assertFalse(model.state.value.canGoBack)
+        openAccount()
         compose.onNodeWithText("Replacement listener").assertIsDisplayed()
         compose.onNodeWithTag("credits-screen").assertDoesNotExist()
         compose.onNodeWithText("JetBrains Mono font license").assertDoesNotExist()
+        back()
+        assertEquals(Page.Settings, model.state.value.page)
         back()
         assertEquals(1, rootBacks)
     }

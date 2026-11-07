@@ -136,11 +136,11 @@ class NativeUiSmokeTest {
                 shell("wm size ${originalSizeOverride ?: "reset"}")
                 compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
                 screenshot("02-home")
-                // Login no longer exposes legal controls; Profile → Credits opens the
+                // Login no longer exposes legal controls; Settings → Credits opens the
                 // complete bundled offline notice through the signed-in destination.
-                compose.onNodeWithTag("nav-profile").performClick()
-                waitFor(hasTestTag("profile-screen"))
-                compose.onNodeWithText("Credits").performScrollTo().performClick()
+                compose.onNodeWithTag("nav-settings").performClick()
+                waitFor(hasTestTag("settings-screen"))
+                settingsAction("Credits").performClick()
                 waitFor(hasTestTag("credits-screen"))
                 compose.onNodeWithText("View full font license").performScrollTo().assertIsDisplayed().performClick()
                 val fontLicenseTitle = hasText("JetBrains Mono font license")
@@ -155,16 +155,16 @@ class NativeUiSmokeTest {
                 compose.onNodeWithText("Done").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
                 screenshot("02a-signed-in-font-license")
                 // Retain the narrow/font2 legal-dialog regression after authentication. A real
-                // configuration recreation may close the dialog; reopen through Profile/Credits.
+                // configuration recreation may close the dialog; reopen through Settings/Credits.
                 shell("wm size ${signInNarrowWidth}x${baselineDisplaySize.substringAfter('x')}")
                 compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == signInNarrowWidth }
                 shell("settings put system font_scale 2.0")
                 waitForFont(2f)
                 if (!exists(fontLicenseTitle)) {
-                    compose.onNodeWithTag("nav-profile").performClick()
+                    compose.onNodeWithTag("nav-settings").performClick()
                     if (!exists(hasTestTag("credits-screen"))) {
-                        waitFor(hasTestTag("profile-screen"))
-                        compose.onNodeWithText("Credits").performScrollTo().performClick()
+                        waitFor(hasTestTag("settings-screen"))
+                        settingsAction("Credits").performClick()
                     }
                     waitFor(hasTestTag("credits-screen"))
                     compose.onNodeWithText("View full font license").performScrollTo().assertIsDisplayed().performClick()
@@ -180,7 +180,7 @@ class NativeUiSmokeTest {
                 waitUntilAbsent(fontLicenseTitle)
                 compose.onNodeWithTag("credits-screen").assertIsDisplayed()
                 pressBack()
-                waitFor(hasTestTag("profile-screen"))
+                waitFor(hasTestTag("settings-screen"))
                 shell("settings put system font_scale $originalFontScale")
                 waitForFont(originalFontScale)
                 shell("wm size ${originalSizeOverride ?: "reset"}")
@@ -377,8 +377,8 @@ class NativeUiSmokeTest {
                 pressBack()
                 waitFor(hasText("Night walk · edited"))
                 assertNoAutoplayOnBrowse(fixture)
-                compose.onNodeWithTag("nav-profile").performClick()
-                waitFor(hasTestTag("profile-screen"))
+                compose.onNodeWithTag("nav-settings").performClick()
+                waitFor(hasTestTag("settings-screen"))
                 compose.onNodeWithText("Playback devices").assertDoesNotExist()
                 assertProfileAttribution(fixture, "08d-profile", playing = false)
                 compose.onNodeWithTag("nav-playlists").performClick()
@@ -1053,7 +1053,7 @@ class NativeUiSmokeTest {
 
     private fun assertCompactNavigationTargets() {
         assertListeningChrome(editing = false)
-        val targets = listOf("Home", "Search", "Playlists", "Profile").map { label ->
+        val targets = listOf("Home", "Search", "Playlists", "Settings").map { label ->
             compose.onNode(hasText(label) and hasAnyAncestor(hasTestTag("primary-navigation")))
                 .assertIsDisplayed().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
                 .getUnclippedBoundsInRoot()
@@ -1070,7 +1070,7 @@ class NativeUiSmokeTest {
                     (bounds.bottom - bounds.top).value in 48f..80f)
             }
         }
-        listOf("Home", "Search", "Playlists", "Profile").forEach { label ->
+        listOf("Home", "Search", "Playlists", "Settings").forEach { label ->
             val text = compose.onNode(hasText(label) and hasAnyAncestor(hasTestTag("primary-navigation")), useUnmergedTree = true)
             val target = compose.onNodeWithTag("nav-${label.lowercase()}").fetchSemanticsNode().boundsInRoot
             val textBounds = text.fetchSemanticsNode().boundsInRoot
@@ -1102,11 +1102,22 @@ class NativeUiSmokeTest {
         }
     }
 
-    /** Profile-owned signed-in notice journey; pre-auth attribution belongs to the Login peer. */
+    private fun settingsAction(label: String) = compose.onNodeWithTag("settings-screen")
+        .performScrollToNode(hasText(label)).let { compose.onNodeWithText(label) }
+
+    /** Settings-owned account/notice journey; pre-auth attribution belongs to the Login peer. */
     private fun assertProfileAttribution(fixture: UiFixtureServer, name: String, playing: Boolean) {
         val before = if (playing) capturePlaying(fixture) else null
-        compose.onNodeWithTag("nav-profile").performClick()
+        compose.onNodeWithTag("nav-settings").performClick()
+        waitFor(hasTestTag("settings-screen"))
+        compose.onNodeWithTag("settings-query").assertExists()
+        settingsAction("Account and server").assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
         waitFor(hasTestTag("profile-screen"))
+        compose.runOnIdle {
+            val state = ViewModelProvider(compose.activity)[LibraryViewModel::class.java].state.value
+            assertEquals(Page.Profile, state.page)
+            assertTrue("Account must nest under Settings", state.canGoBack)
+        }
         compose.onNodeWithText("Username").assertExists()
         compose.onNodeWithText(UiFixtureServer.USERNAME).performScrollTo().assertIsDisplayed()
         compose.onNodeWithText(fixture.origin).performScrollTo().assertIsDisplayed()
@@ -1117,13 +1128,16 @@ class NativeUiSmokeTest {
         compose.onNodeWithText("Remember sign-in on this device").assertDoesNotExist()
         compose.onNodeWithText("Font license").assertDoesNotExist()
         compose.onNodeWithTag("app-actions").assertDoesNotExist()
-        listOf("home", "search", "playlists", "profile").forEach {
+        listOf("home", "search", "playlists", "settings").forEach {
             compose.onNodeWithTag("nav-$it").assertIsDisplayed()
                 .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
         }
         compose.onNodeWithText("Sign out").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("Credits").assertDoesNotExist()
         screenshot(name)
-        compose.onNodeWithText("Credits").performScrollTo().assertHeightIsAtLeast(48.dp).performClick()
+        pressBack()
+        waitFor(hasTestTag("settings-screen"))
+        settingsAction("Credits").assertHeightIsAtLeast(48.dp).performClick()
         waitFor(hasTestTag("credits-screen"))
         compose.onNodeWithText("JetBrains Mono").assertExists()
         compose.onNodeWithText("View full font license").performScrollTo()
@@ -1141,13 +1155,13 @@ class NativeUiSmokeTest {
         waitUntilAbsent(hasText("JetBrains Mono font license"))
         compose.onNodeWithTag("credits-screen").assertIsDisplayed()
         pressBack()
-        waitFor(hasTestTag("profile-screen"))
+        waitFor(hasTestTag("settings-screen"))
         compose.runOnIdle {
             val state = ViewModelProvider(compose.activity)[LibraryViewModel::class.java].state.value
-            assertEquals(Page.Profile, state.page)
-            assertFalse("Profile root must not synthesize Back to Home", state.canGoBack)
+            assertEquals(Page.Settings, state.page)
+            assertFalse("Settings root must not synthesize Back to Home", state.canGoBack)
         }
-        if (before != null) assertPlayingTransition(before, fixture, "Profile/Credits/license/Back presentation")
+        if (before != null) assertPlayingTransition(before, fixture, "Settings/Account/Credits/license/Back presentation")
         else assertNoAutoplayOnBrowse(fixture)
     }
 

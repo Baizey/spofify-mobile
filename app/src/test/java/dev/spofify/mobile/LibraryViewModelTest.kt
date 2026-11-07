@@ -81,7 +81,7 @@ class LibraryViewModelTest {
         invalidateBeforeLaunch: Boolean = false,
         response: () -> MockResponse = { json("""{"items":[{"kind":"track","id":"song","name":"Song","hasAudio":true}],"total":1001,"truncated":true}""") },
         retry: Boolean = false,
-        retireThroughProfile: Boolean = false,
+        retireThroughSettings: Boolean = false,
     ) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val queueStarted = CountDownLatch(1)
@@ -122,18 +122,22 @@ class LibraryViewModelTest {
             if (!enqueue) assertTrue(queueStarted.await(5, TimeUnit.SECONDS))
             else assertEquals("Raw selected receiver owns preparation", 1, playback.listActions.size)
             assertTrue(model.state.value.preparing)
-            if (retireThroughProfile) {
+            if (retireThroughSettings) {
                 val playing = playback.state.value
                 // Retire the route even when no composition samples the intermediate tabs.
-                model.switchTab(Tab.PROFILE)
+                model.switchTab(Tab.SETTINGS)
+                model.open(Page.Profile)
+                model.back()
+                assertEquals(Page.Settings, model.state.value.page)
                 model.open(Page.Credits)
                 model.back()
+                assertEquals(Page.Settings, model.state.value.page)
                 model.switchTab(Tab.HOME)
                 assertEquals(Page.Home, model.state.value.page)
                 assertEquals(playing, playback.state.value)
             } else if (!invalidateBeforeLaunch) PlaybackRequests.invalidate()
             assertEquals("Unsampled navigation ABA retires source authority; transport revocation is separate",
-                !retireThroughProfile, browseSource())
+                !retireThroughSettings, browseSource())
             assertTrue("A fresh source capture may be acquired only by a fresh composition/event", model.captureBrowseSource(client)())
             if (enqueue) {
                 assertFalse("Held receiver work must observe route/epoch cancellation", playback.actionCurrents.removeFirst().invoke())
@@ -189,11 +193,11 @@ class LibraryViewModelTest {
     @Test fun cancelledEmptyQueueDoesNotPublishAStaleNotice() =
         cancelledQueueCompletion(response = { json("""{"items":[],"total":0}""") })
 
-    @Test fun profileCreditsRoundTripRetiresHeldPlayPreparationWithoutAutoplay() =
-        cancelledQueueCompletion(retireThroughProfile = true)
+    @Test fun settingsAccountAndCreditsRoundTripRetiresHeldPlayPreparationWithoutAutoplay() =
+        cancelledQueueCompletion(retireThroughSettings = true)
 
-    @Test fun profileCreditsRoundTripRetiresHeldRowAddWithoutTransportOrStaleNotice() =
-        cancelledQueueCompletion(enqueue = true, retireThroughProfile = true)
+    @Test fun settingsAccountAndCreditsRoundTripRetiresHeldRowAddWithoutTransportOrStaleNotice() =
+        cancelledQueueCompletion(enqueue = true, retireThroughSettings = true)
 
     @Test fun expiryRetiresPrivateProfileRoutesAndIgnoresLateNavigationBeforeNewSignIn() =
         profileSessionRetirement(expire = true)
@@ -228,13 +232,18 @@ class LibraryViewModelTest {
             val model = LibraryViewModel(app, graph, FakePlayback())
             store.put("subject", model)
             until { model.state.value.session != null && !model.state.value.busy }
-            model.switchTab(Tab.PROFILE)
-            assertEquals(Page.Profile, model.state.value.page)
+            model.switchTab(Tab.SETTINGS)
+            assertEquals(Page.Settings, model.state.value.page)
             assertFalse(model.state.value.canGoBack)
+            model.open(Page.Profile)
+            assertEquals(Page.Profile, model.state.value.page)
+            assertTrue(model.state.value.canGoBack)
+            model.back()
+            assertEquals(Page.Settings, model.state.value.page)
             model.open(Page.Credits)
             assertTrue(model.state.value.canGoBack)
             model.switchTab(Tab.PLAYLISTS)
-            model.switchTab(Tab.PROFILE)
+            model.switchTab(Tab.SETTINGS)
             assertEquals(Page.Credits, model.state.value.page)
             if (expire) {
                 retired.clearSession()
@@ -246,7 +255,8 @@ class LibraryViewModelTest {
                 assertNull(model.state.value.searchActivationId)
                 val signedOut = model.state.value
                 // Stale callbacks cannot re-expose Credits/identity or rebuild private stacks.
-                model.switchTab(Tab.PROFILE)
+                model.switchTab(Tab.SETTINGS)
+                model.open(Page.Profile)
                 model.open(Page.Credits)
                 model.back()
                 assertEquals(signedOut, model.state.value)
@@ -256,12 +266,17 @@ class LibraryViewModelTest {
             until { model.state.value.session?.accountId == account && !model.state.value.busy }
             assertNotSame(retired, graph.client)
             assertEquals(Page.Home, model.state.value.page)
-            model.switchTab(Tab.PROFILE)
-            assertEquals(Page.Profile, model.state.value.page)
+            model.switchTab(Tab.SETTINGS)
+            assertEquals(Page.Settings, model.state.value.page)
             assertFalse(model.state.value.canGoBack)
             model.back()
+            assertEquals(Page.Settings, model.state.value.page)
+            model.open(Page.Profile)
             assertEquals(Page.Profile, model.state.value.page)
+            assertTrue(model.state.value.canGoBack)
             assertEquals(account, model.state.value.session?.username)
+            model.back()
+            assertEquals(Page.Settings, model.state.value.page)
         } finally {
             store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain()
         }

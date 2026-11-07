@@ -262,11 +262,14 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                 CompactNavigation(modifier = Modifier.testTag("primary-navigation")) {
                     listOf(Tab.HOME to Icons.Default.Home, Tab.SEARCH to Icons.Default.Search,
                         Tab.PLAYLISTS to Icons.AutoMirrored.Filled.QueueMusic,
-                        Tab.PROFILE to Icons.Default.AccountCircle).forEach { (tab, icon) ->
+                        Tab.SETTINGS to Icons.Default.Settings).forEach { (tab, icon) ->
                         CompactNavigationItem(selected = state.tab == tab,
                             onClick = {
                                 if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                                    if (tab == Tab.SEARCH) model.activateSearch() else model.switchTab(tab)
+                                    if (tab == Tab.SEARCH) model.activateSearch() else {
+                                        focus.clearFocus(); keyboard?.hide()
+                                        model.switchTab(tab)
+                                    }
                                 }
                             },
                             icon = { Icon(icon, null) }, label = tab.name.lowercase().replaceFirstChar { it.titlecase() },
@@ -280,6 +283,8 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                 val pageKey = when (val page = state.page) {
                     is Page.Detail -> "detail:${page.item.kind}:${page.item.id}:${page.navigationId}"
                     Page.Likes -> "likes"
+                    Page.Settings -> "settings"
+                    Page.Profile -> "account"
                     Page.Credits -> "credits"
                     else -> state.tab.name
                 }
@@ -327,9 +332,18 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                             browseMemory = playlistBrowse, sourceEpoch = sourceEpoch)
                         Page.Likes -> LikedSongs(state, model, openExternal, play, showMore, queue, art,
                             feedback, likeStates, contentModifier)
+                        Page.Settings -> SettingsScreen(
+                            username = state.session?.username.orEmpty(), origin = client.server.origin,
+                            onOpen = { destination ->
+                                focus.clearFocus(); keyboard?.hide()
+                                model.open(when (destination) {
+                                    SettingsDestination.ACCOUNT -> Page.Profile
+                                    SettingsDestination.CREDITS -> Page.Credits
+                                })
+                            }, modifier = contentModifier)
                         Page.Profile -> ProfileScreen(
                             username = state.session?.username.orEmpty(), origin = client.server.origin,
-                            busy = state.busy, onCredits = { model.open(Page.Credits) },
+                            busy = state.busy,
                             onSignOut = model::logout, modifier = contentModifier)
                         Page.Credits -> CreditsScreen(onFontLicense = { creditsLicense = true }, modifier = contentModifier)
                     }

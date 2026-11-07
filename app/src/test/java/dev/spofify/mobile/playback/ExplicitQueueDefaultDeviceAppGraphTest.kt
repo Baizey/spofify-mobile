@@ -265,7 +265,7 @@ class ExplicitQueueDefaultDeviceAppGraphTest {
                     assertEquals(starts, PreparedTransportMedia.starts.get())
                     assertEquals(samples, PreparedTransportMedia.samples.get())
                     if (fault == Fault.ROUTE_ABA) compose.runOnIdle {
-                        active.model.switchTab(Tab.PROFILE)
+                        active.model.switchTab(Tab.SETTINGS)
                         active.model.switchTab(Tab.SEARCH); active.model.search(name)
                     } else runBlocking {
                         val remote = foreignApi.register("Synthetic contender")
