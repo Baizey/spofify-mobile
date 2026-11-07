@@ -190,7 +190,7 @@ class RootCopyHostTest {
         compose.onNodeWithText("Create playlist").performClick()
         compose.onNodeWithText("Name").assertIsDisplayed()
         compose.onNodeWithText("Manual playlists keep an editable ordered list. Duplicate tracks remain separate occurrences.")
-            .performScrollTo().assertIsDisplayed()
+            .assertDoesNotExist()
     }
 
     @Test fun emptyLikesRemainConciseAndRecoverable() {

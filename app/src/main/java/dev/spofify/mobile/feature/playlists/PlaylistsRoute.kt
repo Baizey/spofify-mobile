@@ -363,19 +363,21 @@ private fun PlaylistCard(playlist: PersonalPlaylistSummary, onClick: () -> Unit)
     }
 }
 
-private fun playlistFailure(error: Exception, mutation: Boolean = false): String = when {
-    error is ApiException && error.code == "SOURCE_REFERENCED" -> "Another recipe references this playlist. Remove those references explicitly before deleting it."
-    error is ApiException && error.code == "PLAYLIST_KIND_MISMATCH" -> "This operation is not supported by this playlist type. Reload and review the playlist."
-    error is ApiException && error.code == "COPY_LIMIT_EXCEEDED" -> "The complete result exceeds 1,000 occurrences. No editable copy was created."
-    error is ApiException && error.code == "RECIPE_CYCLE" -> "These collection references form a cycle. Choose different sources or membership conditions."
-    error is ApiException && error.code == "RECIPE_LIMIT_EXCEEDED" -> "The recipe exceeds supported graph or condition limits. Simplify it."
-    error is ApiException && error.code == "OCCURRENCE_UNAVAILABLE" -> "This occurrence has no recorded audio. No queue was replaced."
-    error is ApiException && error.status == 409 -> "The playlist or its inputs changed. Verify the saved playlist before trying again. Nothing was resubmitted."
+internal fun playlistFailure(error: Exception, mutation: Boolean = false): String = when {
+    error is ApiException && error.code == "SOURCE_REFERENCED" -> "Remove playlist references before deleting."
+    error is ApiException && error.code == "PLAYLIST_KIND_MISMATCH" -> "Action unavailable. Reload playlist."
+    error is ApiException && error.code == "PLAYLIST_STORAGE_EXCEEDED" -> "Playlist is too large to save."
+    error is ApiException && error.code == "COPY_LIMIT_EXCEEDED" -> "Playlist is too large to copy."
+    error is ApiException && error.code == "RECIPE_CYCLE" -> "Circular playlist sources. Choose another source."
+    error is ApiException && error.code == "RECIPE_LIMIT_EXCEEDED" -> "Too many rules. Simplify them."
+    error is ApiException && error.code == "OCCURRENCE_UNAVAILABLE" -> "Song unavailable."
+    error is ApiException && error.status == 409 -> "Playlist changed. Check saved playlist."
     error is ApiException && error.status == 429 -> "Playlist is updating. Try again in a moment."
-    error is ApiException && error.status == 422 -> "The request could not be accepted. Check the rules and limits. Copies require at most 1,000 complete occurrences; referenced playlists cannot be deleted."
-    error is ApiException && error.status == 404 -> "This playlist or a referenced collection is unavailable."
-    mutation && playlistWriteUncertain(error) -> "The response was lost. This change may already be saved. Verify saved playlists before making another change; nothing was resubmitted."
-    else -> "The request could not finish. No partial result is current."
+    error is ApiException && error.status == 413 -> "Playlist change is too large."
+    error is ApiException && error.status == 422 -> "Could not save playlist. Check its name and rules."
+    error is ApiException && error.status == 404 -> "Playlist unavailable."
+    mutation && playlistWriteUncertain(error) -> "Save unconfirmed. Check saved playlists."
+    else -> "Could not finish. Try again."
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -750,19 +752,20 @@ private fun PlaylistDetail(
         onVerify = { metadata = false; refreshAll(verifyBlocked = true) }, onSave = { name, description -> write {
             summary = api.updatePlaylist(id, name, description, saved.revision); metadata = false; refreshAll()
         } })
-    if (copying && saved != null) PlaylistMetadataDialog("Make editable copy", "${saved.name} (copy)", saved.description,
+    if (copying && saved != null) PlaylistMetadataDialog("Copy playlist", "${saved.name} (copy)", saved.description,
         busy = busy, blocked = blocked || copyNeedsReview || copySource?.isCurrent?.invoke() != true,
-        message = copyReviewMessage ?: if (copySource?.isCurrent?.invoke() != true) "Playlist changed. Close and choose Make editable copy again after it is current." else message,
-        explanation = "Copies the complete result, including unavailable tracks and duplicates (maximum 1,000), not just this page. Original rules stay unchanged.",
+        message = copyReviewMessage ?: if (copySource?.isCurrent?.invoke() != true) "Playlist changed. Reopen copy." else message,
+        saveLabel = "Create",
         onDismiss = { if (!busy) copying = false }, onVerify = {
             busy = true
             scope.launch {
                 try {
-                    val targets = api.playlists(kind = PlaylistKind.MANUAL, limit = 100)
-                    copyReviewMessage = "Saved manual playlists: ${targets.items.joinToString { it.name }}. A matching name cannot prove whether the last copy committed. Close and review saved playlists before deciding on another copy."
+                    api.playlists(kind = PlaylistKind.MANUAL, limit = 100)
+                    copyReviewMessage = if (copyNeedsReview) "Copy unconfirmed. Review saved playlists."
+                        else "Playlist changed. Reopen copy."
                     copyReviewed = true
                 } catch (e: CancellationException) { throw e }
-                catch (_: Exception) { copyReviewMessage = "Saved copies could not load. No copy was resubmitted; verify again explicitly." }
+                catch (_: Exception) { copyReviewMessage = "Could not check saved copies. Try again." }
                 finally { busy = false }
             }
         }, onSave = { name, description ->
@@ -770,16 +773,16 @@ private fun PlaylistDetail(
             if (captured != null && captured.isCurrent() && !stale && !copyNeedsReview) write(onFailure = { error ->
                 if (playlistWriteUncertain(error)) { copyNeedsReview = true; copyReviewed = false }
             }) {
-                val copy = derived.copy(id, name, description, captured.revision, captured.fence)
-                copying = false; message = "Created editable playlist: ${copy.name}. Original rules are unchanged."; refreshAll()
+                derived.copy(id, name, description, captured.revision, captured.fence)
+                copying = false; message = null; refreshAll()
             }
         })
     if (deleting && saved != null) AlertDialog(onDismissRequest = { if (!busy) deleting = false }, title = { Text("Delete playlist?") },
-        text = { Text("Delete “${saved.name}”? This removes the playlist, not music files. Other recipes may prevent deletion.\n${message.orEmpty()}") },
+        text = { Column { Text("Delete “${saved.name}”? Music files are kept."); message?.let { Text(it) } } },
         confirmButton = { TextButton(enabled = !busy && !blocked, onClick = { write { api.deletePlaylist(id, saved.revision); onBack() } }) { Text("Delete playlist") } },
         dismissButton = { TextButton(enabled = !busy, onClick = { deleting = false }) { Text("Cancel") } })
-    if (removing != null && saved != null) AlertDialog(onDismissRequest = { if (!busy) removing = null }, title = { Text("Remove occurrence?") },
-        text = { Text("Only this occurrence is removed. Other copies of the track and music files are unchanged.\n${message.orEmpty()}") },
+    if (removing != null && saved != null) AlertDialog(onDismissRequest = { if (!busy) removing = null }, title = { Text("Remove song from playlist?") },
+        text = { Column { Text(removing!!.track.name); message?.let { Text(it) } } },
         confirmButton = { TextButton(enabled = !busy && !blocked && !stale && removing!!.isCurrent(), onClick = {
             val selection = removing ?: return@TextButton
             if (!stale && selection.isCurrent()) write {
@@ -821,7 +824,7 @@ private fun PlaylistDetail(
                     val queue = api.playback(id)
                     request.deliver {
                         if (!sourceCurrent()) return@deliver
-                        if (entryId != null && queue.items.none { it.entryId == entryId }) message = "This occurrence is outside the prepared playback limit. No queue was replaced."
+                        if (entryId != null && queue.items.none { it.entryId == entryId }) message = "Could not play this song. Reload playlist."
                         else if (action == null) onPlayQueue(queue.queue, trackId, entryId)
                         else if (latestInteractionKey === expectedKey && sourceCurrent()) onPreparedAction?.invoke(queue.queue, trackId, entryId, action, expectedKey, sourceCurrent)
                     }
@@ -900,7 +903,7 @@ private fun PlaylistDetail(
                                 if (editorDraft == null) { editorDraft = PlaylistEditorDraft(playlist, rules.definition); editorTarget = playlist }
                                 else if (editorTarget?.revision != rules.revision) {
                                     editorDraft!!.blocked = true
-                                    editorDraft!!.message = "The saved revision changed while this draft was retained. It has not been rebased or resubmitted. Discard the draft to reload current rules, or keep it for review."
+                                    editorDraft!!.message = "Playlist changed. Review or discard this draft."
                                 }
                                 editing = true
                             }
@@ -920,7 +923,7 @@ private fun PlaylistDetail(
                     ({ collectionActions = null; copying = true }) else null,
                 onAllowNewCopy = if (playlist?.kind == PlaylistKind.DERIVED && copyNeedsReview && copyReviewed) ({
                     collectionActions = null; copyNeedsReview = false; copyReviewMessage = null
-                    message = "Saved copies reviewed. Any further copy is a new explicit operation, not a retry."
+                    message = null
                 }) else null,
                 onReorder = if (playlist != null && playlist.kind != PlaylistKind.DERIVED && playlist.capabilities.editEntries && snapshot == null) ({
                     collectionActions = null; busy = true; generation.invalidate()
@@ -1000,7 +1003,7 @@ private fun PlaylistDetail(
                 if (!busy && fetchFailed) TextButton(onClick = { refreshAll() }) { Text("Retry loading playlist") }
                 if (!busy && blocked) TextButton(onClick = { refreshAll(verifyBlocked = true) }) { Text("Verify saved playlist") }
                 if (stale && saved?.kind == PlaylistKind.DERIVED && message == null) Text(playlistCountLabel(saved, evaluation))
-                if (copyNeedsReview) Text("A copy may already exist. Use More to verify saved copies.")
+                if (copyNeedsReview) Text("Copy unconfirmed.")
                 if (!busy && !stale && (if (saved?.kind == PlaylistKind.DERIVED) evaluation?.total == 0L else saved?.trackCount == 0L)) Text("No songs in this playlist.")
             }
             if (snapshot != null) {
@@ -1125,21 +1128,21 @@ internal fun PlaylistTrackRow(track: LibraryItem, onOpenTrack: (LibraryItem) -> 
 }
 
 @Composable
-private fun PlaylistMetadataDialog(title: String, initialName: String, initialDescription: String,
+internal fun PlaylistMetadataDialog(title: String, initialName: String, initialDescription: String,
     busy: Boolean, blocked: Boolean, message: String?, onDismiss: () -> Unit, onVerify: () -> Unit,
-    onSave: (String, String) -> Unit, explanation: String? = null) {
+    onSave: (String, String) -> Unit, saveLabel: String = "Save") {
     var name by remember { mutableStateOf(initialName) }
     var description by remember { mutableStateOf(initialDescription) }
     val invalid = playlistMetadataError(name, description)
     AlertDialog(onDismissRequest = { if (!busy) onDismiss() }, title = { Text(title) }, text = {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            explanation?.let { Text(it) }
             OutlinedTextField(name, { name = it }, label = { Text("Name") }, enabled = !busy, singleLine = true)
             OutlinedTextField(description, { description = it }, label = { Text("Description (optional)") }, enabled = !busy, maxLines = 4)
             invalid?.let { Text(it) }; message?.let { Text(it) }
         }
     }, confirmButton = {
-        if (blocked) TextButton(enabled = !busy, onClick = onVerify) { Text("Verify saved playlist") }
-        else TextButton(enabled = !busy && invalid == null, onClick = { onSave(name.trim(), description) }) { Text("Save") }
-    }, dismissButton = { TextButton(enabled = !busy, onClick = onDismiss) { Text("Cancel") } })
+        if (blocked) TextButton(enabled = !busy, modifier = Modifier.heightIn(min = 48.dp), onClick = onVerify) { Text("Check") }
+        else TextButton(enabled = !busy && invalid == null, modifier = Modifier.heightIn(min = 48.dp),
+            onClick = { onSave(name.trim(), description) }) { Text(saveLabel) }
+    }, dismissButton = { TextButton(enabled = !busy, modifier = Modifier.heightIn(min = 48.dp), onClick = onDismiss) { Text("Cancel") } })
 }

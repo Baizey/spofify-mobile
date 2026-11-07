@@ -70,6 +70,9 @@ class RecipeBuilderTest {
         compose.onNodeWithText("Exact genre label").assertDoesNotExist()
         advanced()
         compose.onNodeWithText("Duplicates").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Collections are joined", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Genres use", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Local checks", substring = true).assertDoesNotExist()
         assertEquals(0, server.requestCount)
     }
 
@@ -96,7 +99,7 @@ class RecipeBuilderTest {
         advanced()
         click("All matches (no limit)")
         compose.onNodeWithText("First N").performClick()
-        val label = "Number of songs — Playlist size (after conditions and order)"
+        val label = "Number of songs — Playlist size"
         compose.onNodeWithText(label).performScrollTo().performTextReplacement("1e2")
         compose.runOnIdle {
             assertEquals(JsonPrimitive("1e2"), draft.value["take"]!!.jsonObject["count"])
@@ -111,6 +114,9 @@ class RecipeBuilderTest {
         }
         compose.onNodeWithText(label).performTextReplacement("1001")
         compose.runOnIdle { assertNull(recipeValidationError(draft.value)) }
+        click("How your music is chosen")
+        compose.onNodeWithText("Playlist size: Last 1001").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("retaining forward order", substring = true).assertDoesNotExist()
     }
 
     @Test fun disabledBuilderCannotChangeTheDraft() {
@@ -169,6 +175,9 @@ class RecipeBuilderTest {
             compose.onAllNodes(androidx.compose.ui.test.hasText("Astral Ensemble")).fetchSemanticsNodes().isNotEmpty()
         }
         compose.onNodeWithText("Wrong kind").assertDoesNotExist()
+        compose.onNodeWithText("saved matches", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Refine the search", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Searching saved music", substring = true).assertDoesNotExist()
         click("Astral Ensemble")
         compose.onNodeWithText("Astral Ensemble").assertIsDisplayed()
         compose.runOnIdle {

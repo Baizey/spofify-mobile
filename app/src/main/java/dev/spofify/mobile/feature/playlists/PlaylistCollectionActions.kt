@@ -39,8 +39,8 @@ internal fun PlaylistCollectionActionsContent(
             onEditDetails?.let { SongActionRow("Edit details", Icons.Default.Edit, managementEnabled, onClick = it) }
             onEditRules?.let { SongActionRow("Edit rules", Icons.Default.Tune, managementEnabled, onClick = it) }
             onMakeEditableCopy?.let { SongActionRow("Make editable copy", Icons.Default.ContentCopy, copyEnabled, onClick = it) }
-            onVerifySavedCopies?.let { SongActionRow("Verify saved copies", Icons.Default.FactCheck, verifyEnabled, onClick = it) }
-            onAllowNewCopy?.let { SongActionRow("I reviewed saved copies — allow a new copy", Icons.Default.Check,
+            onVerifySavedCopies?.let { SongActionRow("Check saved copies", Icons.Default.FactCheck, verifyEnabled, onClick = it) }
+            onAllowNewCopy?.let { SongActionRow("Allow another copy", Icons.Default.Check,
                 allowNewCopyEnabled, onClick = it) }
             onReorder?.let { SongActionRow("Reorder all occurrences", Icons.Default.Reorder, managementEnabled, onClick = it) }
         }) else null,

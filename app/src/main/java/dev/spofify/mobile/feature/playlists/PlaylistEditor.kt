@@ -29,7 +29,7 @@ internal class EditorPreviewState(
     var stale by mutableStateOf(true); private set
     var error by mutableStateOf<String?>(null); private set
     var identity by mutableStateOf<Any>(Any()); private set
-    var message by mutableStateOf("Not evaluated. Preview is read-only and never plays music."); private set
+    var message by mutableStateOf(""); private set
     private var rules: JsonObject? = null
     private var target: PersonalPlaylistSummary? = null
     private var sourceRevision = 0L
@@ -52,7 +52,7 @@ internal class EditorPreviewState(
     fun invalidate() {
         identity = Any(); job?.cancel(); job = null
         rules = null; pending = false; stale = true; failed = false; error = null
-        message = "Preview is not current. Draft retained; refresh preview explicitly."
+        message = "Preview changed. Refresh preview."
     }
 
     fun refresh(value: JsonObject, derived: Boolean, saved: PersonalPlaylistSummary?, version: Long = 0L) {
@@ -80,7 +80,7 @@ internal class EditorPreviewState(
         val before = page
         val prefix = entries
         pending = true; failed = false; error = null
-        if (before == null) message = "Evaluating preview…"
+        if (before == null) message = ""
         job = scope.launch {
             try {
                 // The source may change after reservation but before this coroutine dispatches.
@@ -114,17 +114,17 @@ internal class EditorPreviewState(
                 entries = all
                 page = result
                 stale = false
-                message = "${result.total} matches · ${result.availableTotal} with recorded audio. Preview is read-only."
+                message = ""
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 if (identity !== ticket) return@launch
                 val invalid = e is IllegalStateException || (e is ApiException && (e.status in 200..299 || e.status == 409 || e.status == 410))
                 stale = invalid
-                if (invalid) message = "Preview changed or expired. Retained rows are not current; refresh preview explicitly."
+                if (invalid) message = "Preview changed. Refresh preview."
                 else {
                     // Initial failures also retry the exact captured definition/null cursor.
                     stale = false; failed = true; failedCursor = cursor
-                    error = "Preview could not load. Your draft and rows are retained."
+                    error = "Preview could not load."
                 }
             } finally { if (identity === ticket) pending = false }
         }
@@ -193,7 +193,7 @@ internal fun PlaylistEditor(
         onLoad = evaluation::more)
     LazyColumn(modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            TextButton(onClick = onBack, enabled = !saving) { Text("Back — keep draft") }
+            TextButton(onClick = onBack, enabled = !saving) { Text("Cancel") }
             Text(if (target == null) "Create playlist" else "Edit rules", style = MaterialTheme.typography.headlineMedium)
             if (target == null) {
                 OutlinedTextField(draft.name, { draft.name = it }, label = { Text("Name") }, enabled = !saving, modifier = Modifier.fillMaxWidth())
@@ -204,37 +204,35 @@ internal fun PlaylistEditor(
                     FilterChip(selected = draft.derived, enabled = !saving, onClick = { draft.derived = true; invalidatePreview() }, label = { Text("Live rules") })
                 }
                 metadataError?.let { Text(it) }
-            } else Text("${target.name} · revision ${target.revision}. Rule changes do not alter the current playback queue.")
+            } else Text(target.name)
             if (draft.derived) {
-                Text("Rules stay live as saved inputs change. Choosing first/last songs from a source happens before conditions; final playlist size happens afterwards.")
                 if (sourceFailed) {
-                    Text("Saved source collections could not load. Existing rules are retained.")
+                    Text("Saved sources could not load.")
                     TextButton(onClick = { sourceRefresh++ }, enabled = !saving) { Text("Reload source choices") }
                 }
                 RecipeBuilder(draft.rules, { draft.rules = it; invalidatePreview() }, sources, client, enabled = !saving)
                 rulesError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                Text("Local checks are structural only. The server checks ownership, saved references, cycles and graph limits on preview and save.", style = MaterialTheme.typography.bodySmall)
                 Row {
                     TextButton(onClick = { evaluation.refresh(draft.rules, draft.derived, target, draft.editVersion) }, enabled = !saving && !previewPending && !draft.blocked && rulesError == null) { Text("Refresh preview") }
                     TextButton(onClick = { invalidatePreview() }, enabled = previewPending) { Text("Cancel preview") }
                 }
-                Text(evaluation.message)
+                if (evaluation.message.isNotBlank()) Text(evaluation.message)
                 if (previewPending && preview == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-            } else Text("Manual playlists keep an editable ordered list. Duplicate tracks remain separate occurrences.")
+            }
             draft.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (draft.blocked) {
                 TextButton(enabled = !saving, onClick = {
                     saving = true
                     scope.launch {
                         try {
-                            val saved = api.playlists(limit = 100)
-                            draft.message = "Saved playlists: ${saved.items.joinToString { it.name }}. A matching name cannot prove whether a previous request committed. Close and review before making another change."
+                            api.playlists(limit = 100)
+                            draft.message = "Review saved playlists."
                         } catch (e: CancellationException) { throw e }
-                        catch (_: Exception) { draft.message = "Verification could not load. No change was resubmitted. Try verification again explicitly." }
+                        catch (_: Exception) { draft.message = "Could not check saved playlists. Try again." }
                         finally { saving = false }
                     }
-                }) { Text("Verify saved playlists") }
-                TextButton(enabled = !saving, onClick = onDiscard) { Text("Discard draft and return to saved playlists") }
+                }) { Text("Check") }
+                TextButton(enabled = !saving, onClick = onDiscard) { Text("Discard draft") }
             } else Button(enabled = !saving && metadataError == null && rulesError == null, onClick = {
                 invalidatePreview(); saving = true; onMutationPendingChange(true)
                 scope.launch {
@@ -249,9 +247,9 @@ internal fun PlaylistEditor(
                         val uncertain = playlistWriteUncertain(e)
                         draft.blocked = conflict || uncertain
                         draft.message = when {
-                            conflict -> "Playlist changed elsewhere. Draft retained. Verify saved playlists and review the current rules before trying again; nothing was resubmitted."
-                            uncertain -> "The save response was lost. A playlist or rule change may already be saved. Verify before another write; nothing was resubmitted."
-                            else -> "The playlist could not be saved. Check its name, rules and references; your draft is retained."
+                            conflict -> "Playlist changed. Check saved playlists."
+                            uncertain -> "Save unconfirmed. Check saved playlists."
+                            else -> "Could not save playlist. Check its name and rules."
                         }
                     } finally { saving = false; onMutationPendingChange(false) }
                 }
@@ -265,7 +263,6 @@ internal fun PlaylistEditor(
                 AppendStatus(previewPending && preview != null, evaluation.error, {
                     if (!saving && !draft.blocked) evaluation.retry()
                 }, retryLabel = "Retry preview")
-                if (!evaluation.stale && preview != null && preview.nextCursor == null) Text("End of preview")
             }
         }
     }

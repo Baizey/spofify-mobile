@@ -273,8 +273,8 @@ class PlaylistEditorContinuousHostTest {
                 scrollTo("80. Song 79")
                 compose.waitForIdle()
                 assertEquals(countAfterEdit, cursors.size)
-                scrollTo("Preview is not current. Draft retained; refresh preview explicitly.")
-                compose.onNodeWithText("Preview is not current. Draft retained; refresh preview explicitly.").assertExists()
+                scrollTo("Preview changed. Refresh preview.")
+                compose.onNodeWithText("Preview changed. Refresh preview.").assertExists()
                 scrollTo("Refresh preview")
                 compose.onNodeWithText("Refresh preview").performScrollTo().performClick()
                 waitForRequests(cursors, countAfterEdit + 1)
@@ -316,7 +316,7 @@ class PlaylistEditorContinuousHostTest {
                 compose.onNodeWithText("Refresh preview").performScrollTo().performClick()
                 waitForRequests(cursors, 1)
                 waitForPublishedPreview()
-                scrollTo("81 matches · 81 with recorded audio. Preview is read-only.")
+                scrollTo("Refresh preview")
                 compose.waitForIdle()
                 assertEquals(listOf("initial"), cursors.toList())
                 val before = client.personalRevision.value.playlists
@@ -325,7 +325,7 @@ class PlaylistEditorContinuousHostTest {
                 // recompose it. No direct checkInputs/invalidate call substitutes for the host.
                 compose.runOnIdle { client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
                 assertEquals(before + 1, client.personalRevision.value.playlists)
-                val stale = "Preview is not current. Draft retained; refresh preview explicitly."
+                val stale = "Preview changed. Refresh preview."
                 compose.waitUntil(5_000) {
                     compose.waitForIdle()
                     compose.onAllNodesWithText(stale).fetchSemanticsNodes().isNotEmpty()
@@ -353,10 +353,11 @@ class PlaylistEditorContinuousHostTest {
     }
 
     private fun waitForPublishedPreview() {
-        // Server receipt is not UI publication: response decoding runs on the HTTP dispatcher.
+        // Observe a real published first row, not a removed routine count/explanation line.
+        compose.onNode(hasScrollToIndexAction()).performScrollToIndex(1)
         compose.waitUntil(5_000) {
             compose.waitForIdle()
-            compose.onAllNodesWithText("81 matches · 81 with recorded audio. Preview is read-only.")
+            compose.onAllNodesWithText("1. Song 0")
                 .fetchSemanticsNodes().isNotEmpty()
         }
         compose.onNodeWithText("Retry preview").assertDoesNotExist()

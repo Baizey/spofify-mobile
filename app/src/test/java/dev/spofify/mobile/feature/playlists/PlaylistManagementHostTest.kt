@@ -102,6 +102,20 @@ class PlaylistManagementHostTest {
         assertTrue("Loading/cancelling the complete order never saves it", writes().isEmpty())
     }
 
+    @Test fun createPlaylistContainsOnlyNeededFieldsChoicesAndActions() = withHost(initialPlaylistId = null) {
+        waitText("Create playlist")
+        compose.onNodeWithText("Create playlist").performClick()
+        compose.onNodeWithText("Name").assertExists()
+        compose.onNodeWithText("Description (optional)").assertExists()
+        compose.onNodeWithText("Manual").assertExists()
+        compose.onNodeWithText("Live rules").assertExists()
+        compose.onNodeWithText("Manual playlists keep", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Rules stay live", substring = true).assertDoesNotExist()
+        dev.spofify.mobile.capturePolishEvidence("create-playlist", compose.onRoot())
+        compose.onNodeWithText("Cancel").performClick()
+        assertTrue(writes().isEmpty())
+    }
+
     @Test fun derivedManagementStillOpensRulesAndCopyWithoutQueueIntentCallback() = withHost(derived = true) {
         awaitLoaded()
         openMore()
@@ -109,15 +123,23 @@ class PlaylistManagementHostTest {
         compose.onNodeWithText("Refresh").assertDoesNotExist()
         compose.onNodeWithText("Reorder all occurrences").assertDoesNotExist()
         menuAction("Edit rules").performClick()
-        waitText("Back — keep draft")
-        compose.onNodeWithText("Back — keep draft").performClick()
+        waitText("Cancel")
+        compose.onNodeWithText("Rules stay live", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Local checks", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("revision", substring = true).assertDoesNotExist()
+        dev.spofify.mobile.capturePolishEvidence("rules-editor", compose.onRoot())
+        compose.onNodeWithText("Cancel").performClick()
         awaitLoaded()
         openMore()
         menuAction("Make editable copy").performClick()
         compose.onNodeWithText("Name").assertExists()
         compose.onNodeWithText("Playlist fixture (copy)").assertExists()
-        compose.onNodeWithText("maximum 1,000", substring = true).assertExists()
-        compose.onNodeWithText("Save").assertIsEnabled()
+        compose.onNodeWithText("Copy playlist").assertExists()
+        compose.onNodeWithText("maximum 1,000", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Copies the complete result", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Original rules", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Create").assertIsEnabled()
+        dev.spofify.mobile.capturePolishEvidence("copy-dialog", compose.onNode(isDialog()))
         compose.onNodeWithText("Cancel").performClick()
         assertTrue(writes().isEmpty())
     }
@@ -194,7 +216,7 @@ class PlaylistManagementHostTest {
         openMore()
         menuAction("Edit details").performClick()
         compose.onNodeWithText("Save").performClick()
-        waitText("Verify saved playlist")
+        waitText("Check")
         compose.onNodeWithText("Save").assertDoesNotExist()
         compose.onNodeWithText("Cancel").performClick()
         openMore()
@@ -215,7 +237,7 @@ class PlaylistManagementHostTest {
             compose.onAllNodesWithContentDescription(songMore)[1].performClick()
             waitText("Like song")
             menuAction("Remove this occurrence").assertIsEnabled().performClick()
-            compose.onNodeWithText("Remove occurrence?").assertIsDisplayed()
+            compose.onNodeWithText("Remove song from playlist?").assertIsDisplayed()
         }
         selectSecondRemoval()
         assertTrue(writes().isEmpty())
@@ -231,7 +253,7 @@ class PlaylistManagementHostTest {
         assertEquals("$detailPath/entries/second-entry", removal.requestUrl!!.encodedPath)
         assertEquals("5", body(removal).getValue("expectedRevision").jsonPrimitive.content)
         assertEquals(setOf("expectedRevision"), body(removal).keys)
-        compose.onNodeWithText("Remove occurrence?").assertDoesNotExist()
+        compose.onNodeWithText("Remove song from playlist?").assertDoesNotExist()
     }
 
     @Test fun uncertainCopyVerificationAndSourceRefreshNeverReplayOrSilentlyUnlockTheWrite() = withHost(
@@ -241,22 +263,26 @@ class PlaylistManagementHostTest {
         awaitLoaded()
         openMore()
         menuAction("Make editable copy").performClick()
-        compose.onNodeWithText("Save").performClick()
-        waitText("Verify saved playlist")
-        compose.onNodeWithText("Save").assertDoesNotExist()
+        compose.onNodeWithText("Create").performClick()
+        waitText("Check")
+        compose.onNodeWithText("Create").assertDoesNotExist()
+        dev.spofify.mobile.capturePolishEvidence("copy-uncertain", compose.onNode(isDialog()))
         val copy = writes().single()
         assertEquals("POST", copy.method)
         assertEquals("$detailPath/copy", copy.requestUrl!!.encodedPath)
         assertEquals("5", body(copy).getValue("expectedRevision").jsonPrimitive.content)
         assertEquals("evaluation-fence", body(copy).getValue("fence").jsonPrimitive.content)
         assertEquals("Playlist fixture (copy)", body(copy).getValue("name").jsonPrimitive.content)
-        compose.onNodeWithText("Verify saved playlist").performClick()
-        waitText("A matching name cannot prove", substring = true)
+        compose.onNodeWithText("Check").performClick()
+        waitText("Copy unconfirmed. Review saved playlists.")
+        compose.onNodeWithText("Saved manual playlists:", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("A matching name", substring = true).assertDoesNotExist()
+        dev.spofify.mobile.capturePolishEvidence("copy-uncertain-checked", compose.onNode(isDialog()))
         assertTrue(requests.any { it.requestUrl?.encodedPath == "/api/me/playlists" && it.requestUrl?.queryParameter("kind") == "manual" })
-        compose.onNodeWithText("Save").assertDoesNotExist()
+        compose.onNodeWithText("Create").assertDoesNotExist()
         compose.onNodeWithText("Cancel").performClick()
         openMore()
-        menuAction("Verify saved copies").assertIsEnabled()
+        menuAction("Check saved copies").assertIsEnabled()
         menuAction("Make editable copy").assertIsNotEnabled()
         dismissDialogWithBack()
         compose.onNodeWithText("Verify saved playlist").performScrollTo().performClick()
@@ -264,7 +290,7 @@ class PlaylistManagementHostTest {
         openMore()
         menuAction("Make editable copy").assertIsNotEnabled()
         // Verification plus a source refresh still needs a separate, explicit review acknowledgement.
-        menuAction("I reviewed saved copies — allow a new copy").performClick()
+        menuAction("Allow another copy").performClick()
         openMore()
         menuAction("Make editable copy").assertIsEnabled()
         assertEquals("Verification, refresh and acknowledgement are reads/UI, not a copy retry", 1, writes().size)
@@ -309,6 +335,7 @@ class PlaylistManagementHostTest {
         capabilities: PlaylistCapabilities = if (derived) PlaylistCapabilities(editEntries = false, editDefinition = true,
             copyToManual = true, addTracks = false) else PlaylistCapabilities(),
         beforeMount: Fixture.() -> Unit = {},
+        initialPlaylistId: String? = "fixture",
         test: Fixture.() -> Unit,
     ) {
         val fixture = Fixture(derived, total, description, capabilities)
@@ -318,9 +345,12 @@ class PlaylistManagementHostTest {
             fixture.beforeMount()
             runBlocking { fixture.client.login("listener", "synthetic") }
             compose.setContent {
-                MaterialTheme {
+                MaterialTheme(colorScheme = dev.spofify.mobile.listeningColorScheme(),
+                    typography = dev.spofify.mobile.ui.theme.AppTypography) {
+                    androidx.compose.material3.Surface {
                     if (shown.value) PlaylistsRoute(fixture.client, {}, { _, _, _ -> fail("Browsing/management must not prepare playback") }, {},
-                        initialPlaylistId = "fixture") // Intentionally no onQueueIntent or prepared-action callback.
+                        initialPlaylistId = initialPlaylistId) // Intentionally no onQueueIntent or prepared-action callback.
+                    }
                 }
             }
             fixture.test()

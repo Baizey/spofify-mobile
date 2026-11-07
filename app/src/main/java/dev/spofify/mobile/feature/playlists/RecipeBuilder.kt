@@ -105,7 +105,6 @@ fun RecipeBuilder(
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Choose music", style = MaterialTheme.typography.titleMedium)
-        Text("Collections are joined in the order below. Collection windows are applied before conditions; the final size is applied afterwards.")
         sources.take(4).forEachIndexed { index, element ->
             val source = element as? JsonObject
             key(source?.text("slotId") ?: "invalid-$index") {
@@ -119,7 +118,7 @@ fun RecipeBuilder(
                         TextButton(onClick = { windowOpen = !windowOpen }) {
                             Text(if (windowOpen) "Hide collection window" else "Limit songs from this collection")
                         }
-                        if (windowOpen) TakeEditor(source, "Collection window (before conditions)", enabled) { next ->
+                        if (windowOpen) TakeEditor(source, "Collection window", enabled) { next ->
                             setSources(sources.toMutableList().apply { set(index, next) })
                         }
                     } else Text("Unsupported source. Remove it and choose a new source.")
@@ -159,7 +158,7 @@ fun RecipeBuilder(
                             PredicateEditor(predicate, 1, playlists, client, labels, enabled, leafCount < 32) {
                                 onChange(definition.withField(field, it))
                             }
-                        } else Text("Conditions exceed local size/depth limits. Clear a group to edit safely.")
+                        } else Text("Too many conditions. Clear a group.")
                         TextButton(enabled = enabled, onClick = { onChange(definition.withField(field, null)) }) {
                             Text("Clear $field conditions")
                         }
@@ -168,17 +167,13 @@ fun RecipeBuilder(
             }
             RecipeChoice("Duplicates", listOf("unique" to "One occurrence per track", "keep" to "Keep duplicate occurrences"),
                 definition.text("duplicates"), enabled) { onChange(definition.withField("duplicates", JsonPrimitive(it))) }
-            RecipeChoice("Result order", listOf("sourceOrder" to "Source order", "title" to "Title (ASCII case-insensitive)"),
+            RecipeChoice("Result order", listOf("sourceOrder" to "Source order", "title" to "Title"),
                 definition.text("sort"), enabled) { onChange(definition.withField("sort", JsonPrimitive(it))) }
-            TakeEditor(definition, "Playlist size (after conditions and order)", enabled, onChange)
-            Text("Genres use the first nonempty tier: track labels, canonical-album labels, then cached credited-artist labels. Missing genres are unknown. Not jazz and excluding jazz both omit unknowns; use Any of with Unknown genre to include them.",
-                style = MaterialTheme.typography.bodySmall)
+            TakeEditor(definition, "Playlist size", enabled, onChange)
         }
         recipeValidationError(definition)?.let {
             Text(it, color = MaterialTheme.colorScheme.error)
         }
-        Text("Local checks do not verify references or playlist cycles. Preview and save validate the complete graph on the server.",
-            style = MaterialTheme.typography.bodySmall)
         TextButton(onClick = { recap = !recap }) {
             Text(if (recap) "Hide how your music is chosen" else "How your music is chosen")
         }
@@ -190,7 +185,7 @@ fun RecipeBuilder(
             Text("Only keep: ${predicateLabel(definition["include"] as? JsonObject, playlists, labels)}")
             if ("exclude" in definition) Text("Exclude: ${predicateLabel(definition["exclude"] as? JsonObject, playlists, labels)}")
             Text(if (definition.text("duplicates") == "keep") "Keep duplicate occurrences" else "Keep the first surviving occurrence of each track")
-            Text(if (definition.text("sort") == "title") "Order by title (ASCII case-insensitive)" else "Keep source order")
+            Text(if (definition.text("sort") == "title") "Order by title" else "Keep source order")
             Text("Playlist size: ${windowLabel(definition["take"] as? JsonObject)}")
         }
     }
@@ -262,7 +257,6 @@ private fun TakeEditor(owner: JsonObject, title: String, enabled: Boolean, onCha
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
             )
-            Text("First / last keeps forward order; it never reverses the songs.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -279,7 +273,7 @@ private fun PredicateEditor(
     replace: (JsonObject) -> Unit,
 ) {
     if (depth > 4) {
-        Text("Condition exceeds four levels. Change or clear the parent condition.", color = MaterialTheme.colorScheme.error)
+        Text("Too many nested conditions. Clear this group.", color = MaterialTheme.colorScheme.error)
         return
     }
     val op = value.text("op")
@@ -371,17 +365,13 @@ private fun SavedMusicPicker(
                 invalidate()
                 val ticket = authority.begin()
                 pending = true
-                status = "Searching saved music…"
+                status = ""
                 job = scope.launch {
                     try {
                         val page = CatalogApi(client).browse(kind = "${kind}s", query = query, availability = "all", limit = 40)
                         if (!authority.isCurrent(ticket)) return@launch
                         results = page.items.filter { it.kind == kind && it.id.isNotEmpty() && it.name.isNotBlank() }.take(40)
-                        status = when {
-                            results.isEmpty() -> "No saved matches."
-                            page.total > results.size -> "Showing ${results.size} of ${page.total}. Refine the search to find another $kind."
-                            else -> "${results.size} saved matches."
-                        }
+                        status = if (results.isEmpty()) "No saved matches." else ""
                         authority.complete(ticket)
                         pending = false
                     } catch (cancelled: CancellationException) {
@@ -389,7 +379,7 @@ private fun SavedMusicPicker(
                     } catch (_: Exception) {
                         if (authority.fail(ticket)) {
                             pending = false
-                            status = "Saved music could not load. Search again explicitly."
+                            status = "Saved music could not load. Try again."
                         }
                     }
                 }
@@ -416,7 +406,7 @@ private fun sourceLabel(source: JsonObject?, playlists: List<Pair<String, String
 
 private fun windowLabel(take: JsonObject?): String = if (take == null) "All matches (no limit)" else {
     val count = (take["count"] as? JsonPrimitive)?.takeUnless { it.isString }?.content ?: "invalid size"
-    "${if (take.text("side") == "last") "Last" else "First"} $count, retaining forward order"
+    "${if (take.text("side") == "last") "Last" else "First"} $count"
 }
 
 private fun predicateLabel(value: JsonObject?, playlists: List<Pair<String, String>>, labels: Map<String, String>, depth: Int = 1): String {
