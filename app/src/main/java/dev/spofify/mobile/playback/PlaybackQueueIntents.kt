@@ -80,13 +80,10 @@ internal object PlaybackQueueIntents {
                 it.targetId.isEmpty() || seen.add(it.targetId to it.occurrenceId)
             }
             if (intent == "now") require(distinct.isNotEmpty())
-            val prune = if (intent == "now") 0 else minOf(before.position.coerceAtLeast(0),
-                (before.queue.size + distinct.size - PlaybackQueue.LIMIT).coerceAtLeast(0))
-            val retained = if (intent == "now") emptyList() else queue.drop(prune)
-            val room = PlaybackQueue.LIMIT - retained.size
-            if (distinct.isNotEmpty() && room <= 0) return Plan(before, metadata, 0, "none", false, emptyList())
-            val selected = distinct.take(room)
-            limited = truncated || selected.size < distinct.size
+            require(!truncated && notice.isEmpty()) { "Incomplete playback selection" }
+            val retained = if (intent == "now") emptyList() else queue
+            val selected = distinct
+            require(retained.size.toLong() + selected.size <= Int.MAX_VALUE) { "Queue index overflow" }
             val baseline = if (intent == "now") -1 else retained.maxOfOrNull { it.order } ?: -1
             require(serial <= MAX_SAFE - selected.size && baseline <= MAX_SAFE - selected.size)
             accepted = selected.mapIndexed { index, track -> track.copy(key = serial + index + 1, order = baseline + index + 1) }

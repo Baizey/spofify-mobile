@@ -73,7 +73,6 @@ import kotlinx.coroutines.launch
 @androidx.annotation.OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
     internal companion object {
-        private const val MAX_PENDING_AUDIO_URLS = 1_000
         private const val ACTION_TRANSPORT = "dev.spofify.mobile.playback.TRANSPORT"
         private const val ACTION_KEEP_ALIVE = "dev.spofify.mobile.playback.KEEP_ALIVE"
         private var active = WeakReference<PlaybackService>(null)
@@ -1329,9 +1328,9 @@ class PlaybackService : MediaSessionService() {
             importedPositionMs = plan.positionMs
             contextIdentity = snapshot.context?.let { LibraryItem(it.kind, it.id, it.name) }
             queueMessage = when (snapshot.notice) {
-                "CLICKED_OCCURRENCE_ONLY" -> "This selection is beyond the 1,000-song limit. Only the selected occurrence is loaded."
-                "PLAYBACK_LIMIT" -> "Queue limited to 1,000 songs."
-                else -> if (snapshot.truncated) "Queue limited to 1,000 songs." else null
+                "CLICKED_OCCURRENCE_ONLY" -> "The selected device loaded only the selected occurrence."
+                "PLAYBACK_LIMIT" -> "The selected device loaded an incomplete queue."
+                else -> if (snapshot.truncated) "The selected device loaded an incomplete queue." else null
             }
             current.shuffleModeEnabled = false
             val selected = snapshot.queue.getOrNull(snapshot.position)
@@ -1788,9 +1787,7 @@ class PlaybackService : MediaSessionService() {
                     return@mutation frozenResult("rejected")
                 }
             val result = if (plan.count == 0) {
-                val full = live.queue.size - live.position.coerceAtLeast(0) >= PlaybackQueue.LIMIT && additions.any { it.targetId.isEmpty() }
-                frozenResult(if (full) "rejected" else "ok", QueueIntentResult(if (full) "full" else "no_op", 0,
-                    null, "none", "unchanged", null, if (full) "PLAYBACK_LIMIT" else ""))
+                frozenResult("ok", QueueIntentResult("no_op", 0, null, "none", "unchanged", null, ""))
             } else commitQueueIntent(plan, permit, ::originCurrent)
             val detail = result.queueIntentResult
             terminalResult = PlaybackActionResult(when (detail?.outcome) {
@@ -1946,7 +1943,7 @@ class PlaybackService : MediaSessionService() {
         if (!admissionIsCurrent() || !isCurrent() || requestEpoch != PlaybackRequests.epoch || requestedClient !== client ||
             requestedClient.currentSession() !== authenticatedSession) return "Playback request cancelled after the session changed."
         val prepared = try {
-            require(items.size in 1..PlaybackQueue.LIMIT && start in items.indices)
+            require(items.isNotEmpty() && start in items.indices)
             require(wireSerial <= 9007199254740991L - items.size)
             // Keys remain unique across local replacements within the same owner epoch, so
             // a stale remote occurrence command cannot target a different new queue entry.
@@ -2166,13 +2163,7 @@ class PlaybackService : MediaSessionService() {
                 resolved?.truncated ?: false, resolved?.notice.orEmpty())
         } catch (_: IllegalArgumentException) { return if (key != null) rejected() else rejected("INVALID_SELECTION") }
         if (plan.count == 0) {
-            val full = plan.snapshot == before && resolved?.tracks?.isNotEmpty() == true &&
-                before.queue.size - before.position.coerceAtLeast(0) >= PlaybackQueue.LIMIT &&
-                resolved.tracks.any { track -> track.targetId.isEmpty() || before.queue.none {
-                    it.targetId == track.targetId && it.occurrenceId == track.occurrenceId
-                } }
-            return frozenResult(if (full) "rejected" else "ok", QueueIntentResult(if (full) "full" else "no_op",
-                0, null, "none", "unchanged", null, if (full) "PLAYBACK_LIMIT" else ""))
+            return frozenResult("ok", QueueIntentResult("no_op", 0, null, "none", "unchanged", null, ""))
         }
         if (!admitted()) return rejected()
         return commitQueueIntent(plan, value, isCurrent)
@@ -2303,7 +2294,6 @@ class PlaybackService : MediaSessionService() {
         if (authority !== value || request != PlaybackRequests.epoch || !hasAuthority()) return frozenResult("rejected")
         if (resolved.enqueue) {
             val result = enqueueWire(resolved.tracks, resolved.first)
-            if (result == null && resolved.truncated) markQueueLimited()
             return frozenResult(if (result == null) "ok" else "rejected")
         }
         if (wireSerial > 9007199254740991L - resolved.tracks.size) return frozenResult("rejected")
@@ -2327,13 +2317,12 @@ class PlaybackService : MediaSessionService() {
             it.targetId == track.targetId && it.occurrenceId == track.occurrenceId
         } }
         if (additions.isEmpty()) { onAccepted(0, false); return null }
-        var order = traversalIds()
-        val retained = PlaybackQueue.retainedForAdd(order, currentId(), additions.size)
-        val room = PlaybackQueue.LIMIT - retained.size
-        if (room <= 0) return "Queue is full."
+        val order = traversalIds()
+        val retained = order
+        if (retained.size.toLong() + additions.size > Int.MAX_VALUE) return "Queue index overflow."
         val baselineMax = wireTracks.values.maxOfOrNull { it.order } ?: physicalIds().size.toLong()
         if (wireSerial > 9007199254740991L - additions.size || baselineMax > 9007199254740991L - additions.size) return "Queue identifiers are exhausted. Choose music again."
-        val accepted = additions.take(room).mapIndexed { index, track -> track.copy(key = wireSerial + index + 1, order = baselineMax + index + 1) }
+        val accepted = additions.mapIndexed { index, track -> track.copy(key = wireSerial + index + 1, order = baselineMax + index + 1) }
         // Validate the COMBINED exact prospective queue before retiring entries, allocating
         // live keys, replacing history/metadata or adding media. Individually safe batches
         // can exceed the 2MiB publication envelope when joined.
@@ -2345,8 +2334,7 @@ class PlaybackService : MediaSessionService() {
         try {
             val nextSnapshot = before.copy(queue = prospective,
                 position = before.queue.getOrNull(before.position)?.key?.let { key -> prospective.indexOfFirst { it.key == key } } ?: 0,
-                truncated = before.truncated || accepted.size < additions.size,
-                notice = if (accepted.size < additions.size) "PLAYBACK_LIMIT" else before.notice)
+                truncated = before.truncated, notice = before.notice)
             val previous = intentMetadata(before)
             val metadata = previous.copy(origins = previous.origins + accepted.associate { it.key to if (placement == "legacy") "legacy" else if (first) "next" else placement },
                 high = previous.high + accepted.map { it.key })
@@ -2356,11 +2344,6 @@ class PlaybackService : MediaSessionService() {
         val media = try { accepted.map { PlaybackMedia.create(PlaybackSnapshotCodec.libraryItem(it), source, "wire-${it.key}") } }
             catch (_: IllegalArgumentException) { return "Invalid queue entry." }
         wireSerial = accepted.last().key
-        if (retained != order) {
-            val retired = order.toSet() - retained.toSet()
-            for (index in current.mediaItemCount - 1 downTo 0) if (PlaybackMedia.occurrence(current.getMediaItemAt(index)) in retired) current.removeMediaItem(index)
-            order = retained
-        }
         val added = accepted.map { "wire-${it.key}" }
         accepted.forEachIndexed { index, track ->
             wireKeys[added[index]] = track.key; wireTracks[added[index]] = track
@@ -2374,16 +2357,9 @@ class PlaybackService : MediaSessionService() {
         current.addMediaItems(media)
         removed = null
         preserveTraversal(next)
-        if (accepted.size < additions.size) markQueueLimited()
         schedulePrune()
-        onAccepted(accepted.size, accepted.size < additions.size)
+        onAccepted(accepted.size, false)
         return null
-    }
-
-    private fun markQueueLimited() {
-        queueMessage = "Queue limited to 1,000 songs."
-        queueTruncated = true
-        queueNoticeCode = "PLAYBACK_LIMIT"
     }
 
     private fun toggleOwnedShuffle() {
@@ -2679,7 +2655,6 @@ class PlaybackService : MediaSessionService() {
             controller: MediaSession.ControllerInfo,
             items: List<MediaItem>,
         ): ListenableFuture<MutableList<MediaItem>> = try {
-            require((player?.mediaItemCount ?: 0) + items.size <= PlaybackQueue.LIMIT)
             val safe = sanitized(controller, items)
             approve(safe, replace = false)
             Futures.immediateFuture(safe)
@@ -2693,7 +2668,6 @@ class PlaybackService : MediaSessionService() {
             require(controller.uid == Process.myUid())
             require(sharedClient === (application as SpofifyApplication).graph.client)
             require(sharedClient.currentSession() != null)
-            require(items.size <= PlaybackQueue.LIMIT)
             return items.map { supplied ->
                 val track = requireNotNull(PlaybackMedia.libraryItem(supplied))
                 // Rebuild instead of trusting localConfiguration, URI, headers, DRM,
@@ -2707,7 +2681,6 @@ class PlaybackService : MediaSessionService() {
             // final entry must not leave URLs from the rejected request authorized.
             val urls = items.map { requireNotNull(it.localConfiguration).uri.toString() }
             val pending = if (replace) urls.toSet() else pendingAudioUrls + urls
-            require(pending.size <= MAX_PENDING_AUDIO_URLS)
             pendingAudioUrls.clear()
             pendingAudioUrls.addAll(pending)
             allowedAudioUrls.addAll(urls)

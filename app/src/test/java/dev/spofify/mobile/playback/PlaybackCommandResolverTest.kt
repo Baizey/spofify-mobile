@@ -133,7 +133,7 @@ class PlaybackCommandResolverTest {
         val command = PlaybackDeviceCommand.musical("playCollection", context = playlist, trackId = "same", entryId = "e2")
         for (items in listOf(listOf(track(entry = "e1")), listOf(track(entry = "e1"), track(entry = "e2", available = false)))) {
             web.enqueue(response(queue("playlist", "manual", items, total = 1200, truncated = true)))
-            rejects(command)
+            fails(command)
         }
         // No bare-track fallback and no second fetch to recover a selected row.
         assertEquals(2, web.requestCount)
@@ -219,26 +219,18 @@ class PlaybackCommandResolverTest {
         assertEquals("o2", result.tracks[result.startIndex].occurrenceId)
     }
 
-    @Test fun unselectedDerivedEnqueueUsesFencedPostWithoutSelectionAndPreservesTruncationNotice() = runBlocking {
+    @Test fun unselectedDerivedEnqueueRejectsPartialCollectionWithoutFallback() = runBlocking {
         web.enqueue(response(derivedBody(start = "o1", total = 5000000000, notice = "PLAYBACK_LIMIT")))
-        val result = resolve(PlaybackDeviceCommand.musical("enqueueContext", context = derived, first = true))
+        fails(PlaybackDeviceCommand.musical("enqueueContext", context = derived, first = true))
         assertEquals(setOf("expectedRevision", "fence"), objectOf(web.takeRequest().body.readUtf8()).keys)
-        assertTrue(result.enqueue)
-        assertTrue(result.first)
-        assertTrue(result.truncated)
-        assertEquals("PLAYBACK_LIMIT", result.notice)
-        assertTrue(result.pinStart)
+        assertEquals(1, web.requestCount)
     }
 
     @Test fun clickedDerivedOccurrenceBeyondPrefixIsExactlyOneOccurrenceNotFirstThousand() = runBlocking {
         web.enqueue(response(derivedBody(items = listOf(derivedTrack("far")), start = "far", total = 5000000000,
             notice = "CLICKED_OCCURRENCE_ONLY")))
-        val result = resolve(PlaybackDeviceCommand.musical("playCollection", context = derived,
+        fails(PlaybackDeviceCommand.musical("playCollection", context = derived,
             occurrenceId = "far", selectionToken = "signed-far"))
-        assertEquals(listOf("far"), result.tracks.map { it.occurrenceId })
-        assertEquals(0, result.startIndex)
-        assertTrue(result.truncated)
-        assertEquals("CLICKED_OCCURRENCE_ONLY", result.notice)
         assertEquals(1, web.requestCount)
     }
 
@@ -283,13 +275,27 @@ class PlaybackCommandResolverTest {
         repeat(web.requestCount) { assertEquals("/api/me/playlists/rules/playback", web.takeRequest().path) }
     }
 
-    @Test fun emptyDuplicateIdentityAndOversizedOrdinaryResultsRejectInsteadOfRepairing() = runBlocking {
-        for (items in listOf(emptyList(), listOf(track(entry = "duplicate"), track(entry = "duplicate")),
-            (0..1000).map { track(entry = "e$it") })) {
+    @Test fun emptyAndDuplicateIdentityOrdinaryResultsRejectInsteadOfRepairing() = runBlocking {
+        for (items in listOf(emptyList(), listOf(track(entry = "duplicate"), track(entry = "duplicate")))) {
             web.enqueue(response(queue("playlist", "manual", items)))
             rejects(PlaybackDeviceCommand.musical("playCollection", context = playlist))
         }
-        assertEquals(3, web.requestCount)
+        assertEquals(2, web.requestCount)
+    }
+
+    @Test fun completeLargeCollectionsSelectLastDuplicateWithoutPrefixOrExtraFetch() = runBlocking {
+        for (size in listOf(1001, 5000)) {
+            val items = (0 until size).map { track(entry = "e$it") }
+            web.enqueue(response(queue("playlist", "manual", items)))
+            val result = resolve(PlaybackDeviceCommand.musical("playCollection", context = playlist,
+                trackId = "same", entryId = "e${size - 1}"))
+            assertEquals(size, result.tracks.size)
+            assertEquals(size - 1, result.startIndex)
+            assertEquals((0 until size).map { "e$it" }, result.tracks.map { it.entryId })
+            assertFalse(result.truncated)
+            assertEquals("", result.notice)
+        }
+        assertEquals(2, web.requestCount)
     }
 
     @Test fun cancellationDuringAwaitPropagatesAndDoesNotStartAnotherRequest() = runBlocking {
@@ -346,10 +352,10 @@ class PlaybackCommandResolverTest {
     private fun track(id: String = "same", entry: String = "", available: Boolean = true, privatePath: String = "/private/never-retain") =
         """{"kind":"track","id":"$id","name":"Song","artists":[{"id":"artist","name":"Artist"}],"durationMs":12345,"hasAudio":$available,"libraryPath":"$privatePath","entryId":"$entry"}"""
     private fun queue(kind: String, id: String, items: List<String>, total: Long = items.size.toLong(), truncated: Boolean = false) =
-        """{"context":{"kind":"$kind","id":"$id","name":"Collection"},"items":[${items.joinToString()}],"total":$total,"limit":1000,"truncated":$truncated,"revision":7}"""
+        """{"context":{"kind":"$kind","id":"$id","name":"Collection"},"items":[${items.joinToString()}],"total":$total,"limit":${items.size},"truncated":$truncated,"revision":7}"""
     private fun derivedTrack(occurrence: String, available: Boolean = true) =
         track(available = available).dropLast(1) + ""","occurrenceId":"$occurrence","selectionToken":"signed-$occurrence"}"""
     private fun derivedBody(items: List<String> = listOf(derivedTrack("o1"), derivedTrack("o2")), start: String,
         total: Long = items.size.toLong(), notice: String? = null) =
-        """{"context":{"kind":"derived","id":"rules","name":"Server name","revision":5,"fence":"${derived.fence}"},"items":[${items.joinToString()}],"total":$total,"limit":1000,"truncated":${total > items.size},"revision":5,"fence":"${derived.fence}","startOccurrenceId":"$start","notice":${notice?.let { "\"$it\"" } ?: "null"}}"""
+        """{"context":{"kind":"derived","id":"rules","name":"Server name","revision":5,"fence":"${derived.fence}"},"items":[${items.joinToString()}],"total":$total,"limit":${items.size},"truncated":${total > items.size},"revision":5,"fence":"${derived.fence}","startOccurrenceId":"$start","notice":${notice?.let { "\"$it\"" } ?: "null"}}"""
 }

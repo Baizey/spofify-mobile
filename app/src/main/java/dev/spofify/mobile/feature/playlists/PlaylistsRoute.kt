@@ -711,8 +711,7 @@ private fun PlaylistDetail(
                     val queue = derived.playback(id, saved.revision, result.fence, selectionToken)
                     request.deliver {
                         if (!sourceCurrent()) return@deliver
-                        message = when (queue.notice) { "CLICKED_OCCURRENCE_ONLY" -> "Only the selected occurrence was prepared because it is beyond the first 1,000 available occurrences."
-                            "PLAYBACK_LIMIT" -> "Playback is limited to the first 1,000 available occurrences."; else -> null }
+                        message = null
                         if (action == null) onPlayQueue(queue.queue, null, queue.startOccurrenceId)
                         else if (latestInteractionKey === expectedKey && sourceCurrent()) onPreparedAction?.invoke(queue.queue, null,
                             queue.startOccurrenceId, action, expectedKey, sourceCurrent)

@@ -79,18 +79,14 @@ internal object PlaybackSnapshotCodec {
         require(startEntryId == null || playable.any { it.entryId == startEntryId && (startTrackId == null || it.id == startTrackId) })
         require(startEntryId != null || startTrackId == null || playable.any { it.id == startTrackId })
         val chosen = playbackStartIndex(playable, startTrackId, startEntryId)
-        val clickedOnly = chosen >= PlaybackQueue.LIMIT
-        val accepted = if (clickedOnly) listOf(playable[chosen]) else playable.take(PlaybackQueue.LIMIT)
-        val tracks = accepted.mapIndexed { index, item -> track(item, index + 1L, index.toLong()) }
-        val selected = tracks[if (clickedOnly) 0 else playbackStartIndex(accepted, startTrackId, startEntryId)]
+        val tracks = playable.mapIndexed { index, item -> track(item, index + 1L, index.toLong()) }
+        val selected = tracks[chosen]
         val order = if (shuffle) listOf(selected) + tracks.filter { it.key != selected.key }.shuffled() else tracks
         val identity = queue.context?.let { LibraryItem(it.kind, it.id, it.name) } ?: context
         val wireContext = identity?.let { PlaybackContext(it.kind,
             if (it.kind == "likes" && it.id.isEmpty()) "likes" else it.id, it.name, queue.revision) }
-        val limited = clickedOnly || queue.truncated || playable.size > PlaybackQueue.LIMIT
         return PlaybackSnapshot(queue = order, position = order.indexOf(selected), context = wireContext,
-            shuffle = shuffle, playing = true, truncated = limited,
-            notice = if (clickedOnly) "CLICKED_OCCURRENCE_ONLY" else if (limited) "PLAYBACK_LIMIT" else "").publicationValidated()
+            shuffle = shuffle, playing = true).publicationValidated()
     }
 
     /** Internal queue identity is intentionally separate from arbitrary wire occurrenceId text. */

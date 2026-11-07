@@ -160,11 +160,8 @@ internal object PlaybackCommandResolver {
             require(if (hasSelection) loaded.startOccurrenceId == selectedOccurrence else start == 0) { "Mismatched derived selection" }
             require(selectedTrack == null || chosen.id == selectedTrack) { "Mismatched selected track" }
             require(selectedEntry == null || chosen.entryId == selectedEntry) { "Mismatched selected entry" }
-            require(loaded.notice == "CLICKED_OCCURRENCE_ONLY" || loaded.notice == if (loaded.truncated) "PLAYBACK_LIMIT" else null) {
-                "Invalid derived notice"
-            }
-            require(loaded.notice != "CLICKED_OCCURRENCE_ONLY" || (hasSelection && items.size == 1 && loaded.truncated)) {
-                "Invalid derived fallback"
+            require(!loaded.truncated && loaded.notice == null && loaded.total == items.size.toLong() && loaded.limit == items.size) {
+                "Incomplete derived playback collection"
             }
             val tracks = items.mapIndexed { index, item ->
                 project(item, index).copy(entryId = "", occurrenceId = requireNotNull(item.entryId), targetId = context.id, playbackContext = context)
@@ -202,7 +199,7 @@ internal object PlaybackCommandResolver {
             else -> throw IllegalArgumentException("Unsupported playback context")
         }
         currentCoroutineContext().ensureActive()
-        require(loaded.limit == 1000 && loaded.items.size <= 1000 && loaded.total >= loaded.items.size) { "Invalid playback bound" }
+        require(!loaded.truncated && loaded.limit == loaded.items.size && loaded.total == loaded.items.size.toLong()) { "Incomplete playback collection" }
         val available = loaded.items.filter { it.kind == "track" && it.playable }
         require(available.isNotEmpty()) { "No available music in this collection" }
         val identities = available.map { if (context.kind == "playlist") it.entryId.orEmpty() else it.id }
@@ -214,9 +211,8 @@ internal object PlaybackCommandResolver {
         // A missing or unavailable clicked row never selects index zero. Even a truncated
         // response is not proof that an absent row still has audio; reject rather than guess.
         require(start >= 0) { "The selected occurrence is unavailable in this context" }
-        val limited = loaded.truncated || loaded.total > 1000
         return result(available.mapIndexed { index, item -> project(item, index) }, loaded.context, start,
-            shuffle, first, enqueue, limited, if (limited) "PLAYBACK_LIMIT" else "", pinStart = hasSelection)
+            shuffle, first, enqueue, pinStart = hasSelection)
     }
 
     private data class OrdinaryQueue(val items: List<LibraryItem>, val total: Long, val limit: Int,

@@ -1,6 +1,5 @@
 package dev.spofify.mobile.feature.player
 
-import dev.spofify.mobile.playback.PlaybackQueue
 import dev.spofify.mobile.playback.QueueEntry
 
 /**
@@ -107,7 +106,7 @@ internal class QueueDragSession<Guard : Any> private constructor(
             layout: QueueDragLayout,
         ): QueueDragSession<Guard>? {
             if (!current.allowDrag || current.currentOccurrenceId == null ||
-                current.upcoming.isEmpty() || current.upcoming.size > PlaybackQueue.LIMIT ||
+                current.upcoming.isEmpty() ||
                 !layout.hasViewport || !pointerY.isFinite() || pointerY !in layout.viewportStart..layout.viewportEnd) return null
             val captured = current.copy(upcoming = current.upcoming.toList())
             val order = captured.order

@@ -120,7 +120,7 @@ class PlaybackListActionViewModelTest {
                         json("""{"items":[{"kind":"track","id":"old-play","name":"Old Play","hasAudio":true}],"total":1}""")
                             .also { gate?.responded?.countDown() }
                     }
-                    "/api/me/playlists/rules/playback" -> json("""{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"fixture-fence"},"items":[{"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-1","selectionToken":"returned-1"},{"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-2","selectionToken":"returned-2"}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"fixture-fence","startOccurrenceId":"occ-2","notice":null}""")
+                    "/api/me/playlists/rules/playback" -> json("""{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"fixture-fence"},"items":[{"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-1","selectionToken":"returned-1"},{"kind":"track","id":"same","name":"Song","hasAudio":true,"occurrenceId":"occ-2","selectionToken":"returned-2"}],"total":2,"limit":2,"truncated":false,"revision":5,"fence":"fixture-fence","startOccurrenceId":"occ-2","notice":null}""")
                     else -> json("""{"items":[],"total":0,"revision":1}""")
                 }
             }

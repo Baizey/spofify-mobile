@@ -32,8 +32,8 @@ internal object PlaybackRawJson {
     private fun names(vararg s: String) = s.toSet()
     private fun checkShape(n: Node, role: String) {
         if (n is Arr) {
-            val max = when (role) { "artists" -> 64; "devices", "receivers", "acks" -> 16; "directives" -> 32; "commands", "results" -> 128; else -> 1000 }
-            require(n.values.size <= max)
+            val max = when (role) { "artists" -> 64; "devices", "receivers", "acks" -> 16; "directives" -> 32; "commands", "results" -> 128; else -> null }
+            require(max == null || n.values.size <= max)
             n.values.forEach { checkShape(it, role) }
             return
         }
@@ -115,7 +115,7 @@ internal object PlaybackRawJson {
                 require(child is Obj && "key" !in child.fields && "order" !in child.fields)
                 checkShape(child, "track")
             } else if (key == "highKeys" && child is Arr) {
-                require(child.values.size <= 1000 && child.values.all { it is Atom && !it.value.isString && it.value.content.matches(Regex("[1-9][0-9]*")) && it.value.longOrNull?.let { v -> v <= 9007199254740991L } == true })
+                require(child.values.all { it is Atom && !it.value.isString && it.value.content.matches(Regex("[1-9][0-9]*")) && it.value.longOrNull?.let { v -> v <= 9007199254740991L } == true })
             } else checkShape(child, next)
         }
     }
@@ -154,7 +154,7 @@ internal object PlaybackRawJson {
                     i++; ws(); val values = arrayListOf<Node>()
                     if (i < source.length && source[i] == ']') { i++; Arr(values) } else {
                         while (true) {
-                            require(values.size < 1000); values.add(value(depth + 1)); ws(); require(i < source.length)
+                            values.add(value(depth + 1)); ws(); require(i < source.length)
                             if (source[i++] == ']') break
                             require(source[i - 1] == ',')
                         }

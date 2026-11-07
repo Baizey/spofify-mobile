@@ -186,7 +186,7 @@ class PlaybackServiceBridgeTest {
 
     private suspend fun derivedQueue(): dev.spofify.mobile.core.PlaybackQueue {
         fun track(occurrence: String, token: String) = """{"kind":"track","id":"same-song","name":"Duplicate song","artists":[],"albumName":"Album","albumId":"album","durationMs":120000,"hasAudio":true,"occurrenceId":"$occurrence","selectionToken":"$token"}"""
-        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Original rules","revision":5,"fence":"original-fence"},"items":[${track("occ-1", "returned-token-1")},${track("occ-2", "returned-token-2")}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"occ-2","notice":null}"""
+        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Original rules","revision":5,"fence":"original-fence"},"items":[${track("occ-1", "returned-token-1")},${track("occ-2", "returned-token-2")}],"total":2,"limit":2,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"occ-2","notice":null}"""
         val response = dev.spofify.mobile.core.DerivedPlaylistsApi(client).playback("rules", 5, "original-fence", "original-signed-click")
         val request = requireNotNull(web.takeRequest(1, TimeUnit.SECONDS))
         assertEquals("/api/me/playlists/rules/playback", request.path)
@@ -1300,7 +1300,7 @@ class PlaybackServiceBridgeTest {
         val items = (0 until 500).joinToString { index ->
             """{"kind":"track","id":"duplicate","name":"Song","artists":[],"albumName":"Album","albumId":"album","durationMs":120000,"hasAudio":true,"occurrenceId":"${occurrence(index)}","selectionToken":"returned-token"}"""
         }
-        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Original rules","revision":5,"fence":"original-fence"},"items":[$items],"total":500,"limit":1000,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"${occurrence(0)}","notice":null}"""
+        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Original rules","revision":5,"fence":"original-fence"},"items":[$items],"total":500,"limit":500,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"${occurrence(0)}","notice":null}"""
         val result = endpoint.execute(PlaybackDeviceCommand.musical("enqueueContext", context = context, first = true), permit)
         assertEquals("rejected", result.status)
         assertEquals(original, result.snapshot)
@@ -1330,7 +1330,7 @@ class PlaybackServiceBridgeTest {
         val occurrence = "derived-" + "x".repeat(1600)
         val context = PlaybackContext("derived", "rules", "Original rules", 5, "original-fence")
         fun track(id: String) = """{"kind":"track","id":"same-song","name":"Duplicate","artists":[],"durationMs":120000,"hasAudio":true,"occurrenceId":"$id","selectionToken":"returned-replacement"}"""
-        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Original rules","revision":5,"fence":"original-fence"},"items":[${track("first")},${track(occurrence)}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"$occurrence","notice":null}"""
+        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Original rules","revision":5,"fence":"original-fence"},"items":[${track("first")},${track(occurrence)}],"total":2,"limit":2,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"$occurrence","notice":null}"""
         shadowOf(controller!!.get()).setThrowInStartForeground(
             android.app.ForegroundServiceStartNotAllowedException("Synthetic background block"))
         val result = endpoint.execute(PlaybackDeviceCommand.musical("playCollection", context = context,

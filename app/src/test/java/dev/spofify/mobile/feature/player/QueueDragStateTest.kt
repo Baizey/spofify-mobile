@@ -196,8 +196,15 @@ class QueueDragStateTest {
         val session = QueueDragSession.begin(current, "occurrence-5", source.midpoint, initial)!!
         mutable.removeAt(0)
         assertFalse("Mutation cannot rewrite the captured baseline", session.validate(current))
-        val tooMany = snapshot.copy(upcoming = (0..1_000).map { QueueEntry("large-$it", duplicate, it) })
-        assertNull(QueueDragSession.begin(tooMany, "large-5", source.midpoint, initial))
+        for (size in listOf(1001, 5000)) {
+            val large = snapshot.copy(upcoming = (0 until size).map { QueueEntry("large-$it", duplicate, it) })
+            val largeLayout = layout(large.order, scroll = 720f)
+            val largeSource = largeLayout.visibleItems.single { it.key == "large-5" }
+            val drag = QueueDragSession.begin(large, "large-5", largeSource.midpoint, largeLayout)!!
+            assertTrue(drag.validate(large))
+            assertEquals(size, drag.previewOrder.size)
+            assertNull(drag.drop(large))
+        }
     }
 
     private fun begin(occurrence: String, pointer: Float, initial: QueueDragLayout) =

@@ -39,8 +39,8 @@ data class PlaybackActionResult(
         return when (status) {
         PlaybackActionStatus.PLAYING -> "Playing track"
         PlaybackActionStatus.ADDED -> if (acceptedCount > 1) "$acceptedCount tracks queued" else "Track queued"
-        PlaybackActionStatus.LIMITED -> "Added $acceptedCount to queue; queue limited to 1,000 songs."
-        PlaybackActionStatus.FULL -> "Queue is full (1,000 songs)."
+        PlaybackActionStatus.LIMITED -> "The selected device accepted only $acceptedCount tracks."
+        PlaybackActionStatus.FULL -> "The selected device could not accept this queue."
         PlaybackActionStatus.NO_OP -> "Already in this queue position."
         PlaybackActionStatus.UNAVAILABLE -> "This selection or playback output is unavailable."
         PlaybackActionStatus.BLOCKED -> "Playback needs a tap on this device."

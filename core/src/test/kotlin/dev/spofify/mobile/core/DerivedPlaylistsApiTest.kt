@@ -178,29 +178,17 @@ class DerivedPlaylistsApiTest {
         assertEquals(initial, client.personalRevision.value)
     }
 
-    @Test fun clickedBeyondPrefixReturnsOnlyExactOccurrenceAndNoticeWithoutChangingLongCount() = runBlocking {
+    @Test fun clickedOnlyLegacyFallbackRejectsInsteadOfPreparingPartialContext() = runBlocking {
         val occurrence = "o1_" + "x".repeat(1024) // Body identity is not restricted to the 128-byte URL-ID bound.
         web.enqueue(jsonResponse(playbackBody("[${flatTrack(occurrence, "signed-token")}]", 5_000_000_000L, occurrence, "CLICKED_OCCURRENCE_ONLY")))
-        val result = api.playback("rules", 5, "f1_fence", "signed-selection")
-        assertEquals(occurrence, result.items.single().entryId)
-        assertEquals(0, result.startIndex)
-        assertEquals(5_000_000_000L, result.total)
-        assertEquals(Int.MAX_VALUE, result.queue.total)
-        assertTrue(result.truncated)
-        assertEquals("CLICKED_OCCURRENCE_ONLY", result.notice)
-        val prepared = requireNotNull(result.queue.preparedState)
-        assertEquals(occurrence, prepared.queue.single().occurrenceId)
-        assertEquals(0, prepared.position)
-        assertTrue(prepared.truncated)
-        assertEquals("CLICKED_OCCURRENCE_ONLY", prepared.notice)
-        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
+        assertEquals(200, apiFailure { api.playback("rules", 5, "f1_fence", "signed-selection") }.status)
         assertEquals(1, web.requestCount)
     }
 
-    @Test fun preparedQueueProjectsOnlyPositiveMusicalFieldsAndPreservesPlaybackLimit() = runBlocking {
+    @Test fun preparedQueueProjectsOnlyPositiveMusicalFieldsAndCompleteContext() = runBlocking {
         val item = flatTrack("occ-1", "returned-selection").dropLast(1) +
             ""","artists":[{"id":"artist-id","name":"Artist"}],"albumId":"album-id","albumName":"Album","durationMs":123456,"libraryPath":"/private/catalog/song.flac","unknownPrivateField":"hidden"}"""
-        web.enqueue(jsonResponse(playbackBody("[$item]", 1001, "occ-1", "PLAYBACK_LIMIT")))
+        web.enqueue(jsonResponse(playbackBody("[$item]", 1, "occ-1")))
         val queue = api.playback("rules", 5, "f1_fence").toPlaybackQueue()
         val prepared = requireNotNull(queue.preparedState)
         val selected = prepared.queue.single()
@@ -210,10 +198,10 @@ class DerivedPlaylistsApiTest {
         assertEquals(123.456, selected.duration, 0.0)
         assertEquals(123.456, prepared.duration, 0.0)
         assertEquals(0.0, prepared.elapsed, 0.0)
-        assertEquals("PLAYBACK_LIMIT", prepared.notice)
-        assertTrue(prepared.truncated)
-        assertEquals(1001, queue.total)
-        assertEquals(1000, queue.limit)
+        assertEquals("", prepared.notice)
+        assertFalse(prepared.truncated)
+        assertEquals(1, queue.total)
+        assertEquals(1, queue.limit)
         assertFalse(queue.items.single().libraryPath.isNullOrEmpty()) // Existing callback data stays unchanged.
         val wire = prepared.toJson().toString()
         listOf("libraryPath", "/private", "unknownPrivateField", "hidden", "selectionToken", "returned-selection", "hasAudio").forEach {
@@ -221,6 +209,22 @@ class DerivedPlaylistsApiTest {
         }
         assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
         assertEquals(1, web.requestCount)
+    }
+
+    @Test fun complete1001DerivedDuplicatesRetainLastSelectionAndRejectPartialAndWrongLimit() = runBlocking {
+        val items = (0..1000).joinToString(",", "[", "]") { flatTrack("occ-$it", "token-$it") }
+        val body = playbackBody(items, 1001, "occ-1000")
+        web.enqueue(jsonResponse(body))
+        val loaded = api.playback("rules", 5, "f1_fence", "signed-click")
+        assertEquals(1001, loaded.queue.items.size)
+        assertEquals(1000, loaded.queue.preparedState!!.position)
+        assertEquals((0..1000).map { "occ-$it" }, loaded.queue.preparedState!!.queue.map { it.occurrenceId })
+        for (invalid in listOf(body.replace("\"limit\":1001", "\"limit\":1000"),
+            body.replace("\"total\":1001", "\"total\":5000"), body.replace("\"truncated\":false", "\"truncated\":true"))) {
+            web.enqueue(jsonResponse(invalid))
+            assertEquals(200, apiFailure { api.playback("rules", 5, "f1_fence") }.status)
+        }
+        assertEquals(4, web.requestCount)
     }
 
     @Test fun emptyPreparedQueueRetainsContextWithoutInventingASelection() = runBlocking {
@@ -309,7 +313,7 @@ class DerivedPlaylistsApiTest {
     private fun track() = """{"kind":"track","id":"same","name":"Song","hasAudio":true}"""
     private fun flatTrack(occurrence: String, token: String) = track().dropLast(1) + ""","occurrenceId":"$occurrence","selectionToken":"$token"}"""
     private fun playbackBody(items: String, total: Long, start: String, notice: String? = null) =
-        """{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"f1_fence"},"items":$items,"total":$total,"limit":1000,"truncated":${total > 2 || notice != null},"revision":5,"fence":"f1_fence","startOccurrenceId":"$start","notice":${notice?.let { "\"$it\"" } ?: "null"}}"""
+        """{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"f1_fence"},"items":$items,"total":$total,"limit":${objectOf("{\"items\":$items}").getValue("items").jsonArray.size},"truncated":${total != objectOf("{\"items\":$items}").getValue("items").jsonArray.size.toLong() || notice != null},"revision":5,"fence":"f1_fence","startOccurrenceId":"$start","notice":${notice?.let { "\"$it\"" } ?: "null"}}"""
     private fun summary(derived: Boolean) =
         """{"id":"${if (derived) "rules" else "copy"}","name":"Rules","description":"","kind":"${if (derived) "derived" else "manual"}","countState":"${if (derived) "unevaluated" else "exact"}","trackCount":${if (derived) "null" else "2"},"availableCount":${if (derived) "null" else "2"},"revision":5,"capabilities":{"editMetadata":true,"editEntries":${!derived},"editDefinition":$derived,"play":true,"copyToManual":$derived,"delete":true,"addTracks":${!derived}}}"""
     private fun objectOf(text: String) = ApiJson.parseToJsonElement(text) as JsonObject

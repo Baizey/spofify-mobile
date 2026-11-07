@@ -94,8 +94,8 @@ class PlaybackConnectionDisplayTest {
         assertTrue(remotePlaybackState(source.copy(error = "queue")).error!!.contains("queue"))
         assertEquals("Move is unsupported.", remotePlaybackState(source, "Move is unsupported.").error)
         assertNull(remotePlaybackState(source).error)
-        assertTrue(remotePlaybackState(source.copy(truncated = true)).notice!!.contains("1,000"))
-        assertTrue(remotePlaybackState(source.copy(notice = "PLAYBACK_LIMIT")).notice!!.contains("1,000"))
+        assertTrue(remotePlaybackState(source.copy(truncated = true)).notice!!.contains("incomplete"))
+        assertTrue(remotePlaybackState(source.copy(notice = "PLAYBACK_LIMIT")).notice!!.contains("incomplete"))
         assertTrue(remotePlaybackState(source.copy(notice = "CLICKED_OCCURRENCE_ONLY")).notice!!.contains("selected occurrence"))
     }
 

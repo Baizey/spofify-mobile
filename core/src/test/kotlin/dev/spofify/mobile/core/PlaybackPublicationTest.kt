@@ -30,6 +30,32 @@ class PlaybackPublicationTest {
         assertEquals("original-event", state.occurrence!!.eventId)
     }
 
+    @Test fun compactLargeQueuePublishesEveryDuplicateOriginHighKeyAndReceipt() {
+        for (size in listOf(1001, 5000)) {
+            val queue = (1..size).map { PlaybackTrack("same", "Song", emptyList(), "", "", 120.0,
+                entryId = "e$it", key = it.toLong(), order = (size - it).toLong()) }
+            val state = PlaybackSnapshot(queue = queue, position = 0, elapsed = 42.125,
+                occurrence = PlaybackOccurrence(1, "same", "event", 17.0, true))
+            val metadata = QueueIntentState("receiver", 2, "tracked", queue.map { QueueIntentOrigin(it.key, "high") },
+                queue.drop(1).map { it.key })
+            val detail = QueueIntentResult("queued", size, 2, "high", "unchanged", null, "")
+            val body = PlaybackPublication.pollBody("phone", 1, 2, state,
+                listOf(PlaybackAck("delivery", 1, "ok", detail)), metadata)
+            val parsed = PlaybackRawJson.parse(body.toString())
+            assertEquals(state, PlaybackSnapshot.fromJson(parsed.getValue("state").jsonObject))
+            assertEquals(metadata, QueueIntentState.fromJson(parsed.getValue("queueIntentState").jsonObject, state))
+            assertEquals(detail, QueueIntentResult.fromJson(parsed.getValue("acks").jsonArray.single().jsonObject.getValue("queueIntentResult").jsonObject))
+            assertEquals(size, state.queue.map { it.entryId }.distinct().size)
+            assertFalse(state.playing)
+            assertTrue(body.toString().toByteArray().size < MAX_PLAYBACK_BODY_BYTES)
+        }
+        val compact = PlaybackSnapshot(queue = listOf(snapshot(1).queue.first()), position = 0).toJson().toString()
+        assertThrows(IllegalArgumentException::class.java) { PlaybackRawJson.parse(compact.replace("\"queue\":", "\"QUEUE\":[],\"queue\":")) }
+        assertThrows(IllegalArgumentException::class.java) { PlaybackRawJson.parse("{\"queue\":" + "[".repeat(17) + "]".repeat(17) + "}") }
+        assertThrows(IllegalArgumentException::class.java) { PlaybackRawJson.parse(compact, 16) }
+        assertThrows(IllegalArgumentException::class.java) { QueueIntentResult("queued", -1, 2, "high", "unchanged", null, "").validated() }
+    }
+
     @Test fun reserveCoversWorstEscapedContextHistoryScalarAndSixteenAckEnvelopeGrowth() {
         val baseline = PlaybackSnapshot(queue = listOf(snapshot(1).queue.first()), position = 0)
         val expanded = baseline.copy(

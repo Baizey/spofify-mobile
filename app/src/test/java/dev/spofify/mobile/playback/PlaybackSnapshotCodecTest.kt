@@ -11,6 +11,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PlaybackSnapshotCodecTest {
+    @Test fun largePreparedAndImportedQueuesRetainLastDuplicateAndFullBaseline() {
+        for (size in listOf(1001, 5000)) {
+            val items = (0 until size).map { LibraryItem("track", "same", "Song", hasAudio = true, entryId = "e$it") }
+            val prepared = PlaybackSnapshotCodec.preparedQueue(dev.spofify.mobile.core.PlaybackQueue(items),
+                "same", "e${size - 1}", false, null)
+            assertEquals(size, prepared.queue.size)
+            assertEquals(size - 1, prepared.position)
+            assertEquals(items.map { it.entryId }, prepared.queue.map { it.entryId })
+            val retained = prepared.copy(queue = prepared.queue.reversed(), position = 0, playing = false,
+                elapsed = 42.125, error = "media", loading = true,
+                occurrence = PlaybackOccurrence(prepared.queue.last().key, "same", "event", 12.0, true))
+            val plan = PlaybackSnapshotCodec.plan(retained)
+            assertEquals(retained, plan.snapshot)
+            assertEquals(prepared.queue, plan.physicalTracks)
+            assertEquals(size - 1, plan.currentIndex)
+            assertEquals((size - 1 downTo 0).toList(), plan.traversalIndices)
+        }
+    }
+
     @Test fun wireProjectionContainsMusicOnlyNeverPrivateLibraryPath() {
         val track = LibraryItem("track", "song", "Song", artists = listOf(ArtistCredit("artist", "Artist")),
             albumId = "album", albumName = "Album", durationMs = 123_456, libraryPath = "/private/music.flac", entryId = "saved-entry")
@@ -113,7 +132,7 @@ class PlaybackSnapshotCodecTest {
             valid.copy(queue = listOf(wire(1, 0).copy(id = "."))),
             valid.copy(queue = listOf(wire(1, 0).copy(id = ".."))),
             valid.copy(elapsed = Double.NaN), valid.copy(elapsed = -1.0),
-            valid.copy(queue = (1..1001).map { wire(it.toLong(), it.toLong()) }),
+            valid.copy(queue = (1..1001).map { wire(it.toLong(), it.toLong()).copy(name = "\\".repeat(512), albumName = "\\".repeat(512)) }),
             valid.copy(occurrence = PlaybackOccurrence(2, valid.queue[1].id, "wrong-current", 1.0, false)),
             valid.copy(occurrence = PlaybackOccurrence(1, valid.queue[0].id, "nonce", 604801.0, false)),
         )

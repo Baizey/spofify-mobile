@@ -110,6 +110,9 @@ data class PersonalPlayback(
     val truncated: Boolean,
     val revision: Long = 0,
 ) {
+    init {
+        require(total == items.size.toLong() && limit == items.size && !truncated) { "Incomplete playback collection" }
+    }
     fun toPlaybackQueue() = PlaybackQueue(
         items, total = total.coerceIn(0, Int.MAX_VALUE.toLong()).toInt(), limit = limit, truncated = truncated,
         context = LibraryPlaybackContext(context.kind, context.id, context.name),

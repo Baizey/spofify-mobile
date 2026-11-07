@@ -647,7 +647,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
             state.value.session?.accountId == expectedAccountId && state.value.page == route && generation == routeGeneration
         playback.playPreparedGuarded(queue, expectedClient, startTrackId, startEntryId = startEntryId,
             isCurrent = { request == queueGeneration && originLifetime() }, admissionIsCurrent = ::originLifetime)
-        if (queue.truncated) mutable.update { it.copy(notice = "This queue is limited to 1,000 available songs.") }
+        if (queue.truncated) mutable.update { it.copy(notice = "The selected device loaded an incomplete queue.") }
     }
 
     private fun preparedSelectionValid(queue: PlaybackQueue, client: SpofifyClient): Boolean {
@@ -804,7 +804,7 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
                     }
                     playback.playPreparedGuarded(queue, client, start?.id, shuffle, startEntryId = start?.entryId,
                         context = context, isCurrent = ::isCurrent, admissionIsCurrent = ::originLifetime)
-                    if (queue.truncated) mutable.update { it.copy(notice = "This queue is limited to 1,000 available songs.") }
+                    if (queue.truncated) mutable.update { it.copy(notice = "The selected device loaded an incomplete queue.") }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error

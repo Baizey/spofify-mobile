@@ -171,6 +171,7 @@ data class DerivedPlayback(
 
     internal fun toPlaybackQueue(selectionAuthority: PreparedPlaybackAuthority?): PlaybackQueue {
         require(context.kind == "derived" && context.revision == revision && context.fence == fence)
+        require(total == items.size.toLong() && limit == items.size && !truncated && notice == null) { "Incomplete playback collection" }
         val preparedContext = PlaybackContext(context.kind, context.id, context.name, revision, fence)
         val tracks = items.mapIndexed { index, item ->
             require(item.kind == "track" && item.playable && item.durationMs >= 0)
@@ -271,9 +272,8 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
             DerivedPreparedTrack(authority.occurrenceId, authority.selectionToken, personalDecode<LibraryItem>(raw))
         }
         if (wire.context.kind != "derived" || wire.context.id != id || wire.revision != expectedRevision || wire.fence != fence ||
-            wire.context.revision != wire.revision || wire.context.fence != wire.fence || wire.total < 0 || wire.limit != 1000 ||
-            items.size > 1000 || wire.total < items.size || wire.truncated != (wire.total > items.size) ||
-            wire.notice !in setOf(null, "CLICKED_OCCURRENCE_ONLY", "PLAYBACK_LIMIT") ||
+            wire.context.revision != wire.revision || wire.context.fence != wire.fence || wire.total != items.size.toLong() ||
+            wire.limit != items.size || wire.truncated || wire.notice != null ||
             items.map { it.occurrenceId }.toSet().size != items.size ||
             (items.isEmpty() != (wire.startOccurrenceId == null)) ||
             (wire.startOccurrenceId != null && items.none { it.occurrenceId == wire.startOccurrenceId })) throw incompatiblePersonalResponse()

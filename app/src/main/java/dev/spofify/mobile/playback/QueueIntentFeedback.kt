@@ -39,6 +39,7 @@ internal fun queueAcceptanceMessage(result: PlaybackActionResult, action: Playba
 /** Safe static facts: even a real started key is not assumed to be the requested row/album.
  * Historical retained receipts must never be relabelled by looking up today's queue. */
 internal fun queueIntentMessage(result: QueueIntentResult, action: PlaybackListAction?): String {
+    if (result.notice == "PUBLICATION_LIMIT") return "This queue is too large to share safely. Nothing was added."
     val accepted = result.acceptedCount > 0
     val selection = action == PlaybackListAction.PLAY_NOW
     if (result.playback == "superseded") return "${if (selection) "Selection" else "Queue change"} accepted; playback start superseded by a newer action."
@@ -48,7 +49,7 @@ internal fun queueIntentMessage(result: QueueIntentResult, action: PlaybackListA
     }
     val acceptance = when {
         !accepted -> null
-        result.outcome == "limited" -> "Queued ${result.acceptedCount}; queue limited to 1,000 songs."
+        result.outcome == "limited" -> "The selected device accepted only ${result.acceptedCount} tracks."
         selection -> "Selection accepted"
         result.acceptedCount == 1 -> "Track queued"
         else -> "${result.acceptedCount} tracks queued"
@@ -62,7 +63,7 @@ internal fun queueIntentMessage(result: QueueIntentResult, action: PlaybackListA
     if (playback != null) return listOfNotNull(acceptance, playback).joinToString(" ")
     return acceptance ?: when (result.outcome) {
         "no_op" -> "Already in this queue position."
-        "full" -> "Queue is full (1,000 songs)."
+        "full" -> "The selected device could not accept this queue."
         "stale" -> "Playback action cancelled after the selection or output changed."
         "unsupported" -> "Update the selected playback device and server to use queue priorities."
         else -> "This selection or playback output is unavailable. Nothing was resubmitted."

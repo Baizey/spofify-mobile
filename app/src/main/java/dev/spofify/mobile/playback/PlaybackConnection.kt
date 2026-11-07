@@ -323,9 +323,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
             val live = { serial == latestPlay.get() && lifetime() }
             if (!live()) return@onMainWithEpoch
             val playable = items.filter { it.kind == "track" && it.playable }
-            val chosen = playbackStartIndex(playable, startTrackId, startEntryId)
-            // Never substitute a different first track when the explicitly selected entry is beyond the cap.
-            val tracks = if (chosen >= PlaybackQueue.LIMIT) listOf(playable[chosen]) else playable.take(PlaybackQueue.LIMIT)
+            val tracks = playable
             if (tracks.isEmpty()) {
                 mutableState.value = mutableState.value.copy(error = "No playable tracks in this queue.")
                 return@onMainWithEpoch
@@ -337,11 +335,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
                     shuffle,
                     client,
                     requestEpoch,
-                    when {
-                        chosen >= PlaybackQueue.LIMIT -> "This selection is beyond the 1,000-song limit. Only the selected occurrence is loaded."
-                        playable.size > PlaybackQueue.LIMIT -> "First 1,000 playable songs loaded. This context has more music."
-                        else -> null
-                    },
+                    null,
                     isCurrent = live, admissionIsCurrent = lifetime,
                 )
             } catch (_: IllegalArgumentException) {
@@ -631,12 +625,11 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         // A service must exist before an empty Add, but no PlayRequest/autoplay is created.
         if (controller == null || pendingPlay != null) {
             val tracks = items.filter { it.kind == "track" && it.playable }
-            val room = (PlaybackQueue.LIMIT - pendingEnqueues.sumOf { it.items.size }).coerceAtLeast(0)
-            if (room == 0 || tracks.isEmpty()) {
-                mutableState.value = mutableState.value.copy(error = if (tracks.isEmpty()) "No playable tracks to add." else "Queue is full (1,000 tracks).")
+            if (tracks.isEmpty()) {
+                mutableState.value = mutableState.value.copy(error = "No playable tracks to add.")
                 return@onMainWithEpoch
             }
-            pendingEnqueues.add(EnqueueRequest(tracks.take(room), client, playNext, requestEpoch))
+            pendingEnqueues.add(EnqueueRequest(tracks, client, playNext, requestEpoch))
             connectInternal()
         } else applyEnqueue(items, client, playNext)
     }
@@ -1083,9 +1076,9 @@ internal fun remotePlaybackState(snapshot: PlaybackSnapshot, error: String? = nu
         context = context?.let { LibraryItem(it.kind, it.id, it.name) },
         canUndoQueueRemoval = false,
         notice = when (snapshot.notice) {
-            "CLICKED_OCCURRENCE_ONLY" -> "This selection is beyond the 1,000-song limit. Only the selected occurrence is loaded."
-            "PLAYBACK_LIMIT" -> "Queue limited to 1,000 songs."
-            else -> if (snapshot.truncated) "Queue limited to 1,000 songs." else null
+            "CLICKED_OCCURRENCE_ONLY" -> "The selected device loaded only the selected occurrence."
+            "PLAYBACK_LIMIT" -> "The selected device loaded an incomplete queue."
+            else -> if (snapshot.truncated) "The selected device loaded an incomplete queue." else null
         },
         remoteSnapshot = snapshot,
     )

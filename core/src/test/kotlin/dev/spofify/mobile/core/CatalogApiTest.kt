@@ -187,7 +187,7 @@ class CatalogApiTest {
     }
 
     @Test fun queueContextAndRevisionAreOptionalAndLegacyAvailabilityRemainsCompatible() = runBlocking {
-        web.enqueue(jsonResponse("""{"context":{"kind":"album","id":"a","name":"Album"},"items":[$track],"total":1,"limit":1000,"truncated":false,"revision":4294967296}"""))
+        web.enqueue(jsonResponse("""{"context":{"kind":"album","id":"a","name":"Album"},"items":[$track],"total":1,"limit":1,"truncated":false,"revision":4294967296}"""))
         val queue = client.playback(LibraryItem("album", "a", "Album"))
         assertEquals(LibraryPlaybackContext("album", "a", "Album"), queue.context)
         assertEquals(4294967296L, queue.revision)

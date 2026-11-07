@@ -711,10 +711,10 @@ class PlaybackListActionServiceTest {
         assertFalse(actualPlayer.playWhenReady)
     }
 
-    @Test fun capacityPrunesOnlyRequiredPlayedPrefixAndProtectsExactCurrentFutureHistoryAndOrigins() = runTest {
+    @Test fun largeQueueAppendProtectsEntirePlayedCurrentFutureHistoryAndOrigins() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
-        val initial = contextQueue(size = 999, position = 500)
+        val initial = contextQueue(size = 5000, position = 2500)
         coordinator.localAction { endpoint.activate(initial, it) }; runCurrent()
         val controls = connect()
         val results = mutableListOf<PlaybackActionResult>()
@@ -724,9 +724,9 @@ class PlaybackListActionServiceTest {
         assertEquals(listOf(PlaybackActionStatus.ADDED), results.map { it.status })
         assertEquals(3, results.single().acceptedCount)
         val after = endpoint.exportSnapshot()
-        assertEquals(1000, after.queue.size)
+        assertEquals(5003, after.queue.size)
         val originalKeys = initial.queue.map { it.key }.toSet()
-        assertEquals(initial.queue.drop(2), after.queue.filter { it.key in originalKeys })
+        assertEquals(initial.queue, after.queue.filter { it.key in originalKeys })
         assertEquals(initial.queue[initial.position], after.queue[after.position])
         assertEquals(initial.queue.drop(initial.position + 1), after.queue.drop(after.position + 1).filter { it.key in originalKeys })
         assertEquals(initial.occurrence, after.occurrence)
@@ -734,36 +734,38 @@ class PlaybackListActionServiceTest {
         assertEquals(listOf("X", "Y", "Z"), after.queue.filter { it.key !in originalKeys }.map { it.id })
         val metadata = endpoint.exportQueueIntentState()!!
         assertEquals(after.queue.map { it.key }, metadata.origins.map { it.key })
-        assertEquals(listOf(1000L, 1001L, 1002L), metadata.highKeys)
+        assertEquals(listOf(5001L, 5002L, 5003L), metadata.highKeys)
         assertTrue(metadata.origins.filter { it.key in originalKeys }.all { it.intent == "legacy" })
         assertTrue(metadata.origins.filter { it.key !in originalKeys }.all { it.intent == "high" })
         assertFalse(actualPlayer.playWhenReady)
     }
 
-    @Test fun capacityWithNoPlayedPrefixReportsOnlyActualPartialAcceptance() = runTest {
+    @Test fun completeLargeBatchReportsFullCountWithoutPartialAdmission() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
-        val initial = contextQueue(size = 999, position = 0)
+        val initial = contextQueue(size = 1, position = 0)
         coordinator.localAction { endpoint.activate(initial, it) }; runCurrent()
         val controls = connect()
         val results = mutableListOf<PlaybackActionResult>()
-        controls.performPreparedAction(prepared("X", "Y", "Z"), client, PlaybackListAction.ADD_TO_QUEUE,
+        val additions = (1..5000).map { "X$it" }
+        controls.performPreparedAction(prepared(*additions.toTypedArray()), client, PlaybackListAction.ADD_TO_QUEUE,
             requireNotNull(PlaybackService.interactionKey()), onResult = results::add)
         releaseDispatch(); runCurrent()
-        assertEquals(listOf(PlaybackActionStatus.LIMITED), results.map { it.status })
-        assertEquals(1, results.single().acceptedCount)
-        assertEquals("PLAYBACK_LIMIT", results.single().queueIntentResult!!.notice)
+        assertEquals(listOf(PlaybackActionStatus.ADDED), results.map { it.status })
+        assertEquals(5000, results.single().acceptedCount)
+        assertEquals(5000, results.single().queueIntentResult!!.acceptedCount)
+        assertEquals("", results.single().queueIntentResult!!.notice)
         val after = endpoint.exportSnapshot()
-        assertEquals(1000, after.queue.size)
-        assertEquals(initial.queue, after.queue.filter { it.key != 1000L })
-        assertEquals("X", after.queue.single { it.key == 1000L }.id)
+        assertEquals(5001, after.queue.size)
+        assertEquals(initial.queue.single(), after.queue.first())
+        assertEquals(additions, after.queue.drop(1).map { it.id })
         assertEquals(initial.occurrence, after.occurrence)
         assertEquals(initial.elapsed, after.elapsed, 0.0)
-        assertEquals(listOf(1000L), endpoint.exportQueueIntentState()!!.highKeys)
+        assertEquals((2L..5001L).toList(), endpoint.exportQueueIntentState()!!.highKeys)
         assertFalse(actualPlayer.playWhenReady)
     }
 
-    @Test fun trulyFullCurrentAndFutureRejectWithoutPruningOrChangingQueueHistoryOrMetadata() = runTest {
+    @Test fun thousandEntryQueueStillAcceptsNextOccurrenceWithoutPruning() = runTest {
         val coordinator = installOwner(backgroundScope)
         runCurrent()
         val initial = contextQueue(size = 1000, position = 0)
@@ -774,10 +776,14 @@ class PlaybackListActionServiceTest {
         controls.performPreparedAction(prepared("Q"), client, PlaybackListAction.ADD_TO_QUEUE,
             requireNotNull(PlaybackService.interactionKey()), startTrackId = "Q", onResult = results::add)
         releaseDispatch(); runCurrent()
-        assertEquals(listOf(PlaybackActionStatus.FULL), results.map { it.status })
-        assertEquals(0, results.single().acceptedCount)
-        assertEquals(initial, endpoint.exportSnapshot())
-        assertEquals(metadata, endpoint.exportQueueIntentState())
+        assertEquals(listOf(PlaybackActionStatus.ADDED), results.map { it.status })
+        assertEquals(1, results.single().acceptedCount)
+        val after = endpoint.exportSnapshot()
+        assertEquals(1001, after.queue.size)
+        assertEquals(initial.queue, after.queue.filter { it.key <= 1000L })
+        assertEquals(initial.occurrence, after.occurrence)
+        assertEquals(initial.elapsed, after.elapsed, 0.0)
+        assertEquals(metadata.origins, endpoint.exportQueueIntentState()!!.origins.filter { it.key <= 1000L })
         assertFalse(actualPlayer.playWhenReady)
     }
 
@@ -879,7 +885,7 @@ class PlaybackListActionServiceTest {
         coordinator.localAction { endpoint.activate(contextQueue(), it) }; runCurrent()
         val controls = connect()
         fun item(occurrence: String) = """{"kind":"track","id":"duplicate","name":"Duplicate","artists":[],"albumName":"Album","albumId":"album","durationMs":120000,"hasAudio":true,"occurrenceId":"$occurrence","selectionToken":"returned-$occurrence"}"""
-        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"original-fence"},"items":[${item("occ-first")},${item("occ-late")}],"total":2,"limit":1000,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"occ-late","notice":null}"""
+        derivedResponse = """{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"original-fence"},"items":[${item("occ-first")},${item("occ-late")}],"total":2,"limit":2,"truncated":false,"revision":5,"fence":"original-fence","startOccurrenceId":"occ-late","notice":null}"""
         expectedRequests++
         val prepared = DerivedPlaylistsApi(client).playback("rules", 5, "original-fence", "signed-rendered-selection").queue
         assertEquals("/api/me/playlists/rules/playback", web.takeRequest(1, TimeUnit.SECONDS)?.path)

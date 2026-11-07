@@ -29,7 +29,7 @@ internal val playbackJson = Json { ignoreUnknownKeys = false; encodeDefaults = t
 ) {
     fun paused() = copy(playing = false, waiting = false, loading = false)
     fun validated(): PlaybackSnapshot = apply {
-        require(version == 1 && queue.size <= 1000 && position >= -1 && position < queue.size && (queue.isEmpty() || position >= 0))
+        require(version == 1 && position >= -1 && position < queue.size && (queue.isEmpty() || position >= 0))
         require(repeat in setOf("off", "all", "one") && error in setOf("", "blocked", "media", "queue"))
         require(notice in setOf("", "PLAYBACK_LIMIT", "CLICKED_OCCURRENCE_ONLY"))
         require(number(elapsed) && number(duration)); context?.validate()

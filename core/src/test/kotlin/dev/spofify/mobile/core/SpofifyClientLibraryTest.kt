@@ -90,13 +90,13 @@ class SpofifyClientLibraryTest {
     }
 
     @Test fun playbackEndpointsAndStandaloneTrackBehavior() = runBlocking {
-        val queue = """{"context":{"kind":"album","id":"a"},"items":[$track],"total":1200,"limit":1000,"truncated":true,"revision":1}"""
+        val queue = """{"context":{"kind":"album","id":"a"},"items":[$track],"total":1,"limit":1,"truncated":false,"revision":1}"""
         web.enqueue(jsonResponse(queue))
         val album = LibraryItem("album", "album/a%", "Album")
         val prepared = client.playback(album)
         assertEquals("t1", prepared.items.single().id)
-        assertTrue(prepared.truncated)
-        assertEquals(1200, prepared.total)
+        assertFalse(prepared.truncated)
+        assertEquals(1, prepared.total)
         assertEquals("/api/library/albums/album%2Fa%25/playback", web.takeRequest().path)
         web.enqueue(jsonResponse(queue))
         client.playback(LibraryItem("track", "t1", "Song", albumId = "parent/album"))
@@ -111,7 +111,7 @@ class SpofifyClientLibraryTest {
     }
 
     @Test fun personalPlaybackUsesAlreadyFlattenedGoItems() = runBlocking {
-        val body = """{"items":[${track.dropLast(1)},"entryId":"e1"}],"total":1,"limit":1000,"truncated":false}"""
+        val body = """{"items":[${track.dropLast(1)},"entryId":"e1"}],"total":1,"limit":1,"truncated":false}"""
         web.enqueue(jsonResponse(body))
         val queueItem = client.playlistPlayback("playlist/1").items.single()
         assertEquals("t1", queueItem.id)

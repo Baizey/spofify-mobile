@@ -10,6 +10,20 @@ class PlaybackQueueTest {
         assertTrue(PlaybackQueue.traversal(0, -1) { -1 }.isEmpty())
     }
 
+    @Test fun largeTraversalMoveRemoveAndUndoHaveNoCountCeiling() {
+        for (size in listOf(1001, 5000)) {
+            val traversal = PlaybackQueue.traversal(size, 0) { (it + 1) % size }
+            assertEquals((0 until size).toList(), traversal)
+            val order = traversal.map(Int::toString)
+            val moved = PlaybackQueue.move(order, "0", "1", size - 2)!!
+            assertEquals("1", moved.last())
+            assertEquals(order.toSet(), moved.toSet())
+            val removal = PlaybackQueue.removal(moved, "0", "1")!!
+            assertEquals(moved, removal.undo(removal.remaining, "0"))
+            assertNull(PlaybackQueue.move(order, "0", "1", Int.MAX_VALUE))
+        }
+    }
+
     @Test fun upNextExcludesPlayedAndCurrentInDisplayedShuffleOrder() {
         assertEquals(listOf("a2", "b"), PlaybackQueue.upcoming(listOf("played", "a1", "a2", "b"), "a1"))
         assertTrue(PlaybackQueue.upcoming(listOf("a"), null).isEmpty())
@@ -49,7 +63,7 @@ class PlaybackQueueTest {
     }
 
     @Test fun capacityPreservesPlayedCurrentAndFutureAndNeverMakesDestructiveRoom() {
-        val order = (0 until PlaybackQueue.LIMIT).map(Int::toString)
+        val order = (0 until 5000).map(Int::toString)
         assertEquals(order, PlaybackQueue.retainedForAdd(order, "700", 20))
         assertEquals(order, PlaybackQueue.retainedForAdd(order, "0", 20))
         assertEquals(order, PlaybackQueue.retainedForAdd(order, "700", 0))

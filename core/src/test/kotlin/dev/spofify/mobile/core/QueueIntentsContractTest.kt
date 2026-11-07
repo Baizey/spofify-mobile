@@ -202,7 +202,9 @@ class QueueIntentsContractTest {
     @Test fun resultValidationRejectsCountRevisionStatusAndPlaybackLies() {
         val (s, m) = state("confirmed-P1-final")
         val queued = result("corrected-P1-queued-B-keeps-paused-A")
-        rejects { queued.copy(acceptedCount = 1001).validated() }
+        assertEquals(1001, queued.copy(acceptedCount = 1001).validated().acceptedCount)
+        assertEquals(5000, queued.copy(acceptedCount = 5000).validated().acceptedCount)
+        rejects { queued.copy(acceptedCount = -1).validated() }
         rejects { queued.copy(commitRevision = 9007199254740992).validated() }
         rejects { queued.copy(playbackKey = 101).validated() }
         rejects { queued.copy(commitRevision = 31).validated(s, m, "ok") }

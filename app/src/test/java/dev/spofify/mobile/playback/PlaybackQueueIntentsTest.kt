@@ -132,6 +132,32 @@ class PlaybackQueueIntentsTest {
         }
     }
 
+    @Test fun largeWholeBatchesPreservePausedCurrentAndExactPriorityPlacement() {
+        for (size in listOf(1001, 5000)) {
+            val before = PlaybackSnapshot(queue = listOf(QueueIntentGolden.track("A", 1), QueueIntentGolden.track("H", 2)),
+                position = 0, elapsed = 42.125, loading = true, error = "media",
+                occurrence = PlaybackOccurrence(1, "A", "event", 12.0, true))
+            val metadata = PlaybackQueueIntents.Metadata(mapOf(1L to "low", 2L to "high"), setOf(2L), "tracked")
+            val additions = (0 until size).map { QueueIntentGolden.track("same", it + 1L).copy(entryId = "e$it") }
+            for (intent in listOf("low", "high", "next", "now")) {
+                val plan = PlaybackQueueIntents.plan(before, metadata, intent, additions, null, 2, startIndex = size - 1)
+                assertEquals(size, plan.count)
+                assertFalse(plan.limited)
+                val projected = if (intent == "now") plan.snapshot.queue else plan.snapshot.queue.filter { it.key > 2 }
+                assertEquals(additions.map { it.entryId }, projected.map { it.entryId })
+                if (intent == "now") {
+                    assertEquals(size - 1, plan.snapshot.position)
+                    assertEquals("e${size - 1}", plan.snapshot.queue[plan.snapshot.position].entryId)
+                } else {
+                    assertEquals(before, plan.snapshot.copy(queue = before.queue))
+                    assertEquals(if (intent == "next") size + 1 else 1, plan.snapshot.queue.indexOfFirst { it.id == "H" })
+                }
+                val state = PlaybackQueueIntents.state("large", 2, plan.snapshot, plan.metadata)
+                PlaybackQueueIntents.publication(plan.snapshot, state)
+            }
+        }
+    }
+
     @Test fun prospectiveOverflowRejectsBeforeAnyLiveStateAndProvenanceOnlyIsAnEdit() {
         val before = PlaybackSnapshot(queue = listOf(QueueIntentGolden.track("A", 1), QueueIntentGolden.track("X", 2)), position = 0)
         val metadata = PlaybackQueueIntents.Metadata(mapOf(1L to "low", 2L to "low"), emptySet(), "tracked")

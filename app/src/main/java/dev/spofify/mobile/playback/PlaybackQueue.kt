@@ -5,15 +5,13 @@ import dev.spofify.mobile.core.LibraryItem
 /** Identity belongs to a prepared occurrence, not a track or saved-playlist entry. */
 data class QueueEntry(val occurrenceId: String, val item: LibraryItem, val timelineIndex: Int)
 
-/** Pure, bounded queue-edit planning. All indices are realized/displayed traversal order. */
+/** Pure queue-edit planning. All indices are realized/displayed traversal order. */
 internal object PlaybackQueue {
-    const val LIMIT = 1_000
-
     fun traversal(size: Int, first: Int, next: (Int) -> Int): List<Int> {
         val result = ArrayList<Int>(size)
         val seen = HashSet<Int>()
         var index = first
-        while (index in 0 until size && seen.add(index) && result.size < LIMIT) {
+        while (index in 0 until size && seen.add(index)) {
             result.add(index)
             index = next(index)
         }
@@ -37,7 +35,7 @@ internal object PlaybackQueue {
 
     data class Removal(val occurrence: String, val index: Int, val current: String, val remaining: List<String>) {
         fun canUndo(order: List<String>, now: String?): Boolean =
-            now == current && order == remaining && order.size < LIMIT && occurrence !in order
+            now == current && order == remaining && occurrence !in order
         fun undo(order: List<String>, now: String?): List<String>? =
             if (canUndo(order, now)) order.toMutableList().apply { add(index, occurrence) } else null
     }
@@ -49,7 +47,7 @@ internal object PlaybackQueue {
         return Removal(occurrence, index, current, order.filterNot { it == occurrence })
     }
 
-    /** Admission never destroys history/current/future to make room. Report limited/full instead. */
+    /** Admission never destroys history/current/future to make room. Byte preflight is atomic. */
     @Suppress("UNUSED_PARAMETER")
     fun retainedForAdd(order: List<String>, current: String?, additions: Int): List<String> = order
 }

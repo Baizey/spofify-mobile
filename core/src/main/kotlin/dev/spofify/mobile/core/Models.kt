@@ -60,14 +60,18 @@ data class LibraryPage(val items: List<LibraryItem>, val total: Int, val limit: 
 @Serializable
 data class PlaybackQueue(
     val items: List<LibraryItem>,
-    val total: Int = 0,
-    val limit: Int = 1000,
+    val total: Int = items.size,
+    val limit: Int = items.size,
     val truncated: Boolean = false,
     val context: LibraryPlaybackContext? = null,
     val revision: Long = 0,
     val preparedState: PlaybackSnapshot? = null,
     @Transient val selectionAuthority: PreparedPlaybackAuthority? = null,
-)
+) {
+    init {
+        require(total == items.size && limit == items.size && !truncated) { "Incomplete playback collection" }
+    }
+}
 
 /**
  * Ephemeral selection permission, never part of a serialized queue or prepared wire snapshot.

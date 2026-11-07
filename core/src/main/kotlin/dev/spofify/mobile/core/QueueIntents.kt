@@ -26,7 +26,7 @@ private fun requireWireTypes(value: JsonObject) { requireWireTypes(value as Json
 @Serializable data class QueueIntentState(val receiverId: String, val revision: Long, val provenance: String, val origins: List<QueueIntentOrigin>, val highKeys: List<Long>) {
     fun validated() = apply {
         require(validPlaybackProtocolId(receiverId) && revision in 1..SAFE && provenance in setOf("tracked", "legacy-reset"))
-        require(origins.size <= 1000 && highKeys.size <= 1000 && origins.map { it.key }.distinct().size == origins.size && highKeys.distinct().size == highKeys.size)
+        require(origins.map { it.key }.distinct().size == origins.size && highKeys.distinct().size == highKeys.size)
         require(origins.all { it.key in 1..SAFE && it.intent in setOf("low", "high", "next", "now", "legacy") } && highKeys.all { it in 1..SAFE })
     }
     fun validated(snapshot: PlaybackSnapshot) = validated().apply {
@@ -46,7 +46,7 @@ private fun requireWireTypes(value: JsonObject) { requireWireTypes(value as Json
 }
 @Serializable data class QueueIntentResult(val outcome: String, val acceptedCount: Int, val commitRevision: Long?, val placement: String, val playback: String, val playbackKey: Long?, val notice: String) {
     fun validated() = apply {
-        require(acceptedCount in 0..1000 && (commitRevision == null || commitRevision in 1..SAFE) && (playbackKey == null || playbackKey in 1..SAFE))
+        require(acceptedCount >= 0 && (commitRevision == null || commitRevision in 1..SAFE) && (playbackKey == null || playbackKey in 1..SAFE))
         require(notice in setOf("", "PLAYBACK_LIMIT", "CLICKED_OCCURRENCE_ONLY", "STALE_BINDING", "INVALID_SELECTION", "OUTPUT_UNAVAILABLE", "PUBLICATION_LIMIT", "PREPARATION_FAILED", "UNSUPPORTED_RECEIVER"))
         require(placement in setOf("low", "high", "next", "replace", "existing", "none"))
         require(playback in setOf("unchanged", "started", "resumed", "blocked", "media", "superseded"))
