@@ -119,6 +119,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         return
     }
     val client = model.graph.client ?: return
+    val cacheSettings by model.graph.songCache.settings.collectAsStateWithLifecycle()
     val playlistBrowse = model.playlistBrowseMemory() ?: return
     val searchPage = state.page is Page.Search || state.page is Page.Catalog
     val searchEditing = rememberSearchEditing(client, state.session?.accountId, searchPage)
@@ -336,6 +337,12 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                             feedback, likeStates, contentModifier)
                         Page.Settings -> SettingsScreen(
                             username = state.session?.username.orEmpty(), origin = client.server.origin,
+                            cacheSettings = cacheSettings,
+                            onSaveCacheSettings = { value ->
+                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    model.graph.songCache.updateSettings(value)
+                                }
+                            },
                             onOpen = { destination ->
                                 focus.clearFocus(); keyboard?.hide()
                                 model.open(when (destination) {

@@ -23,6 +23,7 @@ import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.withLock
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Audio-only, app-private retention. Construct with Context.cacheDir, never an external directory.
@@ -37,10 +38,23 @@ import kotlin.concurrent.withLock
 @androidx.annotation.OptIn(UnstableApi::class)
 class SongCache(
     cacheDir: File,
-    val limits: Limits = Limits(),
+    limits: Limits = Limits(),
     private val deleteFile: (File) -> Boolean = { it.delete() },
     private val openWrite: (File) -> OutputStream = { FileOutputStream(it) },
+    private val settingsStore: AutoCacheSettingsStore? = null,
+    private val filesystemCapacity: () -> Long = { cacheDir.totalSpace },
+    private val filesystemFree: () -> Long = { cacheDir.usableSpace },
 ) : Closeable {
+    @Volatile var limits: Limits = limits
+        private set
+    private val committedSettings = kotlinx.coroutines.flow.MutableStateFlow(settingsStore?.read() ?: AutoCacheSettings())
+    val settings = committedSettings.asStateFlow()
+
+    init {
+        if (settingsStore != null) this.limits = limits.copy(
+            maxTracks = committedSettings.value.maxSongs, maxBytes = committedSettings.value.maxBytes)
+    }
+
     data class Limits(
         val maxTracks: Int = MAX_TRACKS,
         val maxBytes: Long = MAX_BYTES,
@@ -48,7 +62,7 @@ class SongCache(
         val attemptMillis: Long = 30_000,
     ) {
         init {
-            require(maxTracks in 1..MAX_TRACKS && maxBytes in 1..MAX_BYTES)
+            require(maxTracks in 1..MAX_TRACKS && maxBytes in 1..Long.MAX_VALUE / 4)
             require(chunkBytes in 1..64 * 1024 && attemptMillis > 0)
         }
         // Two manifest generations plus both Media3 legacy index generations, with margin.
@@ -105,6 +119,26 @@ class SongCache(
     private val retirement = AtomicReference<Retirement?>(null)
     @Volatile private var closed = false
     private var cleanupFailed = false
+    private var reconciliationPending = false // Storage lock; only policy changes need deferred cleanup.
+
+    /** The application cache owner commits preferences and admission policy under the same lock.
+     * No playback/network work is created; lowering a target may leave protected usage above it. */
+    fun updateSettings(value: AutoCacheSettings): String? = lock.withLock {
+        val error = value.validationError(filesystemCapacity(), filesystemFree(), ownedBytes())
+        if (error != null) return error
+        val store = settingsStore ?: return "Cache settings are unavailable"
+        try { store.write(value) } catch (_: Exception) { return "Could not save cache settings" }
+        limits = limits.copy(maxTracks = value.maxSongs, maxBytes = value.maxBytes)
+        committedSettings.value = value
+        speculation?.cancel()
+        reconciliationPending = true
+        reconcile()
+        null
+    }
+
+    private fun reconcile() {
+        if (reconciliationPending) reconciliationPending = !makeRoom(0, newEntry = false)
+    }
 
     /** Only validated authentication may call this. A suspended handle is never reauthorized. */
     fun bind(origin: String, accountId: String): SessionCache = lock.withLock {
@@ -133,9 +167,9 @@ class SongCache(
     /** Pins/reservations stay owned until this work actually runs, including failed closes. */
     private fun deferredStorage(operation: () -> Unit) {
         if (lock.tryLock()) {
-            try { operation() } finally { lock.unlock() }
+            try { operation(); reconcile() } finally { lock.unlock() }
         } else {
-            storageCleanup.execute { lock.withLock { operation() } }
+            storageCleanup.execute { lock.withLock { operation(); reconcile() } }
         }
     }
 
@@ -166,6 +200,7 @@ class SongCache(
                 root.listFiles().orEmpty().filter { it.isDirectory && it.name !in states }.forEach(::retireDirectory)
             }
         }
+        reconcile()
         states.values.forEach { it.persistSafely(); it.finishIfIdle() }
         forgetReclaimedStates()
     }
@@ -515,7 +550,6 @@ class SongCache(
                 else if (directory.listFiles().orEmpty().isNotEmpty()) throw IOException("Cache manifest missing")
                 inventoryKnown = true
                 if (retired) { finishIfIdle(); return }
-                if (!makeRoom(0, false)) throw IOException("Cache metadata budget unavailable")
                 cache = SimpleCache(File(directory, "media"), NoOpCacheEvictor(), null, null, false, true)
                 cache!!.checkInitialization()
                 // Incomplete entries survived a crash. They are never hits and have no live pins.
@@ -528,7 +562,9 @@ class SongCache(
                     entries[key] = Entry(key)
                     remove(entries.getValue(key))
                 }
-                if (entries.size > limits.maxTracks || ownedBytes() > limits.maxBytes) throw IOException("Cache inventory exceeds budget")
+                // A lowered persisted target is not corruption. Open the existing index first,
+                // then reconcile whole eligible entries without invalidating protected media.
+                if (!makeRoom(0, false)) reconciliationPending = true
                 persist()
             } catch (_: Exception) {
                 disabled = true
@@ -539,17 +575,17 @@ class SongCache(
         }
 
         private fun readManifest() {
-            if (manifest.length() > limits.metadataReserve) throw IOException("Invalid cache index")
+            if (manifest.length() > 4096L + MAX_TRACKS * 512L) throw IOException("Invalid cache index")
             DataInputStream(manifest.inputStream().buffered()).use { input ->
                 if (input.readInt() != MAGIC) throw IOException("Invalid cache index")
                 retired = input.readBoolean()
                 val count = input.readInt()
-                if (count !in 0..limits.maxTracks) throw IOException("Invalid cache index")
+                if (count !in 0..MAX_TRACKS) throw IOException("Invalid cache index")
                 repeat(count) {
                     val key = input.readUTF()
                     if (!key.matches(Regex("[0-9a-f]{64}")) || key in entries) throw IOException("Invalid cache key")
                     val length = input.readLong()
-                    if (length < -1 || length > limits.maxBytes) throw IOException("Invalid cache length")
+                    if (length < -1 || length > Long.MAX_VALUE / 4) throw IOException("Invalid cache length")
                     val modifiedAt = input.readLong()
                     if (modifiedAt < 0) throw IOException("Invalid cache modification time")
                     val digest = ByteArray(32).also { input.readFully(it) }
@@ -582,7 +618,9 @@ class SongCache(
             applyPromotions()
             // This reserve bounds the simultaneous old/new manifest and Media3 index copies.
             val manifestBytes = 9L + entries.values.sumOf { 118L + it.artifact.length }
-            if (ownedBytes() > limits.maxBytes - manifestBytes) throw IOException("Cache metadata budget unavailable")
+            // The admission reserve bounds metadata growth. Rewriting an existing manifest
+            // must remain possible above a lowered target, otherwise safe FIFO cleanup deadlocks.
+            if (manifestBytes > 4096L + MAX_TRACKS * 512L) throw IOException("Cache metadata budget unavailable")
             DataOutputStream(FileOutputStream(pending)).use { out ->
                 out.writeInt(MAGIC)
                 out.writeBoolean(retired)
@@ -638,8 +676,12 @@ class SongCache(
     }
 
     private fun makeRoom(addBytes: Long, newEntry: Boolean): Boolean {
-        fun fits(): Boolean = ownedBytes() <= limits.maxBytes - limits.metadataReserve - addBytes &&
-            (!newEntry || entryCount() < limits.maxTracks)
+        // Free space is independent of the configured target; do not evict media to paper over
+        // another owner's reservations or an exhausted filesystem. Cache misses stay upstream.
+        if ((addBytes > 0 || newEntry) && filesystemFree() < addBytes + limits.metadataReserve + FREE_SPACE_RESERVE) return false
+        val byteCeiling = minOf(limits.maxBytes, (filesystemCapacity() / 2).coerceAtLeast(0))
+        fun fits(): Boolean = ownedBytes() <= byteCeiling - limits.metadataReserve - addBytes &&
+            entryCount() <= (limits.maxTracks - if (newEntry) 1 else 0)
         // Drain before both new admission and eviction, so a later admission remains newer
         // than a successful play recorded while disk I/O held the lock.
         states.values.forEach { it.applyPromotions() }
@@ -715,6 +757,8 @@ class SongCache(
     }
 
     companion object {
+        private const val FREE_SPACE_RESERVE = 16L * 1024 * 1024
+        // Format/read compatibility bound; production admission is the persisted 2–10 policy.
         const val MAX_TRACKS = 100
         const val MAX_BYTES = 1_000_000_000L
         // v2 records mtime and a bounded-prefix digest. Never interpret a v1 whole-file digest

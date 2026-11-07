@@ -15,6 +15,7 @@ import dev.spofify.mobile.core.SessionStoreOwner
 import dev.spofify.mobile.core.AuthenticationChange
 import dev.spofify.mobile.core.AuthenticationChangeKind
 import dev.spofify.mobile.playback.cache.SongCache
+import dev.spofify.mobile.playback.cache.AutoCacheSettingsStore
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import dev.spofify.mobile.playback.PlaybackService
@@ -43,7 +44,7 @@ class SpofifyApplication : Application() {
 
 class AppGraph(private val context: Context, store: SessionStore = EncryptedSessionStore(context),
     private val logins: LoginStore = EncryptedLoginStore(context),
-    audioCacheLimits: SongCache.Limits = SongCache.Limits(),
+    audioCacheLimits: SongCache.Limits? = null,
     private val authenticationTimeMillis: () -> Long = System::currentTimeMillis) {
     private val sessions = SessionStoreOwner(store)
     private val restoreMutex = Mutex()
@@ -65,7 +66,8 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
 
     // Audio bytes confer no authority. Construction is dormant: only a server-validated
     // authentication event can bind the origin/account namespace to a live session.
-    internal val songCache = SongCache(context.cacheDir, audioCacheLimits)
+    internal val songCache = SongCache(context.cacheDir, audioCacheLimits ?: SongCache.Limits(),
+        settingsStore = if (audioCacheLimits == null) AutoCacheSettingsStore(context.filesDir) else null)
     @Volatile private var audioCache: SongCache.SessionCache? = null
     private val cacheAuthenticationLock = Any()
     @Volatile private var cacheSource: SpofifyClient? = null

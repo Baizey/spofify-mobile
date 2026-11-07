@@ -163,6 +163,108 @@ class SongCacheIntegrationTest {
         try { action(); fail("Expected authorization/protocol IOException") } catch (_: IOException) { }
     }
 
+    @Test fun committedLimitsReconcileFifoPreservePinsAndSurviveRestart() {
+        closeCache()
+        val store = AutoCacheSettingsStore(File(temporary.root, "settings"))
+        cache = SongCache(directory, settingsStore = store)
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        listOf("A", "B", "C", "D").forEach { fetch(it) }
+        handle.promote("A")
+        cache.awaitStorageForTest()
+        val reader = source()
+        reader.open(spec("B"))
+        assertNull(cache.updateSettings(AutoCacheSettings(maxSongs = 2)))
+        assertEquals(2, cache.inventory().entries)
+        assertEquals(1, cache.inventory().pinned)
+        reader.close()
+        assertBytes(bytes("A"), fetch("A"))
+        assertBytes(bytes("B"), fetch("B"))
+        assertEquals(1, requests["A"])
+        assertEquals(1, requests["B"])
+        closeCache()
+        cache = SongCache(directory, settingsStore = store)
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        assertEquals(2, cache.limits.maxTracks)
+        assertEquals(AutoCacheSettings(2), cache.settings.value)
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(1, requests["A"])
+    }
+
+    @Test fun loweringBelowActiveReadersDefersDeletionAndNeverTurnsReadsIntoErrors() {
+        closeCache()
+        cache = SongCache(directory, settingsStore = AutoCacheSettingsStore(File(temporary.root, "settings")))
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        listOf("A", "B", "C").forEach { fetch(it) }
+        val readers = listOf("A", "B", "C").map { source().apply { open(spec(it)) } }
+        assertNull(cache.updateSettings(AutoCacheSettings(2)))
+        assertEquals(3, cache.inventory().entries)
+        readers.forEach { reader ->
+            assertTrue(reader.read(ByteArray(16), 0, 16) > 0)
+        }
+        readers.first().close()
+        assertEquals(2, cache.inventory().entries)
+        readers.drop(1).forEach { it.close() }
+        assertFalse(cache.inventory().bypassed)
+    }
+
+    @Test fun settingsEditsAreLocalAndFailedDeletionDoesNotInventReclaimedCapacity() {
+        closeCache()
+        cache = SongCache(directory, deleteFile = { false },
+            settingsStore = AutoCacheSettingsStore(File(temporary.root, "settings")))
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        listOf("A", "B", "C").forEach { fetch(it) }
+        val beforeRequests = web.requestCount
+        val beforeBytes = cache.inventory().ownedBytes
+        assertNull(cache.updateSettings(AutoCacheSettings(2)))
+        assertEquals(beforeRequests, web.requestCount)
+        assertEquals(2, cache.limits.maxTracks)
+        assertEquals(3, cache.inventory().entries)
+        assertTrue(cache.inventory().ownedBytes >= beforeBytes - 512)
+        assertTrue(cache.inventory().cleanupFailed)
+    }
+
+    @Test fun decreaseWhileWriterIsReservedNeverDeletesItsStagingAndDemandStillFinishes() {
+        closeCache()
+        cache = SongCache(directory, settingsStore = AutoCacheSettingsStore(File(temporary.root, "settings")))
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        listOf("A", "B").forEach { fetch(it) }
+        val readerA = source().apply { open(spec("A")) }
+        val readerB = source().apply { open(spec("B")) }
+        val demand = source().apply { open(spec("C")) }
+        assertEquals(3, cache.inventory().entries)
+        assertNull(cache.updateSettings(AutoCacheSettings(2)))
+        assertEquals(3, cache.inventory().pinned)
+        assertEquals(3, cache.inventory().entries)
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(1024)
+        while (true) {
+            val n = demand.read(buffer, 0, buffer.size)
+            if (n == C.RESULT_END_OF_INPUT) break
+            output.write(buffer, 0, n)
+        }
+        demand.close()
+        assertBytes(bytes("C"), output.toByteArray())
+        assertTrue(readerA.read(buffer, 0, buffer.size) > 0)
+        assertTrue(readerB.read(buffer, 0, buffer.size) > 0)
+        readerA.close(); readerB.close()
+        assertEquals(2, cache.inventory().entries)
+        assertFalse(cache.inventory().bypassed)
+    }
+
+    @Test fun unavailableFilesystemSpaceBypassesAdmissionWithoutDeletingHealthyMedia() {
+        closeCache()
+        var free = 1_000_000_000L
+        cache = SongCache(directory, filesystemFree = { free })
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        fetch("A")
+        free = 0
+        assertBytes(bytes("B"), fetch("B"))
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(1, cache.inventory().entries)
+        assertEquals(1, requests["A"])
+        assertFalse(cache.inventory().bypassed)
+    }
+
     @Test fun cachedOnlyContinuationRepeatsWarmCurrentAndNextButFirstMissNeverTouchesNetwork() {
         assertBytes(bytes("A"), fetch("A"))
         assertBytes(bytes("B"), fetch("B"))

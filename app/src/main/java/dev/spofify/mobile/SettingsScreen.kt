@@ -24,14 +24,15 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import dev.spofify.mobile.playback.cache.AutoCacheSettings
 import java.util.Locale
 
 internal enum class SettingsDestination { ACCOUNT, CREDITS }
 
 /**
- * Only implemented destinations are indexed. Add future cache/offline destinations here only when
- * their owning subsystem supplies an actual route and persisted/applied controls; the shell owns
- * neither their policy nor a second copy of their preference state. MainActivity routes [destination].
+ * Only implemented destinations are indexed here. Inline automatic-cache controls have their own
+ * filtered index; the shell owns neither their policy nor committed preference state.
+ * MainActivity routes [destination].
  */
 internal data class SettingsEntry(
     val destination: SettingsDestination,
@@ -48,13 +49,14 @@ internal fun settingsEntries(username: String, origin: String) = listOf(
         "about app typeface font license attribution offline notices"),
 )
 
-internal fun matchingSettings(entries: List<SettingsEntry>, query: String): List<SettingsEntry> {
+internal fun matchesSettingsQuery(query: String, vararg fields: String): Boolean {
     val words = query.trim().lowercase(Locale.ROOT).split(Regex("\\s+")).filter(String::isNotEmpty)
-    return entries.filter { entry ->
-        val text = "${entry.group} ${entry.title} ${entry.summary} ${entry.searchTerms}".lowercase(Locale.ROOT)
-        words.all(text::contains)
-    }
+    val text = fields.joinToString(" ").lowercase(Locale.ROOT)
+    return words.all(text::contains)
 }
+
+internal fun matchingSettings(entries: List<SettingsEntry>, query: String): List<SettingsEntry> =
+    entries.filter { matchesSettingsQuery(query, it.group, it.title, it.summary, it.searchTerms) }
 
 /** A full shell destination; local search never calls music search or the server. */
 @Composable
@@ -63,12 +65,17 @@ internal fun SettingsScreen(
     origin: String,
     onOpen: (SettingsDestination) -> Unit,
     modifier: Modifier = Modifier,
+    cacheSettings: AutoCacheSettings? = null,
+    onSaveCacheSettings: suspend (AutoCacheSettings) -> String? = { "Couldn’t save. Try again." },
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     val entries = remember(username, origin) { settingsEntries(username, origin) }
     val matches = remember(entries, query) { matchingSettings(entries, query) }
+    val cacheMatches = remember(cacheSettings, query) {
+        cacheSettings?.let { matchingAutoCachePreferences(it, query) }.orEmpty()
+    }
     LazyColumn(modifier.testTag("settings-screen"), contentPadding = PaddingValues(bottom = 16.dp)) {
         item(key = "title") {
             Text("Settings", style = MaterialTheme.typography.headlineLarge,
@@ -87,9 +94,12 @@ internal fun SettingsScreen(
                     .testTag("settings-query"),
             )
         }
-        if (matches.isEmpty()) item {
+        if (matches.isEmpty() && cacheMatches.isEmpty()) item {
             Text("No matching settings", style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.padding(16.dp))
+        }
+        if (cacheSettings != null && cacheMatches.isNotEmpty()) item(key = "automatic-cache") {
+            AutoCachePreferences(cacheSettings, onSaveCacheSettings, cacheMatches)
         }
         matches.groupBy(SettingsEntry::group).forEach { (group, rows) ->
             item(key = "group:$group") {
