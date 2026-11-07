@@ -38,7 +38,7 @@ import org.robolectric.annotation.Config
 class LibraryUiTest {
     @get:Rule val compose = createComposeRule()
 
-    @Test fun songTapOpensDetailsAndExplicitPlayAndMoreAreSeparate() {
+    @Test fun songTapPlaysNowAndExplicitPlayAndMoreRemainSeparate() {
         val song = LibraryItem("track", "song", "Song", hasAudio = true)
         var opened = 0; var played = 0; var actions = 0
         compose.setContent {
@@ -46,15 +46,15 @@ class LibraryUiTest {
                 artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(360.dp)) }
         }
         compose.onNodeWithText("Song").performClick()
-        compose.runOnIdle { assertEquals(1, opened); assertEquals(0, played) }
+        compose.runOnIdle { assertEquals(0, opened); assertEquals(1, played) }
         compose.onNodeWithContentDescription("Play Song").assertDoesNotExist()
         val play = compose.onNodeWithText("Song").fetchSemanticsNode().config[SemanticsActions.CustomActions]
             .single { it.label == "Play now" }
         compose.runOnIdle { assertTrue(play.action()) }
         compose.onNodeWithContentDescription("More actions for Song").performClick()
-        compose.runOnIdle { assertEquals(1, played); assertEquals(1, actions) }
+        compose.runOnIdle { assertEquals(2, played); assertEquals(0, opened); assertEquals(1, actions) }
         compose.onNodeWithText("Song").performTouchInput { longClick() }
-        compose.runOnIdle { assertEquals(2, actions) }
+        compose.runOnIdle { assertEquals(2, actions); assertEquals(2, played); assertEquals(0, opened) }
     }
 
     @Test fun unavailableRowsKeepCompactCreditsAndReservedActionsWithDistinctLinksInMore() {

@@ -217,6 +217,10 @@ internal fun CatalogScreenContent(
     val sourceQueue: (LibraryItem) -> Unit = { if (sourceCurrent()) onQueue(it) }
     val sourceLike = onToggleLike?.let { toggle -> { item: LibraryItem -> if (sourceCurrent()) toggle(item) } }
     val sourcePlayback = playback.copy(
+        onPlayNow = playback.onPlayNow?.let { dispatch -> { item, rowCurrent ->
+            val isCurrent = { sourceCurrent() && rowCurrent() }
+            if (isCurrent()) dispatch(item, isCurrent)
+        } },
         onContextual = playback.onContextual?.let { dispatch -> { item, playerKey, gestureCurrent ->
             val isCurrent = { sourceCurrent() && gestureCurrent() }
             if (isCurrent()) dispatch(item, playerKey, isCurrent)

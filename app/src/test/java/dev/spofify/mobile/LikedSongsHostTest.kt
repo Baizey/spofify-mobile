@@ -201,6 +201,12 @@ class LikedSongsHostTest {
     }
     private fun list() = compose.onNodeWithTag("liked-songs-list")
     private fun row(title: String) = compose.onNode(hasText(title) and SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+    private fun openDetailsForBackCoverage(title: String) {
+        // These cases exercise retained browse state across navigation/Back, not the More
+        // menu. Enter details explicitly now that a song-body tap means Play now.
+        compose.runOnIdle { model.open(Page.Detail(model.state.value.items.single { it.name == title })) }
+        await { model.state.value.page is Page.Detail }
+    }
     private fun rowBounds(title: String): Rect {
         val bounds = row(title).getUnclippedBoundsInRoot()
         return with(compose.density) {
@@ -294,6 +300,32 @@ class LikedSongsHostTest {
         assertEquals("Retained row order/identity; ${diagnostics()}", ids.map { "song-$it" }, actual)
     }
 
+    @Test fun songBodyUsesRenderedPlayNowBindingAndLikesContextWithoutNavigationOrPopup() {
+        mountLikes()
+        val retained = anchor()
+        val rendered = compose.runOnIdle { controls.state.value }
+        row(retained.title).performClick()
+        await { controls.pending.size == 1 }
+        compose.runOnIdle {
+            val pending = controls.pending.single()
+            assertEquals(PlaybackListAction.PLAY_NOW, pending.action)
+            assertSame(rendered.interactionKey, pending.key)
+            assertEquals(rendered.queueIntentBinding, pending.binding)
+            val selected = pending.selection as QueueIntentSelection.Track
+            assertEquals(retained.title, selected.track.getValue("name").jsonPrimitive.content)
+            assertEquals(PlaybackContext("likes", "likes", "Liked songs"), selected.context)
+            assertTrue(pending.current())
+            assertEquals(Page.Likes, model.state.value.page)
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))
+        }
+        await { !model.state.value.preparing }
+        compose.runOnIdle {
+            assertEquals(Page.Likes, model.state.value.page)
+            assertNull(model.state.value.feedback)
+            assertNull(model.state.value.notice)
+        }
+    }
+
     @Test fun actualTouchFrontierIsSingleFlightAndOffscreenAndTrueEndDoNotFetch() {
         val append = gate()
         likesReply = { offset, _ -> if (offset == 40) append.hold(page(40, 80, 40 until 80)) else page(offset, 80, 0 until 40) }
@@ -335,8 +367,7 @@ class LikedSongsHostTest {
         await { model.state.value.offset == 80 && !model.state.value.loading }
         assertRows(0 until 78)
         assertAnchor(retained)
-        row(retained.title).performClick()
-        await { model.state.value.page is Page.Detail }
+        openDetailsForBackCoverage(retained.title)
         systemBack()
         list().assertIsDisplayed()
         assertAnchor(retained)
@@ -449,8 +480,7 @@ class LikedSongsHostTest {
         assertAnchor(retained)
         progressFrames()
         assertEquals(listOf(0, 40), offsets.toList())
-        row(retained.title).performClick()
-        await { model.state.value.page is Page.Detail }
+        openDetailsForBackCoverage(retained.title)
         systemBack()
         assertAnchor(retained)
         assertRows(0 until 40)
@@ -511,8 +541,7 @@ class LikedSongsHostTest {
         }
         progressFrames()
         assertEquals("Refresh failed once at zero; ${diagnostics()}", listOf(0, 0), offsets.toList())
-        row(retained.title).performClick()
-        await { model.state.value.page is Page.Detail }
+        openDetailsForBackCoverage(retained.title)
         systemBack()
         assertAnchor(retained, "Back restores offset-zero failure")
         assertRows(0 until 40)
@@ -527,8 +556,7 @@ class LikedSongsHostTest {
         assertEquals("Explicit offset-zero Retry must bypass the retained cache", listOf(0, 0, 0), offsets.toList())
         assertRows(0 until 40)
         assertAnchor(retryAnchor, "Offset-zero Retry held in HTTP")
-        row(retryAnchor.title).performClick()
-        await { model.state.value.page is Page.Detail }
+        openDetailsForBackCoverage(retryAnchor.title)
         retry.release.countDown()
         await { retryReturned.count == 0L }
         // Let the real canceled call drain while the detail route remains current. Do not

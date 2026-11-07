@@ -184,9 +184,18 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         val sourceEpoch = model.browseSourceEpoch
         val preparedGeneration = state.playbackIntentGeneration
         val art: @Composable (LibraryItem, Modifier) -> Unit = { item, modifier -> Artwork(item, model, modifier) }
+        // Freeze values now: reading the delegated player inside a retained callback could
+        // otherwise borrow a successor publication before the row recomposes.
+        val playNowKey = player.interactionKey
+        val playNowBinding = player.queueIntentBinding
         val feedback = CatalogPlaybackFeedback(player.item?.id, player.isPlaying, player.isBuffering, model.playback::toggle,
             interactionKey = player.interactionKey,
             playWhenReady = player.playWhenReady,
+            onPlayNow = { item, rowCurrent ->
+                if (sourceCurrent()) model.queueIntentFrom(client, item,
+                    dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW, playNowKey,
+                    { sourceCurrent() && rowCurrent() }, playNowBinding)
+            },
             onContextual = { item, binding, isCurrent ->
                 if (sourceCurrent()) model.queueIntentFrom(client, item, item.defaultQueueAction(), binding,
                     { sourceCurrent() && isCurrent() }, player.queueIntentBinding)
@@ -399,6 +408,9 @@ internal fun LikedSongs(
     val source = state.likesGeneration
     val sourceCurrent = { model.state.value.let { it.page == Page.Likes && it.likesGeneration == source && !it.likesStale } }
     val rowFeedback = feedback.copy(
+        onPlayNow = feedback.onPlayNow?.let { action -> { item, rowCurrent ->
+            if (sourceCurrent()) action(item, { sourceCurrent() && rowCurrent() })
+        } },
         onContextual = feedback.onContextual?.let { action -> { item, binding, rowCurrent ->
             if (sourceCurrent()) action(item, binding, { sourceCurrent() && rowCurrent() })
         } },

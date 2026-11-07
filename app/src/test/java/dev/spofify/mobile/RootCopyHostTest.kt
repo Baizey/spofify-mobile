@@ -438,7 +438,9 @@ class RootCopyHostTest {
         assertEquals(listOf("start", "cursor-40", "cursor-80"), cursors())
         compose.onNodeWithText("Song 78").performScrollTo().assertIsDisplayed()
         val beforeTrack = compose.onNodeWithText("Song 78").fetchSemanticsNode().boundsInRoot
-        compose.onNodeWithText("Song 78").performClick()
+        // This regression owns route/Back retention, not the More menu. Song-body taps
+        // now play, so enter the intentional details route explicitly.
+        compose.runOnIdle { model.open(Page.Detail(LibraryItem("track", "song-78", "Song 78", hasAudio = true))) }
         await { (model.state.value.page as? Page.Detail)?.item?.id == "song-78" }
         await { requests.any { it.requestUrl?.encodedPath == "/api/library/tracks/song-78" } }
         compose.runOnIdle { systemBack.onBackPressed() }

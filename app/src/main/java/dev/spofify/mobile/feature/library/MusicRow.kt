@@ -18,6 +18,7 @@ import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -37,6 +38,8 @@ data class CatalogPlaybackFeedback(
     val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
     val unselectedQueueOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null,
     val onUnselectedHigh: ((LibraryItem, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)? = null,
+    // Host captures its rendered transport key/binding; the callback retains the row's source lifetime.
+    val onPlayNow: ((LibraryItem, () -> Boolean) -> Unit)? = null,
 ) {
     val activeIntent: Boolean get() = isPlaying || (buffering && playWhenReady)
     val contextualLabel: String get() = "Queue"
@@ -55,7 +58,7 @@ internal fun sourceCurrent(action: () -> Boolean): () -> Boolean =
     (action as? MusicRowActionGuard)?.sourceCurrent ?: action
 
 /**
- * Shared compact identity row. Opening only navigates; Play is always a separate action.
+ * Shared compact identity row. Song bodies share guarded Play now; other identities navigate.
  * [like] and [onToggleLike] supply the optional, pending-guarded Like/Unlike accessibility
  * action without a third inline button. Rich credit links belong in [MusicCredits] in More/details.
  */
@@ -132,55 +135,71 @@ fun MusicRow(
                 if (onShowScopedActions != null) onShowScopedActions(item, actionCurrent) else onShowActions(item)
             }
         }
-        Row(swipeModifier.fillMaxWidth().background(
-            if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background)
-            .combinedClickable(onClick = { if (isCurrent()) onOpenItem(item) },
-                onLongClickLabel = if (actionsEnabled) "More actions for ${item.name}" else null,
-                onLongClick = if (actionsEnabled) ({ more() }) else null)
-            .semantics {
-                if (current) stateDescription = if (playback.buffering) "Buffering" else if (playback.isPlaying) "Playing" else "Paused"
-                customActions = buildList {
-                    if (actionsEnabled) add(CustomAccessibilityAction("More actions") { more(); true })
-                    if (canPlay) {
-                        add(CustomAccessibilityAction("Play now") {
-                            if (actionCurrent() && latestCanPlay && latestCapture === capture) {
-                                if (onPlayScoped != null) onPlayScoped(item, actionCurrent) else onPlayItem(item, false)
-                            }
-                            true
-                        })
-                        if (contextualEnabled) add(CustomAccessibilityAction(playback.contextualLabel) {
-                            if (actionCurrent() && latestCanPlay && latestCapture === capture) capture?.let { contextual(it, actionCurrent) }; true
-                        })
-                    }
-                    if (item.kind == "track" && onToggleLike != null && like?.pending != true) {
-                        add(CustomAccessibilityAction(if (like?.liked == true) "Unlike song" else "Like song") {
-                            onToggleLike(item); true
-                        })
-                    }
+        fun playNow() {
+            if (actionCurrent() && latestCanPlay && latestCapture === capture) {
+                when {
+                    onPlayScoped != null -> onPlayScoped(item, actionCurrent)
+                    playback.onPlayNow != null -> playback.onPlayNow.invoke(item, sourceCurrent(actionCurrent))
+                    else -> onPlayItem(item, false)
                 }
-            }.heightIn(min = rowHeight).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            val type = musicTypeLabel(item.kind)
-            Box(Modifier.size(52.dp).clearAndSetSemantics { contentDescription = type }) {
-                artwork(item, Modifier.fillMaxSize().clip(if (item.kind == "artist") CircleShape else RectangleShape))
-                Icon(when (item.kind) {
-                    "artist" -> Icons.Default.Person
-                    "album" -> Icons.Default.Album
-                    else -> Icons.Default.MusicNote
-                }, contentDescription = null, modifier = Modifier.align(Alignment.BottomEnd).size(18.dp)
-                    .background(MaterialTheme.colorScheme.background, CircleShape).padding(2.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Column(Modifier.weight(1f).padding(horizontal = 10.dp).heightIn(min = copyHeight),
-                verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(item.name, style = titleStyle, maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
-                if (subtitle.isNotBlank()) Text(subtitle, maxLines = 1,
-                    overflow = TextOverflow.Ellipsis, style = subtitleStyle,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            IconButton(onClick = { more() }, enabled = actionsEnabled, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.MoreVert, "More actions for ${item.name}")
+        }
+        fun activateBody() {
+            if (item.kind == "track") playNow() else if (isCurrent()) onOpenItem(item)
+        }
+        val bodyClickLabel = if (item.kind == "track" && canPlay) "Play now" else if (item.kind != "track") "Open details" else null
+        // Dispose the clickable node on output/occurrence replacement: Compose otherwise
+        // updates its retained OnClick wrapper to a successor callback. Keep source outside.
+        key(outputLifetime) {
+            Row(swipeModifier.fillMaxWidth().background(
+                if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background)
+                // Expose our captured guard directly, not the clickable node's mutable wrapper.
+                .semantics { onClick(bodyClickLabel) { activateBody(); true } }
+                .combinedClickable(
+                    onClickLabel = bodyClickLabel,
+                    onClick = ::activateBody,
+                    onLongClickLabel = if (actionsEnabled) "More actions for ${item.name}" else null,
+                    onLongClick = if (actionsEnabled) ({ more() }) else null)
+                .semantics {
+                    if (current) stateDescription = if (playback.buffering) "Buffering" else if (playback.isPlaying) "Playing" else "Paused"
+                    customActions = buildList {
+                        if (actionsEnabled) add(CustomAccessibilityAction("More actions") { more(); true })
+                        if (canPlay) {
+                            add(CustomAccessibilityAction("Play now") { playNow(); true })
+                            if (contextualEnabled) add(CustomAccessibilityAction(playback.contextualLabel) {
+                                if (actionCurrent() && latestCanPlay && latestCapture === capture) capture?.let { contextual(it, actionCurrent) }; true
+                            })
+                        }
+                        if (item.kind == "track" && onToggleLike != null && like?.pending != true) {
+                            add(CustomAccessibilityAction(if (like?.liked == true) "Unlike song" else "Like song") {
+                                onToggleLike(item); true
+                            })
+                        }
+                    }
+                }.heightIn(min = rowHeight).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                val type = musicTypeLabel(item.kind)
+                Box(Modifier.size(52.dp).clearAndSetSemantics { contentDescription = type }) {
+                    artwork(item, Modifier.fillMaxSize().clip(if (item.kind == "artist") CircleShape else RectangleShape))
+                    Icon(when (item.kind) {
+                        "artist" -> Icons.Default.Person
+                        "album" -> Icons.Default.Album
+                        else -> Icons.Default.MusicNote
+                    }, contentDescription = null, modifier = Modifier.align(Alignment.BottomEnd).size(18.dp)
+                        .background(MaterialTheme.colorScheme.background, CircleShape).padding(2.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Column(Modifier.weight(1f).padding(horizontal = 10.dp).heightIn(min = copyHeight),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(item.name, style = titleStyle, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                    if (subtitle.isNotBlank()) Text(subtitle, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis, style = subtitleStyle,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                IconButton(onClick = { more() }, enabled = actionsEnabled, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.MoreVert, "More actions for ${item.name}")
+                }
             }
         }
     }

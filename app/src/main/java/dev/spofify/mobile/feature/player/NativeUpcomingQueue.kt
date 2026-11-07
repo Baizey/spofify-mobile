@@ -34,6 +34,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -53,6 +54,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
@@ -238,6 +240,23 @@ private fun UpcomingQueueHeader(
     }
 }
 
+/** Body and explicit Play now share the exact queued-occurrence action. The clickable's
+ * incarnation is separate from the host lifetime retained by an admitted occurrence intent. */
+@Composable
+private fun UpcomingSongBody(entry: QueueEntry, state: PlaybackState, playNow: () -> Unit,
+    modifier: Modifier, content: @Composable ColumnScope.() -> Unit) {
+    val lifetime = remember(entry, state.interactionKey) { RowActionLifetime() }
+    DisposableEffect(lifetime) { onDispose { lifetime.invalidate() } }
+    val enabled = entry.item.playable && state.interactionKey != null
+    val activate = { if (enabled && lifetime.isCurrent()) playNow() }
+    key(lifetime) {
+        Column(modifier.heightIn(min = 48.dp)
+            .semantics { if (enabled) onClick("Play now") { activate(); true } }
+            .clickable(enabled = enabled, role = Role.Button, onClickLabel = "Play now", onClick = activate)
+            .padding(vertical = 8.dp), content = content)
+    }
+}
+
 /** Extreme short/narrow windows disclose reordering in More, keeping real 48dp actions. */
 @Composable
 private fun CompactUpcomingRow(
@@ -270,9 +289,8 @@ private fun CompactUpcomingRow(
             add(CustomAccessibilityAction("Remove from queue") { controls.removeUpcoming(entry.occurrenceId); true })
         }
     }, verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f).heightIn(min = 48.dp)
-            .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(entry.item) }
-            .padding(vertical = 8.dp)) {
+        UpcomingSongBody(entry, state, intents.single { it.first == "Play now" }.second,
+            Modifier.weight(1f)) {
             Text(entry.item.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodyMedium)
             Text(entry.item.subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -363,11 +381,9 @@ private fun UpcomingRow(
             }, contentAlignment = Alignment.Center,
         ) { Icon(Icons.Default.DragHandle, null) }
         artwork(entry.item, Modifier.size(40.dp))
-        Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
+        UpcomingSongBody(entry, state, intents.single { it.first == "Play now" }.second,
+            Modifier.weight(1f).padding(horizontal = 8.dp)) {
             Text(entry.item.name,
-                Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                    .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(entry.item) }
-                    .padding(vertical = 8.dp),
                 maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
             Text(if (dragging) "Move to position ${queueMoveTarget(index, dragY, rowHeight, count) + 1}" else entry.item.subtitle,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,

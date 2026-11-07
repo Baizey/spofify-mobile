@@ -206,11 +206,11 @@ class MusicRowTest {
                 .assert(SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf(type)))
             compose.onNodeWithText(compactMusicSubtitle(item.value), useUnmergedTree = true).assertHasNoClickAction()
             credits.forEach { compose.onNodeWithText(it.name).assertDoesNotExist() }
-            compose.onAllNodes(hasClickAction()).assertCountEquals(2) // Open and More; no inline transport/Like/credit buttons.
+            compose.onAllNodes(hasClickAction()).assertCountEquals(2) // Body and More; no inline transport/Like/credit buttons.
         }
     }
 
-    @Test fun openMoreLongPressAndCustomPlaybackActionsRemainDistinctAndNeverAutoplay() {
+    @Test fun bodyMoreLongPressAndCustomPlaybackActionsRemainDistinctAndNeverAutoplay() {
         var opened: LibraryItem? = null
         val played = mutableListOf<Pair<LibraryItem, Boolean>>()
         val key = PlaybackInteractionKey()
@@ -235,7 +235,7 @@ class MusicRowTest {
         compose.runOnIdle { assertTrue(played.isEmpty()); assertTrue(contextual.isEmpty()); assertEquals(null, opened) }
         compose.onAllNodes(hasClickAction()).assertCountEquals(2)
         compose.onNodeWithText(track.name).performClick()
-        compose.runOnIdle { assertEquals(track, opened); assertTrue(played.isEmpty()); assertTrue(contextual.isEmpty()) }
+        compose.runOnIdle { assertEquals(null, opened); assertEquals(listOf(track to false), played); assertTrue(contextual.isEmpty()) }
         compose.onNodeWithContentDescription("Play ${track.name}").assertDoesNotExist()
         compose.onNodeWithContentDescription("Pause ${track.name}").assertDoesNotExist()
         compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
@@ -243,11 +243,11 @@ class MusicRowTest {
         val actions = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
             .fetchSemanticsNode().config[SemanticsActions.CustomActions]
         compose.runOnIdle {
-            assertTrue(played.isEmpty())
+            assertEquals(listOf(track to false), played)
             assertTrue(contextual.isEmpty())
             assertEquals(2, more)
             assertTrue(actions.single { it.label == "Play now" }.action())
-            assertEquals(listOf(track to false), played)
+            assertEquals(listOf(track to false, track to false), played)
             assertTrue(contextual.isEmpty())
             assertTrue(actions.single { it.label == "Queue" }.action())
             assertEquals(listOf(track to key), contextual)

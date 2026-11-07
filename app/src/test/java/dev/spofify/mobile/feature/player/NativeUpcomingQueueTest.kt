@@ -1,5 +1,6 @@
 package dev.spofify.mobile.feature.player
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.height
@@ -8,9 +9,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.performTouchInput
 import dev.spofify.mobile.playback.PlaybackInteractionKey
@@ -19,6 +24,9 @@ import dev.spofify.mobile.playback.PlaybackActionStatus
 import dev.spofify.mobile.playback.PlaybackListAction
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.SemanticsMatcher
@@ -35,6 +43,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Density
+import java.io.File
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.listeningColorScheme
@@ -60,6 +70,77 @@ import org.robolectric.annotation.GraphicsMode
 class NativeUpcomingQueueTest {
     @get:Rule val compose = createComposeRule()
     private val track = LibraryItem("track", "duplicate", "Duplicate song", hasAudio = true)
+
+    @Test fun bothPresentationsBodyPlayNowKeepsExactDuplicateAndCapturedLifetimeWithoutNavigation() {
+        val controls = QueueRecordingControls()
+        val entries = listOf(QueueEntry("first", track, 19), QueueEntry("second", track, 3),
+            QueueEntry("unavailable", track.copy(name = "Unavailable queued song", hasAudio = false), 4))
+        val snapshot = mutableStateOf(PlaybackState(item = track, upcoming = entries, interactionKey = PlaybackInteractionKey()))
+        val compact = mutableStateOf(false)
+        val shown = mutableStateOf(true)
+        var opened = 0
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, 2f)) {
+                MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
+                    // Match the production player's Surface and inherited onSurface content.
+                    Surface {
+                        Column(Modifier.size(320.dp, 500.dp).testTag("queue-body-host")) {
+                            if (shown.value) NativeUpcomingQueue(snapshot.value, controls, { opened++ },
+                                { _, modifier -> Box(modifier) }, compact = compact.value)
+                        }
+                    }
+                }
+            }
+        }
+        for (presentation in listOf(false, true)) {
+            val key = PlaybackInteractionKey()
+            compose.runOnIdle {
+                compact.value = presentation; shown.value = true
+                snapshot.value = snapshot.value.copy(upcoming = entries, interactionKey = key)
+                controls.intents.clear(); controls.selected.clear(); controls.playNowPredicates.clear()
+            }
+            val body = compose.onAllNodesWithText(track.name)[1]
+            body.assertHeightIsAtLeast(48.dp)
+            val root = File(System.getProperty("java.io.tmpdir"), "song-body-renders").apply { mkdirs() }
+            val bitmap = compose.onNodeWithTag("queue-body-host").captureToImage().asAndroidBitmap()
+            File(root, "queue-${if (presentation) "compact" else "normal"}-320-font2.png").outputStream().use {
+                assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it))
+            }
+            val retainedClick = checkNotNull(body.fetchSemanticsNode().config[SemanticsActions.OnClick].action)
+            body.performTouchInput { click() }
+            lateinit var admitted: () -> Boolean
+            compose.runOnIdle {
+                assertEquals(listOf(Triple(key, "second", PlaybackListAction.PLAY_NOW)), controls.intents)
+                assertEquals(listOf("second"), controls.selected)
+                admitted = controls.playNowPredicates.single()
+                assertTrue(admitted()); assertEquals(0, opened); assertEquals(0, controls.playbackCalls)
+            }
+            compose.onAllNodesWithContentDescription("Queue actions for ${track.name}")[1].performClick()
+            compose.runOnIdle { assertEquals("More never bubbles to playback", 1, controls.intents.size) }
+            compose.onNodeWithText("Play now").performClick()
+            compose.runOnIdle {
+                assertEquals(List(2) { Triple(key, "second", PlaybackListAction.PLAY_NOW) }, controls.intents)
+                snapshot.value = snapshot.value.copy(interactionKey = PlaybackInteractionKey())
+            }
+            compose.runOnIdle { retainedClick(); assertEquals(2, controls.intents.size); assertTrue(admitted()) }
+            compose.onAllNodesWithText(track.name)[1].performTouchInput { down(center) }
+            compose.runOnIdle { snapshot.value = snapshot.value.copy(interactionKey = key) }
+            compose.onAllNodesWithText(track.name)[1].performTouchInput { up() }
+            compose.onNodeWithText("Unavailable queued song").performTouchInput { click() }
+            compose.runOnIdle {
+                retainedClick()
+                assertEquals("Output ABA/held pointer/unavailable song cannot start", 2, controls.intents.size)
+                snapshot.value = snapshot.value.copy(upcoming = emptyList(), interactionKey = PlaybackInteractionKey())
+            }
+            compose.runOnIdle {
+                assertTrue("Accepted exact occurrence retains queue-host lifetime after self removal", admitted())
+                assertEquals(0, opened); assertEquals(0, controls.playbackCalls)
+                shown.value = false
+            }
+            compose.runOnIdle { assertFalse("Queue disposal retires admitted source", admitted()) }
+        }
+    }
 
     @Test fun parentSeamHasOneActiveScrollerAndKeepsOccurrenceIndicesIndependentOfHeaders() {
         val controls = QueueRecordingControls()
@@ -427,6 +508,7 @@ class NativeUpcomingQueueTest {
         val selected = mutableListOf<String>()
         val contextual = mutableListOf<String>()
         val contextualPredicates = mutableListOf<() -> Boolean>()
+        val playNowPredicates = mutableListOf<() -> Boolean>()
         val playNexts = mutableListOf<Pair<PlaybackInteractionKey, String>>()
         val playNextPredicates = mutableListOf<() -> Boolean>()
         val intents = mutableListOf<Triple<PlaybackInteractionKey, String, PlaybackListAction>>()
@@ -435,7 +517,7 @@ class NativeUpcomingQueueTest {
             intents += Triple(expectedKey, occurrenceId, action)
             when (action) {
                 PlaybackListAction.PLAY_NEXT -> playNextOccurrence(expectedKey, occurrenceId, isCurrent, onResult)
-                PlaybackListAction.PLAY_NOW -> { if (isCurrent()) selected += occurrenceId; onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP)) }
+                PlaybackListAction.PLAY_NOW -> { playNowPredicates += isCurrent; if (isCurrent()) selected += occurrenceId; onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP)) }
                 else -> contextualOccurrence(expectedKey, occurrenceId, isCurrent, onResult)
             }
         }

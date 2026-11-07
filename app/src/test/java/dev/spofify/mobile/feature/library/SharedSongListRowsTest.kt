@@ -292,7 +292,7 @@ class SharedSongListRowsTest {
                     assertTrue(custom.single { it.label == "More actions" }.action())
                     assertTrue(custom.single { it.label == "Queue" }.action())
                     assertTrue(custom.single { it.label == "Unlike song" }.action())
-                    assertEquals(listOf("open", "more", "more", "more", "queue", "like"), events.map { it.second })
+                    assertEquals(listOf("play", "more", "more", "more", "queue", "like"), events.map { it.second })
                     events.forEach { assertEquals(owner, it.first); assertSame(song, it.third) }
                     events.clear()
                 }
@@ -311,8 +311,8 @@ class SharedSongListRowsTest {
                 }
                 row(song).performTouchInput { swipe(start = center, end = center.copy(x = center.x + 8)) }
                 compose.runOnIdle {
-                    // Below touch slop is still an identity tap, never an enqueue/play.
-                    assertEquals(listOf(Triple(owner, "open", song)), events)
+                    // Below touch slop is a song-body tap: Play now once, never enqueue.
+                    assertEquals(listOf(Triple(owner, "play", song)), events)
                     events.clear()
                 }
                 row(song).performTouchInput { down(center); moveBy(androidx.compose.ui.geometry.Offset(8f, 0f)); cancel() }
@@ -320,8 +320,8 @@ class SharedSongListRowsTest {
                 row(song).performTouchInput { swipe(start = center.copy(x = 1f), end = center.copy(x = width * .8f)) }
                 compose.runOnIdle {
                     // This row-local injection has no Android Back interceptor. The excluded,
-                    // unconsumed sequence can complete as identity click, but NEVER enqueue/play.
-                    assertEquals(listOf(Triple(owner, "open", song)), events)
+                    // unconsumed sequence can complete as a body click, but NEVER enqueue.
+                    assertEquals(listOf(Triple(owner, "play", song)), events)
                     events.clear()
                 }
                 row(song).performTouchInput {
