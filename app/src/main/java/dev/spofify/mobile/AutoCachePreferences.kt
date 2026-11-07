@@ -34,7 +34,7 @@ internal enum class AutoCachePreference(val title: String) {
 
 internal fun autoCacheSummary(preference: AutoCachePreference, settings: AutoCacheSettings): String =
     when (preference) {
-        AutoCachePreference.MAX_SONGS -> settings.maxSongs.toString()
+        AutoCachePreference.MAX_SONGS -> if (settings.maxSongs == AutoCacheSettings.MIN_SONGS) "Minimum (2)" else settings.maxSongs.toString()
         AutoCachePreference.STORAGE -> settings.storageGb?.let { "$it GB" }
             ?: "Minimum · ${settings.minimumBytes / 1_000_000L} MB"
     }
@@ -48,6 +48,11 @@ internal fun matchingAutoCachePreferences(settings: AutoCacheSettings, query: St
                 AutoCachePreference.STORAGE -> "space minimum GB size limit"
             })
     }
+
+private val autoCacheSongPresets = listOf(AutoCacheSettings.MIN_SONGS, 10, 100)
+
+internal fun autoCacheSongCount(text: String): Int? =
+    text.takeIf { it.matches(Regex("[0-9]+")) }?.toIntOrNull()?.takeIf { it >= AutoCacheSettings.MIN_SONGS }
 
 /** Decimal GB, with no rounding, unlimited mode or implicit increase of a fixed target. */
 internal fun autoCacheStorageError(maxSongs: Int, storageGb: String): String? {
@@ -73,6 +78,8 @@ internal fun AutoCachePreferences(
 ) {
     var editor by rememberSaveable { mutableStateOf<String?>(null) }
     var songs by rememberSaveable { mutableIntStateOf(settings.maxSongs) }
+    var customSongs by rememberSaveable { mutableStateOf(settings.maxSongs !in autoCacheSongPresets) }
+    var songText by rememberSaveable { mutableStateOf(settings.maxSongs.toString()) }
     var minimum by rememberSaveable { mutableStateOf(settings.storageGb == null) }
     var gb by rememberSaveable { mutableStateOf(settings.storageGb?.toString().orEmpty()) }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
@@ -91,6 +98,8 @@ internal fun AutoCachePreferences(
                 if (preference == AutoCachePreference.MAX_SONGS) Icons.Default.MusicNote else Icons.Default.Storage,
                 onClick = {
                     songs = settings.maxSongs
+                    customSongs = settings.maxSongs !in autoCacheSongPresets
+                    songText = settings.maxSongs.toString()
                     minimum = settings.storageGb == null
                     gb = settings.storageGb?.toString().orEmpty()
                     error = null
@@ -109,9 +118,14 @@ internal fun AutoCachePreferences(
                 verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Column(Modifier.selectableGroup()) {
                     if (active == AutoCachePreference.MAX_SONGS) {
-                        (AutoCacheSettings.MIN_SONGS..AutoCacheSettings.MAX_SONGS).forEach { count ->
-                            AutoCacheChoice("$count", songs == count, !saving,
-                                "auto-cache-songs-$count") { songs = count; error = null }
+                        autoCacheSongPresets.forEach { count ->
+                            AutoCacheChoice(if (count == AutoCacheSettings.MIN_SONGS) "Minimum (2)" else "$count",
+                                !customSongs && songs == count, !saving, "auto-cache-songs-$count") {
+                                songs = count; customSongs = false; error = null
+                            }
+                        }
+                        AutoCacheChoice("Custom", customSongs, !saving, "auto-cache-songs-custom") {
+                            customSongs = true; error = null
                         }
                     } else {
                         AutoCacheChoice("Minimum", minimum, !saving, "auto-cache-minimum") {
@@ -121,6 +135,12 @@ internal fun AutoCachePreferences(
                             minimum = false; error = null
                         }
                     }
+                }
+                if (active == AutoCachePreference.MAX_SONGS && customSongs) {
+                    OutlinedTextField(value = songText, onValueChange = { songText = it; error = null },
+                        label = { Text("Songs") }, singleLine = true, enabled = !saving,
+                        isError = error != null, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth().testTag("auto-cache-song-count"))
                 }
                 if (active == AutoCachePreference.STORAGE && !minimum) {
                     OutlinedTextField(value = gb, onValueChange = { gb = it; error = null },
@@ -142,7 +162,13 @@ internal fun AutoCachePreferences(
                     focus.clearFocus()
                     keyboard?.hide()
                     // Preserve the other, latest owner-supplied field rather than a stale dialog snapshot.
-                    val nextSongs = if (active == AutoCachePreference.MAX_SONGS) songs else settings.maxSongs
+                    val nextSongs = if (active == AutoCachePreference.MAX_SONGS) {
+                        if (customSongs) autoCacheSongCount(songText) else songs
+                    } else settings.maxSongs
+                    if (nextSongs == null) {
+                        error = "Enter a whole number of songs (at least 2)."
+                        return@saveClick
+                    }
                     val nextGb = if (active == AutoCachePreference.STORAGE) {
                         if (minimum) null else gb
                     } else settings.storageGb?.toString()

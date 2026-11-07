@@ -30,9 +30,9 @@ import kotlinx.coroutines.flow.asStateFlow
  * Merely constructing this object does not read media or establish playback authority. The graph
  * must call [bind] only after validating the exact origin/account session. One instance per app.
  *
- * SimpleCache owns its span/index format. A small credential-free manifest adds whole-object
- * completion and FIFO (not access-LRU). The legacy index is intentional: with <=100 opaque keys
- * and no content metadata its atomic-file overhead has a finite bound, unlike a shared SQLite WAL.
+ * SimpleCache owns its span/index format. A credential-free manifest adds whole-object completion
+ * and FIFO (not access-LRU). The legacy index is intentional: opaque keys and no content metadata
+ * let admission reserve its atomic-file overhead per actual entry, unlike a shared SQLite WAL.
  * All mutations and reservations are serialized; network I/O is never under the storage lock.
  */
 @androidx.annotation.OptIn(UnstableApi::class)
@@ -62,11 +62,9 @@ class SongCache(
         val attemptMillis: Long = 30_000,
     ) {
         init {
-            require(maxTracks in 1..MAX_TRACKS && maxBytes in 1..Long.MAX_VALUE / 4)
+            require(maxTracks >= 1 && maxBytes in 1..Long.MAX_VALUE / 4)
             require(chunkBytes in 1..64 * 1024 && attemptMillis > 0)
         }
-        // Two manifest generations plus both Media3 legacy index generations, with margin.
-        internal val metadataReserve: Long get() = 4096L + maxTracks * 512L
     }
 
     data class Inventory(
@@ -575,12 +573,18 @@ class SongCache(
         }
 
         private fun readManifest() {
-            if (manifest.length() > 4096L + MAX_TRACKS * 512L) throw IOException("Invalid cache index")
+            val bytes = manifest.length()
+            // Validate actual storage/heap feasibility, never the desired song target: a lower
+            // saved target must still be able to read healthy entries before FIFO reconciliation.
+            if (bytes < MANIFEST_HEADER_BYTES || bytes > (filesystemCapacity() / 2).coerceAtLeast(0)) {
+                throw IOException("Invalid cache index")
+            }
             DataInputStream(manifest.inputStream().buffered()).use { input ->
                 if (input.readInt() != MAGIC) throw IOException("Invalid cache index")
                 retired = input.readBoolean()
                 val count = input.readInt()
-                if (count !in 0..MAX_TRACKS) throw IOException("Invalid cache index")
+                if (count < 0 || count.toLong() > (bytes - MANIFEST_HEADER_BYTES) / MANIFEST_RECORD_BYTES ||
+                    !metadataFitsMemory(count.toLong())) throw IOException("Invalid cache index")
                 repeat(count) {
                     val key = input.readUTF()
                     if (!key.matches(Regex("[0-9a-f]{64}")) || key in entries) throw IOException("Invalid cache key")
@@ -590,7 +594,10 @@ class SongCache(
                     if (modifiedAt < 0) throw IOException("Invalid cache modification time")
                     val digest = ByteArray(32).also { input.readFully(it) }
                     val artifact = input.readUTF()
-                    if (artifact.isNotEmpty() && !artifact.matches(Regex("media/[0-9]+/[0-9]+\\.[0-9]+\\.[0-9]+\\.v3\\.exo"))) throw IOException("Invalid cache artifact")
+                    if (artifact.length > MAX_ARTIFACT_BYTES ||
+                        (artifact.isNotEmpty() && !artifact.matches(Regex("media/[0-9]+/[0-9]+\\.[0-9]+\\.[0-9]+\\.v3\\.exo")))) {
+                        throw IOException("Invalid cache artifact")
+                    }
                     entries[key] = Entry(key, length, digest, artifact, modifiedAt).also { promotionEntries[key] = it }
                 }
                 if (input.read() != -1) throw IOException("Invalid cache index")
@@ -600,7 +607,9 @@ class SongCache(
         fun persistSafely(): Boolean = try {
             if (released) {
                 if (retired && states[scope] === this) markRetired(directory) else true
-            } else if (!initialized) {
+            } else if (!initialized || !inventoryKnown) {
+                // A refused/corrupt manifest is not an empty cache. In particular a resource
+                // limit while restoring must not overwrite its FIFO and later orphan media.
                 if (retired) markRetired(directory) else true
             } else { persist(); true }
         } catch (_: Exception) { disabled = true; cleanupFailed = true; false }
@@ -616,11 +625,10 @@ class SongCache(
 
         private fun persist() {
             applyPromotions()
-            // This reserve bounds the simultaneous old/new manifest and Media3 index copies.
-            val manifestBytes = 9L + entries.values.sumOf { 118L + it.artifact.length }
-            // The admission reserve bounds metadata growth. Rewriting an existing manifest
-            // must remain possible above a lowered target, otherwise safe FIFO cleanup deadlocks.
-            if (manifestBytes > 4096L + MAX_TRACKS * 512L) throw IOException("Cache metadata budget unavailable")
+            val manifestBytes = MANIFEST_HEADER_BYTES + entries.values.sumOf { MANIFEST_RECORD_BYTES + it.artifact.length }
+            // Admission reserves metadata for actual entries. Rewrites above a lowered policy
+            // remain possible; only actual filesystem resources constrain this cleanup snapshot.
+            if (manifestBytes > (filesystemCapacity() / 2).coerceAtLeast(0)) throw IOException("Cache metadata budget unavailable")
             DataOutputStream(FileOutputStream(pending)).use { out ->
                 out.writeInt(MAGIC)
                 out.writeBoolean(retired)
@@ -678,10 +686,11 @@ class SongCache(
     private fun makeRoom(addBytes: Long, newEntry: Boolean): Boolean {
         // Free space is independent of the configured target; do not evict media to paper over
         // another owner's reservations or an exhausted filesystem. Cache misses stay upstream.
-        if ((addBytes > 0 || newEntry) && filesystemFree() < addBytes + limits.metadataReserve + FREE_SPACE_RESERVE) return false
+        if ((addBytes > 0 || newEntry) && filesystemFree() < addBytes + metadataReserve(newEntry) + FREE_SPACE_RESERVE) return false
         val byteCeiling = minOf(limits.maxBytes, (filesystemCapacity() / 2).coerceAtLeast(0))
-        fun fits(): Boolean = ownedBytes() <= byteCeiling - limits.metadataReserve - addBytes &&
-            entryCount() <= (limits.maxTracks - if (newEntry) 1 else 0)
+        fun fits(): Boolean = entryCount() <= (limits.maxTracks - if (newEntry) 1 else 0) &&
+            metadataFitsMemory(trackedEntryCount() + if (newEntry) 1L else 0L) &&
+            ownedBytes() <= byteCeiling - metadataReserve(newEntry) - addBytes
         // Drain before both new admission and eviction, so a later admission remains newer
         // than a successful play recorded while disk I/O held the lock.
         states.values.forEach { it.applyPromotions() }
@@ -698,12 +707,25 @@ class SongCache(
         return fits()
     }
 
+    private fun trackedEntryCount(): Long = states.values.filter { !it.released || it.directory.exists() }
+        .sumOf { it.entries.size.toLong() }
+
+    /** Two manifest generations and both Media3 legacy index generations, with per-entry margin.
+     * A large configured target is not an instruction to allocate metadata (or fetch tracks).
+     */
+    private fun metadataReserve(newEntry: Boolean): Long = METADATA_BASE_BYTES +
+        (trackedEntryCount() + if (newEntry) 1L else 0L) * METADATA_ENTRY_BYTES
+
+    // Bound actual live index objects by a heap budget, not an arbitrary total-song maximum.
+    private fun metadataFitsMemory(count: Long): Boolean =
+        count <= Runtime.getRuntime().maxMemory() / 4 / ENTRY_HEAP_BYTES
+
     private fun entryCount(): Int {
         // Unopened/failed-retirement directories cannot be treated as reclaimed capacity.
         val directories = root.listFiles()
         if (root.exists() && directories == null) return limits.maxTracks
         val unknown = directories.orEmpty().any { it.isDirectory && states[it.name]?.inventoryKnown != true }
-        return if (unknown) limits.maxTracks else states.values.filter { !it.released || it.directory.exists() }.sumOf { it.entries.size }
+        return if (unknown) limits.maxTracks else trackedEntryCount().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
     fun inventory(): Inventory = lock.withLock {
@@ -713,25 +735,27 @@ class SongCache(
     }
 
     private fun ownedBytes(): Long {
-        var visited = 0
         fun size(file: File, depth: Int): Long {
             val attributes = try {
                 java.nio.file.Files.readAttributes(file.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java,
                     java.nio.file.LinkOption.NOFOLLOW_LINKS)
             } catch (_: java.nio.file.NoSuchFileException) { return 0 }
-            if (++visited > 4096 || depth > 8) throw IOException("Unrecognized cache inventory")
+            if (depth > 8) throw IOException("Unrecognized cache inventory")
             if (attributes.isRegularFile) return attributes.size()
             if (!attributes.isDirectory) throw IOException("Unreadable cache inventory")
-            val children = file.listFiles() ?: throw IOException("Unreadable cache inventory")
-            return children.fold(0L) { total, child -> Math.addExact(total, size(child, depth + 1)) }
+            // Stream directory entries: healthy inventories have no total-file/count ceiling,
+            // and large directories must not require a proportional temporary File array.
+            return java.nio.file.Files.newDirectoryStream(file.toPath()).use { children ->
+                children.fold(0L) { total, child -> Math.addExact(total, size(child.toFile(), depth + 1)) }
+            }
         }
         return try {
-            size(root, 0) + states.values.sumOf { state ->
-                state.entries.values.sumOf { entry ->
+            states.values.fold(size(root, 0)) { total, state ->
+                state.entries.values.fold(total) { owned, entry ->
                     val staging = (entry.openBytes - state.stage(entry).length()).coerceAtLeast(0)
                     val missingPin = if (entry.pins > 0 && entry.pinnedBytes > 0 && entry.artifact.isNotEmpty() &&
                         !File(state.directory, entry.artifact).exists()) entry.pinnedBytes else 0L
-                    staging + missingPin
+                    Math.addExact(owned, Math.addExact(staging, missingPin))
                 }
             }
         } catch (_: Exception) { Long.MAX_VALUE / 2 }
@@ -758,12 +782,20 @@ class SongCache(
 
     companion object {
         private const val FREE_SPACE_RESERVE = 16L * 1024 * 1024
-        // Format/read compatibility bound; production admission is the persisted 2–10 policy.
+        // Legacy default only, not a format bound or a maximum configurable song count.
         const val MAX_TRACKS = 100
         const val MAX_BYTES = 1_000_000_000L
         // v2 records mtime and a bounded-prefix digest. Never interpret a v1 whole-file digest
         // as this format; unsupported/corrupt manifests follow the existing safe bypass path.
         private const val MAGIC = 0x53434732
+        private const val MANIFEST_HEADER_BYTES = 9L
+        private const val MANIFEST_RECORD_BYTES = 116L // UTF key (66), two longs (16), digest (32), UTF artifact prefix (2).
+        // Media3 paths contain only the media prefix, a bucket and bounded Int/Long fields.
+        // Bound this field too, so per-entry disk/heap reserves cannot hide oversized strings.
+        private const val MAX_ARTIFACT_BYTES = 128
+        private const val METADATA_BASE_BYTES = 4096L
+        private const val METADATA_ENTRY_BYTES = 1024L
+        private const val ENTRY_HEAP_BYTES = 2048L // Entry, lookup maps and Media3 index/span objects.
         internal const val VERIFY_PREFIX_BYTES = 16 * 1024
 
         fun authorizedFactory(

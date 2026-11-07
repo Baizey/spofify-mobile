@@ -82,6 +82,12 @@ class SettingsScreenTest {
         }
         assertNull(autoCacheStorageError(10, "1"))
         assertNull(autoCacheStorageError(2, "2"))
+        listOf("", "0", "1", "-2", "1.5", "1e3", "2147483648").forEach {
+            assertNull(it, autoCacheSongCount(it))
+        }
+        listOf(2, 10, 100, 101, 1001, Int.MAX_VALUE).forEach {
+            assertEquals(it, autoCacheSongCount(it.toString()))
+        }
     }
 
     @Test fun rootSearchFindsActualCacheRowsWithoutAddingRoutes() {
@@ -99,7 +105,7 @@ class SettingsScreenTest {
         compose.onNodeWithText("No matching settings").assertIsDisplayed()
     }
 
-    @Test fun songDialogOffersOnlyTwoThroughTenAndCancelDoesNotSave() {
+    @Test fun songDialogOffersPresetsAndCustomAndCancelDoesNotSave() {
         var committed by mutableStateOf(AutoCacheSettings(storageGb = 1))
         val saved = mutableListOf<AutoCacheSettings>()
         compose.setContent {
@@ -111,7 +117,7 @@ class SettingsScreenTest {
         compose.onNodeWithText("Maximum songs").performScrollTo().performClick()
         compose.onNodeWithTag("auto-cache-songs-1").assertDoesNotExist()
         compose.onNodeWithTag("auto-cache-songs-11").assertDoesNotExist()
-        (2..10).forEach { count ->
+        listOf(2, 10, 100).forEach { count ->
             compose.onNodeWithTag("auto-cache-songs-$count").performScrollTo()
                 .assertHasClickAction().assertHeightIsAtLeast(48.dp)
         }
@@ -125,9 +131,66 @@ class SettingsScreenTest {
         compose.onNodeWithTag("auto-cache-save").performClick()
         compose.waitForIdle()
         assertEquals(listOf(AutoCacheSettings(2, 1)), saved)
-        compose.onNode(hasText("Maximum songs") and hasText("2")).assertIsDisplayed()
+        compose.onNode(hasText("Maximum songs") and hasText("Minimum (2)")).assertIsDisplayed()
         compose.onNode(hasText("Storage") and hasText("1 GB")).assertIsDisplayed()
         compose.onNodeWithTag("auto-cache-dialog").assertDoesNotExist()
+    }
+
+    @Test fun customSongCountPersistsThroughOwnerAndDraftRestorationWithoutClamping() {
+        var committed by mutableStateOf(AutoCacheSettings())
+        val saved = mutableListOf<AutoCacheSettings>()
+        val restoration = StateRestorationTester(compose)
+        restoration.setContent {
+            MaterialTheme { SettingsScreen("Listener", "https://music.example", {}, cacheSettings = committed,
+                onSaveCacheSettings = { saved += it; committed = it; null }) }
+        }
+        compose.onNodeWithText("Maximum songs").performScrollTo().performClick()
+        compose.onNodeWithTag("auto-cache-songs-custom").performScrollTo().performClick()
+        compose.onNodeWithTag("auto-cache-song-count").performScrollTo().performTextReplacement("1001")
+        restoration.emulateSavedInstanceStateRestore()
+        compose.onNodeWithTag("auto-cache-songs-custom").performScrollTo().assertIsSelected()
+        compose.onNodeWithTag("auto-cache-song-count").performScrollTo().assertTextContains("1001")
+        assertTrue(saved.isEmpty())
+        compose.onNodeWithTag("auto-cache-save").performClick()
+        compose.waitForIdle()
+        assertEquals(listOf(AutoCacheSettings(1001)), saved)
+        compose.onNode(hasText("Maximum songs") and hasText("1001")).assertIsDisplayed().performClick()
+        compose.onNodeWithTag("auto-cache-songs-custom").performScrollTo().assertIsSelected()
+        compose.onNodeWithTag("auto-cache-song-count").performScrollTo().assertTextContains("1001")
+        capture("automatic-cache-custom-1001", "auto-cache-dialog")
+        compose.onNodeWithText("Cancel").performClick()
+        compose.onNode(hasText("Storage") and hasText("Minimum · 50150 MB")).assertIsDisplayed()
+    }
+
+    @Test fun customSongValidationRejectsOnlyInvalidNumbersAndInsufficientFixedStorage() {
+        var committed by mutableStateOf(AutoCacheSettings(storageGb = 1))
+        val saved = mutableListOf<AutoCacheSettings>()
+        compose.setContent {
+            MaterialTheme { SettingsScreen("Listener", "https://music.example", {}, cacheSettings = committed,
+                onSaveCacheSettings = { saved += it; committed = it; null }) }
+        }
+        compose.onNodeWithText("Maximum songs").performScrollTo().performClick()
+        compose.onNodeWithTag("auto-cache-songs-custom").performScrollTo().performClick()
+        compose.onNodeWithTag("auto-cache-song-count").performScrollTo().performTextReplacement("1")
+        compose.onNodeWithTag("auto-cache-save").performClick()
+        compose.onNodeWithTag("auto-cache-error").performScrollTo()
+            .assertTextEquals("Enter a whole number of songs (at least 2).")
+        compose.onNodeWithTag("auto-cache-song-count").performScrollTo().performTextReplacement("1001")
+        compose.onNodeWithTag("auto-cache-save").performClick()
+        compose.onNodeWithTag("auto-cache-error").performScrollTo()
+            .assertTextEquals("Enter a whole number of GB (at least 51).")
+        assertTrue(saved.isEmpty())
+        assertEquals(AutoCacheSettings(storageGb = 1), committed)
+        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Storage").performScrollTo().performClick()
+        compose.onNodeWithTag("auto-cache-gb").performTextReplacement("51")
+        compose.onNodeWithTag("auto-cache-save").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("Maximum songs").performClick()
+        compose.onNodeWithTag("auto-cache-songs-100").performScrollTo().performClick()
+        compose.onNodeWithTag("auto-cache-save").performClick()
+        compose.waitForIdle()
+        assertEquals(AutoCacheSettings(100, 51), committed)
     }
 
     @Test fun storageValidationAndOwnerFailureStayLocalAndRetryPreservesFixedTarget() {
@@ -186,7 +249,7 @@ class SettingsScreenTest {
         compose.onNodeWithTag("auto-cache-dialog").assertDoesNotExist()
         compose.onNode(hasText("Maximum songs") and hasText("10")).assertIsDisplayed()
         compose.runOnIdle { committed = saved.single() }
-        compose.onNode(hasText("Maximum songs") and hasText("2")).assertIsDisplayed()
+        compose.onNode(hasText("Maximum songs") and hasText("Minimum (2)")).assertIsDisplayed()
     }
 
     @Test fun dialogUsesLatestOwnerValueForTheFieldNotBeingEdited() {
@@ -245,7 +308,8 @@ class SettingsScreenTest {
         compose.onNodeWithText("Maximum songs").assertHeightIsAtLeast(48.dp).performClick()
         compose.onNodeWithTag("auto-cache-songs-2").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         capture("automatic-cache-320-font2-count-first", "auto-cache-dialog")
-        compose.onNodeWithTag("auto-cache-songs-10").performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithTag("auto-cache-songs-custom").performScrollTo().performClick().assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithTag("auto-cache-song-count").performScrollTo().performTextReplacement("1001")
         compose.onNodeWithTag("auto-cache-save").assertIsDisplayed().assertHeightIsAtLeast(48.dp)
         capture("automatic-cache-320-font2-count-last", "auto-cache-dialog")
         compose.onNodeWithText("Cancel").performClick()

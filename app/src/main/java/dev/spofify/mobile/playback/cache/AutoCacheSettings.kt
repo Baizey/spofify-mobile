@@ -10,7 +10,7 @@ import java.io.IOException
 data class AutoCacheSettings(val maxSongs: Int = 10, val storageGb: Int? = null) {
     /** Estimate only: 50 decimal MB per FLAC song plus 100 decimal MB of headroom. */
     val minimumBytes: Long
-        get() = maxSongs.coerceIn(MIN_SONGS, MAX_SONGS) * ESTIMATED_SONG_BYTES + HEADROOM_BYTES
+        get() = maxSongs.coerceAtLeast(MIN_SONGS).toLong() * ESTIMATED_SONG_BYTES + HEADROOM_BYTES
 
     /** Decimal GB; invalid persisted values never turn into an unlimited/negative ceiling. */
     val maxBytes: Long
@@ -18,7 +18,7 @@ data class AutoCacheSettings(val maxSongs: Int = 10, val storageGb: Int? = null)
 
     /** Recovery only. Invalid fixed targets become Minimum, never a silently raised fixed target. */
     fun normalized(): AutoCacheSettings {
-        val count = maxSongs.coerceIn(MIN_SONGS, MAX_SONGS)
+        val count = maxSongs.coerceAtLeast(MIN_SONGS)
         val fixed = storageGb?.takeIf { it > 0 && it.toLong() * BYTES_PER_GB >= minimumBytes }
         return copy(maxSongs = count, storageGb = fixed)
     }
@@ -30,7 +30,7 @@ data class AutoCacheSettings(val maxSongs: Int = 10, val storageGb: Int? = null)
      * Admission must still check free space, staging/reservations and handle ENOSPC on every write.
      */
     fun validationError(capacity: Long, free: Long, owned: Long): String? {
-        if (maxSongs !in MIN_SONGS..MAX_SONGS) return "Choose 2–10 songs"
+        if (maxSongs < MIN_SONGS) return "Choose at least 2 songs"
         if (storageGb != null && storageGb <= 0) return "Choose Minimum or a positive whole GB"
         if (maxBytes < minimumBytes) return "Storage must cover the song minimum"
         if (capacity <= 0 || free < 0 || owned < 0) return "Storage information is unavailable"
@@ -44,7 +44,6 @@ data class AutoCacheSettings(val maxSongs: Int = 10, val storageGb: Int? = null)
 
     companion object {
         const val MIN_SONGS = 2
-        const val MAX_SONGS = 10
         const val BYTES_PER_GB = 1_000_000_000L
         const val ESTIMATED_SONG_BYTES = 50_000_000L
         const val HEADROOM_BYTES = 100_000_000L

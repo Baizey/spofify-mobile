@@ -1,9 +1,11 @@
 # Automatic audio cache
 
-Settings exposes installation-local **Maximum songs** (2–10 unique songs) and **Storage**.
+Settings exposes installation-local **Maximum songs** with **Minimum (2), 10, 100, Custom**
+presets and **Storage**. Custom accepts any representable whole-song count of at least two,
+subject to the actual coupled storage constraints; presets are not total-count ceilings.
 Storage is **Minimum** or a positive integer number of decimal GB (1 GB = 1,000,000,000 bytes).
 Minimum estimates 50,000,000 bytes per FLAC song plus 100,000,000 bytes headroom: 200 MB
-for two songs through 600 MB for ten. This is a simple practical estimate, not a guarantee
+for two songs, 600 MB for ten, and 50.15 GB for 1,001. This is a simple practical estimate, not a guarantee
 for arbitrarily long/high-resolution tracks. Minimum follows song-count edits; fixed GB does
 not change implicitly. Neither setting changes queue length or the current-plus-next-five
 prefetch policy, grants offline playback authority, or creates a download job.
@@ -12,9 +14,10 @@ prefetch policy, grants offline playback authority, or creates a download job.
 `AtomicFile` under app-private `filesDir`, outside disposable cache media. App backup and
 transfer remain excluded. The cache owner serializes durable commits, policy publication,
 reservations, FIFO reconciliation and admission. Missing/corrupt records use safe defaults;
-legacy song counts clamp into 2–10. Existing media/FIFO manifests retain their format and
-are reconciled safely rather than declared corrupt merely because the saved target fell.
-The format compatibility bound of 100 entries is not the production admission ceiling.
+valid stored song counts are preserved without an upper clamp. Existing media/FIFO manifests
+retain their format and are reconciled safely rather than declared corrupt merely because the
+saved target fell. Manifest records are validated against their actual bytes, not a fixed
+100-entry ceiling. Metadata reservations follow actual entries, not the desired count.
 
 Edits must fit at most half of the app-data filesystem's total capacity. They separately
 validate remaining target growth against usable space with a 16 MiB safety reserve.

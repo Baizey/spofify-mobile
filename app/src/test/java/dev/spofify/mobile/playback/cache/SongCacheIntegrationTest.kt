@@ -7,6 +7,8 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.cache.NoOpCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.ServerAddress
@@ -14,6 +16,7 @@ import dev.spofify.mobile.core.SessionStore
 import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.core.StoredSession
 import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -115,10 +118,15 @@ class SongCacheIntegrationTest {
     }
 
     @After fun teardown() {
-        closeCache()
-        client.httpClient.dispatcher.cancelAll()
-        client.httpClient.connectionPool.evictAll()
-        web.shutdown()
+        try {
+            if (::cache.isInitialized) closeCache()
+        } finally {
+            if (::client.isInitialized) {
+                client.httpClient.dispatcher.cancelAll()
+                client.httpClient.connectionPool.evictAll()
+            }
+            if (::web.isInitialized) web.shutdown()
+        }
     }
 
     private fun closeCache() { cache.close(); cache.awaitStorageForTest() }
@@ -188,6 +196,257 @@ class SongCacheIntegrationTest {
         assertEquals(AutoCacheSettings(2), cache.settings.value)
         assertBytes(bytes("A"), fetch("A"))
         assertEquals(1, requests["A"])
+    }
+
+    @Test fun customCountsThroughRepresentableIntPersistRestartAndAdmitWithoutEagerWork() {
+        closeCache()
+        val store = AutoCacheSettingsStore(File(temporary.root, "uncapped-settings"))
+        fun reopen() {
+            cache = SongCache(directory, settingsStore = store,
+                filesystemCapacity = { Long.MAX_VALUE / 2 }, filesystemFree = { Long.MAX_VALUE / 2 })
+            handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        }
+        reopen()
+        for (count in listOf(11, 101, 1001, Int.MAX_VALUE)) {
+            val beforeRequests = web.requestCount
+            val beforeEntries = cache.inventory().entries
+            val value = AutoCacheSettings(count)
+            assertNull(cache.updateSettings(value))
+            assertEquals(value, store.read())
+            assertEquals(value, cache.settings.value)
+            assertEquals(count, cache.limits.maxTracks)
+            assertEquals(beforeRequests, web.requestCount)
+            assertEquals(beforeEntries, cache.inventory().entries)
+            val id = "policy-$count"
+            assertBytes(bytes(id), fetch(id))
+            assertEquals(beforeEntries + 1, cache.inventory().complete)
+            closeCache(); reopen()
+            assertEquals(value, cache.settings.value)
+            assertEquals(count, cache.limits.maxTracks)
+            assertBytes(bytes(id), fetch(id))
+            assertEquals("Restart retains healthy media", 1, requests[id])
+            assertFalse(cache.inventory().bypassed)
+        }
+    }
+
+    @Test fun hugeCountTargetReservesOnlyActualMetadataAndStillRespectsBytesAndFreeSpace() {
+        closeCache()
+        val limits = SongCache.Limits(maxTracks = Int.MAX_VALUE, maxBytes = 24_000)
+        fun reopen() {
+            cache = SongCache(directory, limits, filesystemCapacity = { 1_000_000_000L },
+                filesystemFree = { AutoCacheSettings.FREE_SPACE_RESERVE_BYTES + 16_384 })
+            handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        }
+        reopen()
+        bytes("A", 3_000); bytes("B", 3_000)
+        assertBytes(bytes("A"), fetch("A"))
+        assertBytes(bytes("B"), fetch("B"))
+        assertEquals(2, cache.inventory().complete)
+        assertTrue(cache.inventory().ownedBytes <= limits.maxBytes)
+        closeCache(); reopen()
+        assertBytes(bytes("A"), fetch("A"))
+        assertBytes(bytes("B"), fetch("B"))
+        assertEquals(1, requests["A"])
+        assertEquals(1, requests["B"])
+        assertFalse(cache.inventory().bypassed)
+    }
+
+    @Test fun thousandAndTwoRealEntriesSurviveRestartAndLowerSavedTargetReconcilesFifo() {
+        closeCache()
+        val store = AutoCacheSettingsStore(File(temporary.root, "many-settings"))
+        fun reopen() {
+            cache = SongCache(directory, settingsStore = store,
+                filesystemCapacity = { 1_000_000_000_000L }, filesystemFree = { 1_000_000_000_000L })
+            handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        }
+        reopen()
+        assertNull(cache.updateSettings(AutoCacheSettings(1002)))
+        val beforeRequests = web.requestCount
+        val payload = byteArrayOf(42)
+        val scopeDirectory = handle.state.directory
+        val seededKeys = (0..1000).map { handle.key("entry-$it") }
+        closeCache()
+        // Seed real Media3 spans and a single SCG2 manifest while the owner is stopped. Repeated
+        // owner fills would rescan the growing inventory for every chunk (quadratic on FUSE).
+        // Entry 1,002 below must still traverse actual owner admission, reservation and commit.
+        assertTrue(scopeDirectory.isDirectory || scopeDirectory.mkdirs())
+        val seeded = SimpleCache(File(scopeDirectory, "media"), NoOpCacheEvictor(), null, null, false, true)
+        try {
+            seeded.checkInitialization()
+            val digest = MessageDigest.getInstance("SHA-256").digest(payload)
+            DataOutputStream(FileOutputStream(File(scopeDirectory, "order")).buffered()).use { manifest ->
+                manifest.writeInt(0x53434732) // SCG2
+                manifest.writeBoolean(false)
+                manifest.writeInt(seededKeys.size)
+                for (key in seededKeys) {
+                    val hole = requireNotNull(seeded.startReadWriteNonBlocking(key, 0, payload.size.toLong()))
+                    assertFalse(hole.isCached)
+                    try {
+                        val target = seeded.startFile(key, 0, payload.size.toLong())
+                        target.writeBytes(payload)
+                        seeded.commitFile(target, payload.size.toLong())
+                        val span = seeded.getCachedSpans(key).single()
+                        val artifact = requireNotNull(span.file)
+                        manifest.writeUTF(key)
+                        manifest.writeLong(span.length)
+                        manifest.writeLong(artifact.lastModified())
+                        manifest.write(digest)
+                        manifest.writeUTF(artifact.relativeTo(scopeDirectory).invariantSeparatorsPath)
+                    } finally { seeded.releaseHoleSpan(hole) }
+                }
+            }
+        } finally { seeded.release() }
+        reopen()
+        val writer = handle.writer("entry-1001", speculative = false) {}
+        assertNotNull("Owner admission beyond 1,000 existing entries", writer)
+        assertTrue(writer!!.append(payload, 0, payload.size))
+        writer.finish()
+        assertEquals(1002, cache.inventory().entries)
+        assertEquals(1002, cache.inventory().complete)
+        assertEquals(1002, directory.walkTopDown().count { it.isFile && it.name.endsWith(".exo") })
+        handle.promote("entry-0")
+        cache.awaitStorageForTest()
+        fun cached(id: Int) {
+            val hit = handle.factory(DataSource.Factory { throw IOException("Unexpected cache miss") },
+                { "entry-$id" }, {}).createDataSource()
+            try {
+                hit.open(DataSpec.Builder().setUri("https://cache.invalid/entry-$id").build())
+                assertBytes(payload, drain(hit))
+            } finally { hit.close() }
+        }
+        closeCache(); reopen()
+        assertEquals(1002, cache.limits.maxTracks)
+        cached(0); cached(1001)
+        assertEquals(1002, cache.inventory().complete)
+        val restoredFiles = directory.walkTopDown().filter { it.isFile && it.name.endsWith(".exo") }.toList()
+        assertEquals("All real spans survive restart", 1002, restoredFiles.size)
+        restoredFiles.forEach { assertArrayEquals("Restored span ${it.name}", payload, it.readBytes()) }
+        closeCache()
+        // Simulate a lower committed policy recovered on startup, not a malformed manifest.
+        store.write(AutoCacheSettings(1001))
+        reopen()
+        cached(0); cached(1001)
+        assertEquals(AutoCacheSettings(1001), cache.settings.value)
+        assertEquals(1001, cache.inventory().entries)
+        assertEquals(1001, cache.inventory().complete)
+        assertEquals(1001, directory.walkTopDown().count { it.isFile && it.name.endsWith(".exo") })
+        val order = directory.walkTopDown().single { it.isFile && it.name == "order" }
+            .readBytes().toString(Charsets.ISO_8859_1)
+        assertFalse("Only the oldest unpromoted entry is evicted", order.contains(handle.key("entry-1")))
+        assertTrue(order.contains(handle.key("entry-0")))
+        assertFalse(cache.inventory().bypassed)
+        assertFalse(cache.inventory().cleanupFailed)
+        assertEquals("No network fills or settings-triggered fetches", beforeRequests, web.requestCount)
+    }
+
+    @Test fun incompleteReservationManifestRecoversAfterCrashWithoutDisablingTheNamespace() {
+        // Build the exact durable state just after the first reservation, before any artifact
+        // exists. No live reader/writer is carried across this simulated process boundary.
+        val key = handle.key("partial")
+        val scope = handle.state.scope
+        closeCache()
+        val stateDirectory = File(directory, "song-cache-v1/$scope").apply { mkdirs() }
+        val manifest = File(stateDirectory, "order")
+        java.io.DataOutputStream(manifest.outputStream()).use { output ->
+            output.writeInt(0x53434732)
+            output.writeBoolean(false)
+            output.writeInt(1)
+            output.writeUTF(key)
+            output.writeLong(-1)
+            output.writeLong(0)
+            output.write(ByteArray(32))
+            output.writeUTF("")
+        }
+        val staging = File(stateDirectory, "$key.part").apply { writeBytes(byteArrayOf(42)) }
+        assertEquals(125L, manifest.length())
+        startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertFalse(staging.exists())
+        assertEquals(1, cache.inventory().complete)
+        assertFalse(cache.inventory().bypassed)
+        closeCache(); startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(1, requests["A"])
+    }
+
+    @Test fun manifestClaimMustBeFeasibleForActualRecordBytesNotJustAnInteger() {
+        fetch("A")
+        closeCache()
+        val manifest = directory.walkTopDown().single { it.isFile && it.name == "order" }
+        java.io.RandomAccessFile(manifest, "rw").use { it.seek(5); it.writeInt(Int.MAX_VALUE) }
+        val refused = manifest.readBytes()
+        startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(2, requests["A"])
+        assertTrue(cache.inventory().bypassed)
+        closeCache()
+        assertArrayEquals("Refusal is not an empty FIFO to persist", refused, manifest.readBytes())
+        startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(3, requests["A"])
+        assertTrue(cache.inventory().bypassed)
+        assertEquals("Malformed metadata does not purge healthy media", 1,
+            directory.walkTopDown().count { it.isFile && it.name.endsWith(".exo") })
+    }
+
+    @Test fun manifestFieldsCannotExceedPerEntryMetadataResourceReservation() {
+        fetch("A")
+        closeCache()
+        val manifest = directory.walkTopDown().single { it.isFile && it.name == "order" }
+        val original = manifest.readBytes()
+        java.io.RandomAccessFile(manifest, "rw").use { file ->
+            file.seek(9)
+            file.readUTF(); file.readLong(); file.readLong(); file.skipBytes(32)
+            // Syntactically the old path pattern, but impossible for Media3's Int/Long fields.
+            file.writeUTF("media/0/${"1".repeat(200)}.0.0.v3.exo")
+            file.setLength(file.filePointer)
+        }
+        val refused = manifest.readBytes()
+        startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertTrue(cache.inventory().bypassed)
+        closeCache()
+        assertArrayEquals(refused, manifest.readBytes())
+        manifest.writeBytes(original)
+        startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals(2, requests["A"])
+        assertFalse(cache.inventory().bypassed)
+    }
+
+    @Test fun restoreResourceRefusalPreservesOriginalManifestAndMediaThroughShutdown() {
+        fetch("A")
+        closeCache()
+        val manifest = directory.walkTopDown().single { it.isFile && it.name == "order" }
+        val original = manifest.readBytes()
+        val media = directory.walkTopDown().single { it.isFile && it.name.endsWith(".exo") }
+        // Refuse restoration on actual filesystem capacity, independently of a saved song target.
+        cache = SongCache(directory, filesystemCapacity = { manifest.length() * 2 - 1 })
+        handle = cache.bind(client.server.origin, client.currentSession()!!.accountId)
+        assertBytes(bytes("A"), fetch("A"))
+        assertTrue(cache.inventory().bypassed)
+        closeCache()
+        assertArrayEquals(original, manifest.readBytes())
+        assertEquals(bytes("A").size.toLong(), media.length())
+        startCache()
+        assertBytes(bytes("A"), fetch("A"))
+        assertEquals("Resource recovery reuses healthy media instead of purging it", 2, requests["A"])
+        assertFalse(cache.inventory().bypassed)
+    }
+
+    @Test fun inventoryStreamsMoreThan4096FilesWithoutInventingAnExhaustedBudget() {
+        fetch("A")
+        val before = cache.inventory().ownedBytes
+        val root = File(directory, "song-cache-v1")
+        val extra = (0 until 4097).map { File(root, "inventory-$it") }
+        try {
+            extra.forEach { it.writeBytes(byteArrayOf(1)) }
+            assertEquals(before + extra.size, cache.inventory().ownedBytes)
+            assertBytes(bytes("B"), fetch("B"))
+            assertEquals(2, cache.inventory().complete)
+            assertFalse(cache.inventory().bypassed)
+        } finally { extra.forEach { assertTrue(it.delete()) } }
+        assertTrue(cache.inventory().ownedBytes < cache.limits.maxBytes)
     }
 
     @Test fun loweringBelowActiveReadersDefersDeletionAndNeverTurnsReadsIntoErrors() {
@@ -396,7 +655,7 @@ class SongCacheIntegrationTest {
         assertEquals(0L, cache.inventory().ownedBytes) // No lifetime pin remains after maintenance.
     }
 
-    @Test fun productionConstantsAndHundredAndFirstAdmissionIncludingDuplicateReservation() {
+    @Test fun defaultHundredIsNotAProductMaximumAndStillCountsDuplicateReservations() {
         assertEquals(100, SongCache.MAX_TRACKS)
         assertEquals(1_000_000_000L, SongCache.MAX_BYTES)
         repeat(101) { id -> bytes("T$id", 31); fetch("T$id") }

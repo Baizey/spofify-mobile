@@ -38,14 +38,14 @@ class AutoCacheSettingsTest {
         assertTrue(settings.copy(maxSongs = 10).maxBytes >= settings.copy(maxSongs = 10).minimumBytes)
     }
 
-    @Test fun normalizationClampsLegacyCountsAndPreservesValidFixedChoice() {
-        assertEquals(AutoCacheSettings(10, 2), AutoCacheSettings(100, 2).normalized())
-        assertEquals(AutoCacheSettings(10), AutoCacheSettings(Int.MAX_VALUE).normalized())
+    @Test fun normalizationPreservesRepresentableCountsAndValidFixedChoices() {
+        assertEquals(AutoCacheSettings(100, 6), AutoCacheSettings(100, 6).normalized())
+        assertEquals(AutoCacheSettings(Int.MAX_VALUE), AutoCacheSettings(Int.MAX_VALUE).normalized())
         assertEquals(AutoCacheSettings(2), AutoCacheSettings(Int.MIN_VALUE).normalized())
         assertEquals(AutoCacheSettings(2), AutoCacheSettings(0).normalized())
         assertEquals(AutoCacheSettings(2), AutoCacheSettings(1).normalized())
-        for (count in 2..10) {
-            val settings = AutoCacheSettings(count, 1)
+        for (count in listOf(2, 10, 11, 100, 101, 1001, Int.MAX_VALUE)) {
+            val settings = AutoCacheSettings(count)
             assertEquals(settings, settings.normalized())
             assertEquals(settings.normalized(), settings.normalized().normalized())
         }
@@ -59,8 +59,8 @@ class AutoCacheSettingsTest {
     }
 
     @Test fun invalidUserEditsAreRejectedRatherThanNormalized() {
-        for (count in listOf(Int.MIN_VALUE, 0, 1, 11, 100, Int.MAX_VALUE)) {
-            assertEquals("Choose 2–10 songs", AutoCacheSettings(count).validationError(20 * gb, 20 * gb, 0))
+        for (count in listOf(Int.MIN_VALUE, 0, 1)) {
+            assertEquals("Choose at least 2 songs", AutoCacheSettings(count).validationError(20 * gb, 20 * gb, 0))
         }
         for (fixed in listOf(0, -1, Int.MIN_VALUE)) {
             assertEquals("Choose Minimum or a positive whole GB",
@@ -108,7 +108,8 @@ class AutoCacheSettingsTest {
         assertNull(settings.validationError(Long.MAX_VALUE, Long.MAX_VALUE, 0))
         assertNull(settings.validationError(Long.MAX_VALUE, 0, Long.MAX_VALUE))
         assertNotNull(settings.validationError(Long.MAX_VALUE, 0, 0))
-        assertEquals(600_000_000L, AutoCacheSettings(Int.MAX_VALUE).minimumBytes)
+        assertEquals(107_374_182_450_000_000L, AutoCacheSettings(Int.MAX_VALUE).minimumBytes)
+        assertNull(AutoCacheSettings(Int.MAX_VALUE).validationError(Long.MAX_VALUE, Long.MAX_VALUE, 0))
         assertEquals(200_000_000L, AutoCacheSettings(Int.MIN_VALUE).minimumBytes)
     }
 
@@ -127,17 +128,35 @@ class AutoCacheSettingsTest {
         assertEquals(listOf(AutoCacheSettingsStore.FILE_NAME), directory.listFiles()!!.map { it.name })
     }
 
-    @Test fun legacyCountAndMalformedFixedValueAreRecoveredWithoutRewriteOrMediaDeletion() {
+    @Test fun storedLargeCountAndMalformedFixedValueAreRecoveredWithoutRewriteOrMediaDeletion() {
         val directory = temporary.newFolder("files")
         val config = File(directory, AutoCacheSettingsStore.FILE_NAME)
         val media = File(directory, "protected-media").apply { writeText("untouched") }
-        config.writeBytes(record(100, 2))
-        assertEquals(AutoCacheSettings(10, 2), AutoCacheSettingsStore(directory).read())
-        config.writeBytes(record(100, 0))
+        config.writeBytes(record(1001, 51))
+        assertEquals(AutoCacheSettings(1001, 51), AutoCacheSettingsStore(directory).read())
+        config.writeBytes(record(1001, 0))
         val before = config.readBytes()
-        assertEquals(AutoCacheSettings(10), AutoCacheSettingsStore(directory).read())
+        assertEquals(AutoCacheSettings(1001), AutoCacheSettingsStore(directory).read())
         assertArrayEquals(before, config.readBytes())
         assertEquals("untouched", media.readText())
+    }
+
+    @Test fun customCountsAboveAllPresetsRoundTripAndUseActualStorageConstraints() {
+        val directory = temporary.newFolder("large-counts")
+        for (count in listOf(11, 101, 1001, 10_001, Int.MAX_VALUE)) {
+            for (settings in listOf(AutoCacheSettings(count), AutoCacheSettings(count, Int.MAX_VALUE))) {
+                assertNull(settings.validationError(Long.MAX_VALUE, Long.MAX_VALUE, 0))
+                AutoCacheSettingsStore(directory).write(settings)
+                assertEquals(settings, AutoCacheSettingsStore(directory).read())
+            }
+        }
+        val settings = AutoCacheSettings(1001)
+        assertEquals(50_150_000_000L, settings.minimumBytes)
+        assertNull(settings.validationError(200 * gb, 100 * gb, 0))
+        assertNotNull(settings.validationError(100 * gb, 100 * gb, 0))
+        assertNotNull(settings.validationError(200 * gb, 50 * gb, 0))
+        assertNotNull(AutoCacheSettings(1001, 50).validationError(200 * gb, 100 * gb, 0))
+        assertNull(AutoCacheSettings(1001, 51).validationError(200 * gb, 100 * gb, 0))
     }
 
     @Test fun corruptTruncatedUnknownOrOversizedRecordsFallBackWithoutRewrite() {
