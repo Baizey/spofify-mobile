@@ -881,7 +881,8 @@ private fun PlaylistDetail(
                 playbackEnabled = playbackEnabled, managementEnabled = managementEnabled,
                 copyEnabled = managementEnabled && !stale && !copyNeedsReview,
                 verifyEnabled = !busy, allowNewCopyEnabled = !busy && !stale,
-                artwork = artwork,
+                // Saved collections have no library artwork endpoint. Keep the local menu
+                // placeholder rather than handing a playlist kind to the catalog renderer.
                 onEditDetails = if (playlist?.capabilities?.editMetadata == true)
                     ({ collectionActions = null; metadata = true }) else null,
                 onEditRules = if (playlist != null && playlist.kind == PlaylistKind.DERIVED && playlist.capabilities.editDefinition) ({

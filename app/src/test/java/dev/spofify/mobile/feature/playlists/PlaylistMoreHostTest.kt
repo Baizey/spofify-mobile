@@ -86,6 +86,9 @@ class PlaylistMoreHostTest {
                     MaterialTheme {
                         if (shown.value) PlaylistsRoute(client, {}, { _, _, _ -> fail("No controller preparation") }, {},
                             initialPlaylistId = "fixture", playback = feedback.value,
+                            // Exercise the real artwork URL admission used by MainActivity.Artwork.
+                            // A placeholder-only host masks unsupported collection kinds at More.
+                            artwork = { item, _ -> client.artworkUrl(item) },
                             onQueueIntent = { selection, action, capturedKey, capturedBinding, current ->
                                 assertSame(key, capturedKey); assertEquals(binding, capturedBinding); assertTrue(current())
                                 accepted += selection to action
