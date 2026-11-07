@@ -41,7 +41,20 @@ internal fun AutomaticListDemand(
     frontierKeys: List<Any>,
     enabled: Boolean,
     onLoad: () -> Unit,
+) = AutomaticListDemand(state, identity, frontierKeys, frontierKeys, enabled, onLoad)
+
+/** Grouped visual rows may keep the same key when a short batch fills an existing row.
+ * Progress is request/frontier identity, not a reason to reset the stationary fill budget. */
+@Composable
+internal fun AutomaticListDemand(
+    state: LazyListState,
+    identity: Any,
+    frontierKeys: List<Any>,
+    frontierProgress: Any,
+    enabled: Boolean,
+    onLoad: () -> Unit,
 ) {
+    val currentProgress = rememberUpdatedState(frontierProgress)
     val currentFrontier = rememberUpdatedState(frontierKeys)
     val currentEnabled = rememberUpdatedState(enabled)
     val currentLoad = rememberUpdatedState(onLoad)
@@ -49,7 +62,7 @@ internal fun AutomaticListDemand(
     LaunchedEffect(state, identity, lifecycle) {
         var anchor: Pair<Any?, Int>? = null
         var fills = 0
-        var requested: List<Any>? = null
+        var requested: Any? = null
         val gestures = mutableLongStateOf(0L)
         var observedGesture = 0L
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -64,7 +77,7 @@ internal fun AutomaticListDemand(
                 it.offset < info.viewportEndOffset && it.offset + it.size > info.viewportStartOffset
             }
             DemandViewport(visible.firstOrNull()?.let { it.key to it.offset },
-                visible.map { it.key }, currentFrontier.value, currentEnabled.value, gestures.longValue)
+                visible.map { it.key }, currentFrontier.value, currentProgress.value, currentEnabled.value, gestures.longValue)
         }.collect { view ->
             if (view.anchor != anchor || view.gesture != observedGesture) {
                 anchor = view.anchor
@@ -72,8 +85,8 @@ internal fun AutomaticListDemand(
                 fills = 0
             }
             if (view.enabled && view.frontier.isNotEmpty() &&
-                view.visible.any { it in view.frontier } && requested != view.frontier && fills < 2) {
-                requested = view.frontier.toList()
+                view.visible.any { it in view.frontier } && requested != view.progress && fills < 2) {
+                requested = view.progress
                 fills++
                 currentLoad.value()
             }
@@ -83,7 +96,7 @@ internal fun AutomaticListDemand(
 }
 
 private data class DemandViewport(
-    val anchor: Pair<Any?, Int>?, val visible: List<Any>, val frontier: List<Any>, val enabled: Boolean,
+    val anchor: Pair<Any?, Int>?, val visible: List<Any>, val frontier: List<Any>, val progress: Any, val enabled: Boolean,
     val gesture: Long,
 )
 

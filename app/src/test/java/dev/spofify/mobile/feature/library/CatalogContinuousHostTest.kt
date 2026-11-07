@@ -118,7 +118,8 @@ class CatalogContinuousHostTest {
 
     @Test fun songsVisibleNeverExpandOffscreenEarlierGroupsAndBackRestoresAnchor() {
         val reader = Reader(total = 40, initialSizes = mapOf("artists" to 1, "albums" to 1))
-        mount(reader, kind = "all", height = 400)
+        var playedId: String? = null
+        mount(reader, kind = "all", height = 400, onPlay = { item, _ -> playedId = item.id })
         // The initial viewport contains the entire Artists/Albums frontier AND Songs.
         // Only the last visible row group is allowed to request: neither earlier tail loads.
         compose.onNodeWithText("Artist 0").assertIsDisplayed()
@@ -136,7 +137,14 @@ class CatalogContinuousHostTest {
         await { holder.state.value.current.sections.getValue("tracks").items.size == 20 }
         val saved = compose.runOnIdle { holder.state.value.current.let { it.scrollIndex to it.scrollOffset } }
         compose.onNodeWithText("Song 7").performClick()
-        compose.runOnIdle { assertTrue(holder.back()) }
+        compose.runOnIdle {
+            // Song bodies now Play now, never push a detail destination. Intentional
+            // detail/credit navigation still restores the containing list's anchor.
+            assertEquals("tracks-7", playedId)
+            assertFalse(holder.state.value.canGoBack)
+            holder.open(LibraryItem("track", "tracks-7", "Song 7", hasAudio = true))
+            assertTrue(holder.back())
+        }
         compose.waitForIdle()
         compose.onNodeWithText("Song 7").assertIsDisplayed()
         compose.runOnIdle {

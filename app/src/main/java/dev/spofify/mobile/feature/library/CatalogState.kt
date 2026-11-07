@@ -87,6 +87,8 @@ data class CatalogScreen(
     val sections: Map<String, CatalogSection> = emptyMap(),
     val scrollIndex: Int = 0,
     val scrollOffset: Int = 0,
+    /** First visible artist release, independent of responsive row grouping. */
+    val releaseAnchorId: String? = null,
     val stale: Boolean = false,
     /** Row identity incarnation; unlike requests/scroll this changes on query/filter ABA. */
     val resultGeneration: Long = 0,
@@ -211,11 +213,12 @@ class CatalogStateHolder(
         if (!value) applyPendingRevision()
     }
 
-    fun rememberScroll(screenKey: Long, index: Int, offset: Int, expectedQuery: String? = null, expectedReleaseGroup: String? = null) {
+    fun rememberScroll(screenKey: Long, index: Int, offset: Int, expectedQuery: String? = null,
+        expectedReleaseGroup: String? = null, releaseAnchorId: String? = null) {
         val current = state.value.current
         if (current.key == screenKey && (expectedQuery == null || current.query == expectedQuery) &&
             (expectedReleaseGroup == null || current.releaseGroup == expectedReleaseGroup)) {
-            update { it.copy(scrollIndex = index, scrollOffset = offset) }
+            update { it.copy(scrollIndex = index, scrollOffset = offset, releaseAnchorId = releaseAnchorId) }
         }
     }
 
@@ -241,7 +244,7 @@ class CatalogStateHolder(
         navigationVersion++
         cancelReads()
         update { it.copy(query = cleaned, search = true, item = null, sections = emptyMap(),
-            scrollIndex = 0, scrollOffset = 0, detailResolved = false, resultGeneration = ++serial) }
+            scrollIndex = 0, scrollOffset = 0, releaseAnchorId = null, detailResolved = false, resultGeneration = ++serial) }
         if (cleaned.isBlank()) return
         val token = generation
         queryJob = scope.launch {
@@ -268,7 +271,7 @@ class CatalogStateHolder(
     private fun changeResults(change: (CatalogScreen) -> CatalogScreen) {
         navigationVersion++
         cancelReads()
-        update { change(it).copy(sections = emptyMap(), scrollIndex = 0, scrollOffset = 0, resultGeneration = ++serial) }
+        update { change(it).copy(sections = emptyMap(), scrollIndex = 0, scrollOffset = 0, releaseAnchorId = null, resultGeneration = ++serial) }
         loadVisible()
     }
 
@@ -276,7 +279,7 @@ class CatalogStateHolder(
         if (group !in ReleaseGroups.map { it.first } || group == state.value.current.releaseGroup) return
         navigationVersion++
         cancelReads()
-        update { it.copy(releaseGroup = group, sections = emptyMap(), scrollIndex = 0, scrollOffset = 0, resultGeneration = ++serial) }
+        update { it.copy(releaseGroup = group, sections = emptyMap(), scrollIndex = 0, scrollOffset = 0, releaseAnchorId = null, resultGeneration = ++serial) }
         loadVisible()
     }
 
@@ -592,6 +595,8 @@ fun itemDuration(durationMs: Long): String? = if (durationMs <= 0) null else {
 }
 fun itemYear(item: LibraryItem): String? = item.releaseDate?.take(4)?.takeIf { it.length == 4 && it.all(Char::isDigit) }
 fun itemMetadata(item: LibraryItem): String = listOfNotNull(
-    itemYear(item), itemDuration(item.durationMs),
+    itemYear(item),
+    item.coverage.tracks.takeIf { item.kind != "track" && it > 0 }?.let { "$it ${if (it == 1) "song" else "songs"}" },
+    itemDuration(item.durationMs),
     if (!item.playable) "Unavailable" else null,
 ).joinToString(" · ")

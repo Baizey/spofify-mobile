@@ -50,6 +50,7 @@ import dev.spofify.mobile.ui.AppendStatus
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 
 /**
  * Query-driven listener search. Empty queries never read the global catalog.
@@ -230,14 +231,25 @@ internal fun CatalogScreenContent(
             if (isCurrent()) dispatch(item, origin, isCurrent)
         } },
     )
-    val scroll = remember(screen.key, screen.resultGeneration) {
-        LazyListState(screen.scrollIndex, screen.scrollOffset)
+    BoxWithConstraints(modifier.fillMaxSize()) {
+    val releaseColumns = artistReleaseColumns(
+        (maxWidth - MusicListLayout.horizontalPadding * 2).value, LocalDensity.current.fontScale)
+    fun layoutKey(kind: String, index: Int, item: LibraryItem): String =
+        if (screen.item?.kind == "artist" && kind == "albums")
+            catalogRowKey(screen, kind, screen.sections.getValue(kind).items[index / releaseColumns * releaseColumns])
+        else catalogRowKey(screen, kind, item)
+    val gridColumns = releaseColumns.takeIf { screen.item?.kind == "artist" } ?: 0
+    val scroll = remember(screen.key, screen.resultGeneration, gridColumns) {
+        LazyListState(artistReleaseScrollIndex(screen, releaseColumns), screen.scrollOffset)
     }
-    val rowKinds = remember(screen.key, screen.resultGeneration, screen.sections) {
+    val releaseAnchors = rememberUpdatedState(
+        if (gridColumns == 0) emptyMap() else screen.sections["albums"]?.items.orEmpty()
+            .chunked(releaseColumns).associate { row -> catalogRowKey(screen, "albums", row.first()) to row.first().id })
+    val rowKinds = remember(screen.key, screen.resultGeneration, screen.sections, releaseColumns) {
         buildMap<Any, String> {
             screen.sectionKinds.forEach { kind ->
                 val section = screen.sections[kind]
-                section?.items.orEmpty().forEach { item -> put(catalogRowKey(screen, kind, item), kind) }
+                section?.items.orEmpty().forEachIndexed { index, item -> put(layoutKey(kind, index, item), kind) }
                 // A later group's visible Retry is a real boundary even when it has no rows.
                 // It can release an earlier group's yield, but never supplies error demand.
                 if (section?.error != null || section?.let { it.loading && it.loaded } == true)
@@ -257,18 +269,30 @@ internal fun CatalogScreenContent(
     screen.sectionKinds.forEach { kind ->
         val section = screen.sections[kind]
         val grouped = screen.item == null && screen.search && screen.kind == "all"
-        AutomaticListDemand(scroll, Triple(screen.key, screen.resultGeneration, holder.navigationVersion),
-            section?.items.orEmpty().takeLast(if (grouped) 1 else 3).map { catalogRowKey(screen, kind, it) },
+        val frontier = section?.items.orEmpty().let { items ->
+            ((items.size - if (grouped) 1 else 3).coerceAtLeast(0) until items.size)
+                .map { layoutKey(kind, it, items[it]) }.distinct()
+        }
+        AutomaticListDemand(scroll, Triple(screen.key, screen.resultGeneration, holder.navigationVersion), frontier,
+            frontierProgress = if (gridColumns > 0 && kind == "albums") section?.nextOffset ?: 0 else frontier,
             enabled = lastVisibleKind == kind && section?.hasNext == true && !section.loading &&
                 (!section.demandPaused || !screen.hasLaterGroups(kind)) &&
                 section.error == null && !section.needsReload && !screen.stale && !screen.detailUnavailable,
             onLoad = { holder.demandMore(kind) })
     }
-    LaunchedEffect(scroll, screen.key) {
-        snapshotFlow { scroll.firstVisibleItemIndex to scroll.firstVisibleItemScrollOffset }.distinctUntilChanged()
-            .collect { (index, offset) -> holder.rememberScroll(screen.key, index, offset, screen.query, screen.releaseGroup) }
+    LaunchedEffect(scroll, screen.key, screen.resultGeneration, screen.query, screen.releaseGroup) {
+        snapshotFlow {
+            val index = scroll.firstVisibleItemIndex
+            // Padding-only rows may precede this index; pair identity with this exact offset.
+            // An unmeasured replacement list must not erase its saved release anchor.
+            val first = scroll.layoutInfo.visibleItemsInfo.firstOrNull { it.index == index }
+                ?: return@snapshotFlow null
+            Triple(index, scroll.firstVisibleItemScrollOffset, releaseAnchors.value[first.key])
+        }.filterNotNull().distinctUntilChanged().collect { (index, offset, releaseId) ->
+            holder.rememberScroll(screen.key, index, offset, screen.query, screen.releaseGroup, releaseId)
+        }
     }
-    Column(modifier.fillMaxSize()) {
+    Column(Modifier.fillMaxSize()) {
     LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("catalog-results"), state = scroll,
         contentPadding = PaddingValues(horizontal = MusicListLayout.horizontalPadding, vertical = 8.dp),
         verticalArrangement = MusicListLayout.arrangement) {
@@ -284,25 +308,35 @@ internal fun CatalogScreenContent(
         } else if (detail != null) {
             item(key = "hero") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    if (detail.kind == "track") Row(verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                         artwork(detail, Modifier.size(88.dp))
                         Column(Modifier.weight(1f)) {
                             Text(detail.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                             MusicCredits(detail, sourceOpen)
                             itemMetadata(detail).takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                         }
-                    }
+                    } else DetailIdentity(detail.name, itemMetadata(detail),
+                        artwork = { artwork(detail, it) }, artist = detail.kind == "artist",
+                        credits = { DetailCredits(detail, sourceOpen) })
                     if (detail.genres.isNotEmpty()) Text(detail.genres.joinToString(" · "), style = MaterialTheme.typography.bodySmall)
                     if (detail.kind == "track" && (detail.discNumber > 0 || detail.trackNumber > 0)) Text(
                         listOfNotNull(detail.discNumber.takeIf { it > 0 }?.let { "Disc $it" },
                             detail.trackNumber.takeIf { it > 0 }?.let { "Track $it" }).joinToString(" · "), style = MaterialTheme.typography.bodySmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        val current = detail.kind == "track" && detail.id == playback.trackId
-                        Button(onClick = {
-                            if (current && playback.onToggle != null) playback.onToggle.invoke() else sourcePlay(detail, false)
-                        }, enabled = detail.playable) { Text(if (current && playback.isPlaying) "Pause" else "Play") }
-                        if (detail.kind != "track") OutlinedButton(onClick = { sourcePlay(detail, true) }, enabled = detail.playable) { Text("Shuffle") }
-                        IconButton(onClick = { sourceMore(detail) }) { Icon(Icons.Default.MoreVert, "More actions for ${detail.name}") }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        // Listening controls wrap at large text; More always retains its own
+                        // disjoint target instead of falling beyond a nonwrapping action row.
+                        FlowRow(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            val current = detail.kind == "track" && detail.id == playback.trackId
+                            Button(onClick = {
+                                if (current && playback.onToggle != null) playback.onToggle.invoke() else sourcePlay(detail, false)
+                            }, enabled = detail.playable) { Text(if (current && playback.isPlaying) "Pause" else "Play") }
+                            if (detail.kind != "track") OutlinedButton(onClick = { sourcePlay(detail, true) }, enabled = detail.playable) { Text("Shuffle") }
+                        }
+                        IconButton(onClick = { sourceMore(detail) }, modifier = Modifier.size(48.dp)) {
+                            Icon(Icons.Default.MoreVert, "More actions for ${detail.name}")
+                        }
                     }
                     if (detail.kind == "track" && onToggleLike != null) {
                         val like = likes[detail.id]
@@ -337,10 +371,20 @@ internal fun CatalogScreenContent(
                 Text("No saved ${catalogLabel(kind).lowercase()} in this group.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
             }
-            itemsIndexed(section.items, key = { _, item -> catalogRowKey(screen, kind, item) }) { _, item ->
-                // Preserve the lazy anchor while replacing only the gesture lifetime on a real
-                // source change. A latest onCommit must never adopt a held old swipe; ordinary
-                // append/progress keeps this subtree and its captured source authority alive.
+            if (detail?.kind == "artist" && kind == "albums") {
+                val releaseRows = section.items.chunked(releaseColumns)
+                itemsIndexed(releaseRows, key = { _, row -> catalogRowKey(screen, kind, row.first()) }) { _, row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        row.forEach { release ->
+                            key(release.id, sourceVersion, screen.resultGeneration, sourceEpoch) {
+                                ArtistReleaseCard(release, sourceOpen, sourceMore, artwork, Modifier.weight(1f))
+                            }
+                        }
+                        if (row.size < releaseColumns) Spacer(Modifier.weight(1f))
+                    }
+                }
+            } else itemsIndexed(section.items, key = { _, item -> catalogRowKey(screen, kind, item) }) { _, item ->
+                // Keep the existing shared song body, occurrence and held-action semantics.
                 key(sourceVersion, screen.resultGeneration, sourceEpoch) {
                     MusicRow(item, sourceOpen, sourcePlay, sourceMore, sourceQueue, artwork,
                         playback = sourcePlayback, like = likes[item.id], onToggleLike = sourceLike)
@@ -379,6 +423,7 @@ internal fun CatalogScreenContent(
                 activationId = searchActivationId, onActivationConsumed = onSearchActivationConsumed,
                 commit = holder::commitQuery)
         }
+    }
     }
     }
 }

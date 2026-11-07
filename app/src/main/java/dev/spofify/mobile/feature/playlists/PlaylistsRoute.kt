@@ -978,11 +978,11 @@ private fun PlaylistDetail(
         contentPadding = PaddingValues(horizontal = MusicListLayout.horizontalPadding, vertical = 16.dp),
         verticalArrangement = MusicListLayout.arrangement) {
         item {
-            Column(Modifier.padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(saved?.name ?: "Playlist", style = MaterialTheme.typography.headlineMedium)
-                saved?.description?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+            Column(Modifier.padding(bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 val count = if (saved?.kind == PlaylistKind.DERIVED) evaluation?.total?.takeIf { !stale } else saved?.trackCount
-                count?.let { Text("$it ${if (it == 1L) "song" else "songs"}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                PlaylistDetailIdentity(saved?.name ?: "Playlist", saved?.description, count,
+                    if (saved?.kind == PlaylistKind.DERIVED) derivedEntries.firstOrNull()?.track else manualEntries.firstOrNull()?.track,
+                    artwork)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     if (saved?.capabilities?.play == true) Button(onClick = { play() }, enabled = !busy && !stale) { Text("Play") }
                     IconButton(onClick = {

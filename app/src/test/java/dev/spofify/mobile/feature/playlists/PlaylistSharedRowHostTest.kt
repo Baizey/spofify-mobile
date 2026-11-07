@@ -1,8 +1,15 @@
 package dev.spofify.mobile.feature.playlists
 
+import android.graphics.Bitmap
+import java.io.File
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.testTag
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import dev.spofify.mobile.listeningColorScheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
@@ -48,7 +55,7 @@ class PlaylistSharedRowHostTest {
         val passivePreparations = AtomicInteger()
         MockWebServer().use { web ->
             fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
-            fun summary(derived: Boolean) = """{"id":"${if (derived) "derived" else "manual"}","name":"Listening mix","kind":"${if (derived) "derived" else "manual"}","countState":"${if (derived) "unevaluated" else "exact"}","trackCount":${if (derived) "null" else "2"},"availableCount":${if (derived) "null" else "1"},"revision":5}"""
+            fun summary(derived: Boolean) = """{"id":"${if (derived) "derived" else "manual"}","name":"Evening 音楽 🌙 — a long listening collection","kind":"${if (derived) "derived" else "manual"}","countState":"${if (derived) "unevaluated" else "exact"}","trackCount":${if (derived) "null" else "2"},"availableCount":${if (derived) "null" else "1"},"revision":5}"""
             web.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse {
                     val path = request.requestUrl!!.encodedPath
@@ -61,7 +68,7 @@ class PlaylistSharedRowHostTest {
                         path == "/api/me/playlists/manual" -> json(summary(false))
                         path == "/api/me/playlists/derived" -> json(summary(true))
                         path == "/api/me/playlists/manual/entries" -> json("""{"items":[${encoded.mapIndexed { i, track -> """{"id":"entry-$i","position":$i,"track":$track}""" }.joinToString(",")}],"total":2,"offset":0,"limit":40}""")
-                        path == "/api/me/playlists/derived/evaluation" -> json("""{"items":[${encoded.mapIndexed { i, track -> """{"occurrenceId":"path-$i","selectionToken":"token.$i","position":$i,"track":$track}""" }.joinToString(",")}],"total":2,"availableTotal":1,"limit":40,"nextCursor":null,"revision":5,"fence":"fence","complete":true}""")
+                        path == "/api/me/playlists/derived/entries" -> json("""{"items":[${encoded.mapIndexed { i, track -> """{"occurrenceId":"path-$i","selectionToken":"token.$i","position":$i,"track":$track}""" }.joinToString(",")}],"total":2,"availableTotal":1,"limit":40,"nextCursor":null,"revision":5,"fence":"fence","complete":true}""")
                         path == "/api/me/playlists" -> json("""{"items":[],"total":0,"offset":0,"limit":40}""")
                         else -> MockResponse().setResponseCode(404)
                     }
@@ -80,12 +87,13 @@ class PlaylistSharedRowHostTest {
             compose.setContent {
                 val density = LocalDensity.current
                 CompositionLocalProvider(LocalDensity provides Density(density.density, scale.floatValue)) {
-                    MaterialTheme(typography = AppTypography) {
+                    MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                         if (shown.value) key(host.value, scale.floatValue) {
                             val artwork: @Composable (LibraryItem, Modifier) -> Unit = { _, modifier ->
-                                SideEffect { rendererCalls++ }; Box(modifier)
+                                SideEffect { rendererCalls++ }; Box(modifier.background(MaterialTheme.colorScheme.surfaceContainerHigh))
                             }
-                            Box(Modifier.requiredSize(320.dp, 900.dp)) {
+                            Surface(Modifier.requiredSize(320.dp, 900.dp).testTag("playlist-detail-render-host"),
+                                color = MaterialTheme.colorScheme.background) {
                                 when (host.value) {
                                     "recent" -> {
                                         val scope = rememberCoroutineScope()
@@ -124,6 +132,13 @@ class PlaylistSharedRowHostTest {
                             val credit = compose.onNodeWithText(compactMusicSubtitle(track), useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
                             // Compare local slots, leaving meaningful shelf/header spacing host-owned.
                             listOf(row, art, title, credit, more).map { it.translate(-row.left, -row.top) }
+                        }
+                        if (source == "manual" || source == "derived") {
+                            val directory = File(System.getProperty("java.io.tmpdir"), "list-details-renders").apply { mkdirs() }
+                            val bitmap = compose.onNodeWithTag("playlist-detail-render-host").captureToImage().asAndroidBitmap()
+                            File(directory, "playlist-$source-font$fontScale.png").outputStream().use {
+                                assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it))
+                            }
                         }
                         reference?.let { expected ->
                             for (i in rows.indices) for (slot in rows[i].indices) {
