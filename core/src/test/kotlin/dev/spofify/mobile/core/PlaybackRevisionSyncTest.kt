@@ -119,16 +119,46 @@ class PlaybackRevisionSyncTest {
         rejected { sync.response(JsonObject(wire + ("control" to JsonObject(wire.getValue("control").jsonObject + ("queueIntents" to badBinding)))),true,false) }
     }
 
+    @Test fun malformedAdvertisedVersionFailsClosedBeforeFallbackRegistrationOrExtendedWrites() = runBlocking {
+        for (version in listOf("null", "true", "false", "\"1\"", "\"2\"", "1.0", "2.5", "1e0", "0", "-1", "9007199254740992")) {
+            val server = MockWebServer(); server.start()
+            try {
+                val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${server.port}"), MemorySessionStore())
+                server.enqueue(loginResponse()); client.login("synthetic", "password"); server.takeRequest()
+                val api = PlaybackDevicesApi(client)
+                val malformed = snapshot(4).toString().replace("\"version\":1,\"incarnation\"", "\"version\":$version,\"incarnation\"")
+                server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody(malformed))
+                // A permissive fallback would consume this and proceed to registration.
+                server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody(view().toJson().toString()))
+                try {
+                    api.register("Phone", null, "a".repeat(32), "receiver")
+                    fail("Malformed advertised version $version admitted registration")
+                } catch (failure: Exception) {
+                    assertTrue(failure is IllegalArgumentException || failure is ApiException)
+                }
+                assertFalse(api.revisionSyncSupported)
+                try {
+                    api.pollLive("phone", 2, 2, PlaybackSyncReference("room",4), PlaybackSyncLive.from(state()))
+                    fail("Malformed probe authorized extended writes")
+                } catch (_: IllegalStateException) { }
+                val probe = server.takeRequest()
+                assertEquals("GET",probe.method); assertEquals("revision-v1",probe.getHeader("X-Spofify-Playback-Sync"))
+                assertNull("No fallback GET or POST for version $version", server.takeRequest(30, java.util.concurrent.TimeUnit.MILLISECONDS))
+                assertEquals(2,server.requestCount) // Login + read probe only.
+            } finally { server.shutdown() }
+        }
+    }
+
     @Test fun probeUsesIndependentHeadersAndLegacyOrUnknownSupportNeverSendsNewFields() = runBlocking {
-        for (mode in listOf("legacy", "unknown", "supported")) {
+        for (mode in listOf("legacy", "unknown", "unknown-max-safe", "supported")) {
             val server = MockWebServer(); server.start()
             try {
                 val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${server.port}"), MemorySessionStore())
                 server.enqueue(loginResponse()); client.login("synthetic","password"); server.takeRequest()
                 fun enqueue(json: JsonObject) = server.enqueue(MockResponse().setHeader("Content-Type","application/json").setBody(json.toString()))
                 val api = PlaybackDevicesApi(client)
-                enqueue(when(mode) { "legacy" -> view().toJson(); "unknown" -> JsonObject(snapshot(4) + ("sync" to JsonObject(ref(4) + ("version" to JsonPrimitive(2))))); else -> snapshot(4) })
-                if(mode == "unknown") enqueue(view().toJson())
+                enqueue(when(mode) { "legacy" -> view().toJson(); "unknown", "unknown-max-safe" -> JsonObject(snapshot(4) + ("sync" to JsonObject(ref(4) + ("version" to JsonPrimitive(if (mode == "unknown") 2L else 9007199254740991L))))); else -> snapshot(4) })
+                if(mode.startsWith("unknown")) enqueue(view().toJson())
                 val probe = api.probeQueueIntents()
                 val request = server.takeRequest()
                 assertEquals("GET",request.method)
@@ -136,7 +166,7 @@ class PlaybackRevisionSyncTest {
                 assertEquals("queue-intents-v1",request.getHeader("X-Spofify-Playback-Extensions"))
                 assertEquals("installation-v1",request.getHeader("X-Spofify-Playback-Registration"))
                 assertEquals("last-requested-v1",request.getHeader("X-Spofify-Playback-Leadership"))
-                if(mode == "unknown") assertNull(server.takeRequest().getHeader("X-Spofify-Playback-Sync"))
+                if(mode.startsWith("unknown")) assertNull(server.takeRequest().getHeader("X-Spofify-Playback-Sync"))
                 assertEquals(mode == "supported",api.revisionSyncSupported)
                 if(mode == "supported") {
                     api.acceptSyncSnapshot(probe); enqueue(status(4)); api.pollLive("phone",2,2,PlaybackSyncReference("room",4),PlaybackSyncLive.from(state()))

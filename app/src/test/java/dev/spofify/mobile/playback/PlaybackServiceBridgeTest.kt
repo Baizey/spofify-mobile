@@ -280,6 +280,86 @@ class PlaybackServiceBridgeTest {
         assertSilent()
     }
 
+    @Test
+    @Config(shadows = [RevisionTimelineMedia::class])
+    fun revisionSyncDurationSourceUpdateKeepsCachedStructureButRealSourceAndPlaylistChangesInvalidate() = runBlocking {
+        fun awaitPlayer(description: String, ready: () -> Boolean) {
+            repeat(150) {
+                shadowOf(Looper.getMainLooper()).idleFor(20, TimeUnit.MILLISECONDS)
+                if (ready()) return
+                Thread.sleep(10)
+            }
+            fail("Timed out awaiting $description")
+        }
+        val reasons = mutableListOf<Int>()
+        val observer = object : Player.Listener {
+            override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) { reasons += reason }
+        }
+        player.addListener(observer)
+        try {
+            for (count in listOf(1, 40, 1000)) {
+                val tracks = (1..count).map { n -> PlaybackTrack("track-$n", "Song", emptyList(), "Album", "album", 120.0,
+                    key = n.toLong(), order = n.toLong()) }
+                val source = PlaybackSnapshot(queue = tracks, position = 0, duration = 37.0,
+                    occurrence = PlaybackOccurrence(1, "track-1", "duration-event-$count", 0.0, false))
+                assertEquals("ok",endpoint.activate(source,authority()).status)
+                val first = requireNotNull(endpoint.captureRevisionSync())
+                assertEquals(37.0,first.live.duration,0.0)
+                reasons.clear()
+                val service = requireNotNull(controller).get()
+                val field = PlaybackService::class.java.getDeclaredField("wireTracks").apply { isAccessible = true }
+                @Suppress("UNCHECKED_CAST") val original = field.get(service) as MutableMap<String, PlaybackTrack>
+                var queueTrackReads = 0
+                // Transparent read spy: retain every production track and all real mutations.
+                // Every full preparedTracks/export must read this map for each queue entry.
+                val tracked = object : MutableMap<String, PlaybackTrack> by original {
+                    override fun get(key: String): PlaybackTrack? { queueTrackReads++; return original[key] }
+                }
+                field.set(service,tracked)
+                try {
+                    // Real source preparation discovers duration and emits SOURCE_UPDATE;
+                    // no listener is called directly and no play/start is requested.
+                    player.prepare()
+                    awaitPlayer("real duration SOURCE_UPDATE") {
+                        Player.TIMELINE_CHANGE_REASON_SOURCE_UPDATE in reasons && player.duration == 120_000L
+                    }
+                    repeat(5) {
+                        val tick = requireNotNull(endpoint.captureRevisionSync())
+                        assertSame("Duration discovery must not export/copy queue $count",first.structure,tick.structure)
+                        assertSame(first.metadata,tick.metadata); assertEquals(first.semanticFence,tick.semanticFence)
+                        assertEquals(120.0,tick.live.duration,0.0)
+                        assertEquals(120.0,tick.live.toJson().getValue("duration").let { (it as kotlinx.serialization.json.JsonPrimitive).content.toDouble() },0.0)
+                    }
+                    assertEquals("No full export/semantic queue projection after duration discovery",0,queueTrackReads)
+                    assertFalse(player.playWhenReady); assertFalse(player.isPlaying)
+                    println("duration-source-update queue=$count liveDuration=120 quietCaptures=5 queueTrackReads=0 fullExports=0 sameStructure=true sameFence=true")
+                    val before = reasons.count { it == Player.TIMELINE_CHANGE_REASON_SOURCE_UPDATE }
+                    val actualSource = requireNotNull(RevisionTimelineMedia.sources["wire-1"])
+                    assertTrue(actualSource.publishMetadataChange())
+                    awaitPlayer("structural SOURCE_UPDATE") {
+                        reasons.count { it == Player.TIMELINE_CHANGE_REASON_SOURCE_UPDATE } > before &&
+                            player.currentMediaItem?.mediaMetadata?.title == "Updated source metadata"
+                    }
+                    val changed = requireNotNull(endpoint.captureRevisionSync())
+                    assertNotEquals(first.semanticFence,changed.semanticFence); assertNotSame(first.structure,changed.structure)
+                    assertTrue("Real source identity/metadata changes must still export",queueTrackReads > 0)
+                    if(count > 1) {
+                        reasons.clear(); player.moveMediaItem(count - 1,0)
+                        awaitPlayer("structural playlist callback") { Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED in reasons }
+                        val reordered = requireNotNull(endpoint.captureRevisionSync())
+                        assertNotEquals(changed.semanticFence,reordered.semanticFence)
+                        assertNotSame(changed.structure,reordered.structure)
+                    }
+                } finally { field.set(service,original) }
+            }
+            assertNull(web.takeRequest(30,TimeUnit.MILLISECONDS))
+            assertEquals(loginCount,web.requestCount)
+        } finally {
+            player.removeListener(observer)
+            RevisionTimelineMedia.sources.clear()
+        }
+    }
+
     @Test fun originalDerivedRouteThroughViewModelConnectionAndServicePreservesDuplicateStartAndFence() = runTest {
         val published = mutableListOf<PlaybackSnapshot>()
         val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", published)

@@ -312,8 +312,16 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
     }
     override suspend fun probeQueueIntents(): PlaybackDevicesView = withTimeout(4000) {
         val raw = requireNotNull(transport.send("GET", path, playbackExtensions = true, playbackRegistration = true, playbackSync = true))
-        val version = (raw["sync"] as? JsonObject)?.get("version")
-        val view = if (version is JsonPrimitive && version != JsonPrimitive(1)) {
+        val version = raw["sync"]?.let { advertised ->
+            require(advertised is JsonObject) { "Invalid revision sync advertisement" }
+            val value = advertised["version"]
+            require(value is JsonPrimitive && !value.isString &&
+                value.content.matches(Regex("[1-9][0-9]*")) && value.longOrNull?.let { it in 1..MAX_SAFE } == true) {
+                "Invalid revision sync version"
+            }
+            value.long
+        }
+        val view = if (version != null && version != 1L) {
             check(!revisionSync.supported) { "Revision sync capability changed" }
             PlaybackDevicesView.fromJson(requireNotNull(transport.send("GET", path, playbackExtensions = true, playbackRegistration = true)), true, true)
         } else revisionSync.probe(raw)

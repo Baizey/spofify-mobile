@@ -604,8 +604,15 @@ class PlaybackService : MediaSessionService() {
             override fun onAvailableCommandsChanged(availableCommands: Player.Commands) { observeDirections() }
             override fun onRepeatModeChanged(repeatMode: Int) { observeDirections(); if (!importing && !arranging) exportPrepared() }
             override fun onTimelineChanged(timeline: Timeline, reason: Int) {
-                syncTimelineVersion++
-                schedulePrune()
+                // SOURCE_UPDATE also reports duration/seekability/period discovery. Those
+                // are live facts, but a source may genuinely replace items/order too.
+                // Classify on the callback boundary, never by exporting at poll time.
+                val structure = syncTimelineStructure(timeline)
+                if (structure != syncObservedTimeline) {
+                    syncObservedTimeline = structure
+                    syncTimelineVersion++
+                    schedulePrune()
+                }
             }
 
             override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
@@ -998,6 +1005,17 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    private data class SyncTimelineStructure(val items: List<MediaItem>, val first: Int, val next: List<Int>)
+    private var syncObservedTimeline: SyncTimelineStructure? = null
+    private fun syncTimelineStructure(timeline: Timeline): SyncTimelineStructure {
+        val window = Timeline.Window()
+        // Window/period UIDs may rotate during source preparation without changing music.
+        // Physical items (including occurrence/metadata) and shuffle traversal are the
+        // structural identities. Duration, dynamic/seekable flags and periods are not.
+        val items = (0 until timeline.windowCount).map { timeline.getWindow(it, window).mediaItem }
+        val next = (0 until timeline.windowCount).map { timeline.getNextWindowIndex(it, Player.REPEAT_MODE_OFF, true) }
+        return SyncTimelineStructure(items, timeline.getFirstWindowIndex(true), next)
+    }
     private var syncTimelineVersion = 0L
     private data class SyncSemanticFence(val service: String, val timeline: Long, val queueEpoch: Long, val revision: Long,
         val current: String?, val event: String?, val context: PlaybackContext?, val shuffle: Boolean,
