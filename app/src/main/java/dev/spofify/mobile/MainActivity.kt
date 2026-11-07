@@ -52,6 +52,7 @@ import dev.spofify.mobile.ui.ListeningChrome
 import dev.spofify.mobile.ui.CompactNavigation
 import dev.spofify.mobile.ui.CompactNavigationItem
 import dev.spofify.mobile.ui.MusicActionsContent
+import dev.spofify.mobile.ui.SongActionSheet
 import dev.spofify.mobile.ui.RowActionLifetime
 import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.ui.hideListeningChrome
@@ -357,7 +358,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                 } == catalogRoute)
             }
             LaunchedEffect(item.id) { if (isCurrent() && item.kind == "track") model.checkLike(item) }
-            ModalBottomSheet(onDismissRequest = { more = null }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+            SongActionSheet(onDismiss = { more = null }) {
                 MusicActionsContent(item, state.likes[item.id], item.id in state.pendingLikes, item.id in state.failedLikeStatus,
                     onPlay = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW, binding, isCurrent, selection.queueIntentBinding) },
                     onPlayNext = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NEXT, binding, isCurrent, selection.queueIntentBinding) },
@@ -372,7 +373,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                     onToggleLike = { if (isCurrent()) model.likeAction(item) },
                     onRetryLike = { if (isCurrent()) model.checkLike(item) },
                     onAddToPlaylist = { if (isCurrent()) { more = null; addToPlaylist = item } },
-                    onOpenItem = { target -> if (isCurrent()) { more = null; openExternal(target) } })
+                    onOpenItem = { target -> if (isCurrent()) { more = null; openExternal(target) } }, artwork = art)
             }
         }
         addToPlaylist?.let { item -> AddToPlaylistSheet(client, item, onDismiss = {

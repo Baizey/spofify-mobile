@@ -1,9 +1,9 @@
 package dev.spofify.mobile.ui
 
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.Surface
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.Modifier
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.LocalDensity
@@ -87,7 +87,6 @@ class MusicActionsContentTest {
         compose.runOnIdle { assertEquals(listOf("low", "high", "next", "now"), events) }
     }
 
-    @OptIn(ExperimentalMaterial3Api::class)
     private fun checkReachability(fontScale: Float) {
         val item = LibraryItem("track", "song", "A long song title with many individually navigable music credits",
             artists = (1..24).map { ArtistCredit("artist-$it", "Credited artist $it") },
@@ -97,8 +96,8 @@ class MusicActionsContentTest {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale)) {
                 MaterialTheme(typography = AppTypography) {
-                    ModalBottomSheet(onDismissRequest = { events += "dismiss" },
-                        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+                    // Supported component host: this proves body geometry, not native modal/Back acceptance.
+                    Surface(Modifier.fillMaxSize()) {
                         MusicActionsContent(item, liked = false, likePending = false, likeFailed = false,
                             onPlay = { events += "play" }, onPlayNext = { events += "next" },
                             onEnqueue = { events += "queue" }, onQueueLow = { events += "low" }, onToggleLike = { events += "like" },

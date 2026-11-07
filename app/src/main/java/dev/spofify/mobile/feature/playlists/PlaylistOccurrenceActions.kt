@@ -1,16 +1,14 @@
 package dev.spofify.mobile.feature.playlists
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
+import dev.spofify.mobile.ui.*
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.SpofifyClient
 import kotlinx.coroutines.CancellationException
@@ -27,6 +25,7 @@ internal fun PlaylistOccurrenceActions(
     onRemove: (() -> Unit)? = null,
     removeEnabled: Boolean = true,
     isCurrent: () -> Boolean = { true },
+    artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
 ) {
     var liked by remember(client, track.id) { mutableStateOf<Boolean?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -43,40 +42,72 @@ internal fun PlaylistOccurrenceActions(
         catch (_: Exception) { liked = null; message = "Like status could not load. Check it again explicitly." }
         finally { busy = false }
     }
-    AlertDialog(onDismissRequest = { if (!busy) onDismiss() }, title = { Text(track.name) }, text = {
-        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextButton(onClick = { perform(onPlayNow) }, enabled = playbackEnabled && actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Play now") }
-            onContextual?.let { action ->
-                TextButton(onClick = { perform(action) }, enabled = playbackEnabled && actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Queue High") }
-            }
-            onPlayNext?.let { action -> TextButton(onClick = { perform(action) }, enabled = playbackEnabled && actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Play next") } }
-            // Priority is explicit and independent of the output's play/pause state.
-            onEnqueue?.let { action ->
-                TextButton(onClick = { perform(action) }, enabled = playbackEnabled && actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Queue Low") }
-            }
-            TextButton(onClick = { perform(onOpen) }, enabled = actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Open track details") }
-            TextButton(onClick = { perform(onAdd) }, enabled = actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Add to playlist") }
-            if (liked == null) TextButton(onClick = { perform { statusRefresh++ } }, enabled = actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Check like status") }
-            else TextButton(enabled = actionsEnabled, modifier = Modifier.heightIn(min = 48.dp), onClick = {
-                if (!current()) return@TextButton
-                val wanted = !liked!!
-                busy = true
-                scope.launch {
-                    try {
-                        client.setLiked(track.id, wanted)
-                        liked = wanted; onPersonalChange(); message = null
-                    } catch (e: CancellationException) { throw e }
-                    catch (_: Exception) {
-                        liked = null
-                        message = "The like response was not confirmed. Check saved status before another change; nothing was resubmitted."
-                    } finally { busy = false }
+    SongActionSheet(onDismiss = onDismiss, dismissEnabled = !busy) {
+        PlaylistOccurrenceActionsContent(track, liked, busy, message, playbackEnabled, actionsEnabled,
+            onOpen = { perform(onOpen) }, onAdd = { perform(onAdd) },
+            onPlayNow = { perform(onPlayNow) },
+            onContextual = onContextual?.let { action -> { perform(action) } },
+            onEnqueue = onEnqueue?.let { action -> { perform(action) } },
+            onPlayNext = onPlayNext?.let { action -> { perform(action) } },
+            onOpenItem = { item -> perform { onOpenItem(item) } },
+            onRemove = onRemove?.let { action -> { perform(action) } }, removeEnabled = removeEnabled,
+            onCheckLike = { perform { statusRefresh++ } },
+            onToggleLike = {
+                if (current() && !busy && liked != null) {
+                    val wanted = !liked!!
+                    busy = true
+                    scope.launch {
+                        try {
+                            client.setLiked(track.id, wanted)
+                            liked = wanted; onPersonalChange(); message = null
+                        } catch (e: CancellationException) { throw e }
+                        catch (_: Exception) {
+                            liked = null
+                            message = "The like response was not confirmed. Check saved status before another change; nothing was resubmitted."
+                        } finally { busy = false }
+                    }
                 }
-            }) { Text(if (liked == true) "Unlike song" else "Like song") }
-            dev.spofify.mobile.feature.library.MusicCredits(track, { item -> perform { onOpenItem(item) } })
-            onRemove?.let { action ->
-                TextButton(onClick = { perform(action) }, enabled = removeEnabled && actionsEnabled, modifier = Modifier.heightIn(min = 48.dp)) { Text("Remove this occurrence") }
-            }
+            }, artwork = artwork)
+    }
+}
+
+/** Production body for supported component hosts too; modal/runtime acceptance remains separate. */
+@Composable
+internal fun PlaylistOccurrenceActionsContent(
+    track: LibraryItem, liked: Boolean?, busy: Boolean, message: String?,
+    playbackEnabled: Boolean, actionsEnabled: Boolean,
+    onOpen: () -> Unit, onAdd: () -> Unit, onPlayNow: () -> Unit,
+    onContextual: (() -> Unit)?, onEnqueue: (() -> Unit)?, onPlayNext: (() -> Unit)?,
+    onOpenItem: (LibraryItem) -> Unit, onRemove: (() -> Unit)?, removeEnabled: Boolean,
+    onCheckLike: () -> Unit, onToggleLike: () -> Unit,
+    artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
+) {
+    val content: @Composable () -> Unit = {
+        SongActionGroup("Playback", divider = false) {
+            SongActionRow("Play now", Icons.Default.PlayArrow, playbackEnabled && actionsEnabled, onClick = onPlayNow)
+            onPlayNext?.let { action -> SongActionRow("Play next", Icons.Default.SkipNext,
+                playbackEnabled && actionsEnabled, onClick = action) }
+            onContextual?.let { action -> SongActionRow("Queue High", Icons.AutoMirrored.Filled.PlaylistPlay,
+                playbackEnabled && actionsEnabled, onClick = action) }
+            // Priority remains explicit and independent of the output's play/pause state.
+            onEnqueue?.let { action -> SongActionRow("Queue Low", Icons.AutoMirrored.Filled.QueueMusic,
+                playbackEnabled && actionsEnabled, onClick = action) }
+        }
+        SongActionGroup("Library") {
+            if (liked == null) SongActionRow(if (busy) "Checking like status" else "Check like status",
+                Icons.Default.FavoriteBorder, actionsEnabled, onClick = onCheckLike)
+            else SongActionRow(if (busy) "Saving like" else if (liked == true) "Unlike song" else "Like song",
+                if (liked == true) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                enabled = actionsEnabled, onClick = onToggleLike)
+            SongActionRow("Add to playlist", Icons.AutoMirrored.Filled.PlaylistAdd, actionsEnabled, onClick = onAdd)
             message?.let { Text(it) }
         }
-    }, confirmButton = { TextButton(onClick = onDismiss, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp)) { Text("Done") } })
+        SongActionGroup("Navigation") {
+            SongActionRow("Open track details", Icons.Default.Info, actionsEnabled, onClick = onOpen)
+            SongActionNavigation(track, actionsEnabled, onOpenItem)
+        }
+        SongActionRemoval(removeEnabled && actionsEnabled, onRemove)
+    }
+    if (artwork == null) SongActionLayout(track) { content() }
+    else SongActionLayout(track, artwork = artwork) { content() }
 }

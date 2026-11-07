@@ -1,23 +1,13 @@
 package dev.spofify.mobile.ui
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalWindowInfo
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.LibraryItem
-import dev.spofify.mobile.feature.library.MusicCredits
 
 /** The actual More sheet body: every action and credit stays reachable without shrinking targets. */
 @Composable
@@ -37,20 +27,15 @@ internal fun MusicActionsContent(
     contextualLabel: String = "Play now",
     onContextual: (() -> Unit)? = null,
     onQueueLow: (() -> Unit)? = null,
+    artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
 ) {
-    // Keep a finite scroll viewport even if a sheet measures its body with loose constraints.
-    // The sheet's own smaller constraints (safe areas, drag handle, IME) still take precedence.
-    val windowHeight = with(LocalDensity.current) { LocalWindowInfo.current.containerSize.height.toDp() }
-    Column(
-        modifier.fillMaxWidth().heightIn(max = windowHeight).testTag("music-actions")
-            .verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 28.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        Text(item.name, style = MaterialTheme.typography.titleLarge)
-        MusicAction("Play now", enabled = item.playable, onClick = onPlay)
-        MusicAction("Play next", enabled = item.playable, onClick = onPlayNext)
-        MusicAction("Queue High", enabled = item.playable, onClick = onContextual ?: onEnqueue)
-        onQueueLow?.let { action -> MusicAction("Queue Low", enabled = item.playable, onClick = action) }
+    val content: @Composable () -> Unit = {
+        SongActionGroup("Playback", divider = false) {
+            SongActionRow("Play now", Icons.Default.PlayArrow, enabled = item.playable, onClick = onPlay)
+            SongActionRow("Play next", Icons.Default.SkipNext, enabled = item.playable, onClick = onPlayNext)
+            SongActionRow("Queue High", Icons.AutoMirrored.Filled.PlaylistPlay, enabled = item.playable, onClick = onContextual ?: onEnqueue)
+            onQueueLow?.let { action -> SongActionRow("Queue Low", Icons.AutoMirrored.Filled.QueueMusic, enabled = item.playable, onClick = action) }
+        }
         if (item.kind == "track") {
             val likeLabel = when {
                 likePending -> "Saving like"
@@ -59,18 +44,18 @@ internal fun MusicActionsContent(
                 liked -> "Unlike song"
                 else -> "Like song"
             }
-            MusicAction(likeLabel, enabled = !likePending && (liked != null || likeFailed),
-                onClick = { if (liked == null) onRetryLike() else onToggleLike() })
-            MusicAction("Add to playlist", onClick = onAddToPlaylist)
+            SongActionGroup("Library") {
+                SongActionRow(likeLabel, if (liked == true) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                    enabled = !likePending && (liked != null || likeFailed),
+                    onClick = { if (liked == null) onRetryLike() else onToggleLike() })
+                SongActionRow("Add to playlist", Icons.AutoMirrored.Filled.PlaylistAdd, onClick = onAddToPlaylist)
+            }
         }
-        MusicAction("Open details", onClick = { onOpenItem(item) })
-        MusicCredits(item, onOpenItem)
+        SongActionGroup("Navigation") {
+            SongActionRow("Open details", Icons.Default.Info, onClick = { onOpenItem(item) })
+            SongActionNavigation(item, onOpenItem = onOpenItem)
+        }
     }
-}
-
-@Composable
-private fun MusicAction(label: String, enabled: Boolean = true, onClick: () -> Unit) {
-    TextButton(onClick = onClick, enabled = enabled, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-        Text(label, Modifier.fillMaxWidth())
-    }
+    if (artwork == null) SongActionLayout(item, modifier) { content() }
+    else SongActionLayout(item, modifier, artwork) { content() }
 }

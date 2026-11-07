@@ -758,7 +758,8 @@ private fun PlaylistDetail(
                     occurrenceActions = null; removing = selection
                 }
             }) else null,
-            removeEnabled = !busy && !blocked && !stale && selection.isCurrent(), isCurrent = selection.isCurrent)
+            removeEnabled = !busy && !blocked && !stale && selection.isCurrent(), isCurrent = selection.isCurrent,
+            artwork = artwork)
     }
     collectionActions?.let { captured ->
         val managementEnabled = !busy && !blocked && captured.isCurrent()
