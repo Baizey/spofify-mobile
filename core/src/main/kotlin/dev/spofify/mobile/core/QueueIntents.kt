@@ -152,10 +152,11 @@ private fun ascii(value: String, max: Int) = value.isNotEmpty() && value.length 
 @Serializable data class QueueIntentDirective(val deliveryId: String, val state: QueueIntentState?)
 @Serializable data class QueueIntentCommandResult(val commandId: String, val result: QueueIntentResult)
 @Serializable data class QueueIntentsView(val version: Int, val receivers: List<QueueIntentReceiver>, val binding: QueueIntentBinding?, val state: QueueIntentState?, val directives: List<QueueIntentDirective>, val results: List<QueueIntentCommandResult>) {
-    fun validated(view: PlaybackDevicesView) = apply {
+    fun validated(view: PlaybackDevicesView): QueueIntentsView = validated(view, false)
+    internal fun validated(view: PlaybackDevicesView, cachedStructure: Boolean) = apply {
         require(version == 1 && receivers.size <= 16 && directives.size <= 16 && results.size <= 128)
         require(receivers.map { it.deviceId }.distinct().size == receivers.size && receivers.all { it.version == 1 && validPlaybackProtocolId(it.deviceId) && view.devices.any { d -> d.deviceId == it.deviceId } })
-        state?.validated(requireNotNull(view.state))
+        if (!cachedStructure) state?.validated(requireNotNull(view.state))
         binding?.validated()?.let {
             require(it.outputDeviceId == view.activeDeviceId && receivers.any { r -> r.deviceId == it.outputDeviceId })
             require(view.transfer == null && view.quarantineMs == 0L && view.leaseMs > 0 && view.devices.any { d -> d.deviceId == it.outputDeviceId && d.available })

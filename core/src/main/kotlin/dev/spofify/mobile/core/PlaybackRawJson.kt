@@ -39,6 +39,7 @@ internal object PlaybackRawJson {
         }
         if (n !is Obj) return
         val actualRole = if (role == "root") when {
+            "sync" in n.fields -> "syncEnvelope"
             "action" in n.fields -> "request"
             "devices" in n.fields -> "view"
             "type" in n.fields -> "command"
@@ -47,10 +48,17 @@ internal object PlaybackRawJson {
             else -> "snapshot"
         } else role
         val allowed = when (actualRole) {
+            "syncEnvelope" -> names("kind", "sync", "snapshot", "live", "control", "publicationAck")
+            "sync" -> names("version", "incarnation", "revision")
+            "base" -> names("incarnation", "revision")
+            "publicationAck" -> names("stateSeq", "base")
+            "live" -> names("stateSeq", "stateAgeMs", "currentKey", "currentEventId", "elapsed", "duration", "playing", "waiting", "loading", "error", "progress", "reported")
+            "control" -> names("deviceId", "activeDeviceId", "epoch", "leaseMs", "quarantineMs", "availability", "transfer", "directives", "commands", "error", "queueIntents", "registration", "leadership")
+            "availability" -> names("deviceId", "available")
             "view" -> names("deviceId", "devices", "activeDeviceId", "epoch", "leaseMs", "quarantineMs", "state", "stateSeq", "stateAgeMs", "transfer", "directives", "commands", "error", "queueIntents", "registration", "leadership")
             "request" -> when (n.string("action")) {
                 "register" -> names("action", "name", "queueIntentsVersion", "registration")
-                "poll" -> names("action", "deviceId", "epoch", "stateSeq", "state", "queueIntentState", "acks")
+                "poll" -> names("action", "deviceId", "epoch", "stateSeq", "state", "queueIntentState", "acks", "base", "live")
                 "command" -> names("action", "deviceId", "epoch", "commandId", "command")
                 "rename" -> names("action", "deviceId", "name")
                 "leave" -> names("action", "deviceId")
@@ -105,6 +113,7 @@ internal object PlaybackRawJson {
                 require(child.value.longOrNull?.let { it in -9007199254740991L..9007199254740991L } == true)
             }
             val next = when {
+                key == "snapshot" && actualRole == "syncEnvelope" -> "view"
                 key == "state" && actualRole == "leadership" -> "leadState"
                 key == "state" && (actualRole == "queueIntents" || actualRole == "directives" && "type" !in n.fields) -> "metadata"
                 key == "state" -> "snapshot"

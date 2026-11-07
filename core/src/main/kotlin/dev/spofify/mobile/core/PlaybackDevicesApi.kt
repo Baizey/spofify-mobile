@@ -75,7 +75,7 @@ internal fun libraryId(s: String) = s.isNotEmpty() && s.trim() == s && text(s, 5
 private fun optionalId(s: String) = s.isEmpty() || libraryId(s)
 private val wireNumbers = setOf("version", "position", "elapsed", "duration", "key", "order", "revision", "progress", "epoch", "leaseMs", "quarantineMs", "stateSeq", "stateAgeMs", "acceptedRevision", "value", "acceptedCount", "currentKey", "commitRevision", "playbackKey", "queueIntentsVersion")
 private val wireBooleans = setOf("shuffle", "playing", "waiting", "loading", "truncated", "reported", "available", "first")
-private val wireStrings = setOf("id", "name", "albumName", "albumId", "entryId", "targetId", "occurrenceId", "selectionToken", "kind", "fence", "repeat", "error", "notice", "trackId", "eventId", "deviceId", "activeDeviceId", "commandId", "sourceDeviceId", "targetDeviceId", "phase", "deliveryId", "type", "status", "direction", "receiverId", "outputDeviceId", "currentEventId", "intent", "provenance", "outcome", "placement", "playback", "generation", "admissionToken", "registrationGeneration", "targetRegistrationGeneration", "attemptId", "expectedGeneration")
+private val wireStrings = setOf("incarnation", "id", "name", "albumName", "albumId", "entryId", "targetId", "occurrenceId", "selectionToken", "kind", "fence", "repeat", "error", "notice", "trackId", "eventId", "deviceId", "activeDeviceId", "commandId", "sourceDeviceId", "targetDeviceId", "phase", "deliveryId", "type", "status", "direction", "receiverId", "outputDeviceId", "currentEventId", "intent", "provenance", "outcome", "placement", "playback", "generation", "admissionToken", "registrationGeneration", "targetRegistrationGeneration", "attemptId", "expectedGeneration")
 internal fun requireWireTypes(value: JsonElement, depth: Int = 0) {
     require(depth <= 16)
     when (value) {
@@ -200,20 +200,36 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
     val registration: PlaybackRegistrationView? = null,
     val leadership: PlaybackLeadership? = null,
 ) {
-    fun validated() = apply {
+    // Body properties are deliberately not copied by data-class copy(). Only the exact
+    // instance validated at this boundary may skip a later redundant traversal.
+    @kotlinx.serialization.Transient private var validationComplete = false
+    @kotlinx.serialization.Transient var syncSnapshotReference: PlaybackSyncReference? = null
+        internal set
+    @kotlinx.serialization.Transient var syncStatusReference: PlaybackSyncReference? = null
+        internal set
+    @kotlinx.serialization.Transient var syncLive: PlaybackSyncLive? = null
+        internal set
+    @kotlinx.serialization.Transient var publicationAck: PlaybackSyncPublicationAck? = null
+        internal set
+    fun validated(): PlaybackDevicesView = validate(false)
+    internal fun validatedCachedStructure(): PlaybackDevicesView = validate(true)
+    private fun validate(cachedStructure: Boolean): PlaybackDevicesView = apply {
+        if (validationComplete) return@apply
         require(epoch in 1..MAX_SAFE && stateSeq in 0..MAX_SAFE && leaseMs in 0..8000 && quarantineMs in 0..8000 && stateAgeMs in 0..MAX_SAFE)
         require(deviceId.isEmpty() || validPlaybackProtocolId(deviceId))
         require(devices.size <= 16 && devices.map { it.deviceId }.distinct().size == devices.size)
         require(devices.all { validPlaybackProtocolId(it.deviceId) && validPlaybackDeviceName(it.name) })
         require(activeDeviceId.isEmpty() || devices.any { it.deviceId == activeDeviceId })
-        state?.validated(); require(directives.size <= 32 && commands.size <= 128)
+        if (!cachedStructure) state?.validated()
+        require(directives.size <= 32 && commands.size <= 128)
         transfer?.let { require(validPlaybackProtocolId(it.commandId) && validPlaybackProtocolId(it.targetDeviceId) && (it.sourceDeviceId.isEmpty() || validPlaybackProtocolId(it.sourceDeviceId)) && it.phase in setOf("waiting", "preparing", "releasing", "activating")) }
         directives.forEach { require(validPlaybackProtocolId(it.deliveryId) && it.epoch == epoch && it.type in setOf("prepare", "release", "activate", "command")); it.state?.validated(); it.command?.let(PlaybackDeviceCommand::fromJson) }
         commands.forEach { require(validPlaybackProtocolId(it.commandId) && it.status in setOf("pending", "ok", "blocked", "media", "rejected", "timeout", "cancelled")) }
         leadership?.validated()
         registration?.validated(this)
-        queueIntents?.validated(this)
+        queueIntents?.validated(this, cachedStructure)
         if (queueIntents == null) require(directives.none { it.command?.get("type")?.jsonPrimitive?.content == "queueIntent" })
+        validationComplete = cachedStructure
     }
     fun toJson(): JsonObject = JsonObject(playbackJson.encodeToJsonElement(serializer(), validated()).jsonObject.filterKeys { (it != "queueIntents" || queueIntents != null) && (it != "registration" || registration != null) && (it != "leadership" || leadership != null) })
     companion object {
@@ -240,6 +256,12 @@ data class PlaybackDeviceCommand private constructor(val json: JsonObject) {
 /** Injectable protocol boundary for deterministic service tests. No write is ever automatically retried. */
 interface PlaybackDevicesProtocol {
     suspend fun view(): PlaybackDevicesView
+    val revisionSyncSupported: Boolean get() = false
+    val syncSnapshotNeeded: Boolean get() = false
+    fun acceptSyncSnapshot(view: PlaybackDevicesView) {}
+    suspend fun fetchSyncSnapshot(): PlaybackDevicesView = view()
+    suspend fun pollLive(deviceId: String, epoch: Long, stateSeq: Long, base: PlaybackSyncReference, live: PlaybackSyncLive): PlaybackDevicesView =
+        throw UnsupportedOperationException("Revision sync is unavailable")
     suspend fun register(name: String): PlaybackDevicesView
     suspend fun probeQueueIntents(): PlaybackDevicesView = view()
     suspend fun register(name: String, queueIntentsVersion: Int?, installationId: String?, receiverId: String): PlaybackDevicesView = register(name, queueIntentsVersion)
@@ -280,8 +302,29 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
     private data class PendingRegistration(val name: String, val queueVersion: Int?, val attempt: PlaybackRegistrationAttempt)
     private var pendingRegistration: PendingRegistration? = null
     private var rejectedReceiver: String? = null
+    private val revisionSync = PlaybackRevisionSync()
+    override val revisionSyncSupported get() = revisionSync.supported
+    override val syncSnapshotNeeded get() = revisionSync.needsSnapshot
+    override fun acceptSyncSnapshot(view: PlaybackDevicesView) = revisionSync.accept(view)
+    override suspend fun fetchSyncSnapshot(): PlaybackDevicesView = withTimeout(4000) {
+        revisionSync.snapshot(requireNotNull(transport.send("GET", path, playbackExtensions = extensions,
+            playbackRegistration = registrationSupported, playbackSync = true)), extensions, registrationSupported)
+    }
     override suspend fun probeQueueIntents(): PlaybackDevicesView = withTimeout(4000) {
-        val view = PlaybackDevicesView.fromJson(transport.send("GET", path, playbackExtensions = true, playbackRegistration = true)!!, true, true)
+        val raw = requireNotNull(transport.send("GET", path, playbackExtensions = true, playbackRegistration = true, playbackSync = true))
+        val version = raw["sync"]?.let { advertised ->
+            require(advertised is JsonObject) { "Invalid revision sync advertisement" }
+            val value = advertised["version"]
+            require(value is JsonPrimitive && !value.isString &&
+                value.content.matches(Regex("[1-9][0-9]*")) && value.longOrNull?.let { it in 1..MAX_SAFE } == true) {
+                "Invalid revision sync version"
+            }
+            value.long
+        }
+        val view = if (version != null && version != 1L) {
+            check(!revisionSync.supported) { "Revision sync capability changed" }
+            PlaybackDevicesView.fromJson(requireNotNull(transport.send("GET", path, playbackExtensions = true, playbackRegistration = true)), true, true)
+        } else revisionSync.probe(raw)
         check(!registrationSupported || view.registration != null) { "Negotiated registration metadata is missing" }
         check(!leadershipSupported || view.leadership != null) { "Negotiated leadership metadata is missing" }
         leadershipSupported = view.leadership != null
@@ -305,7 +348,11 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
         }
         require(body.toString().toByteArray(Charsets.UTF_8).size <= MAX_PLAYBACK_BODY_BYTES) { "Queue is too large to share" }
         PlaybackRequestContract.fromRawJson(body.toString())
-        decodeView(requireNotNull(transport.send("POST", path, body, playbackExtensions = extensions, playbackRegistration = registrationSupported)))
+        val sync = action == "poll" && revisionSync.supported
+        val raw = requireNotNull(transport.send("POST", path, body, playbackExtensions = extensions,
+            playbackRegistration = registrationSupported, playbackSync = sync))
+        if (sync) revisionSync.response(raw, extensions, registrationSupported).also { observedRegistration = it.registration }
+        else decodeView(raw)
     }
     private fun decodeView(json: JsonObject): PlaybackDevicesView = PlaybackDevicesView.fromJson(json, extensions, registrationSupported).also {
         require(!leadershipSupported || it.leadership != null) { "Negotiated leadership metadata is missing" }
@@ -372,6 +419,13 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
         require(!receiverCapable || state == null || queueIntentState != null)
         val body = PlaybackPublication.pollBody(deviceId, epoch, stateSeq, state, acks, queueIntentState)
         return post("poll") { body.forEach { (key, value) -> if (key != "action") put(key, value) } }
+    }
+    override suspend fun pollLive(deviceId: String, epoch: Long, stateSeq: Long, base: PlaybackSyncReference, live: PlaybackSyncLive): PlaybackDevicesView {
+        check(revisionSync.supported)
+        return post("poll") {
+            identity(deviceId, epoch); put("stateSeq", stateSeq); put("base", base.toJson()); put("live", live.toJson())
+            put("acks", JsonArray(emptyList()))
+        }
     }
     override suspend fun rename(deviceId: String, name: String): PlaybackDevicesView { require(validPlaybackProtocolId(deviceId) && validPlaybackDeviceName(name)); return post("rename") { put("deviceId", deviceId); put("name", name) } }
     override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView { require(validPlaybackProtocolId(commandId)); if (command.type == "queueIntent") requireExtensions(); return post("command") { identity(deviceId, epoch); put("commandId", commandId); put("command", command.json) } }

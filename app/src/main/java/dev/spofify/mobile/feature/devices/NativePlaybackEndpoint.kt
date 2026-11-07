@@ -23,6 +23,9 @@ interface NativePlaybackEndpoint {
     /** Advertise only after complete authoritative queue/provenance/result support. */
     val supportsQueueIntents: Boolean get() = false
     fun exportQueueIntentState(): QueueIntentState? = null
+    /** Serial-owner capture. Null keeps legacy endpoints on full publication. Implementations
+     * must not export/project/validate the queue merely to observe an unchanged fence. */
+    fun captureRevisionSync(): PlaybackSyncCapture? = null
     /** Synchronous, idempotent: cancel ALL pending starts/generations, pause actual buffered output. No history reset. */
     fun suspendOutput()
     /** Explicit same-owner Pause interrupt only. Coordinator calls ONLY while its tracked
@@ -54,6 +57,13 @@ interface NativePlaybackEndpoint {
 }
 
 /** Cache-only local continuation, deliberately not receiver/lease authority. */
+data class PlaybackSyncCapture(
+    val semanticFence: Any, val live: dev.spofify.mobile.core.PlaybackSyncLive,
+    val structure: PlaybackSnapshot, val metadata: QueueIntentState?,
+) {
+    fun snapshot(): PlaybackSnapshot = live.applyTo(structure)
+}
+
 class CachedPlaybackPermission internal constructor(private val check: () -> Boolean) {
     fun isValid(): Boolean = check()
 }

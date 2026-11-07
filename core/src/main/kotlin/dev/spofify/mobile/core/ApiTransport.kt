@@ -32,6 +32,7 @@ class ApiTransport(val client: SpofifyClient) {
         query: Map<String, String> = emptyMap(),
         playbackExtensions: Boolean = false,
         playbackRegistration: Boolean = false,
+        playbackSync: Boolean = false,
     ): JsonObject? {
         require(method in setOf("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")) { "Unsupported API method" }
         require(path.isNotEmpty() && path.none { segment -> segment.isEmpty() || segment == "." || segment == ".." || segment.any { it.isISOControl() } }) { "Invalid API path" }
@@ -45,8 +46,9 @@ class ApiTransport(val client: SpofifyClient) {
             else -> null
         }
         val deviceRequest = path == listOf("api", "me", "player")
-        require(!(playbackExtensions || playbackRegistration) || deviceRequest)
+        require(!(playbackExtensions || playbackRegistration || playbackSync) || deviceRequest)
         val request = Request.Builder().url(url).header("Accept", "application/json").apply {
+            if (playbackSync) header("X-Spofify-Playback-Sync", "revision-v1")
             if (playbackExtensions) header("X-Spofify-Playback-Extensions", "queue-intents-v1")
             if (playbackRegistration) header("X-Spofify-Playback-Registration", "installation-v1")
             if (deviceRequest) header("X-Spofify-Playback-Leadership", "last-requested-v1")

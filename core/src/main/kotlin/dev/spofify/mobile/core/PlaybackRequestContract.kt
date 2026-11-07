@@ -34,8 +34,14 @@ object PlaybackRequestContract {
             "poll" -> {
                 identity(root)
                 val snapshot = root["state"]?.let { PlaybackSnapshot.fromJson(it.jsonObject) }
-                require((snapshot == null) == (root["stateSeq"] == null))
-                if (snapshot != null) require(root.getValue("stateSeq").jsonPrimitive.long in 1..9007199254740991L)
+                val live = root["live"]?.let { PlaybackSyncLive.fromJson(it.jsonObject) }
+                val base = root["base"]?.let {
+                    playbackJson.decodeFromJsonElement(PlaybackSyncReference.serializer(), it).validated()
+                }
+                require((base == null) == (live == null))
+                require((snapshot == null && live == null) == (root["stateSeq"] == null))
+                if (snapshot != null || live != null) require(root.getValue("stateSeq").jsonPrimitive.long in 1..9007199254740991L)
+                if (live != null) require(snapshot == null && "queueIntentState" !in root && root["acks"]?.jsonArray?.isEmpty() != false)
                 val metadata = root["queueIntentState"]?.let { QueueIntentState.fromJson(it.jsonObject, requireNotNull(snapshot)) }
                 val acks = root["acks"]?.jsonArray ?: JsonArray(emptyList())
                 require(acks.size <= 16)

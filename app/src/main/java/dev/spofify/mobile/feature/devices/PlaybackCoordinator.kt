@@ -108,7 +108,16 @@ class PlaybackCoordinator(
     private var generation = 0L
     private var epoch = 0L
     private var sequence = 0L
+    private data class AcknowledgedUpload(val reference: PlaybackSyncReference, val deviceId: String,
+        val epoch: Long, val lifecycle: Long, val generation: Long, val registration: PlaybackRegistrationDevice?,
+        val receiverId: String?, val receiverRevision: Long?, val semanticFence: Any)
+    private var acknowledgedUpload: AcknowledgedUpload? = null
+    private data class RetainedSemanticCheck(val fence: Any, val remoteQueue: dev.spofify.mobile.playback.PlaybackReference,
+        val metadata: dev.spofify.mobile.playback.PlaybackReference?, val position: Int, val context: PlaybackContext?,
+        val shuffle: Boolean, val repeat: String, val truncated: Boolean, val notice: String, val event: String?)
+    private var retainedSemanticCheck: Pair<RetainedSemanticCheck, Boolean>? = null
     private var interactionRevision = 0L
+    private var acceptedViewVersion = 0L
     private var transportDirections = false to false
     /** Capability ABA is transport-only; generic queue/action receipts do not depend on it. */
     internal var transportCapabilityVersion = 0L
@@ -1162,14 +1171,23 @@ class PlaybackCoordinator(
         ackState = null; ackQueueIntentState = null
         // These two endpoint reads are synchronous on the serial owner dispatcher. No
         // suspension, resolver or publication may split musical state from its sidecar.
-        val snapshot = if (state.value.activeDeviceId == id && (authorized() && activatedEpoch == epoch || final != null)) final ?: endpoint.exportSnapshot().validated() else null
+        val owner = state.value.activeDeviceId == id && authorized() && activatedEpoch == epoch
+        val capture = if (owner && final == null && pending.isEmpty() && api.revisionSyncSupported) endpoint.captureRevisionSync() else null
+        val base = acknowledgedUpload?.takeIf { b -> capture != null && b.deviceId == id && b.epoch == epoch &&
+            b.lifecycle == lifecycle && b.generation == generation && b.registration == ownRegistration &&
+            b.receiverId == capture.metadata?.receiverId && b.receiverRevision == capture.metadata?.revision &&
+            b.semanticFence == capture.semanticFence }
+        val compact = capture != null && base != null
+        val snapshot = if (compact) null else if (owner || final != null && state.value.activeDeviceId == id)
+            final ?: capture?.snapshot() ?: endpoint.exportSnapshot().validated() else null
         val metadata = if (snapshot == null || !receiverRegistered) null
-            else if (final != null) requireNotNull(finalMetadata) else requireNotNull(endpoint.exportQueueIntentState())
+            else if (final != null) requireNotNull(finalMetadata) else capture?.metadata ?: requireNotNull(endpoint.exportQueueIntentState())
         val publication = playAdmission?.takeIf { snapshot != null && it.activatedEpoch == epoch && it.stagedVersion == it.payloadVersion }
             ?.let { it.id to it.payloadVersion }
         val queue = queueExecution
         val requestEpoch = epoch
-        val requestSequence = if (snapshot != null) ++sequence else null
+        val requestSequence = if (snapshot != null || compact) ++sequence else null
+        val uploadLife = lifecycle; val uploadGeneration = generation; val uploadRegistration = ownRegistration
         val sent = clockMs()
         // Capture the ACTUAL outgoing request before suspension. The buffers above have
         // already been cleared; inspecting them in a catch would misclassify sent ACKs.
@@ -1181,7 +1199,22 @@ class PlaybackCoordinator(
             } == true }
         try {
             request(ownerPoll = true, admissionPublication = publication) {
-                api.poll(id, requestEpoch, requestSequence, snapshot, pending, metadata)
+                val response = if (compact) api.pollLive(id, requestEpoch, requireNotNull(requestSequence),
+                    requireNotNull(base).reference, requireNotNull(capture).live)
+                else api.poll(id, requestEpoch, requestSequence, snapshot, pending, metadata)
+                if (requestSequence != null) {
+                    acknowledgedUpload = null
+                    val ack = response.publicationAck
+                    if (capture != null && pending.isEmpty() && final == null && ack?.stateSeq == requestSequence &&
+                        ack.base == (response.syncStatusReference ?: response.syncSnapshotReference) &&
+                        response.activeDeviceId == id && response.epoch == requestEpoch && uploadLife == lifecycle &&
+                        uploadGeneration == generation && uploadRegistration == ownRegistration &&
+                        endpoint.captureRevisionSync()?.semanticFence == capture.semanticFence) {
+                        acknowledgedUpload = AcknowledgedUpload(ack.base, id, requestEpoch, uploadLife, uploadGeneration,
+                            uploadRegistration, capture.metadata?.receiverId, capture.metadata?.revision, capture.semanticFence)
+                    }
+                }
+                response
             }
         } catch (error: ApiException) {
             if (inbox == null || !reconcileHandoffInbox(error, inbox, sent)) throw error
@@ -1249,11 +1282,12 @@ class PlaybackCoordinator(
             expected.outputDeviceId != localDeviceId || view.queueIntents?.binding != expected ||
             expected.currentKey != null || expected.currentEventId != null) return false
         val accepted = view.state ?: return false
-        val live = endpoint.exportSnapshot().validated()
+        val capture = if (api.revisionSyncSupported) endpoint.captureRevisionSync() else null
+        val live = capture?.snapshot() ?: endpoint.exportSnapshot().validated()
         fun empty(snapshot: PlaybackSnapshot) = snapshot.queue.isEmpty() && snapshot.position == -1 &&
             snapshot.occurrence == null && !snapshot.playing && !snapshot.waiting && !snapshot.loading
         if (!empty(accepted) || !empty(live)) return false
-        val metadata = endpoint.exportQueueIntentState()?.validated(live) ?: return false
+        val metadata = capture?.metadata ?: endpoint.exportQueueIntentState()?.validated(live) ?: return false
         return metadata == view.queueIntents?.state && metadata.receiverId == expected.receiverId &&
             metadata.revision == expected.revision && accepted.context == live.context && accepted.shuffle == live.shuffle &&
             accepted.repeat == live.repeat && accepted.truncated == live.truncated && accepted.notice == live.notice
@@ -1269,15 +1303,23 @@ class PlaybackCoordinator(
             view.commands.any { it.status == "pending" } ||
             view.devices.none { it.deviceId == localDeviceId && it.available }) return null
         val accepted = view.state ?: return null
-        val live = endpoint.exportSnapshot().validated()
+        val capture = if (api.revisionSyncSupported) endpoint.captureRevisionSync() else null
+        val live = capture?.snapshot() ?: endpoint.exportSnapshot().validated()
         val current = live.queue.getOrNull(live.position) ?: return null
         if (live.playing || live.waiting || live.loading || expected.currentKey != current.key ||
             expected.currentEventId != live.occurrence?.eventId) return null
-        val metadata = endpoint.exportQueueIntentState()?.validated(live) ?: return null
-        if (metadata != view.queueIntents?.state || metadata.receiverId != expected.receiverId ||
-            metadata.revision != expected.revision ||
-            PlaybackQueueIntents.semanticSnapshot(accepted) != PlaybackQueueIntents.semanticSnapshot(live)) return null
-        return live
+        val metadata = capture?.metadata ?: endpoint.exportQueueIntentState()?.validated(live) ?: return null
+        if (metadata.receiverId != expected.receiverId || metadata.revision != expected.revision) return null
+        val remoteMetadata = view.queueIntents?.state
+        val check = capture?.let { RetainedSemanticCheck(it.semanticFence,
+            dev.spofify.mobile.playback.PlaybackReference(accepted.queue),
+            remoteMetadata?.let { dev.spofify.mobile.playback.PlaybackReference(it) }, accepted.position, accepted.context,
+            accepted.shuffle, accepted.repeat, accepted.truncated, accepted.notice, accepted.occurrence?.eventId) }
+        val matching = if (check != null && retainedSemanticCheck?.first == check) retainedSemanticCheck!!.second else {
+            (metadata == remoteMetadata && PlaybackQueueIntents.semanticSnapshot(accepted) == PlaybackQueueIntents.semanticSnapshot(live))
+                .also { if (check != null) retainedSemanticCheck = check to it }
+        }
+        return live.takeIf { matching }
     }
 
     /** NEW serialized prepared action only; never called by consume/poll or a directive.
@@ -1358,9 +1400,30 @@ class PlaybackCoordinator(
         val sentCommand = pendingCommand?.let { CommandFeedback(it, observedPendingCommand == it) }
         val view = withTimeout(4000) { call() }.validated()
         if (life != lifecycle || closed || !serviceActive || !work.isActive) return
+        val beforeApply = acceptedViewVersion
         consume(view, sent, registration, startsAllowed = revision == actionVersion,
             grantAuthority = registration || ownerPoll || state.value.connected, sentFeedback = sentFeedback,
             sentCommand = sentCommand, admissionPublication = admissionPublication)
+        if (acceptedViewVersion != beforeApply) api.acceptSyncSnapshot(view)
+        // Control/live is already applied (including lease cancellation and deliveries).
+        // Exactly one serialized GET attempt follows this exchange, never retry-until-stable.
+        if (api.syncSnapshotNeeded && life == lifecycle && !closed && serviceActive && work.isActive) {
+            val controlAtFetch = state.value.view
+            val controlVersion = acceptedViewVersion
+            val fetchRevision = actionVersion
+            val snapshot = withTimeout(4000) { api.fetchSyncSnapshot() }.validated()
+            if (life == lifecycle && fetchRevision == actionVersion && !closed && serviceActive && work.isActive &&
+                acceptedViewVersion == controlVersion && state.value.view === controlAtFetch && snapshot.epoch >= epoch &&
+                (snapshot.epoch != epoch || snapshot.stateSeq >= (controlAtFetch?.stateSeq ?: 0))) {
+                if (acknowledgedUpload?.reference != snapshot.syncSnapshotReference) acknowledgedUpload = null
+                val accepted = snapshot.copy(deviceId = state.value.deviceId, directives = emptyList())
+                val beforeSnapshotApply = acceptedViewVersion
+                consume(accepted, sent, startsAllowed = false,
+                    grantAuthority = registration || ownerPoll || state.value.connected,
+                    leaseCeiling = leaseDeadline)
+                if (acceptedViewVersion != beforeSnapshotApply) api.acceptSyncSnapshot(snapshot)
+            }
+        }
         // A successful fresh observation may make a NEW explicit tap possible; it never
         // resurrects the retired intent or treats pending recovery as an empty room.
         if (ownerPoll && state.value.connected && view.transfer == null && view.directives.isEmpty() &&
@@ -1376,7 +1439,10 @@ class PlaybackCoordinator(
         sentCommand: CommandFeedback? = null,
         admissionPublication: Pair<String, Long>? = null,
         handoffReconciliation: HandoffWitness? = null,
+        leaseCeiling: Long? = null,
     ) {
+        val responseRef = view.syncStatusReference ?: view.syncSnapshotReference
+        if (leaseCeiling == null && (responseRef == null || acknowledgedUpload?.reference != responseRef)) acknowledgedUpload = null
         // Leadership precedes registration checks, state imports and directives.
         if (reconcileCachedLeadership(view)) return
         if (registration) {
@@ -1441,7 +1507,8 @@ class PlaybackCoordinator(
         sequence = maxOf(if (changed) 0 else sequence, view.stateSeq)
         // Only owner polling/registration/activation grants authority; GET/rename/command responses
         // may expose remaining lease but never extend it beyond the request's conservative sent time.
-        leaseDeadline = if (grantAuthority && view.activeDeviceId == id) sent + (view.leaseMs - 2000).coerceAtLeast(0) else 0
+        leaseDeadline = if (grantAuthority && view.activeDeviceId == id)
+            minOf(sent + (view.leaseMs - 2000).coerceAtLeast(0), leaseCeiling ?: Long.MAX_VALUE) else 0
         if (grantAuthority && view.activeDeviceId == id && (changed || registration || !state.value.connected) && view.directives.none { it.type == "release" }) released = false
         // Names may be changed by another controller. Only accepted own-device names persist.
         try { identity?.invoke()?.confirmName(view.devices.first { it.deviceId == id }.name, name) }
@@ -1463,8 +1530,8 @@ class PlaybackCoordinator(
             !grantAuthority -> "Playback connection needs verification. The action was not replayed. Reconnect before pressing Play."
             outcomeForgotten || sentCommandForgotten || outcome?.status in failureStatuses ||
                 sentCommandOutcome?.status in failureStatuses || selectionOutcome?.status in failureStatuses -> "The action could not be confirmed. It was not replayed."
-            view.state?.error == "blocked" -> "Playback needs a tap on the selected device."
-            view.state?.error == "media" -> "The selected device could not play this audio. Choose music or retry explicitly."
+            (view.syncLive?.error ?: view.state?.error) == "blocked" -> "Playback needs a tap on the selected device."
+            (view.syncLive?.error ?: view.state?.error) == "media" -> "The selected device could not play this audio. Choose music or retry explicitly."
             else -> ""
         }
         val progress = when {
@@ -1480,6 +1547,7 @@ class PlaybackCoordinator(
             PlaybackDevicesMessagePurpose.PROGRESS else PlaybackDevicesMessagePurpose.GUIDANCE
         observeSelectionFeedback(view, sentFeedback, grantAuthority)
         observeInteractionBinding(id, view)
+        acceptedViewVersion++ // StateFlow may suppress an equal value; application still succeeded.
         mutableState.value = PlaybackDevicesState(id, view,
             intent?.target ?: view.transfer?.targetDeviceId.orEmpty(), intent != null, grantAuthority, false,
             authorizedFor(id, view), view.activeDeviceId == id && view.state?.error == "blocked", connectedMessage,
