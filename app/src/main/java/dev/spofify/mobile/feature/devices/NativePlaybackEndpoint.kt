@@ -16,9 +16,12 @@ interface NativePlaybackEndpoint {
     /** False until exact queue/history import AND generation fencing are implemented. No fake capability registration. */
     /** Install only over already-running exact local output; never starts or imports. */
     fun retainCachedOutput(permission: CachedPlaybackPermission): Boolean = false
-    /** Rebind a genuinely renewed existing receiver lease to THIS continuing output only.
+    /** Opaque service/action witness, captured BEFORE reconnect observation. Never wire authority.
+     * Pause/Resume ABA retires it without revoking otherwise valid cached-read permission. */
+    fun continuingOutputWitness(permission: CachedPlaybackPermission): Any? = null
+    /** Rebind a genuine lease only to the exact observed service/action incarnation.
      * Synchronous acknowledgement; never import, prepare, start, seek or reset history. */
-    fun renewContinuingOutput(permission: CachedPlaybackPermission, authority: PlaybackAuthority): Boolean = false
+    fun renewContinuingOutput(permission: CachedPlaybackPermission, authority: PlaybackAuthority, witness: Any): Boolean = false
     val supportsExactHandoff: Boolean
     /** Advertise only after complete authoritative queue/provenance/result support. */
     val supportsQueueIntents: Boolean get() = false

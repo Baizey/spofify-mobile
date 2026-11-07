@@ -14,10 +14,14 @@ class Media3PlaybackEndpoint : NativePlaybackEndpoint {
         checkMain()
         return PlaybackService.retainCachedOutput(permission)
     }
-    override fun renewContinuingOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission,
-        authority: PlaybackAuthority): Boolean {
+    override fun continuingOutputWitness(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Any? {
         checkMain()
-        return PlaybackService.renewContinuingOutput(permission, authority)
+        return PlaybackService.continuingOutputWitness(permission)
+    }
+    override fun renewContinuingOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission,
+        authority: PlaybackAuthority, witness: Any): Boolean {
+        checkMain()
+        return PlaybackService.renewContinuingOutput(permission, authority, witness)
     }
     override val supportsExactHandoff: Boolean = true
     override val supportsQueueIntents: Boolean = true

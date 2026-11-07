@@ -54,6 +54,12 @@ object PlaybackRequestContract {
                     ack["queueIntentResult"]?.let { result -> QueueIntentResult.fromJson(result.jsonObject).validated(requireNotNull(snapshot), requireNotNull(metadata), status) }
                 }
             }
+            "continue" -> {
+                identity(root)
+                require(validPlaybackInstallationId(root.getValue("deviceId").jsonPrimitive.content))
+                require(validPlaybackProtocolId(root.getValue("registrationGeneration").jsonPrimitive.content))
+                require(root.getValue("expectedLeadRevision").jsonPrimitive.long in 1..9007199254740991L)
+            }
             "rename" -> { require(validPlaybackProtocolId(root.getValue("deviceId").jsonPrimitive.content)); require(validPlaybackDeviceName(root.getValue("name").jsonPrimitive.content)) }
             "leave" -> require(validPlaybackProtocolId(root.getValue("deviceId").jsonPrimitive.content))
             "transfer" -> {

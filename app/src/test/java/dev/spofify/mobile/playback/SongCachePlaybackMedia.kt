@@ -40,6 +40,9 @@ class SongCachePlaybackMedia {
         // Attach only an optional transfer observer to the actual production DataSource.
         // This can hold a real file/HTTP read without replacing authorization, bytes or errors.
         val sources = reflector(FactoryFields::class.java, factory).getDataSourceFactory()
+        // Read-only capture of the SAME service-bound factory. Recovery setup can
+        // fully consume real authorized HTTP through its exact cache/namespace.
+        productionDataSources = sources
         factory.setDataSourceFactory(DataSource.Factory {
             sources.createDataSource().also { source -> transferListener?.let(source::addTransferListener) }
         })
@@ -142,6 +145,7 @@ class SongCachePlaybackMedia {
     }
 
     companion object {
+        @Volatile var productionDataSources: DataSource.Factory? = null
         @Volatile var transferListener: TransferListener? = null
         @Volatile var onLoaderRelease: (() -> (() -> Unit))? = null
         val factories = AtomicLong()
@@ -152,6 +156,7 @@ class SongCachePlaybackMedia {
         val consumed = ConcurrentHashMap<Int, AtomicLong>()
         fun bytes(marker: Int) = consumed[marker]?.get() ?: 0L
         fun reset() {
+            productionDataSources = null
             transferListener = null
             onLoaderRelease = null
             factories.set(0); samples.set(0); starts.set(0); enables.set(0); resets.set(0)

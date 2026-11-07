@@ -73,7 +73,7 @@ private fun requireSnapshotShape(value: JsonObject) {
 }
 internal fun libraryId(s: String) = s.isNotEmpty() && s.trim() == s && text(s, 512)
 private fun optionalId(s: String) = s.isEmpty() || libraryId(s)
-private val wireNumbers = setOf("version", "position", "elapsed", "duration", "key", "order", "revision", "progress", "epoch", "leaseMs", "quarantineMs", "stateSeq", "stateAgeMs", "acceptedRevision", "value", "acceptedCount", "currentKey", "commitRevision", "playbackKey", "queueIntentsVersion")
+private val wireNumbers = setOf("version", "position", "elapsed", "duration", "key", "order", "revision", "progress", "epoch", "leaseMs", "quarantineMs", "stateSeq", "stateAgeMs", "acceptedRevision", "expectedLeadRevision", "value", "acceptedCount", "currentKey", "commitRevision", "playbackKey", "queueIntentsVersion")
 private val wireBooleans = setOf("shuffle", "playing", "waiting", "loading", "truncated", "reported", "available", "first")
 private val wireStrings = setOf("incarnation", "id", "name", "albumName", "albumId", "entryId", "targetId", "occurrenceId", "selectionToken", "kind", "fence", "repeat", "error", "notice", "trackId", "eventId", "deviceId", "activeDeviceId", "commandId", "sourceDeviceId", "targetDeviceId", "phase", "deliveryId", "type", "status", "direction", "receiverId", "outputDeviceId", "currentEventId", "intent", "provenance", "outcome", "placement", "playback", "generation", "admissionToken", "registrationGeneration", "targetRegistrationGeneration", "attemptId", "expectedGeneration")
 internal fun requireWireTypes(value: JsonElement, depth: Int = 0) {
@@ -274,6 +274,9 @@ interface PlaybackDevicesProtocol {
         if (queueIntentState != null || acks.any { it.queueIntentResult != null }) throw UnsupportedOperationException("Queue intents publication is unavailable")
         return poll(deviceId, epoch, stateSeq, state, acks)
     }
+    /** Restore a genuinely continuing local output only; never selection, activation or publication. */
+    suspend fun continueReceiver(registration: PlaybackRegistrationDevice, epoch: Long, leadRevision: Long): PlaybackDevicesView =
+        throw UnsupportedOperationException("Receiver continuation is unavailable")
     suspend fun rename(deviceId: String, name: String): PlaybackDevicesView
     suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView
     suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long): PlaybackDevicesView
@@ -297,6 +300,7 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
     @Volatile private var receiverCapable = false
     @Volatile private var registrationSupported = false
     private var leadershipSupported = false
+    private var continuationUnsupported = false
     private var observedRegistration: PlaybackRegistrationView? = null
     private var ownRegistration: PlaybackRegistrationDevice? = null
     private data class PendingRegistration(val name: String, val queueVersion: Int?, val attempt: PlaybackRegistrationAttempt)
@@ -425,6 +429,19 @@ class PlaybackDevicesApi(private val client: SpofifyClient) : PlaybackDevicesPro
         return post("poll") {
             identity(deviceId, epoch); put("stateSeq", stateSeq); put("base", base.toJson()); put("live", live.toJson())
             put("acks", JsonArray(emptyList()))
+        }
+    }
+    override suspend fun continueReceiver(registration: PlaybackRegistrationDevice, epoch: Long, leadRevision: Long): PlaybackDevicesView {
+        check(registrationSupported && leadershipSupported && !continuationUnsupported) { "Receiver continuation is unavailable" }
+        check(ownRegistration == registration) { "Playback registration changed" }
+        require(leadRevision in 1..MAX_SAFE)
+        return try {
+            post("continue") { identity(registration.deviceId, epoch); put("expectedLeadRevision", leadRevision) }
+        } catch (error: ApiException) {
+            // Older servers reject this new action. Never substitute selection or retry
+            // an unsupported mutation on every heartbeat of the same authenticated client.
+            if (error.status in setOf(400, 405)) continuationUnsupported = true
+            throw error
         }
     }
     override suspend fun rename(deviceId: String, name: String): PlaybackDevicesView { require(validPlaybackProtocolId(deviceId) && validPlaybackDeviceName(name)); return post("rename") { put("deviceId", deviceId); put("name", name) } }

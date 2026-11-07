@@ -4,10 +4,12 @@ import android.app.ActivityManager
 import android.media.AudioManager
 import android.os.Bundle
 import android.os.Looper
+import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
@@ -44,10 +46,12 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.net.InetAddress
+import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -79,8 +83,9 @@ class SongCachePlaybackTest {
         override fun write(value: RememberedLogin?) = Unit
     }
 
-    /** Small, authenticated control room. It reports only states actually published by the
-     * production receiver. No directives/activation/start ACK or cache result are invented.
+    /** Small authenticated synthetic control room, not real-broker acceptance.
+     * Managed bootstrap directives advance only on actual production receiver ACKs;
+     * musical state is published by that receiver, never a fabricated start/cache result.
      */
     private class Room(private val remote: Boolean = false, private val sampleRate: Int = 8000,
         private val longCurrent: Boolean = false, private val longFutureB: Boolean = false,
@@ -109,24 +114,45 @@ class SongCachePlaybackTest {
         private var receiver = ""
         @Volatile var coordinationOutage = false
         @Volatile var receiverExpired = false
+        @Volatile var registrationExpired = false
+        @Volatile var coordinationEpoch = 1L
+        @Volatile var allowContinuation = false
+        val continuations = AtomicInteger()
+        @Volatile var continuationReplyGate: CountDownLatch? = null
+        @Volatile var postGrantReadGate: CountDownLatch? = null
+        val blockedPostGrantReads = AtomicInteger()
+        private var registrationGeneration = "registration-generation"
+        private var ownerSelected = !managedContinuation
+        // Durable selection survives ephemeral leave/disposal of this receiver.
+        private var requestedLeadDeviceId = ""
+        private var bootstrapTransfer: PlaybackTransfer? = null
+        private var bootstrapDirective: PlaybackDirective? = null
+        private var bootstrapDelivered = false
+        private var bootstrapOutcome: PlaybackOutcome? = null
+        val bootstrapClaims = AtomicInteger()
+        val bootstrapPrepareAcks = AtomicInteger()
+        val bootstrapActivationAcks = AtomicInteger()
         val controlTrace = CopyOnWriteArrayList<String>()
-        private fun view(): PlaybackDevicesView {
-            val selected = if (remote) "remote" else if (receiverExpired) "" else phone
+        private fun view(deliver: Boolean = false): PlaybackDevicesView {
+            val selected = if (remote) "remote" else if (receiverExpired || !ownerSelected) "" else phone
+            val directives = bootstrapDirective?.takeIf { deliver && !bootstrapDelivered }?.let {
+                bootstrapDelivered = true; listOf(it)
+            }.orEmpty()
             return PlaybackDevicesView(phone,
-                (if (phone.isEmpty()) emptyList() else listOf(PlaybackDevice(phone, "Phone", true))) +
+                (if (phone.isEmpty() || registrationExpired) emptyList() else listOf(PlaybackDevice(phone, "Phone", true))) +
                     if (remote) listOf(PlaybackDevice("remote", "Remote", true)) else emptyList(),
-                selected, 1, if (selected.isEmpty()) 0 else 8000, state = snapshot, stateSeq = sequence,
-                stateAgeMs = 0, transfer = null, directives = emptyList(), commands = emptyList(),
+                selected, coordinationEpoch, if (selected.isEmpty()) 0 else 8000, state = snapshot, stateSeq = sequence,
+                stateAgeMs = 0, transfer = bootstrapTransfer, directives = directives, commands = listOfNotNull(bootstrapOutcome),
                 queueIntents = QueueIntentsView(1,
-                    if (phone.isEmpty()) emptyList() else listOf(QueueIntentReceiver(phone, 1)),
-                    if (remote || phone.isEmpty()) null else metadata?.let {
+                    if (phone.isEmpty() || registrationExpired) emptyList() else listOf(QueueIntentReceiver(phone, 1)),
+                    if (remote || selected.isEmpty() || registrationExpired || bootstrapTransfer != null) null else metadata?.let {
                         QueueIntentBinding(phone, it.receiverId, it.revision,
                             snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId)
-                    }, if (remote) null else metadata, emptyList(), emptyList()),
+                    }, if (remote) null else metadata, directives.map { QueueIntentDirective(it.deliveryId, metadata) }, emptyList()),
                 registration = if (!managedContinuation) null else PlaybackRegistrationView(1, "admission-generation", "admission-token",
-                    if (phone.isEmpty()) emptyList() else listOf(PlaybackRegistrationDevice(phone, receiver, "registration-generation"))),
-                leadership = if (!managedContinuation) null else PlaybackLeadership(1, if (phone.isEmpty()) 0 else 1,
-                    if (phone.isEmpty()) "unset" else "installation", phone))
+                    if (phone.isEmpty() || registrationExpired) emptyList() else listOf(PlaybackRegistrationDevice(phone, receiver, registrationGeneration))),
+                leadership = if (!managedContinuation) null else PlaybackLeadership(1, if (requestedLeadDeviceId.isNotEmpty()) 1 else 0,
+                    if (requestedLeadDeviceId.isNotEmpty()) "installation" else "unset", requestedLeadDeviceId))
         }
         private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
         override fun dispatch(request: RecordedRequest): MockResponse {
@@ -146,7 +172,7 @@ class SongCachePlaybackTest {
                     return MockResponse().setResponseCode(it)
                 }
                 if (malformedAudio) return MockResponse().setHeader("Content-Type", "audio/wav").setBody("not an audio container")
-                val wav = wav(id, sampleRate, (durationMillis(id) / 1000).toInt())
+                val wav = audioPayload(id)
                 val range = request.getHeader("Range")
                 val start = range?.removePrefix("bytes=")?.substringBefore('-')?.toIntOrNull() ?: 0
                 if (start !in wav.indices) return MockResponse().setResponseCode(416)
@@ -176,37 +202,115 @@ class SongCachePlaybackTest {
             synchronized(this) {
                 if (request.method == "GET") {
                     controlTrace += "GET"
+                    if (continuations.get() > 0) postGrantReadGate?.let { gate ->
+                        blockedPostGrantReads.incrementAndGet()
+                        check(gate.await(5, TimeUnit.SECONDS)) { "Held recovery GET was not released" }
+                    }
                     return json(view().toJson().toString())
                 }
                 check(request.getHeader("X-CSRF-Token") == "cache-csrf")
-                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
-                when (val action = body.getValue("action").jsonPrimitive.content) {
+                check(request.getHeader("Origin") == "http://127.0.0.1:${request.requestUrl!!.port}")
+                val body = PlaybackRequestContract.fromRawJson(request.body.readUtf8())
+                val action = body.getValue("action").jsonPrimitive.content
+                if (managedContinuation && action != "register") {
+                    check(body.getValue("deviceId").jsonPrimitive.content == phone)
+                    check(body.getValue("registrationGeneration").jsonPrimitive.content == registrationGeneration)
+                }
+                when (action) {
                     "register" -> {
+                        controlTrace += "register"
                         registrations.incrementAndGet()
+                        if (registrationExpired) registrationGeneration = "renewed-registration-generation"
+                        registrationExpired = false
                         phone = if (managedContinuation) {
                             val registration = body.getValue("registration").jsonObject
                             receiver = registration.getValue("receiverId").jsonPrimitive.content
                             registration.getValue("deviceId").jsonPrimitive.content
                         } else "phone-${registrations.get()}"
+                        if (managedContinuation) ownerSelected = false // Stable registration is NOT an output grant.
                         if (!remote) { snapshot = PlaybackSnapshot(); metadata = null; sequence = 0 }
+                    }
+                    "transfer" -> {
+                        // Same bounded synthetic handshake as PreparedResumeRoom in the
+                        // actual service bridge tests; only REAL endpoint ACKs advance it.
+                        check(managedContinuation && !ownerSelected && bootstrapTransfer == null)
+                        check(body.getValue("requireUnselected") == JsonPrimitive(true))
+                        check(body.getValue("targetDeviceId").jsonPrimitive.content == phone)
+                        check(body.getValue("targetRegistrationGeneration").jsonPrimitive.content == registrationGeneration)
+                        check(body.getValue("epoch").jsonPrimitive.long == coordinationEpoch)
+                        val command = body.getValue("commandId").jsonPrimitive.content
+                        bootstrapClaims.incrementAndGet(); requestedLeadDeviceId = phone
+                        bootstrapTransfer = PlaybackTransfer(command, "", phone, "preparing")
+                        bootstrapOutcome = PlaybackOutcome(command, "pending")
+                        bootstrapDirective = PlaybackDirective("prepare-$command", coordinationEpoch, "prepare", command, state = snapshot.paused())
+                        bootstrapDelivered = false
+                        controlTrace += "bootstrap:claim"
                     }
                     "poll" -> {
                         polls.incrementAndGet()
                         controlTrace += if ("state" in body) "poll:publication" else "poll:renewal"
-                        if (managedContinuation && "state" !in body) check(body["acks"]?.jsonArray.isNullOrEmpty())
+                        if (managedContinuation) check(body.getValue("epoch").jsonPrimitive.long == coordinationEpoch)
+                        val acknowledgements = body["acks"]?.jsonArray.orEmpty()
+                        val directive = bootstrapDirective
+                        val acknowledgement = directive?.let { d -> acknowledgements.singleOrNull {
+                            it.jsonObject.getValue("deliveryId").jsonPrimitive.content == d.deliveryId
+                        }?.jsonObject }
+                        if (acknowledgement != null && directive != null) {
+                            check(bootstrapDelivered)
+                            check(acknowledgement.getValue("epoch").jsonPrimitive.long == directive.epoch)
+                            check(acknowledgement.getValue("status").jsonPrimitive.content == "ok")
+                            if (directive.type == "prepare") {
+                                check("state" !in body)
+                                bootstrapPrepareAcks.incrementAndGet(); coordinationEpoch++; sequence = 0
+                                ownerSelected = true
+                                bootstrapTransfer = bootstrapTransfer!!.copy(phase = "activating")
+                                bootstrapDirective = PlaybackDirective("activate-${directive.commandId}", coordinationEpoch, "activate",
+                                    directive.commandId, state = snapshot.paused())
+                                bootstrapDelivered = false
+                                controlTrace += "bootstrap:prepare-ack"
+                            } else {
+                                check(directive.type == "activate" && "state" in body && "queueIntentState" in body)
+                                check(!PlaybackSnapshot.fromJson(body.getValue("state").jsonObject).playing)
+                                bootstrapActivationAcks.incrementAndGet()
+                                bootstrapTransfer = null; bootstrapDirective = null
+                                bootstrapOutcome = PlaybackOutcome(directive.commandId, "ok")
+                                controlTrace += "bootstrap:activation-ack"
+                            }
+                        } else if (managedContinuation) check(acknowledgements.isEmpty())
                         body["state"]?.let {
                             check(!remote) { "A controller must never publish local output over selected remote" }
+                            check(!managedContinuation || ownerSelected)
                             snapshot = PlaybackSnapshot.fromJson(it.jsonObject)
                             sequence = body.getValue("stateSeq").jsonPrimitive.long
-                            body["queueIntentState"]?.let { raw -> metadata = QueueIntentState.fromJson(raw.jsonObject, snapshot) }
+                            body["queueIntentState"]?.let { raw ->
+                                metadata = QueueIntentState.fromJson(raw.jsonObject, snapshot)
+                                if (managedContinuation) check(metadata!!.receiverId == receiver)
+                            }
+                        }
+                    }
+                    "continue" -> {
+                        // Synthetic contract fixture only, not a fabricated broker receipt.
+                        // Real server admission/lease behavior has its separate Go gate.
+                        if (!allowContinuation) return MockResponse().setResponseCode(400)
+                        check(managedContinuation && receiverExpired && !registrationExpired)
+                        check(body.keys == setOf("action", "deviceId", "registrationGeneration", "epoch", "expectedLeadRevision"))
+                        check(body.getValue("deviceId").jsonPrimitive.content == phone)
+                        check(body.getValue("registrationGeneration").jsonPrimitive.content == registrationGeneration)
+                        check(body.getValue("epoch").jsonPrimitive.long == coordinationEpoch)
+                        check(body.getValue("expectedLeadRevision").jsonPrimitive.long == 1L)
+                        controlTrace += "continue"
+                        continuations.incrementAndGet(); coordinationEpoch++; receiverExpired = false; ownerSelected = true
+                        continuationReplyGate?.let { gate ->
+                            check(gate.await(5, TimeUnit.SECONDS)) { "Held continuation reply was not released" }
                         }
                     }
                     "leave" -> { phone = ""; metadata = null }
                     else -> mutations += action // A remote transport command is allowed; acquiring output is not.
                 }
-                return json(view().toJson().toString())
+                return json(view(deliver = action == "poll").toJson().toString())
             }
         }
+        fun audioPayload(id: String) = wav(id, sampleRate, (durationMillis(id) / 1000).toInt())
         fun durationMillis(id: String) = if (longCurrent && id == "A" || longFutureB && id == "B") 120_000L else normalTrackSeconds * 1000L
         fun fetched() = audio.filter { it.method == "GET" }.map { it.id }.toSet()
         fun scheduledBodies(id: String) = audio.filter { it.id == id && it.method == "GET" }
@@ -241,11 +345,13 @@ class SongCachePlaybackTest {
         val server = ServerAddress.parse("http://127.0.0.1:${web.port}")
         val sessions = Sessions()
         private val graphs = mutableListOf<AppGraph>()
+        val cacheReadTrace = CopyOnWriteArrayList<String>()
         var graph: AppGraph
             private set
         var client: SpofifyClient
             private set
         private var service: ServiceController<PlaybackService>? = null
+        private var recoveryControls: PlaybackConnection? = null
         var controller: MediaController? = null
             private set
         lateinit var session: MediaSession
@@ -309,6 +415,7 @@ class SongCachePlaybackTest {
             controller = future.get(1, TimeUnit.SECONDS)
         }
         fun stopService() {
+            recoveryControls?.release(); recoveryControls = null
             controller?.release(); controller = null
             service?.destroy(); service = null
             pump(80)
@@ -360,6 +467,35 @@ class SongCachePlaybackTest {
                     media != null && media.isPlaying == live.playing && media.repeatMode == repeat
             }
         }
+        /** Same binding-only seam as PlaybackServiceBridgeTest.connectedPlayback.
+         * The actual prepared/coordinator transport is production PlaybackConnection;
+         * raw controller command admission/Prepare remain untouched and are not fallback. */
+        private fun acceptedRecoveryControls(): PlaybackConnection = recoveryControls ?: PlaybackConnection(app).also { controls ->
+            val binding = requireNotNull(controller)
+            PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true; set(controls, binding) }
+            val listener = PlaybackConnection::class.java.getDeclaredField("listener").let {
+                it.isAccessible = true; it.get(controls) as Player.Listener
+            }
+            binding.addListener(listener)
+            controls.bindExplicitPlayOrigin {
+                val source = client; val login = source.currentSession()
+                val lifetime = service
+                val stillCurrent: () -> Boolean = {
+                    service === lifetime && lifetime != null && controller === binding && client === source &&
+                        graph.client === source && login != null && source.currentSession() === login
+                }
+                stillCurrent
+            }
+            controls.connect()
+            recoveryControls = controls
+        }
+        fun pauseThroughAcceptedControls() {
+            assertTrue("Pause must not accidentally become Resume", PlaybackService.exportLocalSnapshot().playing)
+            acceptedRecoveryControls().toggle()
+        }
+        fun seekThroughAcceptedControls(positionMs: Long) = acceptedRecoveryControls().seekTo(positionMs)
+        fun selectThroughAcceptedControls(index: Int) = acceptedRecoveryControls().select(index)
+
         fun pause() {
             awaitLocalPublication("before Pause")
             controller!!.pause()
@@ -378,6 +514,132 @@ class SongCachePlaybackTest {
             }
             awaitLocalPublication("paused $id replacement")
         }
+        /** Recovery tests need a whole cached object, not successful speculation.
+         * Prepare silently under the real receiver lease, then drain the EXACT
+         * production service DataSource through EOF. No synthetic guard, cache file,
+         * manifest edit, alternate session binding or source replacement is involved. */
+        fun warmPreparedAudioThroughServiceSource(id: String) {
+            require(id != "Z")
+            // A pristine connected receiver has no accepted queue/owner permit yet.
+            // Establish it via real explicit Play/Pause, never a fabricated lease or
+            // an await requiring the publication that the first action must create.
+            play("Z")
+            val owner = requireNotNull(graph.playbackCoordinator)
+            assertEquals(1, room.bootstrapClaims.get())
+            assertEquals(1, room.bootstrapPrepareAcks.get())
+            assertEquals(1, room.bootstrapActivationAcks.get())
+            assertTrue(owner.state.value.exclusiveOwner && owner.state.value.canQueueIntent)
+            val accepted = requireNotNull(owner.state.value.view)
+            assertNull(accepted.transfer)
+            assertEquals("ok", accepted.commands.single().status)
+            val registration = requireNotNull(accepted.registration).devices.single { it.deviceId == owner.state.value.deviceId }
+            assertEquals(registration.receiverId, PlaybackService.exportLocalQueueIntentState()!!.receiverId)
+            assertEquals("cache-account", client.currentSession()!!.accountId)
+            assertSame(client, graph.client)
+            pauseThroughAcceptedControls()
+            await("accepted app Pause stops the bootstrapped output") {
+                !controller!!.isPlaying && !PlaybackService.exportLocalSnapshot().playing
+            }
+            awaitLocalPublication("accepted app Pause before cache setup")
+            graph.songCache.awaitStorageForTest()
+            preparePaused(id)
+            assertFalse(controller!!.playWhenReady)
+            assertTrue(requireNotNull(graph.playbackCoordinator!!.currentAuthority()).isValid())
+            val factory = requireNotNull(SongCachePlaybackMedia.productionDataSources)
+            val spec = DataSpec.Builder().setUri(client.audioUrl(track(id, "$id-warm"))).setKey(id).build()
+            val expected = room.audioPayload(id)
+            val requests = room.audio.count { it.id == id }
+            val sourceInUse = AtomicReference<DataSource?>()
+            val task = FutureTask<Unit> {
+                val before = graph.songCache.inventory()
+                assertFalse(before.bypassed)
+                fun drain(phase: String): Boolean {
+                    val source = factory.createDataSource()
+                    val network = AtomicReference<Boolean>()
+                    sourceInUse.set(source)
+                    source.addTransferListener(object : TransferListener {
+                        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+                        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                            network.set(isNetwork)
+                            val http = source as? HttpDataSource
+                            fun header(name: String) = source.responseHeaders.entries.firstOrNull { it.key.equals(name, true) }?.value?.singleOrNull()
+                            cacheReadTrace += "$phase:start:key=${dataSpec.key}:position=${dataSpec.position}:length=${dataSpec.length}:network=$isNetwork:code=${http?.responseCode}:contentLength=${header("Content-Length")}:range=${header("Content-Range")}"
+                        }
+                        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) = Unit
+                        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) { cacheReadTrace += "$phase:end:key=${dataSpec.key}:network=$isNetwork" }
+                    })
+                    try {
+                        val opened = source.open(spec)
+                        cacheReadTrace += "$phase:open:key=$id:returnedLength=$opened"
+                        assertEquals(expected.size.toLong(), opened)
+                        val digest = MessageDigest.getInstance("SHA-256")
+                        val buffer = ByteArray(16 * 1024)
+                        var count = 0L
+                        while (true) {
+                            val read = source.read(buffer, 0, buffer.size)
+                            if (read == C.RESULT_END_OF_INPUT) break
+                            assertTrue(read > 0)
+                            count += read
+                            assertTrue(count <= expected.size)
+                            digest.update(buffer, 0, read)
+                        }
+                        cacheReadTrace += "$phase:EOF:key=$id:actualReadBytes=$count"
+                        assertEquals(expected.size.toLong(), count)
+                        assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(expected), digest.digest())
+                        return requireNotNull(network.get())
+                    } finally { try { source.close() } finally { sourceInUse.compareAndSet(source, null) } }
+                }
+                assertTrue("First full read must use real authenticated HTTP", drain("warm-http"))
+                graph.songCache.awaitStorageForTest()
+                val committed = graph.songCache.inventory()
+                cacheReadTrace += "warm:commit:before=$before:after=$committed"
+                assertEquals(before.complete + 1, committed.complete)
+                assertFalse(committed.bypassed)
+                assertFalse("Reopen must use the SAME production cache/namespace", drain("warm-reopen"))
+                assertEquals(requests + 1, room.audio.count { it.id == id })
+            }
+            val worker = Thread(task, "receiver-recovery-warm")
+            worker.start()
+            try {
+                await("full production HTTP EOF, commit and file-backed reopen for $id") { task.isDone }
+                task.get(1, TimeUnit.SECONDS)
+            } finally {
+                if (!task.isDone) { task.cancel(true); sourceInUse.get()?.close() }
+                worker.join(10_000)
+                assertFalse("Owned warm worker must stop", worker.isAlive)
+                println("receiver-recovery cache trace=${cacheReadTrace.toList()}")
+            }
+            // A subsequent actual service start must independently demonstrate the
+            // retained file path, not merely reuse these manually consumed bytes.
+            SongCachePlaybackMedia.transferListener = object : TransferListener {
+                override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+                override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                    cacheReadTrace += "service:start:key=${dataSpec.key}:network=$isNetwork"
+                }
+                override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) = Unit
+                override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            }
+        }
+
+        fun assertCachedReadSurvivesButSecureMissIsDenied(cachedId: String, uncachedId: String) {
+            val factory = requireNotNull(SongCachePlaybackMedia.productionDataSources)
+            val before = room.audio.toList()
+            fun spec(id: String) = DataSpec.Builder().setUri(client.audioUrl(track(id, "$id-recovery-read"))).setKey(id).build()
+            val hit = factory.createDataSource()
+            try {
+                assertEquals(room.audioPayload(cachedId).size.toLong(), hit.open(spec(cachedId)))
+                val bytes = ByteArray(64)
+                assertEquals(bytes.size, hit.read(bytes, 0, bytes.size))
+                assertArrayEquals(room.audioPayload(cachedId).copyOf(bytes.size), bytes)
+            } finally { hit.close() }
+            val miss = factory.createDataSource()
+            try {
+                try { miss.open(spec(uncachedId)); fail("Pre-Pause response rearmed a secure cache miss") }
+                catch (expected: IOException) { assertEquals("Required music is not cached. Playback stopped.", expected.message) }
+            } finally { miss.close() }
+            assertEquals("Neither the retained hit nor fenced miss may contact HTTP", before, room.audio.toList())
+        }
+
         fun resume() {
             awaitLocalPublication("before deliberate Resume")
             val id = requireNotNull(controller!!.currentMediaItem).mediaId
@@ -476,7 +738,8 @@ class SongCachePlaybackTest {
                 "controller playing=${controller?.isPlaying},repeat=${controller?.repeatMode},shuffle=${controller?.shuffleModeEnabled}," +
                 "failure=${controller?.playerError?.let(::playbackFailureDiagnostic)}; " +
                 "inventory=${runCatching { graph.songCache.inventory() }.getOrNull()}; " +
-                "audio=${room.audio.takeLast(32).map { "${it.method}:${it.id}:${it.range}" }}"
+                "audio=${room.audio.takeLast(32).map { "${it.method}:${it.id}:${it.range}" }}; " +
+                "cacheReadTrace=${cacheReadTrace.takeLast(24)}"
         }
         fun awaitFetched(vararg ids: String) = await("permitted window ${ids.toList()}") { room.fetched().containsAll(ids.toList()) }
         fun assertBounded(): SongCache.Inventory = graph.songCache.inventory().also {
@@ -615,6 +878,122 @@ class SongCachePlaybackTest {
             assertEquals(paused.occurrence?.eventId, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
             assertEquals(1, j.room.registrations.get())
             assertTrue(j.room.mutations.isEmpty())
+        }
+    }
+
+    private fun verifyRecoveryForkTemp() {
+        val actual = System.getProperty("java.io.tmpdir")
+        assertNotNull("Actual forked JVM temp must not be null", actual)
+        System.getenv("SPOFIFY_TEST_TMPDIR")?.let { expected -> assertEquals(expected, actual) }
+        println("receiver-recovery fork java.io.tmpdir=$actual user.home=${System.getProperty("user.home")}")
+    }
+
+    @Test fun expiredReceiverReenrollmentRestoresSecureUncachedReadsAfterLiveTransportWithoutRestart() {
+        verifyRecoveryForkTemp()
+        Journey(managedContinuation = true, normalTrackSeconds = 30).use { j ->
+            j.startService(); j.warmPreparedAudioThroughServiceSource("A")
+            val aRequests = j.room.audio.filter { it.id == "A" }
+            j.play("A", "B", "C", "D", "E", "F", "G")
+            assertTrue(j.cacheReadTrace.contains("service:start:key=A:network=false"))
+            assertEquals(aRequests, j.room.audio.filter { it.id == "A" })
+            // Exercise the actual service/request authority fence after transport, not
+            // merely the coordinator's renewed lease or an early retained permit.
+            j.seekThroughAcceptedControls(1000); j.awaitLocalPublication("live Seek before expiry")
+            val before = PlaybackService.exportLocalSnapshot()
+            val starts = SongCachePlaybackMedia.starts.get()
+            assertFalse(j.room.fetched().contains("G"))
+            j.room.coordinationOutage = true
+            await("cached-only exact service output") { !j.graph.playbackCoordinator!!.state.value.connected }
+            j.room.receiverExpired = true; j.room.registrationExpired = true
+            j.room.coordinationEpoch = 3; j.room.allowContinuation = true
+            j.room.controlTrace.clear(); j.room.coordinationOutage = false
+            j.awaitLocalPublication("fresh enrollment and conditional new-epoch grant")
+            assertEquals(listOf("GET", "register", "continue"), j.room.controlTrace.take(3))
+            assertEquals(1, j.room.continuations.get()); assertEquals(2, j.room.registrations.get())
+            val after = PlaybackService.exportLocalSnapshot()
+            assertEquals(starts, SongCachePlaybackMedia.starts.get())
+            assertEquals(before.queue, after.queue); assertEquals(before.occurrence?.eventId, after.occurrence?.eventId)
+            assertTrue(after.elapsed >= before.elapsed); assertTrue(j.room.mutations.isEmpty())
+            assertFalse(j.room.fetched().contains("G"))
+            j.selectThroughAcceptedControls(after.queue.indexOfFirst { it.id == "G" })
+            await("previously uncached G uses secure production HTTP and real PCM after recovery") {
+                j.controller!!.currentMediaItem?.mediaId == "G" && j.controller!!.isPlaying && consumed("G") > 0
+            }
+            assertTrue(j.room.fetched().contains("G")); j.assertHealthy()
+        }
+    }
+
+    @Test fun expiredReceiverContinuationGrantKeepsExplicitCachedPauseAndExactOccurrence() {
+        verifyRecoveryForkTemp()
+        Journey(managedContinuation = true, normalTrackSeconds = 30).use { j ->
+            j.startService(); j.warmPreparedAudioThroughServiceSource("A")
+            val aRequests = j.room.audio.filter { it.id == "A" }
+            j.play("A")
+            assertTrue(j.cacheReadTrace.contains("service:start:key=A:network=false"))
+            assertEquals(aRequests, j.room.audio.filter { it.id == "A" })
+            j.room.coordinationOutage = true
+            await("cached output before Pause") { !j.graph.playbackCoordinator!!.state.value.connected }
+            j.pauseThroughAcceptedControls()
+            await("actual cached Pause") { !j.controller!!.isPlaying && !PlaybackService.exportLocalSnapshot().playing }
+            val paused = PlaybackService.exportLocalSnapshot()
+            val starts = SongCachePlaybackMedia.starts.get()
+            j.room.receiverExpired = true; j.room.registrationExpired = true
+            j.room.coordinationEpoch = 3; j.room.allowContinuation = true
+            j.room.controlTrace.clear(); j.room.coordinationOutage = false
+            j.awaitLocalPublication("paused output obtains real authority without starting")
+            assertEquals(listOf("GET", "register", "continue"), j.room.controlTrace.take(3))
+            assertEquals(1, j.room.continuations.get()); assertEquals(starts, SongCachePlaybackMedia.starts.get())
+            val after = PlaybackService.exportLocalSnapshot()
+            assertFalse(j.controller!!.isPlaying); assertFalse(after.playing)
+            assertEquals(paused.queue, after.queue); assertEquals(paused.occurrence?.eventId, after.occurrence?.eventId)
+            assertEquals(paused.elapsed, after.elapsed, 0.05); j.assertHealthy()
+        }
+    }
+
+    @Test fun heldContinuationResponseAcrossCachedPauseNeedsFreshObservationBeforeSecureReads() {
+        verifyRecoveryForkTemp()
+        Journey(managedContinuation = true, normalTrackSeconds = 30).use { j ->
+            val reply = CountDownLatch(1)
+            val freshRead = CountDownLatch(1)
+            try {
+                j.startService(); j.warmPreparedAudioThroughServiceSource("A")
+                j.play("A", "B", "C", "D", "E", "F", "G")
+                assertTrue(j.cacheReadTrace.contains("service:start:key=A:network=false"))
+                val starts = SongCachePlaybackMedia.starts.get()
+                j.room.coordinationOutage = true
+                await("cached continuation before held grant") { !j.graph.playbackCoordinator!!.state.value.connected }
+                j.room.receiverExpired = true; j.room.registrationExpired = true
+                j.room.coordinationEpoch = 3; j.room.allowContinuation = true
+                j.room.continuationReplyGate = reply; j.room.postGrantReadGate = freshRead
+                j.room.controlTrace.clear(); j.room.coordinationOutage = false
+                await("conditional grant accepted but actual HTTP reply held") { j.room.continuations.get() == 1 }
+                j.pauseThroughAcceptedControls()
+                await("cached controller Pause actually drains output") {
+                    !j.controller!!.isPlaying && !PlaybackService.exportLocalSnapshot().playing
+                }
+                val paused = PlaybackService.exportLocalSnapshot()
+                val history = j.room.history.get()
+                reply.countDown()
+                // Reaching this NEW blocked GET proves the old response settled without
+                // switching to ordinary publication. Do not just sample a transient false.
+                await("fresh post-Pause leadership GET starts while old grant stays unarmed") {
+                    j.room.blockedPostGrantReads.get() == 1
+                }
+                assertFalse(j.graph.playbackCoordinator!!.state.value.connected)
+                assertNull(j.graph.playbackCoordinator!!.currentAuthority())
+                j.assertCachedReadSurvivesButSecureMissIsDenied("A", "G")
+                assertEquals(starts, SongCachePlaybackMedia.starts.get())
+                freshRead.countDown()
+                j.awaitLocalPublication("genuinely fresh paused observation and receiver poll")
+                assertEquals(listOf("GET", "register", "continue", "GET", "poll:renewal"), j.room.controlTrace.take(5))
+                assertEquals(1, j.room.continuations.get())
+                assertEquals(starts, SongCachePlaybackMedia.starts.get())
+                assertEquals(history, j.room.history.get())
+                val after = PlaybackService.exportLocalSnapshot()
+                assertFalse(j.controller!!.isPlaying); assertFalse(after.playing)
+                assertEquals(paused.queue, after.queue); assertEquals(paused.occurrence?.eventId, after.occurrence?.eventId)
+                assertEquals(paused.elapsed, after.elapsed, 0.05); j.assertHealthy()
+            } finally { reply.countDown(); freshRead.countDown() }
         }
     }
 

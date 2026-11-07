@@ -1134,10 +1134,12 @@ class PlaybackCoordinator(
     private suspend fun poll(): Unit = verifyConnection {
         if (cachedOnly) {
             val life = lifecycle
+            val permission = cachedPermission.get() ?: return@verifyConnection
+            val witness = endpoint.continuingOutputWitness(permission)
             val observed = withTimeout(4000) { api.view() }.validated()
             if (life == lifecycle && !closed && serviceActive && work.isActive) {
                 reconcileCachedLeadership(observed)
-                if (cachedOnly) recoverExistingReceiver(observed, life)
+                if (cachedOnly && witness != null) recoverExistingReceiver(observed, life, permission, witness)
             }
             return@verifyConnection
         }
@@ -1222,55 +1224,95 @@ class PlaybackCoordinator(
         if (queue?.deliveryId != null && pending.any { it.deliveryId == queue.deliveryId } && queueExecution === queue)
             queueExecution = null
     }
-    /** Read leadership FIRST, then renew only an existing exact receiver. Neither request
-     * carries state/ACKs or selection intent. Uncertain old publications remain discarded. */
-    private suspend fun recoverExistingReceiver(observed: PlaybackDevicesView, life: Long) {
-        val permission = cachedPermission.get() ?: return
-        val own = ownRegistration ?: return // Legacy/unknown receiver cannot prove this seam.
+    /** Leadership GET precedes every reconnect write. Enrollment is only identity;
+     * only a genuine current-owner poll or the landed conditional continuation grant
+     * can restore a lease. Neither carries musical state, ACKs or selection intent. */
+    private suspend fun recoverExistingReceiver(observed: PlaybackDevicesView, life: Long,
+        permission: CachedPlaybackPermission, witness: Any) {
+        var own = ownRegistration ?: return // Legacy/unknown receiver cannot prove this seam.
         val id = state.value.deviceId
         val e = epoch; val g = generation; val revision = actionVersion
+        val leadRevision = observed.leadership?.revision ?: return
         fun current() = life == lifecycle && cachedOnly && !closed && serviceActive && work.isActive &&
             cachedPermission.get() === permission && permission.isValid() &&
-            generation == g && epoch == e && actionVersion == revision
-        fun exactReceiver(view: PlaybackDevicesView) =
-            view.leadership?.names(id) == true && (view.leadership?.revision ?: -1L) >= lastLeadRevision &&
-                view.registration?.devices?.singleOrNull { it.deviceId == id } == own &&
-                view.activeDeviceId == id && view.epoch == e && view.transfer == null &&
-                view.quarantineMs == 0L && view.directives.isEmpty() &&
-                view.devices.any { it.deviceId == id && it.available }
-        if (!current() || !exactReceiver(observed)) return
-        val sent = clockMs()
-        val renewed = try {
-            withTimeout(4000) { api.poll(id, e, null, null, emptyList(), null) }.validated()
+            generation == g && epoch == e && actionVersion == revision && ownRegistration == own &&
+            endpoint.continuingOutputWitness(permission) === witness
+        fun sameLead(view: PlaybackDevicesView) = view.leadership?.let {
+            it.names(id) && it.revision == leadRevision && it.revision >= lastLeadRevision
+        } == true
+        fun quiet(view: PlaybackDevicesView) = view.transfer == null && view.quarantineMs == 0L &&
+            view.directives.isEmpty() && view.activeDeviceId in setOf("", id)
+        suspend fun attempt(block: suspend () -> PlaybackDevicesView): PlaybackDevicesView? = try {
+            withTimeout(4000) { block() }.validated()
         } catch (error: Exception) {
             if (error is CancellationException && error !is TimeoutCancellationException) throw error
             if (error is ApiException && error.status == 401) throw error
-            return // Failed renewal is not a new grant or revocation of cached permission.
+            null // Uncertain grants are observed next time, never replayed as musical work.
         }
+        if (!current() || own.deviceId != id || own.receiverId != registrationReceiverId ||
+            !sameLead(observed) || !quiet(observed)) return
+        var view = observed
+        val listed = view.registration?.devices?.singleOrNull { it.deviceId == id }
+        if (listed != null && listed.receiverId != own.receiverId) {
+            // A stable installation name cannot let an old service replace its live successor.
+            fenceLocal()
+            message("Playback receiver changed. Cached playback stopped.")
+            return
+        }
+        if (listed != own) {
+            if (view.registration == null || !registrationPacing.mayAttempt(clockMs())) return
+            val enrollmentAttempt = registrationPacing.dispatched(clockMs())
+            val registered = attempt { api.register(view.devices.find { it.deviceId == id }?.name ?: name,
+                if (receiverRegistered) 1 else null, id, registrationReceiverId) } ?: return
+            if (!current()) return
+            reconcileCachedLeadership(registered)
+            if (!current() || !sameLead(registered) || !quiet(registered) || registered.deviceId != id) return
+            val accepted = registered.registration?.devices?.singleOrNull { it.deviceId == id } ?: return
+            if (accepted.receiverId != registrationReceiverId) return
+            // This authenticated enrollment receipt, NOT the preceding GET, captures
+            // the issuer generation. It still grants no output or musical publication.
+            own = accepted; ownRegistration = accepted
+            registrationPacing.confirmed(enrollmentAttempt)
+            acknowledgedUpload = null
+            view = registered
+        }
+        if (!current() || view.registration?.devices?.singleOrNull { it.deviceId == id } != own) return
+        val requestEpoch = view.epoch
+        val continuingOwner = view.activeDeviceId == id
+        val sent = clockMs()
+        val renewed = attempt {
+            if (continuingOwner) api.poll(id, requestEpoch, null, null, emptyList(), null)
+            else api.continueReceiver(own, requestEpoch, leadRevision)
+        } ?: return
         if (!current()) return
-        // A newer preference wins even if the old receiver's poll itself succeeded.
         reconcileCachedLeadership(renewed)
-        if (!current() || !exactReceiver(renewed)) return
+        val expectedEpoch = if (continuingOwner) requestEpoch else requestEpoch + 1
+        if (!current() || !sameLead(renewed) || !quiet(renewed) || renewed.activeDeviceId != id ||
+            renewed.epoch != expectedEpoch || renewed.registration?.devices?.singleOrNull { it.deviceId == id } != own ||
+            renewed.devices.none { it.deviceId == id && it.available }) return
         val deadline = sent + (renewed.leaseMs - 2000).coerceAtLeast(0)
         if (clockMs() >= deadline) return
         val before = state.value
-        leaseDeadline = deadline; released = false; activatedEpoch = e
-        sequence = maxOf(sequence, renewed.stateSeq)
-        // The genuine poll is the sole source of this lease. The native endpoint must
-        // acknowledge its exact continuing output before we resume ordinary publication.
+        if (renewed.epoch != epoch) { epoch = renewed.epoch; generation++; sequence = renewed.stateSeq }
+        else sequence = maxOf(sequence, renewed.stateSeq)
+        acknowledgedUpload = null; retainedSemanticCheck = null
+        leaseDeadline = deadline; released = false; activatedEpoch = epoch
+        // Re-arm the ACTUAL service owner for secure uncached reads. This synchronous
+        // acknowledgement cannot import, prepare/start, seek or reset queue/history.
         mutableState.value = before.copy(view = renewed, connected = true, exclusiveOwner = true,
             recovery = PlaybackConnectionRecovery.NONE, canQueueIntent = false, queueIntentBinding = null,
             message = "", messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
         val authority = executionAuthority()
-        val accepted = authority != null && endpoint.renewContinuingOutput(permission, authority)
+        val accepted = authority != null && endpoint.renewContinuingOutput(permission, authority, witness)
         if (!accepted) {
             revokeAuthority(); leaseDeadline = 0; released = true; activatedEpoch = 0
             mutableState.value = before
-            return
+            return // A real server grant may remain; next GET/poll reconciles it, never rollback.
         }
         cachedOnly = false; uncertainConnection = false; recoverPaused = false
-        // No activation/import/start or old ACK replay. The next normal poll publishes
-        // the ACTUAL continuing local queue/history, never the stale server snapshot.
+        observeInteractionBinding(id, renewed)
+        // The next ordinary poll publishes ACTUAL local state, never a stale server
+        // snapshot or uncertain old ACK/history. Pause/stopped intent stays untouched.
         scheduleLeaseExpiry(renewed, id)
     }
 
@@ -1834,7 +1876,15 @@ class PlaybackCoordinator(
         // reconciled through leadership-only GET, never by replaying the failed request.
         val uncertain = error is java.io.IOException || error is TimeoutCancellationException ||
             error is ApiException && (error.status >= 500 || error.status == 404)
-        if (uncertain && retainCachedPlayback()) {
+        if ((uncertain || error is ApiException && error.status == 409) && retainCachedPlayback()) {
+            if (error is ApiException && error.status == 409) {
+                // A server restart/fenced epoch can be the first sign of loss. Honor
+                // authenticated leadership revocation in its safe view immediately;
+                // recovery still starts with a fresh GET and never consumes directives.
+                val safe = try { error.responseBody?.let(PlaybackDevicesView::fromJson)?.validated() }
+                    catch (_: IllegalArgumentException) { null }
+                if (safe != null) reconcileCachedLeadership(safe)
+            }
             clearSelectionFeedback(feedbackAtDispatch)
             return
         }

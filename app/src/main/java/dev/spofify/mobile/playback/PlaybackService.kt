@@ -176,8 +176,10 @@ class PlaybackService : MediaSessionService() {
             active.get()?.dispatchCachedTransport(command, isCurrent) == true
         fun retainCachedOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Boolean =
             active.get()?.retainCachedPlayback(permission) == true
+        fun continuingOutputWitness(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Any? =
+            active.get()?.captureContinuingOutputWitness(permission)
         fun renewContinuingOutput(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission,
-            authority: PlaybackAuthority): Boolean = active.get()?.renewContinuingPlayback(permission, authority) == true
+            authority: PlaybackAuthority, witness: Any): Boolean = active.get()?.renewContinuingPlayback(permission, authority, witness) == true
         fun interruptLocalQueueIntentStart(): Boolean = active.get()?.interruptQueueIntentStart() == true
         suspend fun activateSnapshot(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult =
             active.get()?.importSnapshot(snapshot, authority) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
@@ -220,6 +222,10 @@ class PlaybackService : MediaSessionService() {
     @Volatile private var cachedQueueEpoch = -1L
     @Volatile private var authority: PlaybackAuthority? = null
     @Volatile private var authorityRequestEpoch = -1L
+    // Monotonic identity retirement, independent of cached-read permission and playing.
+    // A completed Pause/Resume cannot make a pre-Pause recovery observation current again.
+    private var recoveryActionWitness: Any = Any()
+    private fun retireRecoveryWitness() { recoveryActionWitness = Any() }
     private var authenticatedSession: Session? = null
     private var audioCache: SongCache.SessionCache? = null
     private data class PrefetchRequest(val trackId: String, val spec: DataSpec)
@@ -821,6 +827,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun releasePlayback() {
+        retireRecoveryWitness()
         if (active.get() === this) {
             onServiceActiveChanged?.invoke(false)
             active.clear()
@@ -898,6 +905,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun settleTerminalOutput() {
+        retireRecoveryWitness()
         cancelSongPrefetch()
         val current = player ?: return
         sampleHistory(current.currentMediaItem, current.currentPosition, historyWasPlaying)
@@ -911,6 +919,7 @@ class PlaybackService : MediaSessionService() {
 
     private fun interruptForSystemPause() {
         if (active.get() !== this) return
+        retireRecoveryWitness()
         if (!hasAuthority() && cachedPermission != null) { PlaybackRequests.invalidate(); suspendBufferedOutput(); return }
         val owner = (application as SpofifyApplication).graph.playbackCoordinator
         // Both focus loss and noisy events cancel pending preparation as well as audible audio.
@@ -933,6 +942,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun suspendBufferedOutput() {
+        retireRecoveryWitness()
         cachedPermission = null; cachedRequestEpoch = -1L; cachedQueueEpoch = -1L
         cancelSongPrefetch()
         promotionPending = null
@@ -1111,9 +1121,12 @@ class PlaybackService : MediaSessionService() {
         client === (application as SpofifyApplication).graph.client &&
         authenticatedSession?.let { client?.hasValidSession(it) } == true
 
+    private fun captureContinuingOutputWitness(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Any? =
+        recoveryActionWitness.takeIf { cachedPermission === permission && hasCachedPermission() && pendingStart == null }
+
     private fun renewContinuingPlayback(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission,
-        value: PlaybackAuthority): Boolean {
-        if (cachedPermission !== permission || !hasCachedPermission() || pendingStart != null ||
+        value: PlaybackAuthority, witness: Any): Boolean {
+        if (captureContinuingOutputWitness(permission) !== witness ||
             !value.isValid() || player?.currentMediaItem == null) return false
         // This exact service/request/queue/session already owns the continuation. Restoring
         // its REAL lease changes neither musical state nor stopped intent.
@@ -1237,6 +1250,7 @@ class PlaybackService : MediaSessionService() {
         if (hasAuthority() || !hasCachedPermission()) return false
         if (command.type !in setOf("pause", "close", "resume", "retry", "seek", "next", "previous", "jump", "repeat")) return true
         if (!isCurrent()) return true
+        retireRecoveryWitness() // All accepted cached actions invalidate in-flight recovery.
         if (command.type == "pause") {
             val permission = cachedPermission
             val request = cachedRequestEpoch
@@ -1357,6 +1371,7 @@ class PlaybackService : MediaSessionService() {
                 provenance = queueIntentState?.provenance ?: "legacy-reset")
             return frozenResult("ok")
         }
+        retireRecoveryWitness()
         cancelSongPrefetch()
         promotionPending = null; promotionOccurrence = null
         importing = true
@@ -1551,6 +1566,7 @@ class PlaybackService : MediaSessionService() {
         isCurrent: () -> Boolean = { true }, onTransportMoved: (TraversalRestartReceipt?) -> Unit = {}): PlaybackEndpointResult {
         if (!isCurrent() || !acceptAuthority(value)) return frozenResult("rejected")
         val current = player ?: return frozenResult("rejected", snapshot = PlaybackSnapshot())
+        retireRecoveryWitness()
         // Resolve a legacy incoming toggle against the raw service player's current intent,
         // including buffering, not the remote UI snapshot. Native callers send explicit intent.
         if (command.type == "toggle") return executeOwned(

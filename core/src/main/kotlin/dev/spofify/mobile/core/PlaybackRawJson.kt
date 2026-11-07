@@ -60,6 +60,7 @@ internal object PlaybackRawJson {
                 "register" -> names("action", "name", "queueIntentsVersion", "registration")
                 "poll" -> names("action", "deviceId", "epoch", "stateSeq", "state", "queueIntentState", "acks", "base", "live")
                 "command" -> names("action", "deviceId", "epoch", "commandId", "command")
+                "continue" -> names("action", "deviceId", "epoch", "expectedLeadRevision")
                 "rename" -> names("action", "deviceId", "name")
                 "leave" -> names("action", "deviceId")
                 "transfer" -> names("action", "deviceId", "epoch", "commandId", "targetDeviceId", "selectionSeq", "requireUnselected")
