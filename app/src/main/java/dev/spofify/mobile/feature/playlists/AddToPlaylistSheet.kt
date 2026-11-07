@@ -43,6 +43,7 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.ApiException
+import dev.spofify.mobile.core.ApiJson
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.core.PersonalCollectionsApi
 import dev.spofify.mobile.core.PersonalPlaylistPage
@@ -52,6 +53,7 @@ import dev.spofify.mobile.core.SpofifyClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.serialization.encodeToString
 
 /** Account-local manual targets only. Creating a playlist never implicitly adds the track. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -366,17 +368,24 @@ internal class AddToPlaylistState(
                 if (failure.uncertain) {
                     check(saved.kind == PlaylistKind.MANUAL)
                     val count = saved.trackCount ?: error("Missing count")
-                    check(count in 0..1000)
+                    check(count in 0..Int.MAX_VALUE.toLong())
                     val entryIds = mutableSetOf<String>()
+                    var retainedBytes = 0L
+                    var previousPosition = -1
                     var seen = 0
                     var occurrences = 0
                     do {
                         val page = api.entries(target.id, limit = 100, offset = seen)
                         current()
                         check(page.offset == seen && page.limit in 1..100 && page.items.size <= page.limit &&
-                            page.total.toLong() == count && seen + page.items.size <= count)
+                            page.total.toLong() == count && seen.toLong() + page.items.size <= count)
                         check(page.items.isNotEmpty() || seen.toLong() == count)
                         for (entry in page.items) {
+                            check(entry.position > previousPosition)
+                            previousPosition = entry.position
+                            // Bound actual entry JSON bytes across this read, not a nominal per-song allowance.
+                            retainedBytes += ApiJson.encodeToString(entry).toByteArray(Charsets.UTF_8).size.toLong()
+                            check(retainedBytes <= 16L * 1024 * 1024)
                             check(entryIds.add(entry.id))
                             if (entry.track.id == track.id) occurrences++
                         }

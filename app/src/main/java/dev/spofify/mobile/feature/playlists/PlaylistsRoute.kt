@@ -51,12 +51,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** Entries have no revision: these checks supplement, never replace, the before/after summaries. */
-internal fun validatePlaylistEntryBatch(page: PersonalEntriesPage, offset: Int, total: Long) {
+internal fun validatePlaylistEntryBatch(page: PersonalEntriesPage, offset: Int, total: Long, afterPosition: Int = -1) {
     if (page.offset != offset || page.total.toLong() != total || page.limit != 40 ||
         page.items.size > page.limit || offset.toLong() + page.items.size > total ||
         (page.items.isEmpty() && offset.toLong() < total) ||
         page.items.map { it.id }.toSet().size != page.items.size ||
-        page.items.withIndex().any { (index, entry) -> entry.position != offset + index }) throw playlistBrowseChanged()
+        page.items.any { it.position < 0 } ||
+        page.items.firstOrNull()?.let { it.position <= afterPosition } == true ||
+        page.items.zipWithNext().any { (left, right) -> left.position >= right.position }) throw playlistBrowseChanged()
 }
 
 private fun samePlaylistSnapshot(before: PersonalPlaylistSummary, after: PersonalPlaylistSummary): Boolean =
@@ -635,9 +637,9 @@ private fun PlaylistDetail(
             try {
                 if (change != client.personalRevision.value.playlists) throw playlistBrowseChanged()
                 if (baseline.kind == PlaylistKind.MANUAL) {
-                    if (requestedOffset > 1_000_000 || !samePlaylistSnapshot(baseline, api.playlist(id))) throw playlistBrowseChanged()
+                    if (!samePlaylistSnapshot(baseline, api.playlist(id))) throw playlistBrowseChanged()
                     val next = api.entries(id, limit = 40, offset = requestedOffset)
-                    validatePlaylistEntryBatch(next, requestedOffset, baseline.trackCount!!)
+                    validatePlaylistEntryBatch(next, requestedOffset, baseline.trackCount!!, manualEntries.lastOrNull()?.position ?: -1)
                     val after = api.playlist(id)
                     if (!samePlaylistSnapshot(baseline, after) ||
                         next.items.any { entry -> manualEntries.any { it.id == entry.id } }) throw playlistBrowseChanged()

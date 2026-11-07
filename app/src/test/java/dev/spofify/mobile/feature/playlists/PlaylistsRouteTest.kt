@@ -159,11 +159,15 @@ class PlaylistsRouteTest {
         val track = LibraryItem("track", "same", "Song", hasAudio = true)
         val entries = listOf(PersonalPlaylistEntry("first", 40, track), PersonalPlaylistEntry("second", 41, track))
         val valid = PersonalEntriesPage(entries, total = 42, offset = 40)
-        validatePlaylistEntryBatch(valid, 40, 42)
+        validatePlaylistEntryBatch(valid, 40, 42, afterPosition = 39)
+        validatePlaylistEntryBatch(valid.copy(items = listOf(entries[0], entries[1].copy(position = 99))), 40, 42, afterPosition = 39)
+        // Catalog deletion may leave gaps, including before the first surviving entry.
+        validatePlaylistEntryBatch(PersonalEntriesPage(listOf(entries[0].copy(position = 4), entries[1].copy(position = 9)), total = 2), 0, 2)
         for (page in listOf(valid.copy(offset = 0), valid.copy(total = 43),
             valid.copy(items = listOf(entries[0], entries[0])),
-            valid.copy(items = listOf(entries[0].copy(position = 39))), valid.copy(items = emptyList()))) {
-            assertThrows(ApiException::class.java) { validatePlaylistEntryBatch(page, 40, 42) }
+            valid.copy(items = listOf(entries[0].copy(position = 39))),
+            valid.copy(items = entries.reversed()), valid.copy(items = emptyList()))) {
+            assertThrows(ApiException::class.java) { validatePlaylistEntryBatch(page, 40, 42, afterPosition = 39) }
         }
     }
 

@@ -3,6 +3,7 @@ package dev.spofify.mobile.core
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -166,14 +167,21 @@ class PersonalCollectionsApi(client: SpofifyClient) {
         val before = playlist(id)
         require(before.kind == PlaylistKind.MANUAL && before.capabilities.editEntries) { "Only manual playlists have editable entries" }
         val count = before.trackCount ?: throw incompatiblePersonalResponse()
-        require(count in 0..1000) { "The complete playlist exceeds the reorder bound" }
+        require(count in 0..Int.MAX_VALUE.toLong()) { "The playlist order cannot be represented" }
         val all = mutableListOf<PersonalPlaylistEntry>()
+        var retainedBytes = 0L
         while (all.size.toLong() < count) {
             val page = entries(id, limit = 100, offset = all.size)
             if (page.total.toLong() != count || page.offset != all.size || page.limit !in 1..100 ||
-                page.items.isEmpty() || page.items.size > page.limit || all.size + page.items.size > count) {
+                page.items.isEmpty() || page.items.size > page.limit || all.size.toLong() + page.items.size > count ||
+                page.items.first().position < 0 ||
+                page.items.first().position <= (all.lastOrNull()?.position ?: -1) ||
+                page.items.zipWithNext().any { (left, right) -> left.position >= right.position }) {
                 throw snapshotChanged()
             }
+            // Admit actual serialized metadata bytes across pages, never a fixed allowance per song.
+            retainedBytes += page.items.sumOf { ApiJson.encodeToString(it).toByteArray(Charsets.UTF_8).size.toLong() }
+            require(retainedBytes <= MANUAL_SNAPSHOT_BYTES) { "The playlist order is too large to load" }
             all.addAll(page.items)
         }
         if (all.map { it.id }.toSet().size != all.size) throw snapshotChanged()
@@ -197,15 +205,18 @@ class PersonalCollectionsApi(client: SpofifyClient) {
 
     suspend fun reorder(snapshot: ManualPlaylistSnapshot, entryIds: List<String>): PersonalPlaylistSummary {
         val original = snapshot.entryIds
-        require(original.size <= 1000 && original.size.toLong() == snapshot.playlist.trackCount &&
+        require(original.size.toLong() == snapshot.playlist.trackCount &&
             entryIds.size == original.size && entryIds.toSet().size == entryIds.size && entryIds.toSet() == original.toSet()) {
             "Reorder requires an exact permutation of the complete occurrence order"
         }
         requirePersonalRevision(snapshot.playlist.revision)
-        return confirmedPlaylistMutation(transport.client, transport.send("PUT", personalPlaylistPath(snapshot.playlist.id) + "order", buildJsonObject {
-            putJsonArray("entryIds") { entryIds.forEach { add(JsonPrimitive(it)) } }
+        val body = buildJsonObject {
+            putJsonArray("entryIds") { entryIds.forEach { add(JsonPrimitive(requirePersonalId(it))) } }
             put("expectedRevision", snapshot.playlist.revision)
-        }, emptyMap()))
+        }
+        // Match the server's JSON request-byte admission before dispatching any mutation.
+        require(body.toString().toByteArray(Charsets.UTF_8).size <= MANUAL_ORDER_REQUEST_BYTES) { "The playlist order is too large to save" }
+        return confirmedPlaylistMutation(transport.client, transport.send("PUT", personalPlaylistPath(snapshot.playlist.id) + "order", body, emptyMap()))
     }
 
     suspend fun playback(id: String): PersonalPlayback = personalDecode(transport.get(personalPlaylistPath(id) + "playback", emptyMap()))
@@ -220,6 +231,9 @@ class PersonalCollectionsApi(client: SpofifyClient) {
     suspend fun loadCompleteOrder(id: String) = completeSnapshot(id)
 }
 
+private const val MANUAL_SNAPSHOT_BYTES = 16L * 1024 * 1024
+private const val MANUAL_ORDER_REQUEST_BYTES = 64 * 1024
+
 internal val personalPlaylistsPath = listOf("api", "me", "playlists")
 internal fun personalPlaylistPath(id: String) = personalPlaylistsPath + requirePersonalId(id)
 internal fun requirePersonalId(id: String): String {
@@ -232,7 +246,7 @@ internal fun revisionBody(revision: Long): JsonObject {
     return buildJsonObject { put("expectedRevision", revision) }
 }
 internal fun personalPageQuery(limit: Int, offset: Int): Map<String, String> {
-    require(limit in 1..100 && offset in 0..1_000_000) { "Invalid page" }
+    require(limit in 1..100 && offset >= 0) { "Invalid page" }
     return linkedMapOf("limit" to limit.toString(), "offset" to offset.toString())
 }
 internal fun validatePlaylistMetadata(name: String, description: String) {

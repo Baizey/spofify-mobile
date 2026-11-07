@@ -109,6 +109,22 @@ class PersonalCollectionsApiTest {
         assertEquals(initial.playlists + 1, client.personalRevision.value.playlists)
     }
 
+    @Test fun sparseStoredPositionsRemainCanonicalAcrossPagesAndCanBeReordered() = runBlocking {
+        authenticate()
+        web.enqueue(jsonResponse(summary()))
+        web.enqueue(jsonResponse(entriesPage(0, 1, 2)))
+        web.enqueue(jsonResponse(entriesPage(1, 1, 2).replace("\"position\":1", "\"position\":4")))
+        web.enqueue(jsonResponse(summary()))
+        val snapshot = api.loadCompleteOrder("p")
+        assertEquals(listOf(0, 4), snapshot.entries.map { it.position })
+        assertEquals(listOf("e0", "e1"), snapshot.entryIds)
+        repeat(4) { assertEquals("GET", web.takeRequest().method) }
+        web.enqueue(jsonResponse(summary(revision = 2)))
+        api.reorder(snapshot, snapshot.entryIds.reversed())
+        assertEquals(listOf("e1", "e0"), body(web.takeRequest().body.readUtf8())["entryIds"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(6, web.requestCount)
+    }
+
     @Test fun completeOrderRejectsRevisionChangeEvenWhenCountAndTrackIdsStayEqual() = runBlocking {
         web.enqueue(jsonResponse(summary()))
         web.enqueue(jsonResponse(entriesPage(0, 2, 2)))
@@ -119,14 +135,69 @@ class PersonalCollectionsApiTest {
         assertEquals(3, web.requestCount)
     }
 
-    @Test fun completeOrderRejectsIncompleteOrUnboundedOrders() = runBlocking {
-        web.enqueue(jsonResponse(summary(count = 1001)))
-        assertThrows(IllegalArgumentException::class.java) { runBlocking { api.loadCompleteOrder("p") } }
-        web.takeRequest()
+    @Test fun completeOrderRejectsIncompleteOrders() = runBlocking {
         web.enqueue(jsonResponse(summary()))
         web.enqueue(jsonResponse(entriesPage(0, 0, 2)))
         assertEquals(409, apiFailure { api.loadCompleteOrder("p") }.status)
-        assertEquals(3, web.requestCount)
+        assertEquals(2, web.requestCount)
+    }
+
+    @Test fun completeOrderBeyond1000UsesEveryPageAndReordersEveryDuplicateOccurrence() = runBlocking {
+        authenticate()
+        val count = 1201
+        web.enqueue(jsonResponse(summary(count = count)))
+        for (offset in 0 until count step 100) {
+            web.enqueue(jsonResponse(entriesPage(offset, minOf(100, count - offset), count)))
+        }
+        web.enqueue(jsonResponse(summary(count = count)))
+        val snapshot = api.loadCompleteOrder("p")
+        assertEquals(count, snapshot.entries.size)
+        assertEquals(List(count) { "e$it" }, snapshot.entryIds)
+        assertEquals(1, snapshot.entries.map { it.track.id }.toSet().size)
+        repeat(15) { assertEquals("GET", web.takeRequest().method) }
+        web.enqueue(jsonResponse(summary(count = count, revision = 2)))
+        api.reorder(snapshot, snapshot.entryIds.reversed())
+        val order = web.takeRequest()
+        assertEquals(List(count) { "e${count - 1 - it}" },
+            body(order.body.readUtf8())["entryIds"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(17, web.requestCount) // Login, complete read and one mutation; no prefix or replay.
+    }
+
+    @Test fun reorderRejectsActualUtf8RequestOverflowBeforeAnyWrite() = runBlocking {
+        val before = client.personalRevision.value
+        val entries = List(150) { index -> PersonalPlaylistEntry("界".repeat(160) + index, index, LibraryItem("track", "same", "Song")) }
+        val snapshot = ManualPlaylistSnapshot(PersonalPlaylistSummary("p", "Mix", trackCount = 150, availableCount = 150, revision = 1), entries)
+        // Same count, different actual encoded bytes: the ASCII order fits; the Unicode order does not.
+        val asciiEntries = entries.map { it.copy(id = it.position.toString()) }
+        val ascii = ManualPlaylistSnapshot(snapshot.playlist, asciiEntries)
+        authenticate()
+        web.enqueue(jsonResponse(summary(count = 150, revision = 2)))
+        api.reorder(ascii, ascii.entryIds.reversed())
+        assertEquals("PUT", web.takeRequest().method)
+        assertThrows(IllegalArgumentException::class.java) { runBlocking { api.reorder(snapshot, snapshot.entryIds.reversed()) } }
+        assertEquals(2, web.requestCount)
+        assertEquals(before.playlists + 1, client.personalRevision.value.playlists)
+    }
+
+    @Test fun completeOrderRejectsAggregateMetadataBytesWithoutPublishingAPrefix() = runBlocking {
+        val initial = client.personalRevision.value
+        web.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): okhttp3.mockwebserver.MockResponse {
+                val offset = request.requestUrl!!.queryParameter("offset")?.toInt()
+                return if (offset == null) jsonResponse(summary(count = 200))
+                else jsonResponse(entriesPage(offset, 10, 200).replace("\"name\":\"Song\"", "\"name\":\"${"x".repeat(128 * 1024)}\""))
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) { runBlocking { api.loadCompleteOrder("p") } }
+        assertTrue(web.requestCount in 2..20)
+        repeat(web.requestCount) { assertEquals("GET", web.takeRequest().method) }
+        assertEquals(initial, client.personalRevision.value)
+    }
+
+    @Test fun personalEntryPagesAllowRepresentableOffsetsBeyondOldCeiling() = runBlocking {
+        web.enqueue(jsonResponse("""{"items":[],"total":1000001,"limit":100,"offset":1000001}"""))
+        api.entries("p", limit = 100, offset = 1_000_001)
+        assertEquals("1000001", web.takeRequest().requestUrl!!.queryParameter("offset"))
     }
 
     @Test fun manualPlaybackKeepsFlatDuplicateEntryIdentityAndContext() = runBlocking {
@@ -184,6 +255,17 @@ class PersonalCollectionsApiTest {
         web.takeRequest()
         assertEquals(3, web.requestCount)
         assertEquals(initial, client.personalRevision.value)
+    }
+
+    @Test fun storageByteRejectionKeepsTypedCodeButNeverPrivateMessageOrMutationRevision() = runBlocking {
+        authenticate()
+        val initial = client.personalRevision.value
+        web.enqueue(jsonResponse("""{"error":{"code":"PLAYLIST_STORAGE_EXCEEDED","message":"private /server/data"}}""", 422))
+        val error = apiFailure { api.add("p", "same", 1) }
+        assertEquals("PLAYLIST_STORAGE_EXCEEDED", error.code)
+        assertFalse(error.message.contains("private"))
+        assertEquals(initial, client.personalRevision.value)
+        assertEquals(2, web.requestCount)
     }
 
     private suspend fun authenticate() {

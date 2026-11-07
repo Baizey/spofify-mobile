@@ -378,13 +378,13 @@ class AddToPlaylistSheetTest {
         }
     }
 
-    @Test fun lostAddCanCountOccurrencesButCannotInferWhetherLastAddSucceeded() = runTest {
+    @Test fun lostAddCanCountSparseOccurrencesButCannotInferWhetherLastAddSucceeded() = runTest {
         MockWebServer().use { web ->
             web.start()
             web.enqueue(response(page(listOf(summary()))))
             web.enqueue(response("{}", 500))
             web.enqueue(response(summary(count = 2)))
-            web.enqueue(response("""{"items":[{"id":"e1","position":0,"track":{"kind":"track","id":"t","name":"Song"}},{"id":"e2","position":1,"track":{"kind":"track","id":"t","name":"Song"}}],"total":2,"limit":100,"offset":0}"""))
+            web.enqueue(response("""{"items":[{"id":"e1","position":0,"track":{"kind":"track","id":"t","name":"Song"}},{"id":"e2","position":4,"track":{"kind":"track","id":"t","name":"Song"}}],"total":2,"limit":100,"offset":0}"""))
             web.enqueue(response(summary(count = 2)))
             val state = state(web)
             state.loadTargets(0)
@@ -400,6 +400,61 @@ class AddToPlaylistSheetTest {
             assertFalse(state.canAdd)
             state.add()
             assertEquals(5, web.requestCount)
+        }
+    }
+
+    @Test fun lostAddBeyond1000VerifiesCompleteOrderWithoutRestoringWriteAuthority() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            val count = 1201
+            web.enqueue(response(page(listOf(summary(count = count - 1)))))
+            web.enqueue(response("{}", 503))
+            web.enqueue(response(summary(revision = 8, count = count)))
+            for (offset in 0 until count step 100) {
+                val entries = (offset until minOf(offset + 100, count)).joinToString(",") {
+                    """{"id":"e$it","position":$it,"track":{"kind":"track","id":"t","name":"Song"}}"""
+                }
+                web.enqueue(response("""{"items":[$entries],"total":$count,"limit":100,"offset":$offset}"""))
+            }
+            web.enqueue(response(summary(revision = 8, count = count)))
+            val state = state(web)
+            state.loadTargets(0); until { !state.busy }
+            state.add(); until { !state.busy }
+            state.verify(); until { !state.busy }
+            assertTrue(state.message.contains("1201 occurrences"))
+            assertNotNull(state.blocked)
+            assertFalse(state.canAdd)
+            repeat(3) { state.add(); state.create() }
+            val requests = (0 until web.requestCount).map { web.takeRequest(1, TimeUnit.SECONDS)!! }
+            assertEquals(1, requests.count { it.method == "POST" })
+            assertEquals((0 until count step 100).map { it.toString() }, requests.mapNotNull { it.requestUrl!!.queryParameter("offset").takeIf { _ -> it.path!!.contains("/entries?") } })
+            assertEquals(17, requests.size)
+        }
+    }
+
+    @Test fun verificationRejectsAggregateEntryBytesWithoutReportingAPrefixOrReplaying() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            web.enqueue(response(page(listOf(summary(count = 50)))))
+            web.enqueue(response("{}", 503))
+            web.enqueue(response(summary(revision = 8, count = 50)))
+            for (offset in 0 until 40 step 10) {
+                val entries = (offset until offset + 10).joinToString(",") {
+                    """{"id":"e$it","position":$it,"track":{"kind":"track","id":"t","name":"${"x".repeat(512 * 1024)}"}}"""
+                }
+                web.enqueue(response("""{"items":[$entries],"total":50,"limit":100,"offset":$offset}"""))
+            }
+            val state = state(web)
+            state.loadTargets(0); until { !state.busy }
+            state.add(); until { !state.busy }
+            state.verify(); until { !state.busy }
+            assertNotNull(state.blocked)
+            assertFalse(state.canAdd)
+            assertFalse(state.message.contains("occurrences of this track"))
+            state.add(); state.create()
+            val requests = (0 until web.requestCount).map { web.takeRequest(1, TimeUnit.SECONDS)!! }
+            assertEquals(1, requests.count { it.method == "POST" })
+            assertEquals(7, requests.size)
         }
     }
 
