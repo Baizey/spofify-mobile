@@ -71,15 +71,15 @@ class AddToPlaylistSheetHostTest {
                 } }
                 waitFor("Playlist p0")
                 compose.waitForIdle()
-                compose.onNodeWithText("Add track").assertIsEnabled()
+                compose.onNodeWithText("Add").assertIsEnabled()
                 val before = client.personalRevision.value.playlists
 
                 // No click, scroll, draft edit or explicit freshness helper may make this pass.
                 // The production host must observe this emission while otherwise idle.
                 compose.runOnIdle { client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
                 assertEquals(before + 1, client.personalRevision.value.playlists)
-                waitFor("Playlists changed. Refresh before choosing a target.")
-                compose.onNodeWithText("Add track").assertIsNotEnabled()
+                waitFor("Playlists changed.")
+                compose.onNodeWithText("Add").assertIsNotEnabled()
                 compose.onNode(hasText("Playlist p0") and hasClickAction()).assertIsNotEnabled()
                 compose.onNodeWithText("Refresh playlists").assertExists()
                 assertEquals("Invalidation neither writes nor automatically resets the chooser", 2, web.requestCount)
@@ -87,7 +87,9 @@ class AddToPlaylistSheetHostTest {
                 web.enqueue(json("""{"items":[${summary("p1", 8)}],"total":1,"limit":40,"offset":0}"""))
                 compose.onNodeWithText("Refresh playlists").performClick()
                 waitFor("Playlist p1")
-                compose.onNodeWithText("Add track").assertIsEnabled()
+                compose.onNodeWithText("Add").assertIsNotEnabled()
+                compose.onNode(hasText("Playlist p1") and hasClickAction()).performClick()
+                compose.onNodeWithText("Add").assertIsEnabled()
                 assertEquals(3, web.requestCount)
                 assertEquals("POST", web.takeRequest(1, TimeUnit.SECONDS)!!.method) // Synthetic login only.
                 repeat(2) { assertEquals("GET", web.takeRequest(1, TimeUnit.SECONDS)!!.method) }
@@ -128,31 +130,32 @@ class AddToPlaylistSheetHostTest {
                 waitFor("Playlist p2")
                 assertEquals(listOf("0"), requests.filter { it.first == "GET" }.map { it.second })
                 if (uncertainCreate) {
-                    compose.onNodeWithText("Create playlist").performClick()
+                    compose.onNodeWithText("New playlist").performClick()
                     compose.onNodeWithText("Name").performTextInput("Retained draft")
-                    compose.onNodeWithText("Create manual playlist").performScrollTo().performClick()
-                    waitFor("Verify saved playlists")
-                    compose.onNodeWithText("Verify saved playlists").performScrollTo().performClick()
+                    compose.onNodeWithText("Create").assertIsDisplayed().performClick()
+                    waitFor("Review")
+                    compose.onNodeWithText("Review").assertIsDisplayed().performClick()
                     waitFor("Playlist p0", scroll = true)
                     compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Playlist p39"))
                     waitFor("Playlist p40", scroll = true)
                     // Blocked writes remove the create action altogether, but retain the disabled draft.
                     compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Retained draft"))
-                    compose.onNodeWithText("Retained draft").assertIsNotEnabled()
-                    compose.onNodeWithText("Create manual playlist").assertDoesNotExist()
-                    compose.onNodeWithText("Add track").assertDoesNotExist()
+                    compose.onNodeWithText("Retained draft").assert(hasNoClickAction())
+                    compose.onAllNodes(hasSetTextAction()).assertCountEquals(0)
+                    compose.onNodeWithText("Create").assertDoesNotExist()
+                    compose.onNodeWithText("Add").assertDoesNotExist()
                     assertEquals(1, requests.count { it.first == "POST" })
                     assertEquals(listOf("0", "0", "40"), requests.filter { it.first == "GET" }.map { it.second })
                 } else {
                     compose.onNode(hasText("Playlist p2") and hasClickAction()).performClick()
                     compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Playlist p39"))
-                    waitFor("Retry loading playlists")
+                    waitFor("Retry")
                     compose.waitForIdle()
                     assertEquals(listOf("0", "40"), requests.filter { it.first == "GET" }.map { it.second })
-                    compose.onNodeWithText("Retry loading playlists").performScrollTo().performClick()
+                    compose.onNodeWithText("Retry").performScrollTo().performClick()
                     waitFor("Playlist p40", scroll = true)
                     assertEquals(listOf("0", "40", "40"), requests.filter { it.first == "GET" }.map { it.second })
-                    compose.onNodeWithText("Add track").performClick()
+                    compose.onNodeWithText("Add").performClick()
                     compose.waitUntil(5_000) { requests.any { it.first == "POST" } }
                     val add = (0 until web.requestCount).map { web.takeRequest(1, TimeUnit.SECONDS)!! }.last()
                     assertEquals("/api/me/playlists/p2/entries", add.path)
@@ -202,6 +205,220 @@ class AddToPlaylistSheetTest {
         while (!condition() && System.nanoTime() < deadline) { runCurrent(); Thread.sleep(5) }
         runCurrent()
         assertTrue("Timed out waiting for sheet operation", condition())
+    }
+
+    @Test fun refreshPreservesIntendedSelectionButNeverAuthorizesAnOldDto() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            var revision = 0L
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), EmptyStore())
+            val state = AddToPlaylistState(PersonalCollectionsApi(client), track, this, personalRevision = { revision })
+            for (rev in listOf(7, 9)) for (offset in listOf(0, 40)) {
+                web.enqueue(response(page((offset until offset + 40).map { summary("p$it", rev) }, 81, offset)))
+            }
+            state.loadTargets(0); until { !state.busy }
+            state.moreTargets(); until { !state.busy }; state.select("p43")
+            state.name = "Retained draft"; state.query = "p43"
+            revision++; state.checkFreshness(revision)
+            state.refreshTargets()
+            assertEquals(80, state.targets!!.items.size) // Pending refresh keeps the viewport, not old authority.
+            assertNull(state.selected); assertFalse(state.canAdd)
+            until { !state.busy }
+            assertNull(state.selected); assertFalse(state.canAdd)
+            assertEquals(40, state.targets!!.items.size)
+            state.moreTargets(); until { !state.busy }
+            assertEquals("p43", state.selected!!.id)
+            assertEquals(9L, state.selected!!.revision)
+            assertTrue(state.canAdd)
+            assertEquals("Retained draft", state.name); assertEquals("p43", state.query)
+            assertEquals(4, web.requestCount)
+        }
+    }
+
+    @Test fun malformedOrOverlappingPagesCannotEstablishCompleteSearchCoverage() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            web.enqueue(response(page((0 until 40).map { summary("p$it") }, 41)))
+            web.enqueue(response(page(listOf(summary("p39")), 41, 40)))
+            val state = state(web)
+            state.loadTargets(0); until { !state.busy }; state.select("p3")
+            state.query = "Missing"
+            state.moreTargets(); until { !state.busy }
+            assertNotNull(state.targetError)
+            assertFalse(state.targetsEnded)
+            assertTrue(state.presentation.searchIncomplete)
+            assertEquals("p3", state.selected!!.id)
+            assertEquals(40, state.targets!!.items.size)
+            state.moreTargets(); assertEquals(2, web.requestCount)
+        }
+    }
+
+    @Test fun retainedSummaryBytesAreBoundedWithoutTurningAPrefixIntoCompleteResults() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            for (offset in 0..80 step 40) {
+                val items = (offset until offset + 40).map { summary("p$it").replace("Playlist p$it", "x".repeat(200 * 1024)) }
+                web.enqueue(response(page(items, 120, offset)))
+            }
+            val state = state(web)
+            state.loadTargets(0); until { !state.busy }
+            state.moreTargets(); until { !state.busy }
+            assertEquals(80, state.targets!!.items.size)
+            state.moreTargets(); until { !state.busy }
+            assertEquals(80, state.targets!!.items.size)
+            assertNotNull(state.targetError)
+            assertFalse(state.targetsEnded)
+            assertEquals(80, state.targetOffset)
+            assertEquals(3, web.requestCount)
+        }
+    }
+
+    @Test fun searchContinuesPast100TargetsWithoutClaimingCompletePrefixCoverage() = runTest {
+        MockWebServer().use { web ->
+            web.start()
+            for (offset in 0..120 step 40) {
+                web.enqueue(response(page((offset until minOf(offset + 40, 121)).map { summary("p$it") }, 121, offset)))
+            }
+            val state = state(web)
+            state.loadTargets(0); until { !state.busy }; state.select("p3")
+            state.query = "  P120  "
+            assertTrue(state.presentation.targets.isEmpty())
+            assertTrue(state.presentation.searchIncomplete)
+            assertEquals("Playlist p3", state.presentation.hiddenSelection)
+            assertEquals(1, web.requestCount) // Local matching does not invent a server search API.
+            repeat(3) { state.moreTargets(); until { !state.busy } }
+            assertEquals(listOf("p120"), state.presentation.targets.map { it.id })
+            assertFalse(state.presentation.searchIncomplete)
+            assertEquals("p3", state.selected!!.id)
+            assertEquals(121, state.targets!!.items.size)
+            assertEquals(listOf("0", "40", "80", "120"), (0 until 4).map {
+                val request = web.takeRequest(1, TimeUnit.SECONDS)!!
+                assertEquals(setOf("kind", "limit", "offset"), request.requestUrl!!.queryParameterNames)
+                request.requestUrl!!.queryParameter("offset")
+            })
+            state.query = "Absent"
+            assertTrue(state.presentation.targets.isEmpty())
+            assertFalse(state.presentation.searchIncomplete)
+            state.query = ""
+            assertEquals(121, state.presentation.targets.size)
+            assertEquals(4, web.requestCount)
+        }
+    }
+
+    @Test fun cancelledCreationRetainsDraftAndTargetAndNeverWrites() = runTest {
+        MockWebServer().use { web ->
+            web.start(); web.enqueue(response(page(listOf(summary()))))
+            val state = state(web)
+            state.loadTargets(0); until { !state.busy }
+            state.beginCreate(); state.name = "Draft"; state.description = "Retained"
+            state.cancelCreate()
+            assertFalse(state.creating)
+            assertEquals("p", state.selected!!.id)
+            assertTrue(state.canAdd)
+            state.beginCreate()
+            assertEquals("Draft", state.name)
+            assertEquals("Retained", state.description)
+            assertEquals("", state.message)
+            assertEquals(1, web.requestCount)
+        }
+    }
+
+    @Test fun disposalOrAccountReplacementBeforeDispatchPreventsReservedCreateAndRead() = runTest {
+        for (dispose in listOf(true, false)) MockWebServer().use { web ->
+            web.start()
+            var session: Any = Any()
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), EmptyStore())
+            val state = AddToPlaylistState(PersonalCollectionsApi(client), track, this, currentSession = { session })
+            state.beginCreate(); state.name = "Draft"; state.create()
+            assertTrue(state.mutating)
+            if (dispose) state.dispose() else session = Any()
+            runCurrent()
+            assertFalse(state.busy)
+            assertFalse(state.canAdd)
+            assertNull(state.selected)
+            assertEquals(0, web.requestCount)
+            val readState = AddToPlaylistState(PersonalCollectionsApi(client), track, this, currentSession = { session })
+            readState.loadTargets(0)
+            if (dispose) readState.dispose() else session = Any()
+            runCurrent()
+            assertFalse(readState.busy)
+            assertNull(readState.targets)
+            assertEquals(0, web.requestCount)
+        }
+    }
+
+    @Test fun lateCreateAfterDisposalOrAccountReplacementCannotPublishOrAdd() = runTest {
+        for (dispose in listOf(true, false)) {
+            val release = CountDownLatch(1)
+            MockWebServer().use { web ->
+                web.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse {
+                        release.await(5, TimeUnit.SECONDS)
+                        return response(summary("late"), 201)
+                    }
+                }
+                web.start()
+                try {
+                    var session: Any = Any()
+                    val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), EmptyStore())
+                    val state = AddToPlaylistState(PersonalCollectionsApi(client), track, this, currentSession = { session })
+                    state.beginCreate(); state.name = "Draft"; state.create()
+                    until { web.requestCount == 1 }
+                    if (dispose) state.dispose() else session = Any()
+                    release.countDown(); until { !state.busy }
+                    assertNull(state.targets); assertNull(state.selected); assertFalse(state.finished)
+                    assertFalse(state.canAdd); assertFalse(state.createdTarget)
+                    state.add(); state.create(); state.verify()
+                    assertEquals(1, web.requestCount)
+                } finally { release.countDown() }
+            }
+        }
+    }
+
+    @Test fun createdTargetDoesNotBypassLaterPersonalRevisionFence() = runTest {
+        MockWebServer().use { web ->
+            web.start(); web.enqueue(response(summary("new"), 201))
+            var revision = 0L
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), EmptyStore())
+            val state = AddToPlaylistState(PersonalCollectionsApi(client), track, this, personalRevision = { revision })
+            state.beginCreate(); state.name = "New"; state.create(); until { !state.busy }
+            assertTrue(state.canAdd)
+            revision++; state.checkFreshness(revision)
+            assertTrue(state.targetsStale); assertFalse(state.canAdd)
+            state.add(); assertEquals(1, web.requestCount)
+            web.enqueue(response(page(listOf(summary("new", revision = 9)))))
+            state.refreshTargets(); until { !state.busy }
+            assertFalse(state.createdTarget); assertTrue(state.canAdd)
+            assertEquals(9L, state.selected!!.revision)
+        }
+    }
+
+    @Test fun personalRevisionChangeAfterAddReservationPreventsDispatch() = runTest {
+        MockWebServer().use { web ->
+            web.start(); web.enqueue(response(page(listOf(summary()))))
+            var revision = 0L
+            val client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), EmptyStore())
+            val state = AddToPlaylistState(PersonalCollectionsApi(client), track, this, personalRevision = { revision })
+            state.loadTargets(0); until { !state.busy }
+            state.add(); revision++; runCurrent()
+            assertEquals(1, web.requestCount)
+            assertNotNull(state.blocked); assertFalse(state.blocked!!.uncertain)
+            assertEquals("Playlist changed.", state.message)
+            assertFalse(state.canAdd)
+        }
+    }
+
+    @Test fun readFailuresRetainActualAccountPermissionAndUnavailableStates() = runTest {
+        for ((status, message) in listOf(401 to "Session expired. Sign in again.", 403 to "Permission denied.",
+            404 to "Playlist unavailable.", 429 to "Too many requests. Try later.")) {
+            MockWebServer().use { web ->
+                web.start(); web.enqueue(response("{\"private\":\"backend detail\"}", status))
+                val state = state(web)
+                state.loadTargets(0); until { !state.busy }
+                assertEquals(message, state.targetError)
+                assertNull(state.targets); assertFalse(state.canAdd)
+            }
+        }
     }
 
     @Test fun recoveryDecisionsBlockEveryUncertainOutcomeAndConflict() {
@@ -265,7 +482,10 @@ class AddToPlaylistSheetTest {
             assertEquals(2, web.requestCount)
             assertEquals("p3", state.selected!!.id)
             assertEquals(40, state.targets!!.items.size)
-            state.retryTargets(); state.retryTargets(); until { !state.busy }
+            state.retryTargets()
+            assertTrue(state.reading)
+            assertNotNull(state.presentation.targetError)
+            state.retryTargets(); until { !state.busy }
             assertEquals(80, state.targets!!.items.size)
             state.moreTargets(); until { !state.busy }
             assertTrue(state.targetsEnded)
@@ -309,7 +529,10 @@ class AddToPlaylistSheetTest {
             repeat(4) { state.moreVerification(); state.add(); state.create() }
             assertEquals(3, web.requestCount)
             assertEquals(40, state.verifiedTargets!!.items.size)
-            state.retryVerification(); state.retryVerification(); until { !state.busy }
+            state.retryVerification()
+            assertTrue(state.reading)
+            assertNotNull(state.presentation.reviewError)
+            state.retryVerification(); until { !state.busy }
             assertEquals(41, state.verifiedTargets!!.items.size)
             assertTrue(state.verificationEnded)
             assertEquals(blocked, state.blocked)
@@ -326,6 +549,7 @@ class AddToPlaylistSheetTest {
             web.enqueue(response(summary("new", revision = 2, count = 1)))
             val state = state(web)
             state.beginCreate()
+            state.query = "An earlier search"
             state.name = "  New mix  "
             state.description = "  Description  "
             state.create()
@@ -335,6 +559,9 @@ class AddToPlaylistSheetTest {
             assertFalse(state.finished)
             assertTrue(state.canAdd)
             assertEquals("  New mix  ", state.name)
+            assertEquals(listOf("new"), state.presentation.targets.map { it.id })
+            assertFalse(state.presentation.searchIncomplete)
+            assertFalse(state.presentation.searchable)
             val create = web.takeRequest(1, TimeUnit.SECONDS)!!
             assertEquals("/api/me/playlists", create.path)
             val body = create.body.readUtf8()
@@ -369,7 +596,7 @@ class AddToPlaylistSheetTest {
             state.verify()
             until { !state.busy }
             assertEquals(1, state.verifiedTargets!!.items.size)
-            assertTrue(state.message.contains("does not prove"))
+            assertEquals("Create unconfirmed.", state.message)
             assertNotNull(state.blocked)
             state.create(); state.add()
             assertEquals(2, web.requestCount)
@@ -395,8 +622,8 @@ class AddToPlaylistSheetTest {
             state.add()
             state.verify()
             until { !state.busy }
-            assertTrue(state.message.contains("2 occurrences"))
-            assertTrue(state.message.contains("cannot prove whether the last add succeeded"))
+            assertEquals(2, state.reviewCount)
+            assertEquals("Add unconfirmed.", state.message)
             assertFalse(state.canAdd)
             state.add()
             assertEquals(5, web.requestCount)
@@ -421,7 +648,8 @@ class AddToPlaylistSheetTest {
             state.loadTargets(0); until { !state.busy }
             state.add(); until { !state.busy }
             state.verify(); until { !state.busy }
-            assertTrue(state.message.contains("1201 occurrences"))
+            assertEquals(1201, state.reviewCount)
+            assertEquals("Add unconfirmed.", state.message)
             assertNotNull(state.blocked)
             assertFalse(state.canAdd)
             repeat(3) { state.add(); state.create() }
@@ -450,7 +678,8 @@ class AddToPlaylistSheetTest {
             state.verify(); until { !state.busy }
             assertNotNull(state.blocked)
             assertFalse(state.canAdd)
-            assertFalse(state.message.contains("occurrences of this track"))
+            assertNull(state.reviewCount)
+            assertEquals("Add unconfirmed.", state.message)
             state.add(); state.create()
             val requests = (0 until web.requestCount).map { web.takeRequest(1, TimeUnit.SECONDS)!! }
             assertEquals(1, requests.count { it.method == "POST" })
@@ -473,7 +702,8 @@ class AddToPlaylistSheetTest {
             assertFalse(state.message.contains("private diagnostic"))
             state.verify()
             until { !state.busy }
-            assertTrue(state.message.contains("Close and reopen"))
+            assertEquals("Playlist changed.", state.message)
+            assertEquals(10L, state.reviewedTarget!!.revision)
             assertFalse(state.canAdd)
             state.add()
             assertEquals(3, web.requestCount)
