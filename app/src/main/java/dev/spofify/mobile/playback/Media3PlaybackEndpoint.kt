@@ -38,6 +38,11 @@ class Media3PlaybackEndpoint : NativePlaybackEndpoint {
         return PlaybackService.interruptLocalQueueIntentStart()
     }
 
+    override fun captureRevisionSync(): dev.spofify.mobile.feature.devices.PlaybackSyncCapture? {
+        checkMain()
+        return PlaybackService.captureLocalRevisionSync()
+    }
+
     override fun exportSnapshot(): PlaybackSnapshot {
         checkMain()
         return PlaybackService.exportLocalSnapshot()

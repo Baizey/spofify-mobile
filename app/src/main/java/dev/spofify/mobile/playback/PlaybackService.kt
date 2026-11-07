@@ -166,6 +166,7 @@ class PlaybackService : MediaSessionService() {
         fun setQueueNotice(value: String?) { active.get()?.localEdit { queueMessage = value } }
         fun queueNotice(): String? = active.get()?.let { it.currentTransportNotice() ?: it.queueMessage }
         fun restartCurrentTraversal() { active.get()?.localEdit { restartTraversal() } }
+        fun captureLocalRevisionSync(): dev.spofify.mobile.feature.devices.PlaybackSyncCapture? = active.get()?.captureRevisionSync()
         fun exportLocalSnapshot(): PlaybackSnapshot = active.get()?.exportPrepared() ?: PlaybackSnapshot()
         fun exportLocalQueueIntentState(): QueueIntentState? = active.get()?.exportIntentState()
         suspend fun activateSnapshot(snapshot: PlaybackSnapshot, queueIntentState: QueueIntentState?, authority: PlaybackAuthority): PlaybackEndpointResult =
@@ -603,6 +604,7 @@ class PlaybackService : MediaSessionService() {
             override fun onAvailableCommandsChanged(availableCommands: Player.Commands) { observeDirections() }
             override fun onRepeatModeChanged(repeatMode: Int) { observeDirections(); if (!importing && !arranging) exportPrepared() }
             override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                syncTimelineVersion++
                 schedulePrune()
             }
 
@@ -994,6 +996,48 @@ class PlaybackService : MediaSessionService() {
             if (!ownAudibleHistoryCreation) startAttemptValidity = null
             startHistoryObservation = null
         }
+    }
+
+    private var syncTimelineVersion = 0L
+    private data class SyncSemanticFence(val service: String, val timeline: Long, val queueEpoch: Long, val revision: Long,
+        val current: String?, val event: String?, val context: PlaybackContext?, val shuffle: Boolean,
+        val repeat: Int, val truncated: Boolean, val notice: String)
+    private var syncFence: SyncSemanticFence? = null
+    private var syncStructure: PlaybackSnapshot? = null
+    private var syncMetadata: QueueIntentState? = null
+    private fun syncSemanticFence(current: ExoPlayer) = SyncSemanticFence(serviceNonce, syncTimelineVersion, PlaybackRequests.queueEpoch,
+        intentRevision.revision, currentId(), preparedHistoryEventId(), wireContext,
+        importedShuffle ?: current.shuffleModeEnabled, current.repeatMode, queueTruncated, queueNoticeCode)
+
+    /** Main-thread coherent capture: only scalar/history reads on an unchanged queue. Full
+     * immutable structure and sidecar are replaced once when a semantic fence changes. */
+    private fun captureRevisionSync(): dev.spofify.mobile.feature.devices.PlaybackSyncCapture? {
+        val current = player ?: return null
+        sampleHistory(current.currentMediaItem, current.currentPosition, current.isPlaying)
+        if (syncStructure == null || syncFence != syncSemanticFence(current)) {
+            val exported = exportPrepared()
+            val snapshot = exported.copy(queue = java.util.Collections.unmodifiableList(exported.queue.map { track ->
+                track.copy(artists = java.util.Collections.unmodifiableList(track.artists.toList()))
+            }))
+            val metadata = exportIntentState(snapshot)
+            syncStructure = snapshot
+            syncMetadata = metadata.copy(origins = java.util.Collections.unmodifiableList(metadata.origins.toList()),
+                highKeys = java.util.Collections.unmodifiableList(metadata.highKeys.toList()))
+            syncFence = syncSemanticFence(current)
+        }
+        val id = currentId()
+        val gate = id?.let { history[it]?.snapshot() }
+        val duration = current.duration
+        val live = dev.spofify.mobile.core.PlaybackSyncLive(wireKeys[id], preparedHistoryEventId(),
+            importedElapsed?.takeIf { current.currentPosition == importedPositionMs } ?: current.currentPosition.coerceAtLeast(0) / 1000.0,
+            if (duration == C.TIME_UNSET) importedDuration ?: ((current.currentMediaItem?.let(PlaybackMedia::libraryItem)?.durationMs ?: 0L).coerceAtLeast(0) / 1000.0)
+                else duration.coerceAtLeast(0) / 1000.0,
+            hasOutputPermission() && current.playWhenReady && current.playbackState != Player.STATE_ENDED && current.playerError == null && outputError.isEmpty(),
+            hasOutputPermission() && current.playbackState == Player.STATE_BUFFERING, false,
+            outputError.ifEmpty { if (current.playerError != null) "media" else "" },
+            if (gate == null) 0.0 else (gate.accumulatedMs / 1000.0 + (progressRemainders[id] ?: 0.0)).coerceAtMost(604800.0), gate?.recorded ?: false).validated()
+        return dev.spofify.mobile.feature.devices.PlaybackSyncCapture(requireNotNull(syncFence), live,
+            requireNotNull(syncStructure), syncMetadata)
     }
 
     private fun exportPrepared(): PlaybackSnapshot {

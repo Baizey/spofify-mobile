@@ -249,6 +249,37 @@ class PlaybackServiceBridgeTest {
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
+    @Test fun revisionSyncActualServiceCaptureReusesStructureAndFenceAcrossQuietPolls() = runBlocking {
+        println("revision-capture java.io.tmpdir=${System.getProperty("java.io.tmpdir")}")
+        for (count in listOf(1, 40, 1000)) {
+            val tracks = (1..count).map { n -> PlaybackTrack("track-$n", "Song", emptyList(), "Album", "album", 120.0,
+                key = n.toLong(), order = n.toLong()) }
+            val source = PlaybackSnapshot(queue = tracks, position = 0, duration = 120.0,
+                occurrence = PlaybackOccurrence(1, "track-1", "event-$count", 0.0, false))
+            assertEquals("ok", endpoint.activate(source, authority()).status)
+            val first = requireNotNull(endpoint.captureRevisionSync())
+            repeat(8) {
+                val next = requireNotNull(endpoint.captureRevisionSync())
+                assertSame("Actual production cached structure for $count entries", first.structure, next.structure)
+                assertSame(first.metadata, next.metadata)
+                assertEquals(first.semanticFence, next.semanticFence)
+                assertEquals(source.queue, next.snapshot().queue)
+            }
+            val held = PlaybackService.interactionKey()
+            // A benign clock tick must not rotate local receiver/gesture authority.
+            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
+            val tick = requireNotNull(endpoint.captureRevisionSync())
+            assertEquals(first.semanticFence, tick.semanticFence)
+            assertSame(held, PlaybackService.interactionKey())
+            assertEquals("ok", endpoint.execute(PlaybackDeviceCommand.transport("repeat"), authority()).status)
+            val changed = requireNotNull(endpoint.captureRevisionSync())
+            assertNotEquals(first.semanticFence, changed.semanticFence)
+            assertNotSame(first.structure, changed.structure)
+            println("production-capture queue=$count quietCaptures=9 reusedStructure=true reusedMetadata=true fullQueueRebuildsAfterWarmup=0")
+        }
+        assertSilent()
+    }
+
     @Test fun originalDerivedRouteThroughViewModelConnectionAndServicePreservesDuplicateStartAndFence() = runTest {
         val published = mutableListOf<PlaybackSnapshot>()
         val owner = installOwner(backgroundScope, { testScheduler.currentTime }, "phone", published)

@@ -54,7 +54,11 @@ class CachedContinuationCoordinatorTest {
         }
         override suspend fun leave(deviceId: String) = Unit
     }
-    private fun activatedView() = view(directives = listOf(PlaybackDirective("activate", 1, "activate", state = music)))
+    // A genuine source handoff may carry playing intent. A source-less registration
+    // recovery is deliberately imported PAUSED and cannot seed cached continuation.
+    private fun activatedView() = view(directives = listOf(PlaybackDirective("activate", 1, "activate", state = music))).copy(
+        devices = listOf(PlaybackDevice(phone, "Phone", true), PlaybackDevice("source", "Source", true)),
+        transfer = PlaybackTransfer("handoff", "source", phone, "activating"))
 
     @Test fun outageAndSameLeadReconnectionKeepExactOutputWithoutPublicationOrRestart() = runTest {
         val wire = Wire(activatedView()); val output = Output()
