@@ -1,5 +1,6 @@
 package dev.spofify.mobile.feature.playlists
 
+import androidx.activity.ComponentDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.*
@@ -25,6 +26,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.shadows.ShadowDialog
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
@@ -60,9 +62,9 @@ class MaintainedPlaylistRouteTest {
         awaitText("Song 0")
         more("Song 0")
         awaitText("Like song")
-        compose.onNodeWithText("Queue Low").performScrollTo().performClick()
+        compose.onNodeWithText("Queue").performScrollTo().performClick()
         compose.runOnIdle {
-            assertEquals(PlaybackListAction.QUEUE_LOW, f.actions.single().action)
+            assertEquals(PlaybackListAction.QUEUE_HIGH, f.actions.single().action)
             assertTrue(f.actions.single().current())
         }
         more("Song 0")
@@ -71,7 +73,7 @@ class MaintainedPlaylistRouteTest {
         awaitText("Unlike song")
         compose.waitUntil(5_000) { compose.waitForIdle(); f.entries.get() == 2 }
         compose.onNodeWithText("Play now").performScrollTo().assertIsNotEnabled() // Old menu stays old.
-        compose.onNodeWithText("Done").performClick()
+        dismissActions()
         awaitText("Song 1")
         compose.runOnIdle {
             assertEquals(1, f.actions.size)
@@ -79,7 +81,7 @@ class MaintainedPlaylistRouteTest {
         }
         more("Song 1")
         awaitText("Unlike song")
-        compose.onNodeWithText("Queue High").performScrollTo().assertIsEnabled().performClick()
+        compose.onNodeWithText("Queue").performScrollTo().assertIsEnabled().performClick()
         compose.runOnIdle {
             val selected = f.actions.last().selection as QueueIntentSelection.Track
             assertEquals("fence-1", selected.context?.fence)
@@ -102,7 +104,7 @@ class MaintainedPlaylistRouteTest {
         more("Song 0")
         awaitText("Like song")
         compose.onNodeWithText("Play now").performScrollTo().assertIsNotEnabled()
-        compose.onNodeWithText("Done").performClick()
+        dismissActions()
         f.resultState = "error"
         compose.runOnIdle { f.client.notifyPersonalChange(PersonalCollection.PLAYLISTS) }
         awaitText("1 tracks · 1 with audio · Previous result; update failed")
@@ -221,7 +223,7 @@ class MaintainedPlaylistRouteTest {
         }
         openPlaylistMore()
         compose.onNodeWithText("Edit details").performScrollTo().assertIsEnabled()
-        compose.onNodeWithText("Done").performClick()
+        dismissActions()
         assertEquals("Reconciliation is read-only; the uncertain write is never replayed", 1, f.mutations.get())
     }
 
@@ -256,9 +258,15 @@ class MaintainedPlaylistRouteTest {
         compose.onNodeWithText("Delete").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Edit rules").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Make editable copy").performScrollTo().assertIsNotEnabled()
-        compose.onNodeWithText("Done").performClick()
+        dismissActions()
         compose.onAllNodesWithText("Save").assertCountEquals(0)
         assertEquals("Failed/cancelled verification cannot admit a second mutation", 1, f.mutations.get())
+    }
+
+    private fun dismissActions() {
+        val dialog = compose.runOnIdle { ShadowDialog.getLatestDialog() as ComponentDialog }
+        compose.runOnIdle { dialog.onBackPressedDispatcher.onBackPressed() }
+        compose.waitForIdle()
     }
 
     private val readFailure = "Playlist could not load."

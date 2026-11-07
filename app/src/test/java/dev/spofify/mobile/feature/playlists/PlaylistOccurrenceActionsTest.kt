@@ -83,9 +83,9 @@ class PlaylistOccurrenceActionsTest {
                     MaterialTheme(typography = AppTypography) {
                         if (shown.value) PlaylistOccurrenceActions(client, track,
                             onDismiss = {}, onOpen = {}, onAdd = {}, onPersonalChange = {},
-                            playbackEnabled = true, contextualLabel = "Queue High",
-                            onPlayNow = { events += "play-now" }, onContextual = { events += "contextual" },
-                            onEnqueue = { events += "enqueue" }, onPlayNext = { events += "play-next" },
+                            playbackEnabled = true,
+                            onPlayNow = { events += "play-now" }, onQueue = { events += "queue" },
+                            onPlayNext = { events += "play-next" },
                             onOpenItem = {})
                     }
                 }
@@ -96,19 +96,19 @@ class PlaylistOccurrenceActionsTest {
                     compose.onAllNodesWithText("Like song").fetchSemanticsNodes().size == 1
                 }
                 compose.runOnIdle { assertEquals(emptyList<String>(), events) }
-                val swipeLabel = "Queue High"
-                compose.onAllNodesWithText("Queue Low").assertCountEquals(1)
+                val swipeLabel = "Queue"
+                compose.onNodeWithText("Queue Low").assertDoesNotExist()
+                compose.onNodeWithText("Queue High").assertDoesNotExist()
                 compose.onAllNodesWithText("Play now").assertCountEquals(1)
                 compose.onAllNodesWithText(swipeLabel).assertCountEquals(1)
                 compose.onAllNodesWithText("Play next").assertCountEquals(1)
                 // Long intentional credits force a finite scroll body; both kinds of intent stay reachable.
                 compose.onNodeWithText("Credited artist 12").performScrollTo().assertIsDisplayed()
-                compose.onNodeWithText("Queue Low").performScrollTo().assertIsDisplayed()
-                    .assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
-                compose.runOnIdle { assertEquals(listOf("enqueue"), events) }
                 compose.onNodeWithText(swipeLabel).performScrollTo().assertIsDisplayed()
                     .assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
-                compose.runOnIdle { assertEquals(listOf("enqueue", "contextual"), events) }
+                compose.runOnIdle { assertEquals(listOf("queue"), events) }
+                compose.onNodeWithText("Play next").performScrollTo().assertIsEnabled().performClick()
+                compose.runOnIdle { assertEquals(listOf("queue", "play-next"), events) }
 
                 val login = web.takeRequest(1, TimeUnit.SECONDS)
                 val status = web.takeRequest(1, TimeUnit.SECONDS)

@@ -21,6 +21,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.RemoveCircleOutline
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -61,15 +64,49 @@ import dev.spofify.mobile.playback.PlaybackListAction
 import dev.spofify.mobile.playback.QueueEntry
 import dev.spofify.mobile.ui.ContextualSwipeRow
 import dev.spofify.mobile.ui.RowActionLifetime
+import dev.spofify.mobile.ui.MusicActionsContent
+import dev.spofify.mobile.ui.SongActionSheet
+import dev.spofify.mobile.ui.SongActionGroup
+import dev.spofify.mobile.ui.SongActionRow
+import dev.spofify.mobile.playback.defaultQueueAction
 
-/** The four intentional actions always address the exact retained upcoming occurrence. */
+/** Intentional actions always address the exact retained upcoming occurrence, never song ID. */
 private fun upcomingIntentActions(entry: QueueEntry, state: PlaybackState, controls: PlaybackControls,
     rowIsCurrent: () -> Boolean, hostIsCurrent: () -> Boolean): List<Pair<String, () -> Unit>> {
     val key = state.interactionKey
-    return listOf("Queue Low" to PlaybackListAction.QUEUE_LOW, "Queue High" to PlaybackListAction.QUEUE_HIGH,
-        "Play next" to PlaybackListAction.PLAY_NEXT, "Play now" to PlaybackListAction.PLAY_NOW).map { (label, action) ->
+    return listOf("Play now" to PlaybackListAction.PLAY_NOW, "Play next" to PlaybackListAction.PLAY_NEXT,
+        "Queue" to entry.item.defaultQueueAction()).map { (label, action) ->
         label to { if (key != null && entry.item.playable && rowIsCurrent() && hostIsCurrent())
             controls.queueIntentOccurrence(key, entry.occurrenceId, action, hostIsCurrent) {} }
+    }
+}
+
+/** Same grouped menu as catalog/playlist songs; queue edits retain their exact occurrence closures. */
+@Composable
+private fun UpcomingOccurrenceActions(
+    entry: QueueEntry, state: PlaybackState, intents: List<Pair<String, () -> Unit>>,
+    canMoveUp: Boolean, canMoveDown: Boolean, onDismiss: () -> Unit,
+    onOpenItem: (LibraryItem) -> Unit, onMoveUp: () -> Unit, onMoveDown: () -> Unit, onRemove: () -> Unit,
+    artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
+) {
+    val actions = intents.toMap()
+    fun perform(action: () -> Unit) { onDismiss(); action() }
+    SongActionSheet(onDismiss) {
+        MusicActionsContent(entry.item,
+            onPlay = { perform(actions.getValue("Play now")) },
+            onPlayNext = { perform(actions.getValue("Play next")) },
+            onQueue = { perform(actions.getValue("Queue")) },
+            playbackEnabled = entry.item.playable && state.interactionKey != null,
+            onOpenItem = { item -> perform { onOpenItem(item) } },
+            artwork = artwork,
+            contextualContent = {
+                SongActionGroup("This queue") {
+                    SongActionRow("Move up", Icons.Default.KeyboardArrowUp, canMoveUp, onClick = { perform(onMoveUp) })
+                    SongActionRow("Move down", Icons.Default.KeyboardArrowDown, canMoveDown, onClick = { perform(onMoveDown) })
+                    SongActionRow("Remove from queue", Icons.Default.RemoveCircleOutline,
+                        destructive = true, onClick = { perform(onRemove) })
+                }
+            })
     }
 }
 
@@ -245,18 +282,11 @@ private fun CompactUpcomingRow(
                 IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
                     Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
                 }
-                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    intents.forEach { (label, action) ->
-                        DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable && state.interactionKey != null,
-                            onClick = { menuOpen = false; action() })
-                    }
-                    DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
-                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index - 1) })
-                    DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,
-                        onClick = { menuOpen = false; controls.moveUpcoming(entry.occurrenceId, index + 1) })
-                    DropdownMenuItem(text = { Text("Remove from queue") },
-                        onClick = { menuOpen = false; controls.removeUpcoming(entry.occurrenceId) })
-                }
+                if (menuOpen) UpcomingOccurrenceActions(entry, state, intents, index > 0, index < count - 1,
+                    onDismiss = { menuOpen = false }, onOpenItem = onOpenItem,
+                    onMoveUp = { controls.moveUpcoming(entry.occurrenceId, index - 1) },
+                    onMoveDown = { controls.moveUpcoming(entry.occurrenceId, index + 1) },
+                    onRemove = { controls.removeUpcoming(entry.occurrenceId) })
             }
         }
     }
@@ -347,18 +377,9 @@ private fun UpcomingRow(
             IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(48.dp)) {
                 Icon(Icons.Default.MoreVert, "Queue actions for ${entry.item.name}")
             }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                intents.forEach { (label, action) ->
-                    DropdownMenuItem(text = { Text(label) }, enabled = entry.item.playable && state.interactionKey != null,
-                        onClick = { menuOpen = false; action() })
-                }
-                DropdownMenuItem(text = { Text("Move up") }, enabled = index > 0,
-                    onClick = { menuOpen = false; moveUp() })
-                DropdownMenuItem(text = { Text("Move down") }, enabled = index < count - 1,
-                    onClick = { menuOpen = false; moveDown() })
-                DropdownMenuItem(text = { Text("Remove from queue") },
-                    onClick = { menuOpen = false; remove() })
-            }
+            if (menuOpen) UpcomingOccurrenceActions(entry, state, intents, index > 0, index < count - 1,
+                onDismiss = { menuOpen = false }, onOpenItem = onOpenItem,
+                onMoveUp = moveUp, onMoveDown = moveDown, onRemove = remove, artwork = artwork)
         }
     }
     }

@@ -3,6 +3,9 @@ package dev.spofify.mobile.playback
 import dev.spofify.mobile.core.PlaybackContext
 import dev.spofify.mobile.core.PlaybackDeviceCommand
 import dev.spofify.mobile.core.PlaybackSnapshot
+import dev.spofify.mobile.core.PlaybackTrack
+import dev.spofify.mobile.core.QueueIntentBinding
+import dev.spofify.mobile.core.QueueIntentSelection
 import dev.spofify.mobile.core.ServerAddress
 import dev.spofify.mobile.core.SessionStore
 import dev.spofify.mobile.core.SpofifyClient
@@ -313,6 +316,70 @@ class PlaybackCommandResolverTest {
         }
         assertEquals(2, web.requestCount)
     }
+
+    @Test fun collectionLowResolvesCanonicalWholeAndPreservesPausedCurrentAndHighPrecedence() = runBlocking {
+        for (kind in listOf("album", "artist", "playlist")) {
+            val context = PlaybackContext(kind, "collection", "Collection")
+            web.enqueue(response(queue(kind, "collection", listOf(track("b1", "e1"), track("b2", "e2")))))
+            val resolved = requireNotNull(PlaybackCommandResolver.resolveQueueIntent(intent("low", QueueIntentSelection.Collection(context)), client))
+            val before = PlaybackSnapshot(queue = listOf(live("a", 1), live("h1", 2), live("c1", 3), live("c2", 4)),
+                position = 0, elapsed = 42.0, duration = 100.0, playing = false)
+            val metadata = PlaybackQueueIntents.Metadata(mapOf(1L to "low", 2L to "high", 3L to "low", 4L to "low"), setOf(2L), "tracked")
+            val plan = PlaybackQueueIntents.plan(before, metadata, "low", resolved.tracks, null, 4, resolved.context, resolved.startIndex)
+            assertEquals(listOf("a", "h1", "c1", "c2", "b1", "b2"), plan.snapshot.queue.map { it.id })
+            assertEquals(before.copy(queue = plan.snapshot.queue), plan.snapshot)
+            assertEquals(setOf(2L), plan.metadata.high)
+            assertEquals(2, plan.count)
+            assertEquals("low", plan.placement)
+            assertTrue(plan.newTracks.all { plan.metadata.origins[it.key] == "low" })
+            PlaybackQueueIntents.publication(plan.snapshot, PlaybackQueueIntents.state("receiver", 2, plan.snapshot, plan.metadata))
+        }
+        assertEquals(3, web.requestCount)
+    }
+
+    @Test fun songHighInCollectionAddsOnlyClickedDuplicateWhileNowReplacesCompleteCanonicalBase() = runBlocking {
+        val body = queue("playlist", "manual", listOf(track("before", "e1"), track("same", "e2"), track("same", "e3"), track("after", "e4")))
+        val selection = QueueIntentSelection.Track(rawSelection(wire(entry = "e3")), playlist)
+        val before = PlaybackSnapshot(queue = listOf(live("old", 10), live("manual", 11)), position = 0, elapsed = 42.0)
+        val metadata = PlaybackQueueIntents.Metadata(mapOf(10L to "low", 11L to "high"), setOf(11L), "tracked")
+        web.enqueue(response(body))
+        val high = requireNotNull(PlaybackCommandResolver.resolveQueueIntent(intent("high", selection), client))
+        assertEquals(listOf("e3"), high.tracks.map { it.entryId })
+        val added = PlaybackQueueIntents.plan(before, metadata, "high", high.tracks, null, 11)
+        assertEquals(listOf("old", "manual", "same"), added.snapshot.queue.map { it.id })
+        assertEquals(42.0, added.snapshot.elapsed, 0.0)
+        assertEquals(0, added.snapshot.position)
+        web.enqueue(response(body))
+        val now = requireNotNull(PlaybackCommandResolver.resolveQueueIntent(intent("now", selection), client))
+        val replaced = PlaybackQueueIntents.plan(before, metadata, "now", now.tracks, null, 11, now.context, now.startIndex)
+        assertEquals(listOf("e1", "e2", "e3", "e4"), replaced.snapshot.queue.map { it.entryId })
+        assertEquals(2, replaced.snapshot.position)
+        assertEquals("e3", replaced.snapshot.queue[replaced.snapshot.position].entryId)
+        assertTrue(replaced.metadata.high.isEmpty())
+        assertTrue(replaced.snapshot.queue.filterIndexed { index, _ -> index != 2 }.all { replaced.metadata.origins[it.key] == "low" })
+        val later = PlaybackQueueIntents.plan(replaced.snapshot, replaced.metadata, "high", listOf(live("later", 1)), null, 15)
+        assertEquals(listOf("before", "same", "same", "later", "after"), later.snapshot.queue.map { it.id })
+        assertEquals(2, later.snapshot.position)
+        assertEquals(2, web.requestCount)
+    }
+
+    @Test fun songHighWithArtistContextDoesNotExpandAlbumOrArtistButNowUsesWholeArtist() = runBlocking {
+        val context = PlaybackContext("artist", "artist/a%", "Artist")
+        val selection = QueueIntentSelection.Track(rawSelection(wire(album = "different-album")), context)
+        val high = requireNotNull(PlaybackCommandResolver.resolveQueueIntent(intent("high", selection), client))
+        assertEquals(listOf("same"), high.tracks.map { it.id })
+        assertEquals(0, web.requestCount)
+        web.enqueue(response(queue("artist", context.id, listOf(track("before"), track(), track("after")))))
+        val now = requireNotNull(PlaybackCommandResolver.resolveQueueIntent(intent("now", selection), client))
+        assertEquals(listOf("before", "same", "after"), now.tracks.map { it.id })
+        assertEquals(1, now.startIndex)
+        assertEquals("/api/library/artists/artist%2Fa%25/playback", web.takeRequest().path)
+    }
+
+    private fun rawSelection(track: JsonObject) = JsonObject(track.filterKeys { it != "key" && it != "order" })
+    private fun live(id: String, key: Long) = PlaybackTrack(id, id, emptyList(), "", "", 100.0, key = key, order = key - 1)
+    private fun intent(name: String, selection: QueueIntentSelection) = PlaybackDeviceCommand.queueIntent(name,
+        QueueIntentBinding("phone", "receiver", 1, 1, null), selection)
 
     @Test fun cancellationDuringAwaitPropagatesAndDoesNotStartAnotherRequest() = runBlocking {
         web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))

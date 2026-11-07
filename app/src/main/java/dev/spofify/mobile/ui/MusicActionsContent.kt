@@ -3,58 +3,82 @@ package dev.spofify.mobile.ui
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
-import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import dev.spofify.mobile.core.LibraryItem
 
-/** The actual More sheet body: every action and credit stays reachable without shrinking targets. */
+/**
+ * One menu body for catalog items, saved-playlist occurrences, collections and upcoming songs.
+ * Unsupported callbacks are absent, not reordered. Callers own bindings, guards and dismissal;
+ * contextual saved-data/queue actions stay last, outside the shared non-destructive groups.
+ */
 @Composable
 internal fun MusicActionsContent(
     item: LibraryItem,
-    liked: Boolean?,
-    likePending: Boolean,
-    likeFailed: Boolean,
-    onPlay: () -> Unit,
-    onPlayNext: () -> Unit,
-    onEnqueue: () -> Unit,
-    onToggleLike: () -> Unit,
-    onRetryLike: () -> Unit,
-    onAddToPlaylist: () -> Unit,
-    onOpenItem: (LibraryItem) -> Unit,
+    liked: Boolean? = null,
+    likePending: Boolean = false,
+    likeFailed: Boolean = false,
+    onPlay: (() -> Unit)? = null,
+    onPlayNext: (() -> Unit)? = null,
+    onQueue: (() -> Unit)? = null,
+    onToggleLike: (() -> Unit)? = null,
+    onRetryLike: (() -> Unit)? = null,
+    onAddToPlaylist: (() -> Unit)? = null,
+    onOpenItem: ((LibraryItem) -> Unit)? = null,
     modifier: Modifier = Modifier,
-    contextualLabel: String = "Play now",
-    onContextual: (() -> Unit)? = null,
-    onQueueLow: (() -> Unit)? = null,
+    playbackEnabled: Boolean = item.playable,
+    actionsEnabled: Boolean = true,
+    onOpen: (() -> Unit)? = onOpenItem?.let { open -> { open(item) } },
+    pendingLikeLabel: String = "Saving like",
+    checkLikeLabel: String = if (likeFailed) "Retry like status" else "Checking like status",
+    likeStatusEnabled: Boolean = likeFailed,
+    likeMessage: String? = null,
+    libraryContent: (@Composable () -> Unit)? = null,
+    contextualContent: (@Composable () -> Unit)? = null,
     artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
 ) {
     val content: @Composable () -> Unit = {
-        SongActionGroup("Playback", divider = false) {
-            SongActionRow("Play now", Icons.Default.PlayArrow, enabled = item.playable, onClick = onPlay)
-            SongActionRow("Play next", Icons.Default.SkipNext, enabled = item.playable, onClick = onPlayNext)
-            SongActionRow("Queue High", Icons.AutoMirrored.Filled.PlaylistPlay, enabled = item.playable, onClick = onContextual ?: onEnqueue)
-            onQueueLow?.let { action -> SongActionRow("Queue Low", Icons.AutoMirrored.Filled.QueueMusic, enabled = item.playable, onClick = action) }
-        }
-        if (item.kind == "track") {
-            val likeLabel = when {
-                likePending -> "Saving like"
-                liked == null && likeFailed -> "Retry like status"
-                liked == null -> "Checking like status"
-                liked -> "Unlike song"
-                else -> "Like song"
+        if (onPlay != null || onPlayNext != null || onQueue != null) {
+            SongActionGroup("Playback", divider = false) {
+                onPlay?.let { SongActionRow("Play now", Icons.Default.PlayArrow,
+                    enabled = playbackEnabled && actionsEnabled, onClick = it) }
+                onPlayNext?.let { SongActionRow("Play next", Icons.Default.SkipNext,
+                    enabled = playbackEnabled && actionsEnabled, onClick = it) }
+                onQueue?.let { SongActionRow("Queue", Icons.AutoMirrored.Filled.QueueMusic,
+                    enabled = playbackEnabled && actionsEnabled, onClick = it) }
             }
+        }
+        val hasLike = item.kind == "track" && (onToggleLike != null || onRetryLike != null)
+        val addToPlaylist = onAddToPlaylist.takeIf { item.kind == "track" }
+        if (hasLike || addToPlaylist != null || libraryContent != null) {
             SongActionGroup("Library") {
-                SongActionRow(likeLabel, if (liked == true) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                    enabled = !likePending && (liked != null || likeFailed),
-                    onClick = { if (liked == null) onRetryLike() else onToggleLike() })
-                SongActionRow("Add to playlist", Icons.AutoMirrored.Filled.PlaylistAdd, onClick = onAddToPlaylist)
+                if (hasLike) {
+                    val likeLabel = when {
+                        likePending -> pendingLikeLabel
+                        liked == null -> checkLikeLabel
+                        liked -> "Unlike song"
+                        else -> "Like song"
+                    }
+                    SongActionRow(likeLabel, if (liked == true) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                        enabled = actionsEnabled && !likePending &&
+                            (if (liked == null) likeStatusEnabled && onRetryLike != null else onToggleLike != null),
+                        onClick = { if (liked == null) onRetryLike?.invoke() else onToggleLike?.invoke() })
+                }
+                addToPlaylist?.let { SongActionRow("Add to playlist", Icons.AutoMirrored.Filled.PlaylistAdd,
+                    enabled = actionsEnabled, onClick = it) }
+                likeMessage?.let { Text(it) }
+                libraryContent?.invoke()
             }
         }
-        SongActionGroup("Navigation") {
-            SongActionRow("Open details", Icons.Default.Info, onClick = { onOpenItem(item) })
-            SongActionNavigation(item, onOpenItem = onOpenItem)
+        if (onOpen != null || onOpenItem != null) {
+            SongActionGroup("Navigation") {
+                onOpen?.let { SongActionRow("Open details", Icons.Default.Info, actionsEnabled, onClick = it) }
+                onOpenItem?.let { SongActionNavigation(item, actionsEnabled, onOpenItem = it) }
+            }
         }
+        contextualContent?.invoke()
     }
     if (artwork == null) SongActionLayout(item, modifier) { content() }
     else SongActionLayout(item, modifier, artwork) { content() }

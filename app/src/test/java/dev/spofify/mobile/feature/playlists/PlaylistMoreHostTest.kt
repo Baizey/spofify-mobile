@@ -36,9 +36,9 @@ import java.util.concurrent.TimeUnit
 class PlaylistMoreHostTest {
     private val scheduler = TestCoroutineScheduler()
     @get:Rule val compose = createComposeRule(effectContext = StandardTestDispatcher(scheduler))
-    @Test fun manualMorePreservesExactDuplicateEntryForAllFourIntentsWithoutControllerPreparation() = check(derived = false)
-    @Test fun derivedMorePreservesSignedExactOccurrenceAndFenceForAllFourIntentsWithoutPreparation() = check(derived = true)
-    @Test fun manualCollectionMoreSendsWholeBoundedContextForAllFourIntents() = check(derived = false, collection = true)
+    @Test fun manualMorePreservesExactDuplicateEntryForAllSupportedIntentsWithoutControllerPreparation() = check(derived = false)
+    @Test fun derivedMorePreservesSignedExactOccurrenceAndFenceForAllSupportedIntentsWithoutPreparation() = check(derived = true)
+    @Test fun manualCollectionMoreSendsWholeBoundedContextForAllSupportedIntents() = check(derived = false, collection = true)
     @Test fun derivedCollectionMorePreservesEvaluatedRevisionAndFence() = check(derived = true, collection = true)
     @Test fun manualOpenMoreCannotReviveAfterOutputReplacementABA() = check(derived = false, stale = true)
     @Test fun derivedOpenMoreCannotReviveAfterOutputReplacementABA() = check(derived = true, stale = true)
@@ -97,7 +97,7 @@ class PlaylistMoreHostTest {
                     compose.waitForIdle()
                     compose.onAllNodesWithContentDescription("More actions for Fixture song").fetchSemanticsNodes().size == 1
                 }
-                val labels = listOf("Queue Low" to PlaybackListAction.QUEUE_LOW, "Queue High" to PlaybackListAction.QUEUE_HIGH,
+                val labels = listOf("Queue" to if (collection) PlaybackListAction.QUEUE_LOW else PlaybackListAction.QUEUE_HIGH,
                     "Play next" to PlaybackListAction.PLAY_NEXT, "Play now" to PlaybackListAction.PLAY_NOW)
                 for ((label, expectedAction) in if (stale) labels.take(1) else labels) {
                     compose.runOnIdle { feedback.value = feedback.value.copy(interactionKey = key, queueIntentBinding = binding) }

@@ -962,7 +962,7 @@ class NativePlayerTest {
             upcoming = listOf(QueueEntry("first", duplicate, 19), QueueEntry("second", duplicate, 3)))
         setNowPlaying(snapshot, controls)
         compose.onNodeWithContentDescription("Upcoming queue").assertIsDisplayed()
-        for (label in listOf("Queue Low", "Queue High", "Play next", "Play now")) {
+        for (label in listOf("Play now", "Play next", "Queue")) {
             compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1]
                 .performScrollTo().performClick()
             compose.onNodeWithText(label).performClick()
@@ -981,10 +981,9 @@ class NativePlayerTest {
         compose.runOnIdle {
             assertEquals(listOf("first" to 1), controls.moves)
             assertEquals(listOf(
-                dev.spofify.mobile.playback.PlaybackListAction.QUEUE_LOW,
-                dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
-                dev.spofify.mobile.playback.PlaybackListAction.PLAY_NEXT,
                 dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW,
+                dev.spofify.mobile.playback.PlaybackListAction.PLAY_NEXT,
+                dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
             ).map { Triple(interactionKey, "second", it) }, controls.queueIntents)
             assertTrue("No legacy Play-next fallback", controls.playNexts.isEmpty())
             assertEquals(listOf("second"), controls.removed)

@@ -51,7 +51,7 @@ class PlaylistManagementHostTest {
         total = 204,
     ) {
         awaitLoaded()
-        assertCleanHeader("204 songs") // Only two occurrences are in this browse page.
+        assertCleanHeader("204 songs") // Only the first 40 occurrences are in this browse page.
         compose.onAllNodes(blankText, useUnmergedTree = true).assertCountEquals(0)
         compose.onNodeWithText("2 songs").assertDoesNotExist()
         openMore()
@@ -78,7 +78,7 @@ class PlaylistManagementHostTest {
         awaitLoaded()
         openMore()
         listOf("Edit details", "Delete", "Reorder all occurrences").forEach { menuAction(it).assertIsEnabled() }
-        listOf("Edit rules", "Make editable copy", "Queue Low", "Queue High", "Play next", "Play now").forEach {
+        listOf("Edit rules", "Make editable copy", "Queue", "Play next", "Play now").forEach {
             compose.onNodeWithText(it).assertDoesNotExist()
         }
         menuAction("Edit details").performClick()
@@ -399,10 +399,16 @@ class PlaylistManagementHostTest {
                             typedJson(summary())
                         }
                         path == "$detailPath/entries" && !derived -> {
-                            val entries = listOf(PersonalPlaylistEntry("first-entry", 0, track)) +
+                            val offset = request.requestUrl!!.queryParameter("offset")?.toInt() ?: 0
+                            val limit = request.requestUrl!!.queryParameter("limit")?.toInt() ?: 40
+                            val currentTotal = total - if (removed.get()) 1 else 0
+                            val entries = if (total > 40) {
+                                (offset until minOf(offset + limit, currentTotal)).map { index ->
+                                    PersonalPlaylistEntry("entry-$index", index, track)
+                                }
+                            } else listOf(PersonalPlaylistEntry("first-entry", 0, track)) +
                                 if (removed.get()) emptyList() else listOf(PersonalPlaylistEntry("second-entry", 1, track))
-                            typedJson(PersonalEntriesPage(entries, total - if (removed.get()) 1 else 0,
-                                limit = request.requestUrl!!.queryParameter("limit")?.toInt() ?: 40))
+                            typedJson(PersonalEntriesPage(entries, currentTotal, offset = offset, limit = limit))
                         }
                         path == "$detailPath/entries" && derived -> {
                             if (!evaluationGate.await(20, TimeUnit.SECONDS)) failure(503)

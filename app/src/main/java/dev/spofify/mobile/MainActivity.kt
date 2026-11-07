@@ -52,6 +52,7 @@ import dev.spofify.mobile.ui.ListeningChrome
 import dev.spofify.mobile.ui.CompactNavigation
 import dev.spofify.mobile.ui.CompactNavigationItem
 import dev.spofify.mobile.ui.MusicActionsContent
+import dev.spofify.mobile.playback.defaultQueueAction
 import dev.spofify.mobile.ui.SongActionSheet
 import dev.spofify.mobile.ui.RowActionLifetime
 import dev.spofify.mobile.playback.PlaybackInteractionKey
@@ -187,19 +188,22 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             interactionKey = player.interactionKey,
             playWhenReady = player.playWhenReady,
             onContextual = { item, binding, isCurrent ->
-                if (sourceCurrent()) model.contextualFrom(client, item, binding, { sourceCurrent() && isCurrent() })
+                if (sourceCurrent()) model.queueIntentFrom(client, item, item.defaultQueueAction(), binding,
+                    { sourceCurrent() && isCurrent() }, player.queueIntentBinding)
             },
             queueIntentBinding = player.queueIntentBinding,
             unselectedQueueOrigin = player.unselectedQueueOrigin,
             onUnselectedHigh = { item, origin, isCurrent ->
-                if (sourceCurrent()) model.queueIntentFrom(client, item,
-                    dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, null, { sourceCurrent() && isCurrent() }, null, origin)
+                if (sourceCurrent() && item.kind == "track") model.queueIntentFrom(client, item,
+                    item.defaultQueueAction(), null, { sourceCurrent() && isCurrent() }, null, origin)
             })
         val likeStates = state.likes.mapValues { (id, liked) ->
             CatalogLikeState(liked, id in state.pendingLikes, id in state.failedLikeStatus)
         } + state.failedLikeStatus.filterNot { it in state.likes }.associateWith { CatalogLikeState(failed = true) }
         val play: (LibraryItem, Boolean) -> Unit = { item, shuffle -> if (sourceCurrent()) model.playFrom(client, item, shuffle) }
-        val queue: (LibraryItem) -> Unit = { if (sourceCurrent()) model.enqueueFrom(client, it) }
+        val queue: (LibraryItem) -> Unit = { item ->
+            if (sourceCurrent()) model.queueIntentFrom(client, item, item.defaultQueueAction())
+        }
         val toggleLike: (LibraryItem) -> Unit = { if (sourceCurrent()) model.likeAction(it) }
         val catalog = when (val page = state.page) {
             is Page.Search, is Page.Catalog -> model.catalogHolder()
@@ -362,14 +366,13 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                 MusicActionsContent(item, state.likes[item.id], item.id in state.pendingLikes, item.id in state.failedLikeStatus,
                     onPlay = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NOW, binding, isCurrent, selection.queueIntentBinding) },
                     onPlayNext = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.PLAY_NEXT, binding, isCurrent, selection.queueIntentBinding) },
-                    onEnqueue = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH, binding, isCurrent, selection.queueIntentBinding, selection.unselectedOrigin) },
-                    onQueueLow = { more = null; model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_LOW, binding, isCurrent, selection.queueIntentBinding) },
-                    contextualLabel = feedback.contextualLabel,
-                    onContextual = binding?.let { capturedKey -> {
+                    onQueue = {
                         more = null
-                        model.queueIntentFrom(client, item, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
-                            capturedKey, isCurrent, selection.queueIntentBinding)
-                    } },
+                        model.queueIntentFrom(client, item, item.defaultQueueAction(), binding, isCurrent,
+                            selection.queueIntentBinding, selection.unselectedOrigin.takeIf {
+                                item.defaultQueueAction() == dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH
+                            })
+                    },
                     onToggleLike = { if (isCurrent()) model.likeAction(item) },
                     onRetryLike = { if (isCurrent()) model.checkLike(item) },
                     onAddToPlaylist = { if (isCurrent()) { more = null; addToPlaylist = item } },

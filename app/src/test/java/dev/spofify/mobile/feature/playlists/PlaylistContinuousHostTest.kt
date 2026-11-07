@@ -278,13 +278,13 @@ class PlaylistContinuousHostTest {
             host(fixture) { host ->
                 await { visible("Song 0") }
                 compose.onNodeWithContentDescription("More actions for Fixture playlist").performClick()
-                compose.onNodeWithText("Queue Low").assertIsEnabled()
+                compose.onNodeWithText("Queue").assertIsEnabled()
                 compose.runOnIdle { host.advanceSourceEpoch(); host.heartbeat() }
-                compose.onNodeWithText("Queue Low").performScrollTo().performClick()
+                compose.onNodeWithText("Queue").performScrollTo().performClick()
                 compose.waitForIdle()
                 assertTrue("An open collection selection cannot borrow the latest VM source epoch", host.accepted.isEmpty())
                 compose.onNodeWithContentDescription("More actions for Fixture playlist").performClick()
-                compose.onNodeWithText("Queue Low").performScrollTo().performClick()
+                compose.onNodeWithText("Queue").performScrollTo().performClick()
                 compose.waitForIdle()
                 val selection = host.accepted.single().first as QueueIntentSelection.Collection
                 assertEquals("fixture", selection.context.id)
@@ -343,11 +343,11 @@ class PlaylistContinuousHostTest {
                 // Manual validation includes the summary AFTER the held entries response.
                 await { fixture.requests().size == 2 && appendSettled() && (source == Source.DERIVED || fixture.summaryReads.get() >= 4) }
                 compose.waitForIdle()
-                compose.onNodeWithText("Queue Low").assertIsEnabled().performScrollTo().performClick()
+                compose.onNodeWithText("Queue").assertIsEnabled().performScrollTo().performClick()
                 compose.waitForIdle()
                 assertEquals(before, compose.onNodeWithText("Song 38").getUnclippedBoundsInRoot())
                 val selection = host.accepted.single().first as QueueIntentSelection.Track
-                assertEquals(PlaybackListAction.QUEUE_LOW, host.accepted.single().second)
+                assertEquals(PlaybackListAction.QUEUE_HIGH, host.accepted.single().second)
                 assertEquals("same", selection.track.getValue("id").jsonPrimitive.content)
                 if (source == Source.MANUAL) assertEquals("entry-38", selection.track.getValue("entryId").jsonPrimitive.content)
                 else {
@@ -396,7 +396,7 @@ class PlaylistContinuousHostTest {
                 compose.onNodeWithText("Song 0").assertExists()
                 compose.onNodeWithContentDescription("More actions for Song 0").performClick()
                 await { visible("Like song") }
-                compose.onNodeWithText("Queue Low").assertIsNotEnabled()
+                compose.onNodeWithText("Queue").assertIsNotEnabled()
                 compose.runOnIdle { repeat(8) { host.heartbeat() } }
                 assertTrue(host.accepted.isEmpty())
                 assertEquals(listOf(0, 40), fixture.requests())

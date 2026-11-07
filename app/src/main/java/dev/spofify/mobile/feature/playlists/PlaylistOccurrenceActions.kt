@@ -1,11 +1,5 @@
 package dev.spofify.mobile.feature.playlists
 
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
-import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
-import androidx.compose.material.icons.automirrored.filled.QueueMusic
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import dev.spofify.mobile.ui.*
@@ -19,8 +13,8 @@ import kotlinx.coroutines.launch
 internal fun PlaylistOccurrenceActions(
     client: SpofifyClient, track: LibraryItem, onDismiss: () -> Unit,
     onOpen: () -> Unit, onAdd: () -> Unit, onPersonalChange: () -> Unit,
-    playbackEnabled: Boolean, contextualLabel: String, onPlayNow: () -> Unit,
-    onContextual: (() -> Unit)?, onEnqueue: (() -> Unit)?, onPlayNext: (() -> Unit)?,
+    playbackEnabled: Boolean, onPlayNow: () -> Unit,
+    onQueue: (() -> Unit)?, onPlayNext: (() -> Unit)?,
     onOpenItem: (LibraryItem) -> Unit,
     onRemove: (() -> Unit)? = null,
     removeEnabled: Boolean = true,
@@ -46,8 +40,7 @@ internal fun PlaylistOccurrenceActions(
         PlaylistOccurrenceActionsContent(track, liked, busy, message, playbackEnabled, actionsEnabled,
             onOpen = { perform(onOpen) }, onAdd = { perform(onAdd) },
             onPlayNow = { perform(onPlayNow) },
-            onContextual = onContextual?.let { action -> { perform(action) } },
-            onEnqueue = onEnqueue?.let { action -> { perform(action) } },
+            onQueue = onQueue?.let { action -> { perform(action) } },
             onPlayNext = onPlayNext?.let { action -> { perform(action) } },
             onOpenItem = { item -> perform { onOpenItem(item) } },
             onRemove = onRemove?.let { action -> { perform(action) } }, removeEnabled = removeEnabled,
@@ -77,37 +70,18 @@ internal fun PlaylistOccurrenceActionsContent(
     track: LibraryItem, liked: Boolean?, busy: Boolean, message: String?,
     playbackEnabled: Boolean, actionsEnabled: Boolean,
     onOpen: () -> Unit, onAdd: () -> Unit, onPlayNow: () -> Unit,
-    onContextual: (() -> Unit)?, onEnqueue: (() -> Unit)?, onPlayNext: (() -> Unit)?,
+    onQueue: (() -> Unit)?, onPlayNext: (() -> Unit)?,
     onOpenItem: (LibraryItem) -> Unit, onRemove: (() -> Unit)?, removeEnabled: Boolean,
     onCheckLike: () -> Unit, onToggleLike: () -> Unit,
     artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
 ) {
-    val content: @Composable () -> Unit = {
-        SongActionGroup("Playback", divider = false) {
-            SongActionRow("Play now", Icons.Default.PlayArrow, playbackEnabled && actionsEnabled, onClick = onPlayNow)
-            onPlayNext?.let { action -> SongActionRow("Play next", Icons.Default.SkipNext,
-                playbackEnabled && actionsEnabled, onClick = action) }
-            onContextual?.let { action -> SongActionRow("Queue High", Icons.AutoMirrored.Filled.PlaylistPlay,
-                playbackEnabled && actionsEnabled, onClick = action) }
-            // Priority remains explicit and independent of the output's play/pause state.
-            onEnqueue?.let { action -> SongActionRow("Queue Low", Icons.AutoMirrored.Filled.QueueMusic,
-                playbackEnabled && actionsEnabled, onClick = action) }
-        }
-        SongActionGroup("Library") {
-            if (liked == null) SongActionRow(if (busy) "Checking like status" else "Check like status",
-                Icons.Default.FavoriteBorder, actionsEnabled, onClick = onCheckLike)
-            else SongActionRow(if (busy) "Saving like" else if (liked == true) "Unlike song" else "Like song",
-                if (liked == true) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                enabled = actionsEnabled, onClick = onToggleLike)
-            SongActionRow("Add to playlist", Icons.AutoMirrored.Filled.PlaylistAdd, actionsEnabled, onClick = onAdd)
-            message?.let { Text(it) }
-        }
-        SongActionGroup("Navigation") {
-            SongActionRow("Open track details", Icons.Default.Info, actionsEnabled, onClick = onOpen)
-            SongActionNavigation(track, actionsEnabled, onOpenItem)
-        }
-        SongActionRemoval(removeEnabled && actionsEnabled, onRemove)
-    }
-    if (artwork == null) SongActionLayout(track) { content() }
-    else SongActionLayout(track, artwork = artwork) { content() }
+    MusicActionsContent(track, liked, likePending = busy,
+        onPlay = onPlayNow, onPlayNext = onPlayNext, onQueue = onQueue,
+        onToggleLike = onToggleLike, onRetryLike = onCheckLike, onAddToPlaylist = onAdd,
+        onOpenItem = onOpenItem, onOpen = onOpen,
+        playbackEnabled = playbackEnabled, actionsEnabled = actionsEnabled,
+        pendingLikeLabel = if (liked == null) "Checking like status" else "Saving like",
+        checkLikeLabel = "Check like status", likeStatusEnabled = true, likeMessage = message,
+        contextualContent = { SongActionRemoval(removeEnabled && actionsEnabled, onRemove) },
+        artwork = artwork)
 }

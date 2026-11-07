@@ -7,6 +7,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
@@ -23,6 +24,8 @@ import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.Coverage
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.playback.PlaybackInteractionKey
+import dev.spofify.mobile.playback.PlaybackListAction
+import dev.spofify.mobile.playback.defaultQueueAction
 import dev.spofify.mobile.ui.theme.AppTypography
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -246,7 +249,7 @@ class MusicRowTest {
             assertTrue(actions.single { it.label == "Play now" }.action())
             assertEquals(listOf(track to false), played)
             assertTrue(contextual.isEmpty())
-            assertTrue(actions.single { it.label == "Queue High" }.action())
+            assertTrue(actions.single { it.label == "Queue" }.action())
             assertEquals(listOf(track to key), contextual)
             assertTrue(actions.single { it.label == "More actions" }.action())
             assertTrue(actions.single { it.label == "Like song" }.action())
@@ -283,7 +286,7 @@ class MusicRowTest {
         val titleBefore = compose.onNodeWithText(track.name, useUnmergedTree = true).bounds()
         compose.runOnIdle { item.value = track.copy(hasAudio = false) }
         compose.onNodeWithContentDescription("More actions for ${track.name}").performClick()
-        assertFalse(actions().any { it.label == "Play now" || it.label == "Queue High" })
+        assertFalse(actions().any { it.label == "Play now" || it.label == "Queue" })
         compose.onNodeWithText(compactMusicSubtitle(item.value), useUnmergedTree = true).assertHasNoClickAction()
         assertEquals(before, compose.onNodeWithTag("row").bounds())
         assertEquals(moreBefore, compose.onNodeWithContentDescription("More actions for ${track.name}").bounds())
@@ -315,6 +318,43 @@ class MusicRowTest {
             actionNode().fetchSemanticsNode().config.contains(SemanticsProperties.StateDescription))
     }
 
+    @Test fun swipeAndAccessibilityQueueKeepTheSameLabelAndItemDefaultAcrossKinds() {
+        val item = mutableStateOf(track)
+        val key = PlaybackInteractionKey()
+        val queued = mutableListOf<Pair<String, PlaybackListAction>>()
+        var bodyOpens = 0
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                MusicRow(item.value, { bodyOpens++ }, { _, _ -> }, {}, {},
+                    artwork = { _, modifier -> Box(modifier) }, modifier = Modifier.width(320.dp).testTag("queue-row"),
+                    playback = CatalogPlaybackFeedback(interactionKey = key,
+                        onContextual = { selected, captured, isCurrent ->
+                            assertSame(key, captured)
+                            assertTrue(isCurrent())
+                            queued += selected.kind to selected.defaultQueueAction()
+                        }))
+            }
+        }
+        for (kind in listOf("track", "album", "artist")) {
+            compose.runOnIdle { item.value = track.copy(kind = kind, coverage = Coverage(inLibrary = 2)) }
+            val actions = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.CustomActions))
+                .fetchSemanticsNode().config[SemanticsActions.CustomActions]
+            assertEquals(1, actions.count { it.label == "Queue" })
+            assertFalse(actions.any { it.label == "Queue High" || it.label == "Queue Low" })
+            compose.runOnIdle { assertTrue(actions.single { it.label == "Queue" }.action()) }
+            compose.onNodeWithTag("queue-row").performTouchInput {
+                swipe(start = Offset(width * .25f, centerY), end = Offset(width * .75f, centerY))
+            }
+            compose.waitForIdle()
+        }
+        compose.runOnIdle {
+            assertEquals(listOf("track" to PlaybackListAction.QUEUE_HIGH, "track" to PlaybackListAction.QUEUE_HIGH,
+                "album" to PlaybackListAction.QUEUE_LOW, "album" to PlaybackListAction.QUEUE_LOW,
+                "artist" to PlaybackListAction.QUEUE_LOW, "artist" to PlaybackListAction.QUEUE_LOW), queued)
+            assertEquals("Queue actions do not activate the row body", 0, bodyOpens)
+        }
+    }
+
     @Test fun contextualActionUsesActiveIntentAndRequiresInteractionKeyAndCallback() {
         val key = PlaybackInteractionKey()
         val contextual = mutableListOf<Pair<LibraryItem, PlaybackInteractionKey>>()
@@ -334,13 +374,13 @@ class MusicRowTest {
             }
         }
         val cases = listOf(
-            Triple(base, "Queue High", true),
-            Triple(base.copy(buffering = true), "Queue High", true),
-            Triple(base.copy(playWhenReady = true), "Queue High", true),
-            Triple(base.copy(isPlaying = true), "Queue High", true),
-            Triple(base.copy(buffering = true, playWhenReady = true), "Queue High", true),
-            Triple(base.copy(isPlaying = true, interactionKey = null), "Queue High", false),
-            Triple(base.copy(isPlaying = true, onContextual = null), "Queue High", false),
+            Triple(base, "Queue", true),
+            Triple(base.copy(buffering = true), "Queue", true),
+            Triple(base.copy(playWhenReady = true), "Queue", true),
+            Triple(base.copy(isPlaying = true), "Queue", true),
+            Triple(base.copy(buffering = true, playWhenReady = true), "Queue", true),
+            Triple(base.copy(isPlaying = true, interactionKey = null), "Queue", false),
+            Triple(base.copy(isPlaying = true, onContextual = null), "Queue", false),
         )
         var acceptedCallbacks = 0
         for ((feedback, label, enabled) in cases) {
@@ -350,10 +390,10 @@ class MusicRowTest {
                 .fetchSemanticsNode().config[SemanticsActions.CustomActions]
             assertEquals("Play now remains one deliberate action regardless of output state", 1,
                 actions.count { it.label == "Play now" })
-            assertEquals("Queue High needs a valid binding, never a sampled playing flag", enabled,
-                actions.any { it.label == "Queue High" })
+            assertEquals("Queue needs a valid binding, never a sampled playing flag", enabled,
+                actions.any { it.label == "Queue" })
             if (enabled) {
-                compose.runOnIdle { assertTrue(actions.single { it.label == "Queue High" }.action()) }
+                compose.runOnIdle { assertTrue(actions.single { it.label == "Queue" }.action()) }
                 acceptedCallbacks++
             }
             compose.onAllNodes(hasClickAction()).assertCountEquals(2)
@@ -415,7 +455,7 @@ class MusicRowTest {
         compose.runOnIdle { assertTrue(current!!.invoke()); feedback.value = feedback.value.copy(buffering = true) }
         compose.runOnIdle {
             assertTrue("Benign buffering keeps the occurrence lifetime", current!!.invoke())
-            retained.single { it.label == "Queue High" }.action()
+            retained.single { it.label == "Queue" }.action()
             assertEquals(1, high)
             enabled.value = false
         }

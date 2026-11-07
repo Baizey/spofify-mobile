@@ -24,6 +24,8 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.LibraryItem
+import dev.spofify.mobile.playback.PlaybackListAction
+import dev.spofify.mobile.playback.defaultQueueAction
 import dev.spofify.mobile.ui.theme.AppTypography
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -53,7 +55,7 @@ class MusicActionsContentTest {
         compose.setContent {
             MaterialTheme(typography = AppTypography) {
                 MusicActionsContent(LibraryItem("track", "song", "Song", hasAudio = true),
-                    liked.value, pending.value, failed.value, onPlay = {}, onPlayNext = {}, onEnqueue = {},
+                    liked.value, pending.value, failed.value, onPlay = {}, onPlayNext = {}, onQueue = {},
                     onToggleLike = { toggles++ }, onRetryLike = { retries++ }, onAddToPlaylist = {}, onOpenItem = {})
             }
         }
@@ -69,22 +71,69 @@ class MusicActionsContentTest {
         compose.runOnIdle { assertEquals(2, toggles); assertEquals(1, retries) }
     }
 
-    @Test fun fourPriorityActionsAreIndependentOfSampledTransportState() {
+    @Test fun queueIsOneActionSeparateFromPlayNextAndPlayNow() {
         val events = mutableListOf<String>()
         compose.setContent {
             MaterialTheme(typography = AppTypography) {
                 MusicActionsContent(LibraryItem("track", "song", "Song", hasAudio = true),
                     liked = false, likePending = false, likeFailed = false,
                     onPlay = { events += "now" }, onPlayNext = { events += "next" },
-                    onEnqueue = { error("High must use its explicit callback") }, onToggleLike = {}, onRetryLike = {},
-                    onAddToPlaylist = {}, onOpenItem = {}, onQueueLow = { events += "low" },
-                    onContextual = { events += "high" })
+                    onQueue = { events += "queue" }, onToggleLike = {}, onRetryLike = {},
+                    onAddToPlaylist = {}, onOpenItem = {})
             }
         }
-        for (label in listOf("Queue Low", "Queue High", "Play next", "Play now")) {
+        compose.onAllNodesWithText("Queue").assertCountEquals(1)
+        compose.onNodeWithText("Queue High").assertDoesNotExist()
+        compose.onNodeWithText("Queue Low").assertDoesNotExist()
+        for (label in listOf("Queue", "Play next", "Play now")) {
             compose.onNodeWithText(label).performScrollTo().assertHeightIsAtLeast(48.dp).assertIsEnabled().performClick()
         }
-        compose.runOnIdle { assertEquals(listOf("low", "high", "next", "now"), events) }
+        compose.runOnIdle { assertEquals(listOf("queue", "next", "now"), events) }
+    }
+
+    @Test fun allItemKindsSharePlaybackOrderWithOneQueueAndHonestLibraryCapabilities() {
+        val item = mutableStateOf(LibraryItem("track", "opaque/song", "Song", hasAudio = true))
+        val queued = mutableListOf<PlaybackListAction>()
+        compose.setContent {
+            MaterialTheme(typography = AppTypography) {
+                MusicActionsContent(item.value, liked = false,
+                    onPlay = {}, onPlayNext = {}, onQueue = { queued += item.value.defaultQueueAction() },
+                    onToggleLike = {}, onRetryLike = {}, onAddToPlaylist = {}, onOpenItem = {}, playbackEnabled = true)
+            }
+        }
+        for (kind in listOf("track", "album", "artist", "playlist", "derived", "likes")) {
+            compose.runOnIdle { item.value = LibraryItem(kind, "opaque/$kind", "Music", hasAudio = true) }
+            compose.onAllNodesWithText("Queue").assertCountEquals(1)
+            compose.onNodeWithText("Queue High").assertDoesNotExist()
+            compose.onNodeWithText("Queue Low").assertDoesNotExist()
+            val now = compose.onNodeWithText("Play now").getUnclippedBoundsInRoot()
+            val next = compose.onNodeWithText("Play next").getUnclippedBoundsInRoot()
+            val queue = compose.onNodeWithText("Queue").getUnclippedBoundsInRoot()
+            assertTrue("Shared playback order must not depend on item kind", now.bottom <= next.top && next.bottom <= queue.top)
+            compose.onNodeWithText("Queue").performScrollTo().performClick()
+            if (kind == "track") {
+                compose.onNodeWithText("Like song").assertExists()
+                compose.onNodeWithText("Add to playlist").assertExists()
+            } else {
+                compose.onNodeWithText("Library").assertDoesNotExist()
+                compose.onNodeWithText("Like song").assertDoesNotExist()
+                compose.onNodeWithText("Add to playlist").assertDoesNotExist()
+            }
+        }
+        assertEquals(listOf(PlaybackListAction.QUEUE_HIGH) + List(5) { PlaybackListAction.QUEUE_LOW }, queued)
+    }
+
+    @Test fun unsupportedActionsAreOmittedWithoutInventingPlaybackOrLibraryCapabilities() {
+        compose.setContent {
+            MaterialTheme {
+                MusicActionsContent(LibraryItem("album", "opaque/album", "Album"), onQueue = {}, onOpenItem = {})
+            }
+        }
+        compose.onNodeWithText("Play now").assertDoesNotExist()
+        compose.onNodeWithText("Play next").assertDoesNotExist()
+        compose.onNodeWithText("Library").assertDoesNotExist()
+        compose.onNodeWithText("Queue").assertExists()
+        compose.onNodeWithText("Open details").performScrollTo().assertIsEnabled()
     }
 
     private fun checkReachability(fontScale: Float) {
@@ -100,7 +149,7 @@ class MusicActionsContentTest {
                     Surface(Modifier.fillMaxSize()) {
                         MusicActionsContent(item, liked = false, likePending = false, likeFailed = false,
                             onPlay = { events += "play" }, onPlayNext = { events += "next" },
-                            onEnqueue = { events += "queue" }, onQueueLow = { events += "low" }, onToggleLike = { events += "like" },
+                            onQueue = { events += "queue" }, onToggleLike = { events += "like" },
                             onRetryLike = { events += "retry" }, onAddToPlaylist = { events += "playlist" },
                             onOpenItem = { events += "${it.kind}:${it.id}" })
                     }
@@ -119,7 +168,7 @@ class MusicActionsContentTest {
             compose.runOnIdle { assertEquals(expected, events.last()) }
         }
         // Traverse back through the actual actions, not a duplicate test-only menu.
-        for (label in listOf("Open details", "Add to playlist", "Queue Low", "Queue High", "Play next", "Play now", "Like song")) {
+        for (label in listOf("Open details", "Add to playlist", "Queue", "Play next", "Play now", "Like song")) {
             val action = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
             val viewport = compose.onNodeWithTag("music-actions").getUnclippedBoundsInRoot()
             val target = action.getUnclippedBoundsInRoot()
@@ -130,7 +179,7 @@ class MusicActionsContentTest {
             action.performClick()
         }
         compose.runOnIdle {
-            assertEquals(listOf("album:album", "artist:artist-24", "track:song", "playlist", "low", "queue", "next", "play", "like"), events)
+            assertEquals(listOf("album:album", "artist:artist-24", "track:song", "playlist", "queue", "next", "play", "like"), events)
         }
     }
 }

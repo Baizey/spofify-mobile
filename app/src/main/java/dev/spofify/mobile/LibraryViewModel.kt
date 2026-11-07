@@ -10,6 +10,7 @@ import dev.spofify.mobile.core.PlaybackQueue
 import dev.spofify.mobile.core.PlaybackContext
 import dev.spofify.mobile.core.QueueIntentSelection
 import dev.spofify.mobile.playback.queueIntentSelection
+import dev.spofify.mobile.playback.defaultQueueAction
 import dev.spofify.mobile.core.PlaylistSummary
 import dev.spofify.mobile.core.ServerAddress
 import dev.spofify.mobile.core.Session
@@ -150,9 +151,12 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         return client
     }
 
+    private fun catalogKey(item: LibraryItem?, navigationId: Long = 0) =
+        item?.let { "${it.kind}:${it.id}:$navigationId" } ?: "search"
+
     fun catalogHolder(item: LibraryItem? = null, navigationId: Long = 0): CatalogStateHolder? {
         val client = ensureFeatureOwner() ?: return null
-        val key = item?.let { "${it.kind}:${it.id}:$navigationId" } ?: "search"
+        val key = catalogKey(item, navigationId)
         return catalogHolders.getOrPut(key) {
             if (catalogHolders.size >= 24) {
                 val oldest = catalogHolders.keys.firstOrNull { it != "search" }
@@ -585,12 +589,30 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         if (cleared || !callerIsCurrent() || graph.client !== expectedClient || state.value.session == null ||
             !item.playable && item.kind !in setOf("likes", "playlist", "derived")) return
         val source = state.value.page
+        // Catalog navigation is nested inside its outer route. Capture the displayed
+        // collection once, without creating a holder or borrowing a later screen at
+        // admission. The same source incarnation guards every asynchronous boundary.
+        val holder = when (source) {
+            is Page.Detail -> catalogHolders[catalogKey(source.item, source.navigationId)]
+            is Page.Search, is Page.Catalog -> catalogHolders[catalogKey(null)]
+            else -> null
+        }
+        val screen = holder?.state?.value?.current
+        val version = holder?.navigationVersion
+        val collection = if (holder != null) screen?.item else (source as? Page.Detail)?.item
         val context = when {
             source == Page.Likes && item.kind == "track" -> PlaybackContext("likes", "likes", "Liked songs")
             source is Page.Playlist && item.kind == "track" -> PlaybackContext("playlist", source.playlist.id, source.playlist.name)
+            item.kind == "track" -> collection?.takeIf { it.kind in setOf("album", "artist") }
+                ?.let { PlaybackContext(it.kind, it.id, it.name) }
             else -> null
         }
-        queueIntentSelectionFrom(expectedClient, queueIntentSelection(item, context), action, expectedKey, callerIsCurrent, expectedBinding, unselectedOrigin)
+        val sourceIsCurrent = {
+            callerIsCurrent() && (holder == null || holder.navigationVersion == version && holder.state.value.current.let {
+                it.key == screen?.key && it.resultGeneration == screen?.resultGeneration && !it.detailUnavailable
+            })
+        }
+        queueIntentSelectionFrom(expectedClient, queueIntentSelection(item, context), action, expectedKey, sourceIsCurrent, expectedBinding, unselectedOrigin)
     }
 
     fun queueIntentSelectionFrom(expectedClient: SpofifyClient, selection: QueueIntentSelection,
@@ -610,16 +632,16 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     }
 
     fun enqueueFrom(expectedClient: SpofifyClient, item: LibraryItem, playNext: Boolean = false) {
-        if (graph.client !== expectedClient || state.value.session == null || !item.playable) return
-        queueIntentFrom(expectedClient, item, if (playNext) PlaybackListAction.PLAY_NEXT else PlaybackListAction.QUEUE_HIGH)
+        if (graph.client !== expectedClient || state.value.session == null) return
+        queueIntentFrom(expectedClient, item, if (playNext) PlaybackListAction.PLAY_NEXT else item.defaultQueueAction())
     }
 
     /** A held row supplies its original binding, never a later UI isPlaying decision. */
     fun contextualFrom(expectedClient: SpofifyClient, item: LibraryItem, expectedKey: PlaybackInteractionKey,
         callerIsCurrent: () -> Boolean = { true }) {
-        if (!callerIsCurrent() || graph.client !== expectedClient || state.value.session == null || !item.playable ||
+        if (!callerIsCurrent() || graph.client !== expectedClient || state.value.session == null ||
             playback.state.value.interactionKey != expectedKey) return
-        queueIntentFrom(expectedClient, item, PlaybackListAction.QUEUE_HIGH, expectedKey, callerIsCurrent)
+        queueIntentFrom(expectedClient, item, item.defaultQueueAction(), expectedKey, callerIsCurrent)
     }
 
     /** Signed/manual playlist selection stays prepared; no token or occurrence ID is repackaged. */

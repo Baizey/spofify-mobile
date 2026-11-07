@@ -39,7 +39,7 @@ data class CatalogPlaybackFeedback(
     val onUnselectedHigh: ((LibraryItem, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)? = null,
 ) {
     val activeIntent: Boolean get() = isPlaying || (buffering && playWhenReady)
-    val contextualLabel: String get() = "Queue High"
+    val contextualLabel: String get() = "Queue"
 }
 
 /** Like state belongs to the account's shared personal-action owner, not each row. */
@@ -108,7 +108,7 @@ fun MusicRow(
     val capture = playback.interactionKey ?: playback.unselectedQueueOrigin
     val latestCapture by rememberUpdatedState(capture)
     val contextualEnabled = canPlay && (playback.interactionKey != null && playback.onContextual != null ||
-        playback.unselectedQueueOrigin != null && playback.onUnselectedHigh != null)
+        item.kind == "track" && playback.unselectedQueueOrigin != null && playback.onUnselectedHigh != null)
     fun contextual(captured: Any, current: () -> Boolean) {
         if (!current()) return
         val admittedSource = sourceCurrent(current)

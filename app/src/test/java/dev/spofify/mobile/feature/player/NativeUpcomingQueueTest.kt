@@ -32,6 +32,7 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.LibraryItem
@@ -121,7 +122,7 @@ class NativeUpcomingQueueTest {
         }
     }
 
-    @Test fun bothUpcomingPresentationsOfferFourExactKeyIntentsForDuplicateOccurrences() {
+    @Test fun bothUpcomingPresentationsOfferThreeExactKeyIntentsForDuplicateOccurrences() {
         val controls = QueueRecordingControls()
         val key = PlaybackInteractionKey()
         val compact = mutableStateOf(false)
@@ -132,14 +133,16 @@ class NativeUpcomingQueueTest {
         } } }
         for (presentation in listOf(false, true)) {
             compose.runOnIdle { compact.value = presentation; controls.intents.clear() }
-            for ((label, action) in listOf("Queue Low" to PlaybackListAction.QUEUE_LOW,
-                "Queue High" to PlaybackListAction.QUEUE_HIGH, "Play next" to PlaybackListAction.PLAY_NEXT,
+            for ((label, action) in listOf("Queue" to PlaybackListAction.QUEUE_HIGH, "Play next" to PlaybackListAction.PLAY_NEXT,
                 "Play now" to PlaybackListAction.PLAY_NOW)) {
                 compose.onAllNodesWithContentDescription("Queue actions for Duplicate song")[1].performClick()
-                compose.onNodeWithText(label).performClick()
+                compose.onAllNodesWithText("Queue").assertCountEquals(1)
+                compose.onNodeWithText("Queue Low").assertDoesNotExist()
+                compose.onNodeWithText("Queue High").assertDoesNotExist()
+                compose.onNodeWithText(label).performScrollTo().performClick()
                 compose.runOnIdle { assertEquals(Triple(key, "second", action), controls.intents.last()) }
             }
-            compose.runOnIdle { assertEquals(4, controls.intents.size); assertEquals(0, controls.playbackCalls) }
+            compose.runOnIdle { assertEquals(3, controls.intents.size); assertEquals(0, controls.playbackCalls) }
         }
     }
 
@@ -192,7 +195,7 @@ class NativeUpcomingQueueTest {
             compose.onNodeWithText("Duplicate song").performTouchInput { up() }
             compose.runOnIdle { assertEquals(listOf(key to "exact-duplicate"), controls.playNexts) }
             compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
-            compose.onNodeWithText("Queue High").performClick()
+            compose.onNodeWithText("Queue").performClick()
             compose.runOnIdle {
                 assertEquals(listOf("exact-duplicate"), controls.contextual)
                 assertEquals(listOf(key to "exact-duplicate"), controls.playNexts)
@@ -319,10 +322,10 @@ class NativeUpcomingQueueTest {
         }
         compose.onNodeWithContentDescription("Queue actions for Duplicate song").performClick()
         compose.runOnIdle { snapshot.value = initial.copy(positionMs = 1_000) }
-        compose.onNodeWithText("Queue High").assertIsDisplayed()
+        compose.onNodeWithText("Queue").assertIsDisplayed()
         compose.onNodeWithText("Play next").assertIsDisplayed()
         compose.runOnIdle { snapshot.value = initial.copy(interactionKey = PlaybackInteractionKey()) }
-        compose.onNodeWithText("Queue High").assertDoesNotExist()
+        compose.onNodeWithText("Queue").assertDoesNotExist()
         compose.onNodeWithText("Play next").assertDoesNotExist()
         // An equal-valued queue returning under another observed binding cannot revive More.
         compose.runOnIdle { snapshot.value = initial.copy(interactionKey = PlaybackInteractionKey()) }

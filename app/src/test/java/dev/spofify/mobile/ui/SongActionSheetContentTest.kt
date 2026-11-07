@@ -19,6 +19,7 @@ import dev.spofify.mobile.core.ArtistCredit
 import dev.spofify.mobile.core.LibraryItem
 import dev.spofify.mobile.listeningColorScheme
 import dev.spofify.mobile.feature.playlists.PlaylistOccurrenceActionsContent
+import dev.spofify.mobile.feature.playlists.PlaylistCollectionActionsContent
 import dev.spofify.mobile.ui.theme.AppTypography
 import java.io.File
 import org.junit.Assert.assertEquals
@@ -45,7 +46,7 @@ class SongActionSheetContentTest {
             MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                 Surface(Modifier.fillMaxSize()) {
                     MusicActionsContent(track, false, false, false, {}, {}, {}, {}, {}, {},
-                        onOpenItem = { targets += "${it.kind}:${it.id}" }, onQueueLow = {})
+                        onOpenItem = { targets += "${it.kind}:${it.id}" })
                 }
             }
         }
@@ -61,6 +62,67 @@ class SongActionSheetContentTest {
         compose.onNodeWithText("Remove from this playlist").assertDoesNotExist()
     }
 
+    @Test fun albumAndArtistUseTheSameGroupedPlaybackPresentation() {
+        val kind = mutableStateOf("album")
+        compose.setContent {
+            MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
+                Surface(Modifier.fillMaxSize()) {
+                    MusicActionsContent(
+                        LibraryItem(kind.value, "opaque/${kind.value}", "Evening collection"),
+                        onPlay = {}, onPlayNext = {}, onQueue = {}, onOpenItem = {}, playbackEnabled = true)
+                }
+            }
+        }
+        for (value in listOf("album", "artist")) {
+            compose.runOnIdle { kind.value = value }
+            compose.onAllNodesWithText("Queue").assertCountEquals(1)
+            compose.onNodeWithText("Queue High").assertDoesNotExist()
+            compose.onNodeWithText("Queue Low").assertDoesNotExist()
+            compose.onNodeWithText("Like song").assertDoesNotExist()
+            compose.onNodeWithText("Add to playlist").assertDoesNotExist()
+            compose.onNodeWithText("Library").assertDoesNotExist()
+            compose.onNodeWithText("Playback").assertIsDisplayed()
+            compose.onNodeWithText("Open details").performScrollTo().assertHeightIsAtLeast(48.dp)
+            capture("shared-$value")
+        }
+    }
+
+    @Test fun wholePlaylistProductionBodyRendersSharedPlaybackManagementAndDestructiveActionLast() {
+        val derived = mutableStateOf(false)
+        val actions = mutableListOf<String>()
+        compose.setContent {
+            MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
+                Surface(Modifier.fillMaxSize()) {
+                    PlaylistCollectionActionsContent(
+                        LibraryItem(if (derived.value) "derived" else "playlist", "opaque/playlist", "Evening playlist"),
+                        playbackEnabled = true, managementEnabled = true,
+                        onPlayNow = { actions += "now" }, onPlayNext = { actions += "next" }, onQueue = { actions += "queue" },
+                        onEditDetails = {}, onEditRules = if (derived.value) ({}) else null,
+                        onMakeEditableCopy = if (derived.value) ({}) else null,
+                        onReorder = if (!derived.value) ({}) else null, onDelete = { actions += "delete" })
+                }
+            }
+        }
+        for (isDerived in listOf(false, true)) {
+            compose.runOnIdle { derived.value = isDerived }
+            compose.onAllNodesWithText("Queue").assertCountEquals(1)
+            compose.onNodeWithText("Queue High").assertDoesNotExist()
+            compose.onNodeWithText("Queue Low").assertDoesNotExist()
+            compose.onNodeWithText("Like song").assertDoesNotExist()
+            compose.onNodeWithText("Navigation").assertDoesNotExist() // Already on this collection's detail route.
+            compose.onNodeWithText("Play now").performScrollTo().assertIsEnabled()
+            capture("shared-playlist-${if (isDerived) "derived" else "manual"}-top")
+            compose.onNodeWithText("Delete").performScrollTo().assertIsEnabled().assertHeightIsAtLeast(48.dp)
+            val terminalManagement = if (isDerived) "Make editable copy" else "Reorder all occurrences"
+            val management = compose.onNodeWithText(terminalManagement).getUnclippedBoundsInRoot()
+            val deletion = compose.onNodeWithText("Delete").getUnclippedBoundsInRoot()
+            org.junit.Assert.assertTrue("Contextual deletion stays last", management.bottom <= deletion.top)
+            capture("shared-playlist-${if (isDerived) "derived" else "manual"}-terminal")
+            compose.onNodeWithText("Queue").performScrollTo().performClick()
+        }
+        assertEquals(listOf("queue", "queue"), actions)
+    }
+
     @Test fun unavailablePendingAndRtlLargeFontRemainHonestAndReachable() {
         var writes = 0
         compose.setContent {
@@ -70,12 +132,12 @@ class SongActionSheetContentTest {
                 MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                     Surface(Modifier.fillMaxSize()) {
                         MusicActionsContent(track.copy(hasAudio = false), null, true, false,
-                            {}, {}, {}, { writes++ }, { writes++ }, {}, {}, onQueueLow = {})
+                            {}, {}, {}, { writes++ }, { writes++ }, {}, {})
                     }
                 }
             }
         }
-        for (label in listOf("Play now", "Play next", "Queue High", "Queue Low", "Saving like")) {
+        for (label in listOf("Play now", "Play next", "Queue", "Saving like")) {
             compose.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertIsNotEnabled()
                 .assertHeightIsAtLeast(48.dp)
         }
@@ -93,7 +155,7 @@ class SongActionSheetContentTest {
             MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                 Surface(Modifier.fillMaxSize()) {
                     PlaylistOccurrenceActionsContent(track, false, false, null, true, true,
-                        {}, {}, {}, {}, {}, {}, {}, remove.value, enabled.value, {}, {})
+                        {}, {}, {}, {}, {}, {}, remove.value, enabled.value, {}, {})
                 }
             }
         }
@@ -102,6 +164,9 @@ class SongActionSheetContentTest {
         compose.runOnIdle { remove.value = { removed += "entry/second-duplicate" } }
         capture("occurrence-supported")
         compose.onNodeWithText("Remove from this playlist").performScrollTo().assertIsNotEnabled()
+        val removal = compose.onNodeWithText("Remove from this playlist").getUnclippedBoundsInRoot()
+        val navigation = compose.onNodeWithText("Evening sessions").getUnclippedBoundsInRoot()
+        org.junit.Assert.assertTrue("Exact-occurrence removal stays after navigation", navigation.bottom <= removal.top)
         capture("remove-disabled")
         compose.runOnIdle { enabled.value = true }
         compose.onNodeWithText("Remove from this playlist").assertHeightIsAtLeast(48.dp).performClick()
@@ -118,7 +183,7 @@ class SongActionSheetContentTest {
             MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                 Surface(Modifier.fillMaxSize()) {
                     PlaylistOccurrenceActionsContent(track, null, false, notice, true, current.value,
-                        {}, {}, {}, {}, {}, {}, {}, { writes++ }, true, { reads++ }, { writes++ })
+                        {}, {}, {}, {}, {}, {}, { writes++ }, true, { reads++ }, { writes++ })
                 }
             }
         }
@@ -129,7 +194,7 @@ class SongActionSheetContentTest {
         assertEquals(0, writes)
         capture("occurrence-uncertain")
         compose.runOnIdle { current.value = false }
-        for (label in listOf("Play now", "Queue High", "Queue Low", "Check like status", "Add to playlist",
+        for (label in listOf("Play now", "Queue", "Check like status", "Add to playlist",
             "First artist", "Evening sessions", "Remove from this playlist")) {
             compose.onNodeWithText(label).performScrollTo().assertIsNotEnabled()
         }
@@ -163,7 +228,7 @@ class SongActionSheetContentTest {
             MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                 Surface(Modifier.fillMaxSize()) {
                     PlaylistOccurrenceActionsContent(track, false, false, null, true, true,
-                        {}, {}, {}, {}, {}, {}, {}, { removed++ }, true, {}, {})
+                        {}, {}, {}, {}, {}, {}, { removed++ }, true, {}, {})
                 }
             }
         }

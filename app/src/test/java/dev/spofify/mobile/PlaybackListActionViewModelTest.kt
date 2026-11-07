@@ -137,6 +137,84 @@ class PlaybackListActionViewModelTest {
             block(Fixture(model, client, graph, controls, reads, account))
         } finally { gate?.release?.countDown(); store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain() }
     }
+    @Test fun defaultQueueApisUseSongHighAndCollectionLowWithoutPreparationOrReplacement() = fixture { f ->
+        for (item in listOf(f.row, LibraryItem("album", "album", "Album", coverage = Coverage(inLibrary = 2)),
+            LibraryItem("artist", "artist", "Artist", coverage = Coverage(inLibrary = 2)),
+            LibraryItem("playlist", "manual", "Manual"))) {
+            for (contextual in listOf(false, true)) {
+                val count = f.controls.pending.size + 1
+                if (contextual) f.model.contextualFrom(f.client, item, f.controls.key)
+                else f.model.enqueueFrom(f.client, item)
+                until { f.controls.pending.size == count }
+                val pending = f.controls.pending.last()
+                assertEquals(if (item.kind == "track") PlaybackListAction.QUEUE_HIGH else PlaybackListAction.QUEUE_LOW, pending.action)
+                assertEquals(item.kind == "track", pending.selection is QueueIntentSelection.Track)
+                pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP)); runCurrent()
+            }
+        }
+        assertEquals(0, f.playbackReads.get())
+        assertEquals(0, f.controls.replacementPlays)
+    }
+
+    @Test fun nestedCatalogActionsCaptureDisplayedCollectionAndFenceNavigationIncludingABA() = fixture { f ->
+        val artist = LibraryItem("artist", "outer-artist", "Artist")
+        val album = LibraryItem("album", "displayed-album", "Album")
+        val other = album.copy(id = "other-album")
+        for (fromSearch in listOf(false, true)) {
+            if (fromSearch) f.model.open(Page.Search("query")) else f.model.open(Page.Detail(artist))
+            runCurrent()
+            val holder = requireNotNull(if (fromSearch) f.model.catalogHolder() else {
+                val page = f.model.state.value.page as Page.Detail
+                f.model.catalogHolder(page.item, page.navigationId)
+            })
+            if (fromSearch) holder.open(artist)
+            holder.open(album) // Actual inner catalog navigation, without changing the outer Page.
+            for (action in listOf(PlaybackListAction.PLAY_NOW, PlaybackListAction.QUEUE_HIGH)) {
+                val count = f.controls.pending.size + 1
+                f.submit(action); until { f.controls.pending.size == count }
+                val pending = f.controls.pending.last()
+                val selected = pending.selection as QueueIntentSelection.Track
+                assertEquals(PlaybackContext("album", album.id, album.name), selected.context)
+                assertEquals(action, pending.action)
+                assertTrue(pending.current())
+                holder.open(other)
+                assertFalse("A pending action cannot borrow the next album", pending.current())
+                holder.back()
+                assertFalse("Returning to the same collection cannot revive the action", pending.current())
+                pending.complete(PlaybackActionResult(PlaybackActionStatus.STALE)); runCurrent()
+            }
+            holder.back() // Artist reached inside Search or Detail, rather than the outer route.
+            val count = f.controls.pending.size + 1
+            f.submit(PlaybackListAction.PLAY_NOW); until { f.controls.pending.size == count }
+            val pending = f.controls.pending.last()
+            assertEquals(PlaybackContext("artist", artist.id, artist.name), (pending.selection as QueueIntentSelection.Track).context)
+            pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP)); runCurrent()
+        }
+        assertEquals(0, f.playbackReads.get())
+        assertEquals(0, f.controls.replacementPlays)
+    }
+
+    @Test fun detailTrackMenuPreservesArtistOrAlbumContextWithoutChangingSongQueueIntent() = fixture { f ->
+        for (kind in listOf("artist", "album")) {
+            val collection = LibraryItem(kind, "$kind/a%", "Rendered collection")
+            f.model.open(Page.Detail(collection)); runCurrent()
+            for (action in listOf(PlaybackListAction.PLAY_NOW, PlaybackListAction.QUEUE_HIGH)) {
+                val count = f.controls.pending.size + 1
+                f.submit(action); until { f.controls.pending.size == count }
+                val pending = f.controls.pending.last()
+                val selected = pending.selection as QueueIntentSelection.Track
+                assertEquals(PlaybackContext(kind, collection.id, collection.name), selected.context)
+                assertEquals("same", selected.track.getValue("id").jsonPrimitive.content)
+                assertEquals(action, pending.action)
+                assertSame(f.controls.key, pending.key)
+                assertEquals(f.controls.binding, pending.binding)
+                pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP)); runCurrent()
+            }
+        }
+        assertEquals(0, f.playbackReads.get())
+        assertEquals(0, f.controls.replacementPlays)
+    }
+
     @Test fun fourRawIntentsPreserveOriginalBindingAndDoNotPrepareOnController() = fixture { f ->
         for (action in listOf(PlaybackListAction.QUEUE_LOW, PlaybackListAction.QUEUE_HIGH,
             PlaybackListAction.PLAY_NEXT, PlaybackListAction.PLAY_NOW)) {

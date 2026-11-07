@@ -30,6 +30,8 @@ import dev.spofify.mobile.playback.PlaybackInteractionKey
 import dev.spofify.mobile.playback.PlaybackListAction
 import dev.spofify.mobile.ui.AutomaticListDemand
 import dev.spofify.mobile.ui.AppendStatus
+import dev.spofify.mobile.ui.SongActionSheet
+import dev.spofify.mobile.playback.defaultQueueAction
 import dev.spofify.mobile.core.*
 import dev.spofify.mobile.playback.PlaybackRequests
 import dev.spofify.mobile.playback.queueIntentSelection
@@ -747,10 +749,9 @@ private fun PlaylistDetail(
             onAdd = { occurrenceActions = null; addingTrack = selection.track },
             // Successful Like publishes personalRevision; the single bounded read above consumes it.
             onPersonalChange = {},
-            playbackEnabled = playable, contextualLabel = playback.contextualLabel,
+            playbackEnabled = playable,
             onPlayNow = { perform() },
-            onContextual = if (preparedEnabled) ({ perform(PlaybackListAction.QUEUE_HIGH) }) else null,
-            onEnqueue = if (preparedEnabled) ({ perform(PlaybackListAction.QUEUE_LOW) }) else null,
+            onQueue = if (preparedEnabled) ({ perform(selection.track.defaultQueueAction()) }) else null,
             onPlayNext = if (preparedEnabled) ({ perform(PlaybackListAction.PLAY_NEXT) }) else null,
             onOpenItem = { occurrenceActions = null; onOpenTrack(it) },
             onRemove = if (saved?.capabilities?.editEntries == true && selection.entryId != null) ({
@@ -766,79 +767,74 @@ private fun PlaylistDetail(
         val playbackEnabled = !busy && !stale && saved?.capabilities?.play == true &&
             captured.selection != null && captured.isCurrent() &&
             (captured.key == null || latestInteractionKey === captured.key)
-        AlertDialog(onDismissRequest = { collectionActions = null }, title = { Text(saved?.name ?: "Playlist") }, text = {
-            Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
-                if (onQueueIntent != null && saved?.capabilities?.play == true) {
-                    listOf("Queue Low" to PlaybackListAction.QUEUE_LOW, "Queue High" to PlaybackListAction.QUEUE_HIGH,
-                        "Play next" to PlaybackListAction.PLAY_NEXT, "Play now" to PlaybackListAction.PLAY_NOW).forEach { (label, action) ->
-                        TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = playbackEnabled, onClick = {
-                            collectionActions = null; submit(captured.selection, action, captured.key, captured.binding, captured.isCurrent, captured.unselectedOrigin)
-                        }) { Text(label) }
-                    }
-                    HorizontalDivider()
-                }
-                saved?.let { playlist ->
-                    if (playlist.capabilities.editMetadata) TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                        enabled = managementEnabled, onClick = { collectionActions = null; metadata = true }) { Text("Edit details") }
-                    if (playlist.kind == PlaylistKind.DERIVED) {
-                        if (playlist.capabilities.editDefinition) TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                            enabled = managementEnabled, onClick = {
-                            val source = PlaylistSourceStamp(client)
-                            val ticket = generation.ticket()
-                            collectionActions = null; busy = true
-                            scope.launch {
-                                try {
-                                    val rules = derived.definition(id)
-                                    if (!source.isCurrent() || !generation.accepts(ticket) || !actionLifetime.isCurrent()) return@launch
-                                    if (rules.revision != playlist.revision) { stale = true; message = "Playlist changed. Reload before editing rules."; fetchFailed = true }
-                                    else {
-                                        if (editorDraft == null) { editorDraft = PlaylistEditorDraft(playlist, rules.definition); editorTarget = playlist }
-                                        else if (editorTarget?.revision != rules.revision) {
-                                            editorDraft!!.blocked = true
-                                            editorDraft!!.message = "The saved revision changed while this draft was retained. It has not been rebased or resubmitted. Discard the draft to reload current rules, or keep it for review."
-                                        }
-                                        editing = true
-                                    }
-                                } catch (e: CancellationException) { throw e }
-                                catch (e: Exception) { if (source.isCurrent() && generation.accepts(ticket)) message = playlistFailure(e) }
-                                finally { if (generation.accepts(ticket)) busy = false }
-                            }
-                        }) { Text("Edit rules") }
-                        if (playlist.capabilities.copyToManual) TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                            enabled = managementEnabled && !stale && !copyNeedsReview,
-                            onClick = {
-                                val result = evaluation
-                                if (result?.current == true) {
-                                    copySource = PlaylistCopySource(playlist.revision, result.fence, captureCurrent())
-                                    collectionActions = null; copying = true; copyReviewMessage = null
+        val canPlay = onQueueIntent != null && saved?.capabilities?.play == true
+        val collectionItem = LibraryItem("playlist", id, saved?.name ?: "Playlist")
+        val playlist = saved
+        fun perform(action: PlaybackListAction) {
+            collectionActions = null
+            submit(captured.selection, action, captured.key, captured.binding, captured.isCurrent,
+                captured.unselectedOrigin.takeIf { action == PlaybackListAction.PLAY_NOW })
+        }
+        SongActionSheet(onDismiss = { collectionActions = null }) {
+            PlaylistCollectionActionsContent(
+                item = collectionItem,
+                onPlayNow = if (canPlay) ({ perform(PlaybackListAction.PLAY_NOW) }) else null,
+                onPlayNext = if (canPlay) ({ perform(PlaybackListAction.PLAY_NEXT) }) else null,
+                onQueue = if (canPlay) ({ perform(collectionItem.defaultQueueAction()) }) else null,
+                playbackEnabled = playbackEnabled, managementEnabled = managementEnabled,
+                copyEnabled = managementEnabled && !stale && !copyNeedsReview,
+                verifyEnabled = !busy, allowNewCopyEnabled = !busy && !stale,
+                artwork = artwork,
+                onEditDetails = if (playlist?.capabilities?.editMetadata == true)
+                    ({ collectionActions = null; metadata = true }) else null,
+                onEditRules = if (playlist != null && playlist.kind == PlaylistKind.DERIVED && playlist.capabilities.editDefinition) ({
+                    val source = PlaylistSourceStamp(client)
+                    val ticket = generation.ticket()
+                    collectionActions = null; busy = true
+                    scope.launch {
+                        try {
+                            val rules = derived.definition(id)
+                            if (!source.isCurrent() || !generation.accepts(ticket) || !actionLifetime.isCurrent()) return@launch
+                            if (rules.revision != playlist.revision) { stale = true; message = "Playlist changed. Reload before editing rules."; fetchFailed = true }
+                            else {
+                                if (editorDraft == null) { editorDraft = PlaylistEditorDraft(playlist, rules.definition); editorTarget = playlist }
+                                else if (editorTarget?.revision != rules.revision) {
+                                    editorDraft!!.blocked = true
+                                    editorDraft!!.message = "The saved revision changed while this draft was retained. It has not been rebased or resubmitted. Discard the draft to reload current rules, or keep it for review."
                                 }
-                            }) { Text("Make editable copy") }
-                        if (copyNeedsReview) {
-                            TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !busy,
-                                onClick = { collectionActions = null; copying = true }) { Text("Verify saved copies") }
-                            if (copyReviewed) TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !busy && !stale,
-                                onClick = {
-                                    collectionActions = null; copyNeedsReview = false; copyReviewMessage = null
-                                    message = "Saved copies reviewed. Any further copy is a new explicit operation, not a retry."
-                                }) { Text("I reviewed saved copies — allow a new copy") }
-                        }
-                    } else if (playlist.capabilities.editEntries && snapshot == null) {
-                        TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = managementEnabled, onClick = {
-                            collectionActions = null; busy = true; generation.invalidate()
-                            browseRequests.invalidate(); appendJob?.cancel(); appending = false
-                            scope.launch {
-                                try { val complete = api.completeSnapshot(id); snapshot = complete; ordered = complete.entries; summary = complete.summary }
-                                catch (e: CancellationException) { throw e }
-                                catch (e: Exception) { message = playlistFailure(e); blocked = true }
-                                finally { busy = false }
+                                editing = true
                             }
-                        }) { Text("Reorder all occurrences") }
+                        } catch (e: CancellationException) { throw e }
+                        catch (e: Exception) { if (source.isCurrent() && generation.accepts(ticket)) message = playlistFailure(e) }
+                        finally { if (generation.accepts(ticket)) busy = false }
                     }
-                    if (playlist.capabilities.delete) TextButton(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                        enabled = managementEnabled, onClick = { collectionActions = null; deleting = true }) { Text("Delete") }
-                }
-            }
-        }, confirmButton = { TextButton(onClick = { collectionActions = null }) { Text("Done") } })
+                }) else null,
+                onMakeEditableCopy = if (playlist != null && playlist.kind == PlaylistKind.DERIVED && playlist.capabilities.copyToManual) ({
+                    val result = evaluation
+                    if (result?.current == true) {
+                        copySource = PlaylistCopySource(playlist.revision, result.fence, captureCurrent())
+                        collectionActions = null; copying = true; copyReviewMessage = null
+                    }
+                }) else null,
+                onVerifySavedCopies = if (playlist?.kind == PlaylistKind.DERIVED && copyNeedsReview)
+                    ({ collectionActions = null; copying = true }) else null,
+                onAllowNewCopy = if (playlist?.kind == PlaylistKind.DERIVED && copyNeedsReview && copyReviewed) ({
+                    collectionActions = null; copyNeedsReview = false; copyReviewMessage = null
+                    message = "Saved copies reviewed. Any further copy is a new explicit operation, not a retry."
+                }) else null,
+                onReorder = if (playlist != null && playlist.kind != PlaylistKind.DERIVED && playlist.capabilities.editEntries && snapshot == null) ({
+                    collectionActions = null; busy = true; generation.invalidate()
+                    browseRequests.invalidate(); appendJob?.cancel(); appending = false
+                    scope.launch {
+                        try { val complete = api.completeSnapshot(id); snapshot = complete; ordered = complete.entries; summary = complete.summary }
+                        catch (e: CancellationException) { throw e }
+                        catch (e: Exception) { message = playlistFailure(e); blocked = true }
+                        finally { busy = false }
+                    }
+                }) else null,
+                onDelete = if (playlist?.capabilities?.delete == true)
+                    ({ collectionActions = null; deleting = true }) else null)
+        }
     }
     val renderedSourceTicket = generation.ticket()
     val renderedCurrent = captureCurrent()

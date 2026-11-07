@@ -315,7 +315,7 @@ class PlaybackHeldQueueIntentBindingTest {
     private fun releaseSwipe() = compose.onNodeWithTag("catalog-row").performTouchInput { up() }
     private fun openUpcomingMenu() {
         compose.onAllNodesWithContentDescription("Queue actions for Upcoming duplicate")[1].performClick()
-        compose.onNodeWithText("Queue High").assertIsDisplayed()
+        compose.onNodeWithText("Queue").assertIsDisplayed()
     }
 
     private enum class SemanticChange { REPEAT_ABA, HISTORY_EVENT }
@@ -402,7 +402,7 @@ class PlaybackHeldQueueIntentBindingTest {
         // The actual normal/compact popup must dismiss on its changed semantic key.
         // Do not invoke a detached Compose clickable: that wrapper still requires an
         // attached Modifier node for its click sound/CompositionLocal, before app code.
-        compose.onNodeWithText("Queue High").assertDoesNotExist()
+        compose.onNodeWithText("Queue").assertDoesNotExist()
         assertNoHeldEffect(before, metadata)
         assertTrue("Auto-dismissal must not dispatch a queue action", controls.upcoming.isEmpty())
         // Independently emulate an already-delivered production callback at the real
@@ -416,7 +416,7 @@ class PlaybackHeldQueueIntentBindingTest {
         assertEquals(0, controls.results.single().acceptedCount)
         assertEquals(listOf(oldKey to oldOccurrenceId), controls.upcoming)
         assertNoHeldEffect(before, metadata)
-        compose.onNodeWithText("Queue High").assertDoesNotExist()
+        compose.onNodeWithText("Queue").assertDoesNotExist()
         assertNotSame(oldKey, connection.state.value.interactionKey)
         assertNotEquals(oldBinding, connection.state.value.queueIntentBinding)
     }
@@ -496,7 +496,7 @@ class PlaybackHeldQueueIntentBindingTest {
         content(); val binding = connection.state.value.queueIntentBinding
         openUpcomingMenu(); compose.runOnIdle { benignChurn() }
         val before = endpoint.exportSnapshot()
-        compose.onNodeWithText("Queue High").performClick()
+        compose.onNodeWithText("Queue").performClick()
         until { controls.results.size == 1 }
         val command = wireCommands.single { it.type == "queueIntent" }
         assertEquals(binding, command.expected); assertEquals(QueueIntentSelection.Occurrence(4), command.selection)
