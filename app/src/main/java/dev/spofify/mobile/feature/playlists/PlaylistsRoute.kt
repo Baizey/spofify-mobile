@@ -1,16 +1,25 @@
 package dev.spofify.mobile.feature.playlists
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.BringIntoViewSpec
+import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.unit.toSize
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -98,7 +107,7 @@ private data class PlaylistCollectionSelection(val selection: QueueIntentSelecti
     val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null)
 
 /** Session-local browse data only. Jobs, requests, gestures and transient editors stay on the host. */
-class PlaylistBrowseMemory {
+class PlaylistBrowseMemory(private val projectionDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default) {
     private var owner: SpofifyClient? = null
     private var session: Session? = null
     private var seeded = false
@@ -137,7 +146,7 @@ class PlaylistBrowseMemory {
 
     internal fun detail(id: String, change: Long): PlaylistDetailBrowseMemory {
         if (detailId != id) {
-            detailId = id; currentDetail = PlaylistDetailBrowseMemory(change)
+            detailId = id; currentDetail = PlaylistDetailBrowseMemory(change, projectionDispatcher)
         }
         return checkNotNull(currentDetail)
     }
@@ -155,7 +164,10 @@ internal class PlaylistIndexBrowseMemory {
     val baselineSession = mutableStateOf<Session?>(null, referentialEqualityPolicy())
 }
 
-internal class PlaylistDetailBrowseMemory(change: Long) {
+internal data class PlaylistScrollAnchor(val key: Any?, val index: Int, val offset: Int)
+
+internal class PlaylistDetailBrowseMemory(change: Long,
+    projectionDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default) {
     val initialized = mutableStateOf(false)
     val summary = mutableStateOf<PersonalPlaylistSummary?>(null)
     val entries = mutableStateOf<PersonalEntriesPage?>(null)
@@ -174,6 +186,16 @@ internal class PlaylistDetailBrowseMemory(change: Long) {
     val blocked = mutableStateOf(false)
     val message = mutableStateOf<String?>(null)
     val copyNeedsReview = mutableStateOf(false)
+    val filterQuery = mutableStateOf("")
+    // Separate anchors: clearing returns to the unfiltered source occurrence where possible.
+    val songsScroll = LazyListState()
+    val filteredScroll = LazyListState()
+    val manualProjection = ResidentPlaylistProjection<PersonalPlaylistEntry>(projectionDispatcher)
+    val derivedProjection = ResidentPlaylistProjection<DerivedEvaluationEntry>(projectionDispatcher)
+    // Pending layouts must not overwrite this anchor, even across another source update/tab disposal.
+    var pendingFilteredAnchor: Pair<String, PlaylistScrollAnchor>? = null
+    val filterDemandPaused = mutableStateOf(false)
+    var unfilteredAnchor: PlaylistScrollAnchor? = null
 }
 
 /** Account-local navigation. Browsing never prepares or starts a queue. */
@@ -354,6 +376,7 @@ private fun playlistFailure(error: Exception, mutation: Boolean = false): String
     else -> "The request could not finish. No partial result is current."
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PlaylistDetail(
     client: SpofifyClient, id: String, onOpenTrack: (LibraryItem) -> Unit,
@@ -426,7 +449,81 @@ private fun PlaylistDetail(
     var editorTarget by remember(id) { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var snapshot by remember(id) { mutableStateOf<ManualPlaylistSnapshot?>(null) }
     var ordered by remember(id) { mutableStateOf<List<PersonalPlaylistEntry>>(emptyList()) }
-    val listState = rememberLazyListState()
+    var filterQuery by browse.filterQuery
+    var filterEditing by remember { mutableStateOf(false) }
+    val filtering = filterQuery.trim().isNotEmpty()
+    // Capture the old occurrence before a same-query source update temporarily measures a
+    // pending projection. Cached exact-source results avoid that empty measurement on tab return.
+    val changedFilterSource = if (summary?.kind == PlaylistKind.DERIVED) browse.derivedProjection.result?.let {
+        it.query == filterQuery && it.source !== derivedEntries
+    } == true else browse.manualProjection.result?.let { it.query == filterQuery && it.source !== manualEntries } == true
+    if (filtering && changedFilterSource && browse.pendingFilteredAnchor == null) {
+        val state = browse.filteredScroll
+        browse.pendingFilteredAnchor = filterQuery to PlaylistScrollAnchor(state.layoutInfo.visibleItemsInfo
+            .firstOrNull { it.index == state.firstVisibleItemIndex }?.key, state.firstVisibleItemIndex, state.firstVisibleItemScrollOffset)
+    }
+    val manualProjection = residentPlaylistProjection(browse.manualProjection, manualEntries, filterQuery) { it.track }
+    val derivedProjection = residentPlaylistProjection(browse.derivedProjection, derivedEntries, filterQuery) { it.track }
+    val filteredManual = manualProjection.orEmpty()
+    val filteredDerived = derivedProjection.orEmpty()
+    val filterPending = if (summary?.kind == PlaylistKind.DERIVED) derivedProjection == null else manualProjection == null
+    val listState = if (filtering && snapshot == null) browse.filteredScroll else browse.songsScroll
+    LaunchedEffect(manualProjection, derivedProjection, filterQuery) {
+        val anchor = browse.pendingFilteredAnchor?.takeIf { it.first == filterQuery }?.second
+        if (filtering && !filterPending && anchor != null) {
+            val index = if (summary?.kind == PlaylistKind.DERIVED) filteredDerived.indexOfFirst { it.occurrenceId == anchor.key }
+                else filteredManual.indexOfFirst { it.id == anchor.key }
+            val size = if (summary?.kind == PlaylistKind.DERIVED) filteredDerived.size else filteredManual.size
+            browse.filteredScroll.scrollToItem(if (index >= 0) index + 2 else minOf(anchor.index, size + 1), anchor.offset)
+            browse.pendingFilteredAnchor = null
+        }
+    }
+    var restoringFilterAnchor by remember { mutableStateOf(false) }
+    val latestRestoringFilterAnchor by rememberUpdatedState(restoringFilterAnchor)
+    // A query/clear-induced short viewport must never admit a page. Ordinary subsequent
+    // scrolling of the unfiltered list restores demand, without eager full materialization.
+    LaunchedEffect(listState, filtering) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (scrolling && !filtering && !latestRestoringFilterAnchor) browse.filterDemandPaused.value = false
+        }
+    }
+    // Keep the browsing anchor before focus-driven bring-into-view can move a pinned input
+    // to its natural list position. Query callbacks run after that focus request.
+    LaunchedEffect(filtering, filterEditing) {
+        if (!filtering && !filterEditing) snapshotFlow {
+            val state = browse.songsScroll
+            PlaylistScrollAnchor(state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == state.firstVisibleItemIndex }?.key,
+                state.firstVisibleItemIndex, state.firstVisibleItemScrollOffset)
+        }.collect { browse.unfilteredAnchor = it }
+    }
+    fun changeFilter(query: String) {
+        if (query == filterQuery) return
+        browse.filterDemandPaused.value = true
+        browse.pendingFilteredAnchor = null
+        val nextFiltering = query.trim().isNotEmpty()
+        if (!filtering && nextFiltering && browse.unfilteredAnchor == null) {
+            val state = browse.songsScroll
+            browse.unfilteredAnchor = PlaylistScrollAnchor(state.layoutInfo.visibleItemsInfo
+                .firstOrNull { it.index == state.firstVisibleItemIndex }?.key,
+                state.firstVisibleItemIndex, state.firstVisibleItemScrollOffset)
+        }
+        filterQuery = query
+        if (nextFiltering) scope.launch { browse.filteredScroll.scrollToItem(0) }
+        else if (filtering) browse.unfilteredAnchor?.let { anchor ->
+            restoringFilterAnchor = true
+            scope.launch {
+                try {
+                    // Let the focused sticky input transfer to the unfiltered viewport first;
+                    // its bring-into-view must not overwrite the retained song anchor.
+                    withFrameNanos { }
+                    val row = if (summary?.kind == PlaylistKind.DERIVED) derivedEntries.indexOfFirst { it.occurrenceId == anchor.key }
+                        else manualEntries.indexOfFirst { it.id == anchor.key }
+                    browse.songsScroll.scrollToItem(if (row >= 0) row + 2 else anchor.index, anchor.offset)
+                    withFrameNanos { }
+                } finally { restoringFilterAnchor = false }
+            }
+        }
+    }
 
     fun refreshAll(verifyBlocked: Boolean = false, resetObservationBudget: Boolean = true) {
         if (resetObservationBudget) browse.observationChecks.intValue = 0
@@ -583,7 +680,7 @@ private fun PlaylistDetail(
     AutomaticListDemand(listState, refresh,
         if (summary?.kind == PlaylistKind.DERIVED) derivedEntries.takeLast(3).map { it.occurrenceId }
         else manualEntries.takeLast(3).map { it.id },
-        !busy && !appending && !stale && appendError == null && snapshot == null && !editing && !copying &&
+        !filtering && !browse.filterDemandPaused.value && !busy && !appending && !stale && appendError == null && snapshot == null && !editing && !copying &&
             (if (summary?.kind == PlaylistKind.DERIVED) evaluation?.nextCursor != null else offset < (entries?.total ?: 0))) { append() }
     BackHandler {
         if (!busy) when { editing -> editing = false; copying -> copying = false; snapshot != null -> refreshAll(); else -> onBack() }
@@ -838,7 +935,46 @@ private fun PlaylistDetail(
     }
     val renderedSourceTicket = generation.ticket()
     val renderedCurrent = captureCurrent()
-    LazyColumn(modifier.fillMaxSize(), state = listState,
+    val defaultBringIntoView = LocalBringIntoViewSpec.current
+    val latestFilterEditing by rememberUpdatedState(filterEditing)
+    var filterInputBounds by remember { mutableStateOf<Rect?>(null) }
+    var filterViewportBounds by remember { mutableStateOf<Rect?>(null) }
+    LaunchedEffect(filterEditing, filterInputBounds, filterViewportBounds, listState) {
+        val input = filterInputBounds ?: return@LaunchedEffect
+        val viewport = filterViewportBounds ?: return@LaunchedEffect
+        if (filterEditing && input.height <= viewport.height) {
+            val distance = when {
+                input.bottom > viewport.bottom -> input.bottom - viewport.bottom
+                input.top < viewport.top -> input.top - viewport.top
+                else -> 0f
+            }
+            if (distance != 0f) {
+                restoringFilterAnchor = true
+                try { listState.scrollBy(distance) }
+                finally { restoringFilterAnchor = false }
+            }
+        }
+    }
+    val latestFilterInputBounds by rememberUpdatedState(filterInputBounds)
+    val latestFilterViewportBounds by rememberUpdatedState(filterViewportBounds)
+    val filterBringIntoView = remember(defaultBringIntoView) {
+        object : BringIntoViewSpec {
+            override fun calculateScrollDistance(offset: Float, size: Float, containerSize: Float): Float {
+                // The focused input is pinned and already visible. Relocating its natural
+                // (offscreen) item position would erase the source/filtered song anchors.
+                val input = latestFilterInputBounds
+                val viewport = latestFilterViewportBounds
+                val inputFullyVisible = input != null && viewport != null && input.top >= viewport.top &&
+                    input.bottom <= viewport.bottom && input.left >= viewport.left && input.right <= viewport.right
+                return if (latestFilterEditing && inputFullyVisible) 0f
+                    else defaultBringIntoView.calculateScrollDistance(offset, size, containerSize)
+            }
+        }
+    }
+    CompositionLocalProvider(LocalBringIntoViewSpec provides filterBringIntoView) {
+    LazyColumn(modifier.fillMaxSize().onGloballyPositioned {
+        filterViewportBounds = Rect(it.positionInWindow(), it.size.toSize())
+    }, state = listState,
         contentPadding = PaddingValues(horizontal = MusicListLayout.horizontalPadding, vertical = 16.dp),
         verticalArrangement = MusicListLayout.arrangement) {
         item {
@@ -874,6 +1010,21 @@ private fun PlaylistDetail(
                 }
             }
         }
+        if (snapshot == null) stickyHeader(key = "playlist-filter") {
+            Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
+                PlaylistFilterField(filterQuery, modifier = Modifier.onGloballyPositioned {
+                    filterInputBounds = Rect(it.positionInWindow(), it.size.toSize())
+                }, onEditingChanged = { filterEditing = it }, onQueryChange = ::changeFilter)
+                val resident = if (saved?.kind == PlaylistKind.DERIVED) derivedEntries.size else manualEntries.size
+                val matching = if (saved?.kind == PlaylistKind.DERIVED) filteredDerived.size else filteredManual.size
+                val total = if (saved?.kind == PlaylistKind.DERIVED) evaluation?.total else saved?.trackCount
+                Text(if (filterPending) "Filtering loaded songs…" else playlistFilterCoverage(resident, total, matching, filtering),
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 4.dp))
+                if (filtering && !filterPending && matching == 0) Text("No loaded songs match. Try a title, artist, or album.",
+                    style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 8.dp))
+            }
+        }
         if (snapshot != null) items(ordered, key = { it.id }) { entry ->
             val index = ordered.indexOfFirst { it.id == entry.id }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -898,7 +1049,7 @@ private fun PlaylistDetail(
                 }
             }
         } else if (saved?.kind == PlaylistKind.DERIVED) {
-            items(derivedEntries, key = { it.occurrenceId }) { entry ->
+            items(filteredDerived, key = { it.occurrenceId }) { entry ->
                 PlaylistTrackRow(entry.track, onOpenTrack, { track, rowCurrent ->
                     val current = captureCurrent(rowCurrent)
                     if (current()) occurrenceActions = PlaylistRowSelection(track, entry.selectionToken, interactionKey = playback.interactionKey, isCurrent = current,
@@ -917,12 +1068,12 @@ private fun PlaylistDetail(
                     }) else null)
             }
             item {
-                AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
-                if (!busy && !stale && derivedEntries.isEmpty()) Text("No songs match these rules.")
-                else if (!busy && !stale && evaluation?.nextCursor == null) Text("All songs loaded.")
+                if (!filtering) AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
+                if (!filtering && !busy && !stale && derivedEntries.isEmpty()) Text("No songs match these rules.")
+                else if (!filtering && !busy && !stale && evaluation?.nextCursor == null) Text("All songs loaded.")
             }
         } else {
-            items(manualEntries, key = { it.id }) { entry ->
+            items(filteredManual, key = { it.id }) { entry ->
                     PlaylistTrackRow(entry.track, onOpenTrack, { track, isCurrent -> occurrenceActions = PlaylistRowSelection(track, entryId = entry.id, interactionKey = playback.interactionKey, isCurrent = captureCurrent(isCurrent),
                         queueSelection = exactSelection(track, entryId = entry.id), binding = playback.queueIntentBinding,
                         unselectedOrigin = playback.unselectedQueueOrigin) },
@@ -940,11 +1091,12 @@ private fun PlaylistDetail(
                         }) else null)
             }
             item {
-                AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
-                if (!busy && !stale && manualEntries.isEmpty()) Text("No songs yet.")
-                else if (!busy && !stale && offset >= (entries?.total ?: 0)) Text("All songs loaded.")
+                if (!filtering) AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
+                if (!filtering && !busy && !stale && manualEntries.isEmpty()) Text("No songs yet.")
+                else if (!filtering && !busy && !stale && offset >= (entries?.total ?: 0)) Text("All songs loaded.")
             }
         }
+    }
     }
 }
 
