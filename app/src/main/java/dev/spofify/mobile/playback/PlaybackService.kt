@@ -58,6 +58,7 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -192,7 +193,7 @@ class PlaybackService : MediaSessionService() {
         var onServiceActiveChanged: ((Boolean) -> Unit)? = null
     }
 
-    private var player: ExoPlayer? = null
+    @Volatile private var player: ExoPlayer? = null
     private var session: MediaSession? = null
     private val serviceNonce = UUID.randomUUID().toString()
     private var foreground: PlaybackForegroundNotification? = null
@@ -214,7 +215,7 @@ class PlaybackService : MediaSessionService() {
     private val admissions = mutableMapOf<MediaSession.ControllerInfo, Admission>()
     private data class MediaButtonDown(val key: Int, val device: Int, val source: Int, val down: Long, val time: Long)
     private val mediaButtonDowns = linkedSetOf<MediaButtonDown>() // Bounded exact-event dedup, not tap debounce.
-    private var client: SpofifyClient? = null
+    @Volatile private var client: SpofifyClient? = null
     private val handler = Handler(Looper.getMainLooper())
     private val historyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     @Volatile private var cachedPermission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission? = null
@@ -226,7 +227,7 @@ class PlaybackService : MediaSessionService() {
     // A completed Pause/Resume cannot make a pre-Pause recovery observation current again.
     private var recoveryActionWitness: Any = Any()
     private fun retireRecoveryWitness() { recoveryActionWitness = Any() }
-    private var authenticatedSession: Session? = null
+    @Volatile private var authenticatedSession: Session? = null
     private var audioCache: SongCache.SessionCache? = null
     private data class PrefetchRequest(val trackId: String, val spec: DataSpec)
     private var songPrefetch: SongPrefetchScheduler<PrefetchRequest>? = null
@@ -433,11 +434,23 @@ class PlaybackService : MediaSessionService() {
     private var queueStartInterruption = 0L
     private var queueIntentTransaction: Any? = null
 
+    // Main owns observation/invalidation. Resolver guards read only this immutable scalar
+    // publication, never Media3 or the mutable queue/history ledger. The opaque change
+    // identity prevents unsampled A -> B -> A from resurrecting a held Resume.
+    private data class PreparedResumeSemantic(val change: Any, val revision: Long, val key: Long?, val eventId: String?)
+    private var preparedResumeChange: Any = Any()
+    private val preparedResumeSemantic = AtomicReference<PreparedResumeSemantic?>()
+    private fun invalidatePreparedResume() {
+        preparedResumeChange = Any()
+        preparedResumeSemantic.set(null)
+    }
+
     private fun interruptQueueIntentStart(): Boolean {
         // The coordinator also owns the finalized-but-publication-pending window. It is
         // responsible for calling this narrow hook only for its tracked queue execution.
         if (!hasAuthority()) return false
         val current = player ?: return false
+        invalidatePreparedResume()
         queueStartInterruption++
         startAttempt = null
         startAttemptValidity = null
@@ -607,7 +620,7 @@ class PlaybackService : MediaSessionService() {
             }
 
             override fun onAvailableCommandsChanged(availableCommands: Player.Commands) { observeDirections() }
-            override fun onRepeatModeChanged(repeatMode: Int) { observeDirections(); if (!importing && !arranging) exportPrepared() }
+            override fun onRepeatModeChanged(repeatMode: Int) { invalidatePreparedResume(); observeDirections(); if (!importing && !arranging) exportPrepared() }
             override fun onTimelineChanged(timeline: Timeline, reason: Int) {
                 // SOURCE_UPDATE also reports duration/seekability/period discovery. Those
                 // are live facts, but a source may genuinely replace items/order too.
@@ -616,11 +629,13 @@ class PlaybackService : MediaSessionService() {
                 if (structure != syncObservedTimeline) {
                     syncObservedTimeline = structure
                     syncTimelineVersion++
+                    invalidatePreparedResume()
                     schedulePrune()
                 }
             }
 
             override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+                invalidatePreparedResume()
                 if (arranging || importing || !shuffleModeEnabled) return
                 // Shuffle only the future; played/current retain their positions.
                 val ids = physicalIds()
@@ -631,6 +646,7 @@ class PlaybackService : MediaSessionService() {
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                invalidatePreparedResume()
                 // Record transitions even between UI samples (including A -> B -> A).
                 interactionKeys.invalidate()
                 mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
@@ -827,6 +843,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun releasePlayback() {
+        invalidatePreparedResume()
         retireRecoveryWitness()
         if (active.get() === this) {
             onServiceActiveChanged?.invoke(false)
@@ -905,6 +922,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun settleTerminalOutput() {
+        invalidatePreparedResume()
         retireRecoveryWitness()
         cancelSongPrefetch()
         val current = player ?: return
@@ -919,6 +937,7 @@ class PlaybackService : MediaSessionService() {
 
     private fun interruptForSystemPause() {
         if (active.get() !== this) return
+        invalidatePreparedResume()
         retireRecoveryWitness()
         if (!hasAuthority() && cachedPermission != null) { PlaybackRequests.invalidate(); suspendBufferedOutput(); return }
         val owner = (application as SpofifyApplication).graph.playbackCoordinator
@@ -942,6 +961,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun suspendBufferedOutput() {
+        invalidatePreparedResume()
         retireRecoveryWitness()
         cachedPermission = null; cachedRequestEpoch = -1L; cachedQueueEpoch = -1L
         cancelSongPrefetch()
@@ -1012,6 +1032,8 @@ class PlaybackService : MediaSessionService() {
             if (!ownAudibleHistoryCreation) startAttemptValidity = null
             startHistoryObservation = null
         }
+        preparedResumeSemantic.set(PreparedResumeSemantic(preparedResumeChange, intentRevision.revision,
+            snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId))
     }
 
     private data class SyncTimelineStructure(val items: List<MediaItem>, val first: Int, val next: List<Int>)
@@ -1574,8 +1596,9 @@ class PlaybackService : MediaSessionService() {
         val json = command.json
         when (command.type) {
             "queueIntent" -> return executeQueueIntent(command, value, isCurrent)
-            "pause" -> { cancelSongPrefetch(); promotionPending = null; queueStartInterruption++; startAttempt = null; startAttemptValidity = null; startHistoryObservation = null; audioFocus?.abandon(); current.pause(); current.stop(); historyWasPlaying = false; resetHistoryAnchor(current.currentMediaItem); foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem)) }
+            "pause" -> { invalidatePreparedResume(); cancelSongPrefetch(); promotionPending = null; queueStartInterruption++; startAttempt = null; startAttemptValidity = null; startHistoryObservation = null; audioFocus?.abandon(); current.pause(); current.stop(); historyWasPlaying = false; resetHistoryAnchor(current.currentMediaItem); foreground?.demote(session, current.currentMediaItem?.let(PlaybackMedia::libraryItem)) }
             "close" -> {
+                invalidatePreparedResume()
                 cancelSongPrefetch(); promotionPending = null
                 mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
                 PlaybackRequests.invalidate(); PlaybackRequests.queueChanged()
@@ -2126,21 +2149,27 @@ class PlaybackService : MediaSessionService() {
         val request = PlaybackRequests.epoch
         var executionExpectedNonce = intended.occurrence?.eventId
         var executionExpectedRevision = intentRevision.revision
-        fun bindingCurrent() = admissionIsCurrent() && active.get() === this && graph.playbackCoordinator === owner && player === output &&
+        val executionSemantic = AtomicReference(requireNotNull(preparedResumeSemantic.get()))
+        fun lifecycleCurrent() = admissionIsCurrent() && active.get() === this && graph.playbackCoordinator === owner && player === output &&
             source === client && source === graph.client && login === authenticatedSession && source.currentSession() === login &&
-            request == PlaybackRequests.epoch && queueEpoch == PlaybackRequests.queueEpoch &&
-            preparedTracks() == intended.queue && wireKeys[currentId()] == selected.key
-        fun lifetimeCurrent(): Boolean {
-            observePreparedSemantics(preparedSemanticSnapshot())
-            return bindingCurrent() && preparedHistoryEventId() == executionExpectedNonce && intentRevision.revision == executionExpectedRevision
-        }
+            request == PlaybackRequests.epoch && queueEpoch == PlaybackRequests.queueEpoch
+        fun bindingCurrent() = lifecycleCurrent() && preparedTracks() == intended.queue && wireKeys[currentId()] == selected.key
+        // Both predicates are retained by the coordinator's unfinished authority and run
+        // on audio loaders too. No live player/ledger reads or queue-length work here.
+        fun lifetimeCurrent() = lifecycleCurrent() && preparedResumeSemantic.get() == executionSemantic.get()
         fun current() = isCurrent() && lifetimeCurrent()
-        if (!current()) return "Playback changed. Choose music again."
+        fun revalidatedCurrent(): Boolean {
+            check(Looper.myLooper() == Looper.getMainLooper())
+            observePreparedSemantics(preparedSemanticSnapshot())
+            return current() && bindingCurrent() && preparedHistoryEventId() == executionExpectedNonce &&
+                intentRevision.revision == executionExpectedRevision
+        }
+        if (!revalidatedCurrent()) return "Playback changed. Choose music again."
         transportNotice = null
         owner.explicitLocalPlay(isCurrent = ::current, admissionIsCurrent = ::lifetimeCurrent,
             onRejected = { transportRejected(owner, ::current) }, preparedResume = intended.paused()) { permit ->
-            if (!current()) frozenResult("rejected")
-            else executeOwned(PlaybackDeviceCommand.transport(if (intended.error.isEmpty()) "resume" else "retry"), permit, ::current) { receipt ->
+            if (!revalidatedCurrent()) frozenResult("rejected")
+            else executeOwned(PlaybackDeviceCommand.transport(if (intended.error.isEmpty()) "resume" else "retry"), permit, ::revalidatedCurrent) { receipt ->
                 val restarted = receipt?.after
                 // Only this action's exact synchronous ended-restart receipt may advance the
                 // nonce fence. Origin/lifecycle/queue/current fences remain unchanged, and an
@@ -2155,11 +2184,14 @@ class PlaybackService : MediaSessionService() {
                     // witnessed successor installed. Roll back the local fence on authority loss.
                     val previous = executionExpectedNonce
                     val previousRevision = executionExpectedRevision
+                    val previousSemantic = executionSemantic.get()
                     executionExpectedNonce = restarted.eventId
                     executionExpectedRevision = intentRevision.revision
+                    executionSemantic.set(requireNotNull(preparedResumeSemantic.get()))
                     if (!permit.isValid()) {
                         executionExpectedNonce = previous
                         executionExpectedRevision = previousRevision
+                        executionSemantic.set(previousSemantic)
                     }
                 }
             }

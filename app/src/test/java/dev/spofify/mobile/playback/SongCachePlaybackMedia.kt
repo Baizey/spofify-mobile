@@ -44,7 +44,18 @@ class SongCachePlaybackMedia {
         // fully consume real authorized HTTP through its exact cache/namespace.
         productionDataSources = sources
         factory.setDataSourceFactory(DataSource.Factory {
-            sources.createDataSource().also { source -> transferListener?.let(source::addTransferListener) }
+            val source = sources.createDataSource().also { transferListener?.let(it::addTransferListener) }
+            if (dataSourceFailure == null) source else object : DataSource by source {
+                override fun open(spec: androidx.media3.datasource.DataSpec): Long = observe { source.open(spec) }
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+                    observe { source.read(buffer, offset, length) }
+                private fun <T> observe(operation: () -> T): T {
+                    try { return operation() } catch (error: Throwable) {
+                        // Observe on the REAL loader thread, then preserve the identical failure.
+                        try { dataSourceFailure?.invoke(error, Thread.currentThread()) } finally { throw error }
+                    }
+                }
+            }
         })
         val direct = reflector(BuilderDirect::class.java, builder)
 
@@ -147,6 +158,7 @@ class SongCachePlaybackMedia {
     companion object {
         @Volatile var productionDataSources: DataSource.Factory? = null
         @Volatile var transferListener: TransferListener? = null
+        @Volatile var dataSourceFailure: ((Throwable, Thread) -> Unit)? = null
         @Volatile var onLoaderRelease: (() -> (() -> Unit))? = null
         val factories = AtomicLong()
         val samples = AtomicLong()
@@ -158,6 +170,7 @@ class SongCachePlaybackMedia {
         fun reset() {
             productionDataSources = null
             transferListener = null
+            dataSourceFailure = null
             onLoaderRelease = null
             factories.set(0); samples.set(0); starts.set(0); enables.set(0); resets.set(0)
             consumed.clear()

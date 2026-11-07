@@ -493,6 +493,25 @@ class SongCachePlaybackTest {
             assertTrue("Pause must not accidentally become Resume", PlaybackService.exportLocalSnapshot().playing)
             acceptedRecoveryControls().toggle()
         }
+        fun activeAuthorityForReadOnlyProbe(): dev.spofify.mobile.feature.devices.PlaybackAuthority =
+            PlaybackService::class.java.getDeclaredField("authority").apply { isAccessible = true }
+                .get(requireNotNull(service).get()) as dev.spofify.mobile.feature.devices.PlaybackAuthority
+        fun resumePreparedThroughAcceptedControls() {
+            assertFalse(PlaybackService.exportLocalSnapshot().playing)
+            acceptedRecoveryControls().toggle()
+        }
+        fun releaseBorrowedRecoveryControls() {
+            val controls = recoveryControls ?: return
+            // This connection borrowed Journey's existing controller; Journey still owns it.
+            val field = PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true }
+            val listener = PlaybackConnection::class.java.getDeclaredField("listener").apply { isAccessible = true }
+                .get(controls) as Player.Listener
+            assertSame(controller, field.get(controls))
+            controller!!.removeListener(listener)
+            field.set(controls, null)
+            controls.release()
+            recoveryControls = null
+        }
         fun seekThroughAcceptedControls(positionMs: Long) = acceptedRecoveryControls().seekTo(positionMs)
         fun selectThroughAcceptedControls(index: Int) = acceptedRecoveryControls().select(index)
 
@@ -1010,6 +1029,170 @@ class SongCachePlaybackTest {
             j.pause()
             j.resume()
             j.assertHealthy()
+        }
+    }
+
+    @Test fun preparedResumeUsesAuthenticatedLoaderWithoutApplicationThreadAccess() {
+        verifyRecoveryForkTemp()
+        val owned = requireNotNull(System.getenv("SPOFIFY_RUN_ROOT"))
+        assertEquals("$owned/home", System.getProperty("user.home"))
+        assertEquals("$owned/tmp", System.getProperty("java.io.tmpdir"))
+        Journey(managedContinuation = true).use { j ->
+            j.startService()
+            val sameClient = j.client
+            val sameSession = requireNotNull(sameClient.currentSession())
+            val sameController = requireNotNull(j.controller)
+            // Real explicit activation, including terminal prepare/activation ACKs, not a
+            // lease-only startup. Existing managed fixture rejects wrong receiver metadata.
+            j.play("Z")
+            assertEquals(1, j.room.bootstrapClaims.get())
+            assertEquals(1, j.room.bootstrapPrepareAcks.get())
+            assertEquals(1, j.room.bootstrapActivationAcks.get())
+            j.pauseThroughAcceptedControls()
+            await("accepted bootstrap Pause") { !sameController.isPlaying && !PlaybackService.exportLocalSnapshot().playing }
+            j.awaitLocalPublication("bootstrap Pause")
+            j.preparePaused("A")
+            val prepared = PlaybackService.exportLocalSnapshot()
+            val metadata = requireNotNull(PlaybackService.exportLocalQueueIntentState())
+            val state = requireNotNull(j.graph.playbackCoordinator).state.value
+            val accepted = requireNotNull(state.view)
+            val acceptedSnapshot = requireNotNull(accepted.state)
+            assertEquals(1, prepared.queue.size)
+            assertEquals(1, sameController.mediaItemCount)
+            assertEquals(1, metadata.origins.size)
+            assertEquals(prepared.queue, acceptedSnapshot.queue)
+            assertEquals(metadata, accepted.queueIntents!!.state)
+            assertEquals(prepared.queue.single().key, acceptedSnapshot.queue[acceptedSnapshot.position].key)
+            assertEquals("A-paused-probe", prepared.queue.single().entryId)
+            assertFalse(prepared.playing); assertFalse(sameController.playWhenReady)
+            assertNull(accepted.transfer)
+            assertSame(sameClient, j.graph.client); assertSame(sameSession, sameClient.currentSession())
+            assertSame(sameController, j.controller); assertTrue(sameController.isConnected)
+            println("prepared-resume preconditions sameClient=true sameSession=true sameController=true queue=1 origins=1 accepted=1 selectedOccurrence=true terminalActivation=true")
+            // No message/toString/URL/header/payload capture: only causal code locations.
+            fun safeCause(error: Throwable): String = generateSequence(error) { it.cause }.take(8).joinToString(" <- ") { cause ->
+                cause.javaClass.name + cause.stackTrace.take(48).joinToString(prefix = "[", postfix = "]") { frame ->
+                    "${frame.className}.${frame.methodName}(${frame.fileName}:${frame.lineNumber})"
+                }
+            }
+            val failures = CopyOnWriteArrayList<String>()
+            val terminal = CopyOnWriteArrayList<String>()
+            val listener = object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) { terminal += safeCause(error) }
+            }
+            sameController.addListener(listener)
+            SongCachePlaybackMedia.dataSourceFailure = { error, thread ->
+                if (failures.size < 4) failures += "thread=${thread.name} id=${thread.id} cause=${safeCause(error)}"
+            }
+            val pcm = consumed("A")
+            val requests = j.room.audio.count { it.id == "A" }
+            try {
+                j.resumePreparedThroughAcceptedControls()
+                await("one-track prepared Resume reaches real PCM or a terminal causal diagnostic") {
+                    terminal.isNotEmpty() || sameController.isPlaying && sameController.currentPosition >= 50 && consumed("A") > pcm
+                }
+                failures.forEach { println("prepared-resume-loader $it") }
+                terminal.forEach { println("prepared-resume-terminal $it") }
+                assertTrue("Production loader must not enter application-thread-only state: ${failures.joinToString()}", failures.isEmpty())
+                assertTrue("Prepared Resume must consume the authenticated WAV", terminal.isEmpty() && consumed("A") > pcm)
+                assertTrue(j.room.audio.count { it.id == "A" } > requests)
+                j.awaitLocalPublication("one-track prepared Resume")
+                val resumed = PlaybackService.exportLocalSnapshot()
+                assertEquals(prepared.queue, resumed.queue)
+                assertEquals(prepared.position, resumed.position)
+                val priorOccurrence = prepared.occurrence
+                if (priorOccurrence != null) assertEquals(priorOccurrence.eventId, resumed.occurrence?.eventId)
+                else {
+                    // A never-played prepared occurrence gets only its own witnessed restart.
+                    val created = requireNotNull(resumed.occurrence)
+                    assertEquals(prepared.queue.single().key, created.key)
+                    assertEquals(prepared.queue.single().id, created.trackId)
+                    assertEquals(created.eventId, PlaybackService.exportLocalSnapshot().occurrence?.eventId)
+                }
+                assertSame(sameClient, j.graph.client); assertSame(sameSession, sameClient.currentSession())
+                assertSame(sameController, j.controller)
+                j.assertHealthy()
+            } finally {
+                SongCachePlaybackMedia.dataSourceFailure = null
+                sameController.removeListener(listener)
+                j.releaseBorrowedRecoveryControls()
+                assertSame(sameController, j.controller)
+                assertTrue(sameController.isConnected)
+            }
+        }
+    }
+
+    @Test fun pendingPreparedResumePermitIsWorkerSafeAndCannotBorrowAnotherActionsSemanticSuccessor() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val loaderReleased = CountDownLatch(1)
+        val held = AtomicBoolean()
+        val heldSource = AtomicReference<DataSource>()
+        Journey(managedContinuation = true).use { j ->
+            try {
+                j.startService(); j.play("Z")
+                j.pauseThroughAcceptedControls()
+                await("bootstrap Pause") { !j.controller!!.isPlaying && !PlaybackService.exportLocalSnapshot().playing }
+                j.awaitLocalPublication("bootstrap Pause")
+                j.preparePaused("A")
+                SongCachePlaybackMedia.transferListener = object : TransferListener {
+                    override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+                    override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+                    override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                        if (source === heldSource.get()) closed.countDown()
+                    }
+                    override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+                        if (dataSpec.key != "A" || !held.compareAndSet(false, true)) return
+                        check(isNetwork)
+                        heldSource.set(source); entered.countDown()
+                        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                        while (release.count != 0L) {
+                            val remaining = deadline - System.nanoTime()
+                            check(remaining > 0) { "Held Resume read was not released" }
+                            try { release.await(remaining, TimeUnit.NANOSECONDS) } catch (_: InterruptedException) { /* Deliberately outlive cancellation. */ }
+                        }
+                    }
+                }
+                j.resumePreparedThroughAcceptedControls()
+                await("genuine prepared Resume loader is held before readiness") { entered.count == 0L }
+                assertFalse(j.controller!!.isPlaying)
+                val permit = j.activeAuthorityForReadOnlyProbe()
+                fun workerValidity(): Boolean {
+                    val task = FutureTask<Boolean> { permit.isValid() }
+                    val worker = Thread(task, "prepared-resume-permission-probe")
+                    worker.start()
+                    try { return task.get(2, TimeUnit.SECONDS) } finally { worker.join(2000); assertFalse(worker.isAlive) }
+                }
+                assertTrue("Unfinished genuine authority must be readable off-main without Media3", workerValidity())
+                val before = PlaybackService.exportLocalSnapshot()
+                val receiverAuthority = requireNotNull(j.graph.playbackCoordinator!!.currentAuthority())
+                SongCachePlaybackMedia.onLoaderRelease = { { loaderReleased.countDown() } }
+                // Another legitimately admitted receiver action, never a fabricated permit or
+                // raw controller Play. Three synchronous repeat edits return to the same music
+                // before a startup wait can sample it. Its successor cannot refresh our tap.
+                runBlocking {
+                    repeat(3) {
+                        assertEquals("ok", Media3PlaybackEndpoint().execute(PlaybackDeviceCommand.transport("repeat"), receiverAuthority).status)
+                    }
+                }
+                val after = PlaybackService.exportLocalSnapshot()
+                assertEquals(before.queue, after.queue); assertEquals(before.position, after.position)
+                assertEquals(before.repeat, after.repeat)
+                assertTrue("The receiver lease itself remains valid", receiverAuthority.isValid())
+                assertFalse("Semantic ABA must retire the original unfinished permit", workerValidity())
+                PlaybackService.exportLocalSnapshot() // Republishing cannot resurrect it.
+                assertFalse(workerValidity())
+                release.countDown()
+                await("superseded startup drains its real held loader") { closed.count == 0L && loaderReleased.count == 0L }
+                assertFalse(j.controller!!.isPlaying)
+                assertFalse(PlaybackService.exportLocalSnapshot().playing)
+            } finally {
+                release.countDown()
+                SongCachePlaybackMedia.transferListener = null
+                SongCachePlaybackMedia.onLoaderRelease = null
+                j.releaseBorrowedRecoveryControls()
+            }
         }
     }
 

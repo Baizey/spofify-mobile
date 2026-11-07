@@ -527,11 +527,20 @@ class PlaybackListActionServiceTest {
             assertEquals("X", after.queue[after.position].id)
             assertEquals(1, startup.prepares)
             assertEquals(if (interruption == null || interruption == "transport") 1 else 0, startup.plays)
-            assertEquals(when (interruption) {
-                null, "transport" -> queueIntentMessage(QueueIntentResult("queued", 1, 1, "high", "unchanged", null, ""), PlaybackListAction.QUEUE_HIGH)
-                "route", "auth" -> null
-                else -> PlaybackActionResult(PlaybackActionStatus.STALE).userMessage
-            }, model.state.value.notice)
+            if (interruption == null || interruption == "transport") {
+                // Accepted queue success belongs to transient feedback, never durable notice.
+                val feedback = requireNotNull(model.state.value.feedback)
+                assertEquals(queueIntentMessage(QueueIntentResult("queued", 1, 1, "high", "unchanged", null, ""),
+                    PlaybackListAction.QUEUE_HIGH), feedback.message)
+                assertTrue(feedback.isCurrent())
+                assertNull(model.state.value.notice)
+            } else {
+                assertEquals(when (interruption) {
+                    "route", "auth" -> null
+                    else -> PlaybackActionResult(PlaybackActionStatus.STALE).userMessage
+                }, model.state.value.notice)
+                assertNull("Cancelled/stale work must not create a queue-success popup", model.state.value.feedback)
+            }
             // A held non-ticket retains the original empty binding, even on positive completion.
             val held = mutableListOf<PlaybackActionResult>()
             controls.performPreparedAction(prepared("held"), client, PlaybackListAction.CONTEXTUAL, key,

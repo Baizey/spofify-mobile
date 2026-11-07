@@ -79,7 +79,7 @@ class PlaybackConnection(context: Context) : PlaybackControls {
         // without revoking the healthy player's authority or resetting its queue.
         val latestPlay = java.util.concurrent.atomic.AtomicLong()
     }
-    private var requestGeneration = 0L
+    @Volatile private var requestGeneration = 0L
     private var explicitPlayOrigin: (() -> (() -> Boolean))? = null
 
     override fun bindExplicitPlayOrigin(capture: () -> (() -> Boolean)) {
