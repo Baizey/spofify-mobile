@@ -142,22 +142,25 @@ class PlaylistFilterHostTest {
         compose.onNodeWithTag("playlist-filter").performTextReplacement(value)
         compose.waitForIdle()
         projectionScheduler?.runCurrent()
-        compose.waitUntil(5_000) { compose.waitForIdle(); compose.onAllNodesWithText("Filtering loaded songs…").fetchSemanticsNodes().isEmpty() }
+        compose.waitUntil(5_000) { compose.waitForIdle(); value.isBlank() ||
+            compose.onAllNodesWithTag("playlist-filter-result").fetchSemanticsNodes().isNotEmpty() }
     }
 
     @Test fun editsNoMatchWhitespaceAndClearEmitZeroRequestsOrPlaybackAcrossPagedPrefix() {
         Fixture().use { fixture -> host(fixture) { host ->
             val before = fixture.requests()
+            compose.onNodeWithTag("playlist-filter-result").assertDoesNotExist()
             query("  nEEdle  ")
             compose.onAllNodesWithText("Needle duplicate").assertCountEquals(2)
-            compose.onNodeWithText("2 matches in 40 loaded songs · not the whole playlist").assertExists()
+            compose.onNodeWithText("Filtered to 2 songs").assertExists()
             query("no such song")
-            compose.onNodeWithText("No loaded songs match. Try a title, artist, or album.").assertExists()
+            compose.onNodeWithText("Filtered to 0 songs").assertExists()
             capture("paged-no-match")
             query(".*")
             query("MIRA VALE")
             query("after the tide")
             query(" \t ")
+            compose.onNodeWithTag("playlist-filter-result").assertDoesNotExist()
             compose.onNodeWithTag("playlist-filter").performClick()
             compose.onNodeWithContentDescription("Clear playlist filter").performClick()
             compose.onNodeWithTag("playlist-filter").assertIsFocused()
@@ -270,7 +273,7 @@ class PlaylistFilterHostTest {
             compose.waitForIdle()
             val anchor = checkNotNull(detail.pendingFilteredAnchor)
             assertEquals("entry-20", anchor.second.key)
-            compose.onNodeWithText("Filtering loaded songs…").assertExists()
+            compose.onNodeWithTag("playlist-filter-result").assertDoesNotExist()
             compose.runOnIdle { detail.manualEntries.value = detail.manualEntries.value.drop(1) }
             compose.waitForIdle()
             assertSame(anchor, detail.pendingFilteredAnchor)
@@ -296,7 +299,7 @@ class PlaylistFilterHostTest {
             compose.waitForIdle()
             background.runCurrent(); compose.waitForIdle()
             compose.onAllNodesWithText("Needle duplicate").assertCountEquals(2)
-            compose.onNodeWithText("No loaded songs match. Try a title, artist, or album.").assertDoesNotExist()
+            compose.onNodeWithText("Filtered to 0 songs").assertDoesNotExist()
             assertEquals("needle", host.memory.detail("fixture", 0).manualProjection.result!!.query)
             assertTrue(host.accepted.isEmpty())
         } }

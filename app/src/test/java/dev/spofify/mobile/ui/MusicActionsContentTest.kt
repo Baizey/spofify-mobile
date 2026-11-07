@@ -15,6 +15,9 @@ import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -123,6 +126,32 @@ class MusicActionsContentTest {
         assertEquals(listOf(PlaybackListAction.QUEUE_HIGH) + List(5) { PlaybackListAction.QUEUE_LOW }, queued)
     }
 
+    @Test fun tracksOmitRedundantDetailsButPreserveRealMetadataAndMissingAlbumHonesty() {
+        val item = mutableStateOf(LibraryItem("track", "opaque/song", "Song", albumId = "opaque/album", albumName = "Album"))
+        val opened = mutableListOf<LibraryItem>()
+        compose.setContent {
+            MaterialTheme(colorScheme = dev.spofify.mobile.listeningColorScheme(), typography = AppTypography) {
+                Surface { MusicActionsContent(item.value, onOpenItem = opened::add) }
+            }
+        }
+        compose.onNodeWithText("Open details").assertDoesNotExist()
+        compose.onNodeWithText("Song information").assertDoesNotExist()
+        dev.spofify.mobile.capturePolishEvidence("track-album-navigation", compose.onRoot())
+        compose.onNodeWithText("Go to album").performScrollTo().performClick()
+        assertEquals("opaque/album", opened.single().id)
+        assertEquals("album", opened.single().kind)
+        compose.runOnIdle { item.value = item.value.copy(albumId = null, trackNumber = 2, genres = listOf("Ambient")) }
+        compose.onNodeWithText("Go to album").assertDoesNotExist()
+        compose.onNode(hasText("Album") and hasClickAction()).assertIsNotEnabled()
+        dev.spofify.mobile.capturePolishEvidence("track-metadata-missing-album", compose.onRoot())
+        compose.onNodeWithText("Song information").performScrollTo().performClick()
+        assertEquals("opaque/song", opened.last().id)
+        assertEquals("track", opened.last().kind)
+        compose.runOnIdle { item.value = item.value.copy(albumName = null, trackNumber = 0, genres = emptyList()) }
+        compose.onNodeWithText("Navigation").assertDoesNotExist()
+        compose.onNodeWithText("Song information").assertDoesNotExist()
+    }
+
     @Test fun unsupportedActionsAreOmittedWithoutInventingPlaybackOrLibraryCapabilities() {
         compose.setContent {
             MaterialTheme {
@@ -157,6 +186,7 @@ class MusicActionsContentTest {
             }
         }
         compose.runOnIdle { assertTrue(events.isEmpty()) } // Opening/scrolling cannot start audio.
+        compose.onNodeWithText("Open details").assertDoesNotExist()
         compose.onNodeWithText("Final credited album").assertIsNotDisplayed()
         for ((label, expected) in listOf("Final credited album" to "album:album", "Credited artist 24" to "artist:artist-24")) {
             val credit = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
@@ -168,7 +198,7 @@ class MusicActionsContentTest {
             compose.runOnIdle { assertEquals(expected, events.last()) }
         }
         // Traverse back through the actual actions, not a duplicate test-only menu.
-        for (label in listOf("Open details", "Add to playlist", "Queue", "Play next", "Play now", "Like song")) {
+        for (label in listOf("Add to playlist", "Queue", "Play next", "Play now", "Like song")) {
             val action = compose.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertHeightIsAtLeast(48.dp)
             val viewport = compose.onNodeWithTag("music-actions").getUnclippedBoundsInRoot()
             val target = action.getUnclippedBoundsInRoot()
@@ -179,7 +209,7 @@ class MusicActionsContentTest {
             action.performClick()
         }
         compose.runOnIdle {
-            assertEquals(listOf("album:album", "artist:artist-24", "track:song", "playlist", "queue", "next", "play", "like"), events)
+            assertEquals(listOf("album:album", "artist:artist-24", "playlist", "queue", "next", "play", "like"), events)
         }
     }
 }

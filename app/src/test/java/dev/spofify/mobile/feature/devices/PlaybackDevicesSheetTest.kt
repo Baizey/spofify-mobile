@@ -172,12 +172,7 @@ class PlaybackDevicesSheetTest {
             val device = phone.copy(name = name, available = index != 2)
             val selected = if (index == 1 || index == 3) "phone" else ""
             compose.runOnIdle { holder.value = state(device, selected = selected).copy(selectionUnconfirmed = index == 3) }
-            val status = when (index) {
-                1 -> "This device · Available"
-                2 -> "This device · Unavailable"
-                3 -> "This device · Available"
-                else -> "This device · Available"
-            }
+            val status = if (index == 2) "This device · Unavailable" else "This device"
             val title = text(name)
             val statusText = text(status)
             val rename = text("Rename")
@@ -234,7 +229,7 @@ class PlaybackDevicesSheetTest {
         compose.runOnIdle { holder.value = state().copy(deviceId = "") }
         compose.onNodeWithText("Play from here").assertDoesNotExist()
         compose.onNodeWithText("Rename").assertDoesNotExist()
-        compose.onNodeWithText("View only · Playback transfer is unavailable on this phone.").assertExists()
+        compose.onNodeWithText("Playback transfer unavailable on this phone.").assertExists()
         compose.onNodeWithContentDescription("Select output on Phone").assertIsNotEnabled()
         compose.onNodeWithText("Close").assertDoesNotExist()
         compose.runOnIdle { assertEquals(0, calls.dismiss); assertEquals(expectedCalls, calls.selections.size) }
@@ -301,17 +296,17 @@ class PlaybackDevicesSheetTest {
         }
         compose.onNodeWithText(guidance).assertExists()
         compose.onNodeWithText("Continue playback here").assertDoesNotExist()
-        compose.onNodeWithText("View only · Playback transfer is unavailable on this phone.").assertExists()
+        compose.onNodeWithText("Playback transfer unavailable on this phone.").assertExists()
     }
 
     @Test fun selectedPendingPlayingPausedAndUnavailableStatusesRemainTruthful() {
         val calls = Calls()
         val holder = content(state(), calls)
         val cases = listOf(
-            state(active = "phone", snapshot = PlaybackSnapshot(playing = true)) to "This device · Playing",
+            state(active = "phone", snapshot = PlaybackSnapshot(playing = true)) to "This device · Active output · Playing",
             state(active = "phone", snapshot = PlaybackSnapshot()) to "This device · Active output · Paused",
-            state(selected = "phone") to "This device · Available",
-            state(selected = "phone").copy(selectionUnconfirmed = true) to "This device · Available",
+            state(selected = "phone") to "This device",
+            state(selected = "phone").copy(selectionUnconfirmed = true) to "This device",
             state(phone.copy(available = false)) to "This device · Unavailable",
         )
         for ((value, status) in cases) {
@@ -329,7 +324,7 @@ class PlaybackDevicesSheetTest {
         // Physical touches at outer padding, identity and status (not just accessibility invocation).
         row.performTouchInput { click(Offset(2f, 2f)) }
         compose.onNodeWithText("Phone", useUnmergedTree = true).performTouchInput { click() }
-        compose.onNodeWithText("This device · Available", useUnmergedTree = true).performTouchInput { click() }
+        compose.onNodeWithText("This device", useUnmergedTree = true).performTouchInput { click() }
         compose.runOnIdle { assertEquals(listOf("phone", "phone", "phone"), calls.selections) }
         compose.onNodeWithContentDescription("Rename Phone").performTouchInput { click() }
         compose.onNode(hasSetTextAction()).performTouchInput { click() }

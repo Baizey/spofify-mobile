@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
@@ -338,7 +339,6 @@ fun PlaylistsRoute(
                     AppendStatus(appending, if (loading || appending) null else appendError,
                         onRetry = { loadIndex(reset = failedIndexReset, retry = true) }, loadingLabel = "Loading more playlists")
                     if (!loading && page?.total == 0) Text("No playlists yet.")
-                    else if (!loading && message == null && page != null && offset >= page!!.total) Text("All playlists loaded.")
                 }
             }
         }
@@ -1002,7 +1002,6 @@ private fun PlaylistDetail(
                 if (!busy && !stale && (if (saved?.kind == PlaylistKind.DERIVED) evaluation?.total == 0L else saved?.trackCount == 0L)) Text("No songs in this playlist.")
             }
             if (snapshot != null) {
-                Text("Complete bounded order loaded (${ordered.size} occurrences). Drag a handle or use Move up/down; save explicitly.")
                 Row {
                     Button(enabled = !busy && !blocked, onClick = { val complete = snapshot!!; write {
                         summary = api.reorder(complete, ordered.map { it.id }); snapshot = null; refreshAll()
@@ -1016,14 +1015,12 @@ private fun PlaylistDetail(
                 PlaylistFilterField(filterQuery, modifier = Modifier.onGloballyPositioned {
                     filterInputBounds = Rect(it.positionInWindow(), it.size.toSize())
                 }, onEditingChanged = { filterEditing = it }, onQueryChange = ::changeFilter)
-                val resident = if (saved?.kind == PlaylistKind.DERIVED) derivedEntries.size else manualEntries.size
                 val matching = if (saved?.kind == PlaylistKind.DERIVED) filteredDerived.size else filteredManual.size
-                val total = if (saved?.kind == PlaylistKind.DERIVED) evaluation?.total else saved?.trackCount
-                Text(if (filterPending) "Filtering loaded songs…" else playlistFilterCoverage(resident, total, matching, filtering),
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(vertical = 4.dp))
-                if (filtering && !filterPending && matching == 0) Text("No loaded songs match. Try a title, artist, or album.",
-                    style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 8.dp))
+                if (!filterPending) playlistFilterLabel(matching, filterQuery)?.let { label ->
+                    Text(label, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 4.dp).testTag("playlist-filter-result"))
+                }
             }
         }
         if (snapshot != null) items(ordered, key = { it.id }) { entry ->
@@ -1071,7 +1068,6 @@ private fun PlaylistDetail(
             item {
                 if (!filtering) AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
                 if (!filtering && !busy && !stale && derivedEntries.isEmpty()) Text("No songs match these rules.")
-                else if (!filtering && !busy && !stale && evaluation?.nextCursor == null) Text("All songs loaded.")
             }
         } else {
             items(filteredManual, key = { it.id }) { entry ->
@@ -1094,7 +1090,6 @@ private fun PlaylistDetail(
             item {
                 if (!filtering) AppendStatus(appending, if (appending) null else appendError, onRetry = { append() }, loadingLabel = "Loading more songs")
                 if (!filtering && !busy && !stale && manualEntries.isEmpty()) Text("No songs yet.")
-                else if (!filtering && !busy && !stale && offset >= (entries?.total ?: 0)) Text("All songs loaded.")
             }
         }
     }

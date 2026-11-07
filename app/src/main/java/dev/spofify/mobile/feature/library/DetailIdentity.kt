@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,10 +47,8 @@ internal fun DetailCredits(item: LibraryItem, onOpen: (LibraryItem) -> Unit) {
     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         item.artists.forEach { credit ->
             if (credit.id.isBlank()) Text(credit.name, style = MaterialTheme.typography.bodySmall)
-            else TextButton(onClick = { onOpen(LibraryItem("artist", credit.id, credit.name)) },
-                modifier = Modifier.heightIn(min = 48.dp), contentPadding = PaddingValues(0.dp)) {
-                Text(credit.name, style = MaterialTheme.typography.bodySmall)
-            }
+            else dev.spofify.mobile.ui.MusicDetailLink(credit.name,
+                onClick = { onOpen(LibraryItem("artist", credit.id, credit.name)) })
         }
     }
 }

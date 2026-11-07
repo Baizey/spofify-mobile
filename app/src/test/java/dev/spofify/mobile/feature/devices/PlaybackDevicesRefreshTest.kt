@@ -278,6 +278,25 @@ class PlaybackDevicesRefreshTest {
         }
     }
 
+    @Test fun routineInformationIsHiddenButActualOutputAndFailuresRemain() {
+        val calls = Calls()
+        val base = healthy(listOf(phone, room.copy(available = false))).copy(
+            message = "Device name saved. Native handoff remains unavailable on this phone.",
+            messagePurpose = PlaybackDevicesMessagePurpose.INFORMATION,
+            view = healthy(listOf(phone, room.copy(available = false))).view!!.copy(
+                activeDeviceId = "phone", state = PlaybackSnapshot(playing = false)))
+        val holder = host(base, calls)
+        compose.onNodeWithText(base.message).assertDoesNotExist()
+        compose.onNodeWithText("This device · Active output · Paused").assertExists()
+        compose.onNodeWithText("Unavailable").assertExists()
+        dev.spofify.mobile.capturePolishEvidence("devices-normal", compose.onRoot())
+        val failure = "That player is unavailable. Open Spofify on it and choose again."
+        publish(holder, base.copy(message = failure, messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE))
+        compose.onNodeWithText(failure).assertExists()
+        dev.spofify.mobile.capturePolishEvidence("devices-failure", compose.onRoot())
+        compose.runOnIdle { calls.assertQuiet() }
+    }
+
     @Test fun needsTapGuidanceAndContinueAreNotRoutineVerificationOrRetry() {
         val calls = Calls()
         val base = healthy(listOf(phone))

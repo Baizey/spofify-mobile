@@ -325,7 +325,7 @@ class RootCopyHostTest {
         awaitNoProgress()
         scrollTo("Last mix")
         compose.onNodeWithText("Last mix").assertIsDisplayed()
-        compose.onNodeWithText("All playlists loaded.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("All playlists loaded.").assertDoesNotExist()
         repeat(3) { list.performTouchInput { swipeUp() }; compose.waitForIdle() }
         assertEquals("The terminal one-row batch stops automatic demand", listOf(0, 0, 0, 40), indexOffsets())
         scrollTo("Evening mix")

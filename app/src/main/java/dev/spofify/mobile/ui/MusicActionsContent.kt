@@ -38,6 +38,8 @@ internal fun MusicActionsContent(
     libraryContent: (@Composable () -> Unit)? = null,
     contextualContent: (@Composable () -> Unit)? = null,
     artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
+    // MediaSession/wire queue projections omit genres/disc/track metadata; absence is unknown.
+    trackMetadataComplete: Boolean = true,
 ) {
     val content: @Composable () -> Unit = {
         if (onPlay != null || onPlayNext != null || onQueue != null) {
@@ -72,9 +74,15 @@ internal fun MusicActionsContent(
                 libraryContent?.invoke()
             }
         }
-        if (onOpen != null || onOpenItem != null) {
+        // Credits/album already have destinations below. Keep track details only for actual
+        // track-specific metadata, never as a duplicate route to the containing album.
+        val hasTrackMetadata = item.genres.any { it.isNotBlank() } || item.discNumber > 0 || item.trackNumber > 0
+        val openDetails = onOpen.takeUnless { item.kind == "track" && trackMetadataComplete && !hasTrackMetadata }
+        if (openDetails != null || onOpenItem != null && (item.artists.isNotEmpty() ||
+                item.kind == "track" && !item.albumName.isNullOrBlank())) {
             SongActionGroup("Navigation") {
-                onOpen?.let { SongActionRow("Open details", Icons.Default.Info, actionsEnabled, onClick = it) }
+                openDetails?.let { SongActionRow(if (item.kind == "track") "Song information" else "Open details",
+                    Icons.Default.Info, actionsEnabled, onClick = it) }
                 onOpenItem?.let { SongActionNavigation(item, actionsEnabled, onOpenItem = it) }
             }
         }

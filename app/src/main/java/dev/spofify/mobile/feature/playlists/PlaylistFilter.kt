@@ -72,15 +72,8 @@ internal fun <T> residentPlaylistProjection(memory: ResidentPlaylistProjection<T
     return current?.items
 }
 
-internal fun playlistFilterCoverage(resident: Int, total: Long?, matching: Int, active: Boolean): String {
-    val partial = total == null || resident.toLong() < total
-    return when {
-        partial && active -> "$matching matches in $resident loaded songs · not the whole playlist"
-        partial -> "Filters $resident loaded songs · not the whole playlist"
-        active -> "$matching of $resident songs"
-        else -> "Filters all $resident songs"
-    }
-}
+internal fun playlistFilterLabel(matching: Int, query: String): String? =
+    if (query.trim().isNotEmpty()) "Filtered to $matching songs" else null
 
 /** Local input only: no global Search activation, navigation reset, query grammar or submit read. */
 @Composable

@@ -55,10 +55,11 @@ class PlaylistFilterTest {
         }
     }
 
-    @Test fun partialCoverageCannotClaimWholePlaylistSearch() {
-        assertEquals("2 matches in 40 loaded songs · not the whole playlist", playlistFilterCoverage(40, 85, 2, true))
-        assertTrue(playlistFilterCoverage(40, null, 40, false).contains("not the whole playlist"))
-        assertEquals("2 of 40 songs", playlistFilterCoverage(40, 40, 2, true))
+    @Test fun filterLabelIsExactAndAbsentWithoutTrimmedQuery() {
+        assertEquals("Filtered to 2 songs", playlistFilterLabel(2, " needle "))
+        assertEquals("Filtered to 0 songs", playlistFilterLabel(0, "missing"))
+        assertNull(playlistFilterLabel(40, ""))
+        assertNull(playlistFilterLabel(40, " \t "))
     }
 
     @Test fun browseMemoryRetainsQueryAndAnchorsButNewPlaylistRetiresThem() {

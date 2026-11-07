@@ -94,7 +94,7 @@ private fun UpcomingOccurrenceActions(
     val actions = intents.toMap()
     fun perform(action: () -> Unit) { onDismiss(); action() }
     SongActionSheet(onDismiss) {
-        MusicActionsContent(entry.item,
+        MusicActionsContent(entry.item, trackMetadataComplete = false,
             onPlay = { perform(actions.getValue("Play now")) },
             onPlayNext = { perform(actions.getValue("Play next")) },
             onQueue = { perform(actions.getValue("Queue")) },

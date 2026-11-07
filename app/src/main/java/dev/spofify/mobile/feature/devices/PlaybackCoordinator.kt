@@ -18,7 +18,7 @@ import kotlinx.coroutines.sync.withLock
 enum class PlaybackConnectionRecovery { NONE, VERIFICATION_NEEDED, AUTH_REQUIRED, OWNER_ENDED, UNSUPPORTED }
 
 /** Only explicitly classified routine narration may be hidden by the picker. */
-enum class PlaybackDevicesMessagePurpose { GUIDANCE, PROGRESS }
+enum class PlaybackDevicesMessagePurpose { GUIDANCE, PROGRESS, INFORMATION }
 
 /** Opaque in-process presentation identity; never authority or a saved/wire token. */
 data class PlaybackDeviceSelection(val deviceId: String, val token: Long)
@@ -29,7 +29,7 @@ data class PlaybackDevicesState(
     val selectedDeviceId: String = "", val selectionUnconfirmed: Boolean = false,
     val connected: Boolean = false, val connecting: Boolean = false,
     val exclusiveOwner: Boolean = false, val needsTap: Boolean = false,
-    val message: String = "Connect the playback service to use this phone as an output.",
+    val message: String = "",
     val recovery: PlaybackConnectionRecovery = PlaybackConnectionRecovery.NONE,
     val verifyingConnection: Boolean = false,
     val messagePurpose: PlaybackDevicesMessagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE,
@@ -682,7 +682,7 @@ class PlaybackCoordinator(
             work.launch { transport.withLock {
                 try {
                     val view = withTimeout(4000) { api.rename(deviceId, name.trim()) }.validated().copy(directives = emptyList())
-                    if (life == lifecycle && !closed && work.isActive && !serviceActive) mutableState.value = state.value.copy(view = view, message = "Device name saved. Native handoff remains unavailable on this phone.", messagePurpose = PlaybackDevicesMessagePurpose.GUIDANCE)
+                    if (life == lifecycle && !closed && work.isActive && !serviceActive) mutableState.value = state.value.copy(view = view, message = "Device name saved. Native handoff remains unavailable on this phone.", messagePurpose = PlaybackDevicesMessagePurpose.INFORMATION)
                 } catch (error: Exception) {
                     if (error is CancellationException && error !is TimeoutCancellationException) throw error
                     if (life == lifecycle && !closed && work.isActive && !serviceActive) readOnlyFailure(error,

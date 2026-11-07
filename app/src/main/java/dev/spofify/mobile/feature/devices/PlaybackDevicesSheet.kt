@@ -57,9 +57,9 @@ internal fun ColumnScope.PlaybackDevicesContent(
     var draft by remember { mutableStateOf("") }
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         Text("Playback devices", style = MaterialTheme.typography.titleLarge)
-        if (viewOnly) Text("View only · Playback transfer is unavailable on this phone.",
+        if (viewOnly) Text("Playback transfer unavailable on this phone.",
             Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.bodyMedium)
-        if (state.message.isNotEmpty() && state.messagePurpose != PlaybackDevicesMessagePurpose.PROGRESS) Text(state.message,
+        if (state.message.isNotEmpty() && state.messagePurpose == PlaybackDevicesMessagePurpose.GUIDANCE) Text(state.message,
             Modifier.padding(vertical = 12.dp).semantics { liveRegion = LiveRegionMode.Polite })
         if (showConnectionProgress) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (state.retryAvailable) TextButton(onClick = onRetry) { Text("Retry connection") }
@@ -90,7 +90,7 @@ internal fun PlaybackDeviceCard(
     val musical = state.view?.state
     val status = listOfNotNull(
         "This device".takeIf { device.deviceId == state.deviceId },
-        when { !device.available -> "Unavailable"; !active -> "Available"; musical?.error == "blocked" -> "Needs a tap"; musical?.playing == true -> "Playing"; else -> "Active output · Paused" },
+        when { !device.available -> "Unavailable"; !active -> null; musical?.error == "blocked" -> "Needs a tap"; musical?.playing == true -> "Active output · Playing"; else -> "Active output · Paused" },
     ).joinToString(" · ")
     val measurer = rememberTextMeasurer()
     val density = LocalDensity.current
@@ -115,7 +115,7 @@ internal fun PlaybackDeviceCard(
                     // Reserve the small overlay footprint even when idle: no text reflow when intent changes.
                     Column(Modifier.fillMaxWidth().padding(end = ringSize + 8.dp)) {
                         Text(device.name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        Text(status, style = MaterialTheme.typography.bodySmall)
+                        if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
                     }
                     if (pending) LoadingRing(Modifier.align(Alignment.TopEnd).size(ringSize).testTag("Pending output"))
                 }

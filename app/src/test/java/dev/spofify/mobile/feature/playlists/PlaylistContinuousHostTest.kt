@@ -187,7 +187,8 @@ class PlaylistContinuousHostTest {
                 scroll("playlist-78")
                 await { fixture.requests().size == 3 && appendSettled() }
                 scroll("playlist-84")
-                await { visible("All playlists loaded.") }
+                await { visible("Playlist 84") && appendSettled() }
+                compose.onNodeWithText("All playlists loaded.").assertDoesNotExist()
                 compose.runOnIdle { repeat(8) { host.heartbeat() } }
                 compose.waitForIdle()
                 assertEquals(listOf(0, 40, 80), fixture.requests())
@@ -230,7 +231,8 @@ class PlaylistContinuousHostTest {
                     await { fixture.requests().size == offset / 40 + 2 && appendSettled() }
                 }
                 scroll("path-1001")
-                await { visible("All songs loaded.") }
+                await { visible("Song 1001") && appendSettled() }
+                compose.onNodeWithText("All songs loaded.").assertDoesNotExist()
                 compose.onNodeWithContentDescription("More actions for Song 1001").performClick()
                 await { visible("Like song") }
                 compose.onNodeWithText("Play now").performScrollTo().performClick()
@@ -264,7 +266,8 @@ class PlaylistContinuousHostTest {
                 scroll("$prefix-78")
                 await { fixture.requests().size == 4 && appendSettled() }
                 scroll("$prefix-84")
-                await { visible(if (source == Source.INDEX) "All playlists loaded." else "All songs loaded.") }
+                await { visible(if (source == Source.INDEX) "Playlist 84" else "Song 84") && appendSettled() }
+                compose.onNodeWithText(if (source == Source.INDEX) "All playlists loaded." else "All songs loaded.").assertDoesNotExist()
                 assertEquals(listOf(0, 40, 40, 80), fixture.requests())
                 scroll("$prefix-0")
                 compose.onNodeWithText(if (source == Source.INDEX) "Playlist 0" else "Song 0").assertExists()

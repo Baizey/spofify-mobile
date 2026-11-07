@@ -71,6 +71,41 @@ class NativeUpcomingQueueTest {
     @get:Rule val compose = createComposeRule()
     private val track = LibraryItem("track", "duplicate", "Duplicate song", hasAudio = true)
 
+    @Test fun projectedQueueMetadataKeepsExplicitInformationAccessWithoutPlayback() {
+        val controls = QueueRecordingControls()
+        val original = track.copy(id = "opaque/song?%", genres = listOf("Ambient"), discNumber = 1, trackNumber = 7,
+            albumId = "opaque/album", albumName = "Album")
+        val codec = dev.spofify.mobile.playback.PlaybackSnapshotCodec
+        val projected = codec.libraryItem(codec.track(original, 1, 1))
+        assertTrue(projected.genres.isEmpty())
+        assertEquals(0, projected.trackNumber)
+        val state = PlaybackState(item = track, upcoming = listOf(QueueEntry("projected", projected, 1)),
+            interactionKey = PlaybackInteractionKey())
+        val compact = mutableStateOf(false)
+        val opened = mutableListOf<LibraryItem>()
+        compose.setContent {
+            MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
+                Surface { Column(Modifier.size(320.dp, 500.dp)) {
+                    NativeUpcomingQueue(state, controls, opened::add, { _, modifier -> Box(modifier) }, compact = compact.value)
+                } }
+            }
+        }
+        for (presentation in listOf(false, true)) {
+            compose.runOnIdle { compact.value = presentation }
+            compose.onNodeWithContentDescription("Queue actions for ${track.name}").performClick()
+            compose.onNodeWithText("Open details").assertDoesNotExist()
+            compose.onNodeWithText("Go to album").performScrollTo().assertExists()
+            compose.onNodeWithText("Song information").performScrollTo().performClick()
+            compose.runOnIdle {
+                assertEquals(original.id, opened.last().id)
+                assertEquals("track", opened.last().kind)
+                assertTrue(controls.intents.isEmpty())
+                assertEquals(0, controls.playbackCalls)
+            }
+        }
+        assertEquals(2, opened.size)
+    }
+
     @Test fun bothPresentationsBodyPlayNowKeepsExactDuplicateAndCapturedLifetimeWithoutNavigation() {
         val controls = QueueRecordingControls()
         val entries = listOf(QueueEntry("first", track, 19), QueueEntry("second", track, 3),

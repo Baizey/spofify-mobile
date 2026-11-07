@@ -1494,9 +1494,9 @@ class NativeUiSmokeTest {
         val name = UiFixtureServer.TRACK_NAMES[1]
         val top = scrollToCatalogItem(name).fetchSemanticsNode().boundsInRoot.top
         compose.onNodeWithContentDescription("More actions for $name").performClick()
-        waitFor(hasText("Open details") and hasClickAction())
-        compose.onNodeWithText("Open details").assertIsDisplayed().performClick()
-        waitUntilAbsent(hasText("Open details") and hasClickAction())
+        waitFor(hasText("Song information") and hasClickAction())
+        compose.onNodeWithText("Song information").assertIsDisplayed().performClick()
+        waitUntilAbsent(hasText("Song information") and hasClickAction())
         waitFor(hasContentDescription("More actions for $name"))
         UiFixtureServer.CREDIT_ARTISTS.forEach { (id, artist) ->
             compose.onNode(hasText(artist) and hasClickAction()).performScrollTo().performClick()

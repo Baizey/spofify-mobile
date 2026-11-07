@@ -227,18 +227,16 @@ internal fun compactMusicSubtitle(item: LibraryItem): String = buildList {
 fun MusicCredits(item: LibraryItem, onOpenItem: (LibraryItem) -> Unit, modifier: Modifier = Modifier) {
     Column(modifier) {
         item.artists.forEach { artist ->
-            if (artist.id.isNotBlank()) TextButton(onClick = { onOpenItem(LibraryItem("artist", artist.id, artist.name)) },
-                contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 48.dp)) {
-                Text(artist.name, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            } else Text(artist.name, style = MaterialTheme.typography.bodySmall)
+            if (artist.id.isNotBlank()) dev.spofify.mobile.ui.MusicDetailLink(artist.name,
+                onClick = { onOpenItem(LibraryItem("artist", artist.id, artist.name)) })
+            else Text(artist.name, style = MaterialTheme.typography.bodySmall)
         }
         val albumName = item.albumName
         val albumId = item.albumId
         if (item.kind == "track" && !albumName.isNullOrBlank()) {
-            if (!albumId.isNullOrBlank()) TextButton(onClick = { onOpenItem(LibraryItem("album", albumId, albumName)) },
-                contentPadding = PaddingValues(0.dp), modifier = Modifier.heightIn(min = 48.dp)) {
-                Text(albumName, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            } else Text(albumName, style = MaterialTheme.typography.bodySmall)
+            if (!albumId.isNullOrBlank()) dev.spofify.mobile.ui.MusicDetailLink(albumName,
+                onClick = { onOpenItem(LibraryItem("album", albumId, albumName)) })
+            else Text(albumName, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
