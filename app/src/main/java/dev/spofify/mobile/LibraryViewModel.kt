@@ -228,6 +228,24 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     init {
         playback.bindExplicitPlayOrigin(::captureExplicitPlayOrigin)
         viewModelScope.launch {
+            graph.sessionNeedsReconnect.collect { needsReconnect ->
+                if (needsReconnect && graph.sessionNeedsReconnect.value && !signingOut &&
+                    state.value.session != null && graph.client?.currentSession() == null) {
+                    generation++
+                    queueGeneration++
+                    loadJob?.cancel(); queueJob?.cancel()
+                    clearFeatureState(); tabStacks.clear()
+                    stack.clear(); stack.add(Page.Home)
+                    playback.stop()
+                    // Use the existing SignIn saved-connection Retry action. Do not
+                    // clear auth or cancel an explicit reconnect already in flight.
+                    mutable.update { freshState(server = it.server, busy = it.busy,
+                        error = "Saved connection needs verification. Retry to reconnect.")
+                        .copy(canRetryConnection = true) }
+                }
+            }
+        }
+        viewModelScope.launch {
             graph.sessionExpired.collect { expired ->
                 if (expired && !signingOut) {
                     authenticationSerial++
@@ -253,16 +271,18 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         viewModelScope.launch {
             try {
                 val session = graph.restore()
-                if (attempt != authenticationSerial || graph.client !== client || client?.currentSession() !== session) return@launch
+                val restoredClient = graph.client
+                if (attempt != authenticationSerial || (client != null && restoredClient !== client) ||
+                    restoredClient?.currentSession() !== session) return@launch
                 mutable.update { it.copy(restoring = false, busy = false, canRetryConnection = false, session = session,
-                    server = if (session != null) client!!.server.origin else it.server) }
+                    server = if (session != null) restoredClient!!.server.origin else it.server) }
                 if (session != null) {
                     playback.connect()
                     load(Page.Home)
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                if (attempt != authenticationSerial || graph.client !== client) return@launch
+                if (attempt != authenticationSerial || (client != null && graph.client !== client)) return@launch
                 mutable.update { it.copy(restoring = false, busy = false, canRetryConnection = true,
                     error = "Could not reconnect. Check your network or retry the saved connection.") }
             }

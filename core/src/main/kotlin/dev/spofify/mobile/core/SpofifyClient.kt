@@ -59,7 +59,7 @@ data class AuthenticationChange(
 )
 
 /** One origin and one account. The same client can safely be shared with images and Media3. */
-class SpofifyClient internal constructor(
+class SpofifyClient(
     val server: ServerAddress,
     private val store: SessionStore,
     private val authenticationTimeMillis: () -> Long,
@@ -70,6 +70,20 @@ class SpofifyClient internal constructor(
     private var cookie: Cookie? = null
     private var session: Session? = null
     private var generation: Long = 0
+    // Deadline/credential publication is NOT a new logical auth incarnation.
+    private var credentialRevision: Long = 0
+    private var sessionMode: String? = null
+    private var persistedDeadline: Long = 0
+    private var nextPersistenceAttempt: Long = 0
+    private class RestoreProbe(val generation: Long)
+    private class TerminalLogout(val auth: RequestAuthentication)
+    private class RequestAuthentication(val generation: Long, val revision: Long, val cookie: Cookie?,
+        val session: Session?, val restoring: Boolean = false, val terminal: Boolean = false) {
+        @Volatile var dispatchedRevision = revision
+    }
+    // Capture at Call creation, before OkHttp's queue can span an account switch.
+    // Weak keys also retire never-executed Calls; completed Calls remove themselves.
+    private val requests = java.util.WeakHashMap<Call, RequestAuthentication>()
     private var authentication = AuthenticationChange(0, AuthenticationChangeKind.DORMANT, null)
 
     /** Synchronous fencing notification, always OUTSIDE the client lock, including disk failures.
@@ -93,45 +107,57 @@ class SpofifyClient internal constructor(
     @Volatile var onUnauthorized: (() -> Unit)? = null
 
     val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .eventListenerFactory {
-            val requestGeneration = synchronized(lock) { generation }
+        .eventListenerFactory { call ->
+            val captured = requestAuthentication(call.request())
+            synchronized(lock) { requests[call] = captured }
             object : EventListener() {
                 override fun connectionAcquired(call: Call, connection: Connection) {
                     val route = connection.route()
-                    recordPlaybackLeaveRoute(requestGeneration, call.request().url, route.address.url, route.proxy.type(), route.socketAddress)
+                    recordPlaybackLeaveRoute(captured.generation, call.request().url, route.address.url, route.proxy.type(), route.socketAddress)
                 }
+                override fun callEnd(call: Call) { synchronized(lock) { requests.remove(call) } }
+                override fun callFailed(call: Call, ioe: IOException) { synchronized(lock) { requests.remove(call) } }
             }
         }
         .followRedirects(false)
         .followSslRedirects(false)
         .retryOnConnectionFailure(false)
         .cookieJar(object : CookieJar {
-            // Only login may install a session, after the entire response has been validated.
+            // Installation and negotiated deadline updates are explicitly validated below.
             override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) = Unit
             override fun loadForRequest(url: HttpUrl): List<Cookie> = changingAuthentication {
                 expireSessionLocked()
                 if (!server.contains(url)) emptyList()
-                else cookie?.let { listOf(it) } ?: emptyList()
+                else cookie?.takeIf { it.expiresAt > authenticationTimeMillis() }?.let { listOf(it) } ?: emptyList()
             }
         })
         .addInterceptor { chain ->
             val request = chain.request()
             if (!server.contains(request.url)) throw IOException("Off-origin requests are not allowed")
             val login = request.method == "POST" && request.url.encodedPath == "/api/auth/login"
-            val requestGeneration = synchronized(lock) { generation }
-            val builder = request.newBuilder().header("Origin", server.origin).removeHeader("Cookie")
-                .removeHeader("X-CSRF-Token").removeHeader("X-Spofify-Login")
+            val auth = synchronized(lock) {
+                requests[chain.call()] ?: throw IOException("Missing request authentication")
+            }
+            requireLiveDispatch(auth)
+            val builder = request.newBuilder().tag(RequestAuthentication::class.java, auth)
+                .header("Origin", server.origin).removeHeader("Cookie")
+                .removeHeader("X-CSRF-Token").removeHeader("X-Spofify-Login").removeHeader("X-Spofify-Session-Mode")
             if (request.method !in listOf("GET", "HEAD", "OPTIONS")) {
                 builder.header("Content-Type", "application/json")
                 // OkHttp can otherwise replay a body after certain 503/421 responses even
                 // with retryOnConnectionFailure(false). Every mutation is explicitly one-shot.
                 builder.method(request.method, OneShotBody(request.body ?: "".toRequestBody(null)))
-                if (login) builder.header("X-Spofify-Login", "1")
-                else currentSession()?.let { builder.header("X-CSRF-Token", it.csrfToken) }
+                if (login) builder.header("X-Spofify-Login", "1").header("X-Spofify-Session-Mode", ROLLING_SESSION_MODE)
+                else auth.session?.let { builder.header("X-CSRF-Token", it.csrfToken) }
             }
             val response = chain.proceed(builder.build())
             try {
-                if (response.code == 401 && !login) invalidate(requestGeneration, notifyUnauthorized = true)
+                if (!login && !auth.terminal) {
+                    if (response.code == 401 && auth.cookie != null)
+                        invalidate(auth.generation, notifyUnauthorized = true, expectedCredentialRevision = auth.dispatchedRevision)
+                    else if (!auth.restoring && (response.isSuccessful || response.code == 304))
+                        acceptRollingDeadline(response, auth)
+                }
                 response
             } catch (error: Exception) {
                 // The response is not handed to a caller when invalidation/storage fails.
@@ -139,11 +165,24 @@ class SpofifyClient internal constructor(
                 throw error
             }
         }
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            val captured = request.tag(RequestAuthentication::class.java)
+                ?: throw IOException("Missing request authentication")
+            // Recheck after connection/route waits as well as before them. An old
+            // captured cookie is not permission to dispatch after live auth expired.
+            requireLiveDispatch(captured)
+            // CookieJar runs later than request capture. Never let it borrow a successor
+            // account/token (or replace the fixed retired logout credential).
+            val bound = request.newBuilder().removeHeader("Cookie")
+            captured.cookie?.let { bound.header("Cookie", "${it.name}=${it.value}") }
+            chain.proceed(bound.build())
+        }
         .build()
 
     fun currentSession(): Session? = changingAuthentication {
         expireSessionLocked()
-        session
+        session.takeIf { authentication.identity != null }
     }
 
     /** Live, server-validated authority only; a persisted summary or restore-in-flight cookie
@@ -186,6 +225,12 @@ class SpofifyClient internal constructor(
 
     private fun expireSessionLocked() {
         if (cookie?.let { it.expiresAt <= authenticationTimeMillis() } == true) {
+            if (sessionMode == ROLLING_SESSION_MODE) {
+                // A lost reply/save can leave an older LOCAL deadline. Fence all live
+                // authority, retain the encrypted credential for dormant server validation.
+                if (authentication.identity != null) authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
+                return
+            }
             try { resetSessionLocked(AuthenticationChangeKind.EXPIRED) }
             catch (_: IOException) {
                 // Read-only authority queries are used synchronously by playback and UI. Runtime
@@ -219,7 +264,7 @@ class SpofifyClient internal constructor(
     internal fun personalMutationGeneration(): Long = synchronized(lock) { generation }
 
     internal fun notifyPersonalChange(collection: PersonalCollection, expectedGeneration: Long) = synchronized(lock) {
-        if (generation == expectedGeneration && session != null && cookie?.let { it.expiresAt > System.currentTimeMillis() } == true) {
+        if (generation == expectedGeneration && authentication.identity != null && session != null && cookie?.let { it.expiresAt > authenticationTimeMillis() } == true) {
             val previous = mutablePersonalRevision.value
             mutablePersonalRevision.value = when (collection) {
                 PersonalCollection.LIKES -> previous.copy(likes = previous.likes + 1)
@@ -244,7 +289,7 @@ class SpofifyClient internal constructor(
             val oldCookie = cookie
             val oldSession = session
             val oldAddress = playbackLeaveAddress
-            if (oldCookie == null || oldSession == null || oldAddress == null || oldCookie.expiresAt <= System.currentTimeMillis()) null
+            if (authentication.identity == null || oldCookie == null || oldSession == null || oldAddress == null || oldCookie.expiresAt <= authenticationTimeMillis()) null
             else {
                 val body = buildJsonObject {
                     put("action", "leave"); put("deviceId", deviceId)
@@ -271,8 +316,12 @@ class SpofifyClient internal constructor(
     private fun resetSessionLocked(kind: AuthenticationChangeKind): Long {
         cookie = null
         session = null
+        sessionMode = null
+        persistedDeadline = 0
+        nextPersistenceAttempt = 0
         playbackLeaveAddress = null
         generation++
+        credentialRevision++
         authenticationChangedLocked(kind)
         try { store.write(null) }
         catch (_: Exception) { throw IOException("Unable to clear the saved session. Sign in again.") }
@@ -280,8 +329,9 @@ class SpofifyClient internal constructor(
     }
 
     /** Old requests must not clear or resurrect a newer account session. */
-    private fun invalidate(expectedGeneration: Long, notifyUnauthorized: Boolean = false): Boolean = changingAuthentication {
-        if (generation != expectedGeneration) false
+    private fun invalidate(expectedGeneration: Long, notifyUnauthorized: Boolean = false,
+        expectedCredentialRevision: Long? = null): Boolean = changingAuthentication {
+        if (generation != expectedGeneration || (expectedCredentialRevision != null && credentialRevision != expectedCredentialRevision)) false
         else {
             val invalidatedGeneration = generation + 1
             try { resetSessionLocked(AuthenticationChangeKind.INVALIDATED) }
@@ -300,10 +350,16 @@ class SpofifyClient internal constructor(
         val body = buildJsonObject { put("username", username); put("password", password) }.toString()
         return try {
             response(request(server.url("api", "auth", "login"), "POST", body)) { result ->
-                val candidates = result.headers.values("Set-Cookie").mapNotNull { parseSessionCookie(server, it) }
-                val summary = decode<Session>(result)
+                val reply = decode<AuthenticationReply>(result)
+                val mode = if (reply.sessionMode == ROLLING_SESSION_MODE && rollingResponse(result)) ROLLING_SESSION_MODE
+                    else if (reply.sessionMode == null && result.headers.values("X-Spofify-Session-Mode").isEmpty()) null
+                    else throw ApiException(result.code, "The server returned an incompatible session mode")
+                val candidates = result.headers.values("Set-Cookie").mapNotNull {
+                    parseSessionCookie(server, it, authenticationTimeMillis(), absoluteExpiry = mode != null)
+                }
+                val summary = reply.session()
                 if (candidates.size != 1) throw ApiException(result.code, "The server did not issue a valid session cookie")
-                install(summary, candidates.single(), loginGeneration)
+                install(summary, candidates.single(), loginGeneration, mode)
                 summary
             }
         } catch (error: CancellationException) {
@@ -316,28 +372,44 @@ class SpofifyClient internal constructor(
     suspend fun restore(): Session? {
         val (restoreGeneration, saved) = changingAuthentication {
             generation++
+            credentialRevision++
             cookie = null
             session = null
+            sessionMode = null
+            persistedDeadline = 0
+            nextPersistenceAttempt = 0
             playbackLeaveAddress = null
             authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
             generation to store.read()
         }
         if (saved == null) return null
-        val candidate = if (saved.server == server.origin) parseSessionCookie(server, saved.cookie) else null
+        val candidate = if (saved.server == server.origin && saved.sessionMode in setOf(null, ROLLING_SESSION_MODE))
+            parseSessionCookie(server, saved.cookie, authenticationTimeMillis(),
+                allowExpired = saved.sessionMode == ROLLING_SESSION_MODE, absoluteExpiry = saved.sessionMode != null) else null
         if (candidate == null) { invalidate(restoreGeneration); return null }
         synchronized(lock) {
             requireCurrentGeneration(restoreGeneration)
             cookie = candidate
+            sessionMode = saved.sessionMode
         }
         return try {
-            val summary = get<Session>(server.url("api", "auth", "session"))
-            install(summary, candidate, restoreGeneration)
-            summary
+            val probe = request(server.url("api", "auth", "session")).newBuilder()
+                .tag(RestoreProbe::class.java, RestoreProbe(restoreGeneration)).build()
+            response(probe) { result ->
+                val summary = decode<Session>(result)
+                val mode = if (rollingResponse(result)) ROLLING_SESSION_MODE else null
+                if (saved.sessionMode != null && mode == null)
+                    throw ApiException(result.code, "The server returned an incompatible session mode")
+                val validated = if (mode != null) rollingCookie(result, candidate)
+                    ?: throw ApiException(result.code, "The server did not return a valid rolling deadline") else candidate
+                install(summary, validated, restoreGeneration, mode)
+                summary
+            }
         } catch (error: ApiException) {
             // Rate limits and temporary server failures do not prove the saved session
             // invalid. Drop unvalidated runtime auth, but allow an explicit later retry.
-            if (error.status == 429 || error.status in 500..599) forgetRestore(restoreGeneration)
-            else invalidate(restoreGeneration)
+            if (error.status == 401) invalidate(restoreGeneration)
+            else forgetRestore(restoreGeneration)
             if (error.status == 401) null else throw error
         } catch (error: IOException) {
             forgetRestore(restoreGeneration)
@@ -354,16 +426,30 @@ class SpofifyClient internal constructor(
         if (generation == expectedGeneration) {
             cookie = null
             session = null
+            sessionMode = null
+            persistedDeadline = 0
+            nextPersistenceAttempt = 0
             playbackLeaveAddress = null
             generation++
+            credentialRevision++
             authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
         }
     }
 
     suspend fun logout() {
-        val logoutGeneration = synchronized(lock) { generation }
-        try { mutate(server.url("api", "auth", "logout"), "POST", "{}") }
-        finally { invalidate(logoutGeneration) }
+        var clearFailure: IOException? = null
+        val captured = changingAuthentication {
+            val retired = RequestAuthentication(generation, credentialRevision, cookie, session, terminal = true)
+            try { resetSessionLocked(AuthenticationChangeKind.INVALIDATED) }
+            catch (error: IOException) { clearFailure = error }
+            retired
+        }
+        // Local retirement precedes network suspension. Only this fixed one-shot logout
+        // may use the captured old credential; no late reply can mutate successor auth.
+        val logout = request(server.url("api", "auth", "logout"), "POST", "{}").newBuilder()
+            .tag(TerminalLogout::class.java, TerminalLogout(captured)).build()
+        try { response(logout) { Unit } }
+        finally { clearFailure?.let { throw it } }
     }
 
     suspend fun library(kind: String = "albums", query: String = "", offset: Int = 0, artistId: String? = null, albumId: String? = null): LibraryPage {
@@ -435,16 +521,87 @@ class SpofifyClient internal constructor(
     private fun requireCurrentGeneration(expectedGeneration: Long) {
         if (generation != expectedGeneration) throw IOException("The account session changed while the request was in progress")
     }
-    private fun install(summary: Session, value: Cookie, expectedGeneration: Long) = changingAuthentication {
+    private fun install(summary: Session, value: Cookie, expectedGeneration: Long, mode: String? = null) = changingAuthentication {
         if (value.expiresAt <= authenticationTimeMillis()) throw ApiException(200, "The server returned an expired session cookie")
         if (summary.accountId.isBlank() || summary.username.isBlank() || summary.role !in setOf("admin", "user") || summary.csrfToken.isBlank())
             throw ApiException(200, "The server returned an invalid session")
         requireCurrentGeneration(expectedGeneration)
-        store.write(StoredSession(server.origin, value.toString(), summary))
+        store.write(StoredSession(server.origin, value.toString(), summary, mode))
         cookie = value
         session = summary
+        sessionMode = mode
+        persistedDeadline = value.expiresAt
+        nextPersistenceAttempt = 0
+        credentialRevision++
         authenticationChangedLocked(AuthenticationChangeKind.VALIDATED)
     }
+    private fun requestAuthentication(request: Request): RequestAuthentication {
+        if (!server.contains(request.url)) throw IOException("Off-origin requests are not allowed")
+        request.tag(TerminalLogout::class.java)?.let { terminal ->
+            if (request.method != "POST" || request.url != server.url("api", "auth", "logout"))
+                throw IOException("Invalid sign-out request")
+            return terminal.auth
+        }
+        return changingAuthentication {
+            expireSessionLocked()
+            val restoring = request.tag(RestoreProbe::class.java)?.let {
+                it.generation == generation && request.method == "GET" && request.url == server.url("api", "auth", "session")
+            } == true
+            if (cookie != null && authentication.identity == null && !restoring)
+                throw IOException("The saved connection needs validation. Retry the connection.")
+            RequestAuthentication(generation, credentialRevision, cookie, session, restoring)
+        }
+    }
+
+    private fun requireLiveDispatch(captured: RequestAuthentication) = changingAuthentication {
+        if (captured.terminal) return@changingAuthentication
+        requireCurrentGeneration(captured.generation)
+        if (!captured.restoring && captured.cookie != null) {
+            expireSessionLocked()
+            requireCurrentGeneration(captured.generation)
+            val live = cookie
+            if (authentication.identity == null || live == null || live.expiresAt <= authenticationTimeMillis() ||
+                live.name != captured.cookie.name || live.value != captured.cookie.value)
+                throw IOException("The saved connection needs validation. Retry the connection.")
+        }
+        captured.dispatchedRevision = credentialRevision
+    }
+
+    private fun rollingResponse(result: Response) = result.headers.values("X-Spofify-Session-Mode").singleOrNull() == ROLLING_SESSION_MODE
+
+    private fun rollingCookie(result: Response, expected: Cookie): Cookie? {
+        if (!rollingResponse(result) || !server.contains(result.request.url)) return null
+        val candidates = result.headers.values("Set-Cookie").mapNotNull {
+            parseSessionCookie(server, it, authenticationTimeMillis(), absoluteExpiry = true)
+        }
+        return candidates.singleOrNull()?.takeIf { it.name == expected.name && it.value == expected.value }
+    }
+
+    private fun acceptRollingDeadline(result: Response, captured: RequestAuthentication) = changingAuthentication {
+        if (generation != captured.generation || sessionMode != ROLLING_SESSION_MODE || session == null) return@changingAuthentication
+        val previous = cookie ?: return@changingAuthentication
+        if (captured.cookie?.value != previous.value) return@changingAuthentication
+        val validated = rollingCookie(result, previous) ?: return@changingAuthentication
+        if (validated.expiresAt > previous.expiresAt) {
+            cookie = validated
+            credentialRevision++ // Fence old 401s WITHOUT retiring a healthy logical Session.
+            // Once live authority was fenced dormant, an ordinary late response may
+            // save a newer deadline but cannot reacquire it. Only explicit restore can.
+        }
+        val current = checkNotNull(cookie)
+        if (persistedDeadline < current.expiresAt && authenticationTimeMillis() >= nextPersistenceAttempt) {
+            try {
+                store.write(StoredSession(server.origin, current.toString(), checkNotNull(session), sessionMode))
+                persistedDeadline = current.expiresAt
+                nextPersistenceAttempt = 0
+            } catch (_: Exception) {
+                // Never rewrite an accepted musical/API result as failure or delete the old
+                // encrypted credential. A later normal response retries this bounded save.
+                nextPersistenceAttempt = authenticationTimeMillis() + 60_000L
+            }
+        }
+    }
+
     private fun request(url: HttpUrl, method: String = "GET", body: String? = null): Request = Request.Builder().url(url)
         .method(method, body?.toRequestBody("application/json; charset=utf-8".toMediaType())).build()
     private suspend inline fun <reified T> get(url: HttpUrl): T = response(request(url)) { decode<T>(it) }
@@ -579,16 +736,32 @@ private suspend fun <T> Call.awaitResponse(errorFactory: (Response) -> ApiExcept
     }
 
 /** Cookie policy is shared by login and restore; parsing does not install or trust the cookie. */
-internal fun parseSessionCookie(server: ServerAddress, serialized: String): Cookie? {
-    if (serialized.split(';').drop(1).none { it.trim().equals("Path=/", ignoreCase = true) }) return null
-    val value = Cookie.parse(server.url(), serialized) ?: return null
+internal fun parseSessionCookie(server: ServerAddress, serialized: String, nowMillis: Long = System.currentTimeMillis(),
+    allowExpired: Boolean = false, absoluteExpiry: Boolean = false): Cookie? {
+    val parts = serialized.split(';')
+    if (parts.drop(1).none { it.trim().equals("Path=/", ignoreCase = true) }) return null
+    if (absoluteExpiry && (parts.drop(1).none { it.trim().startsWith("Expires=", ignoreCase = true) } ||
+        parts.drop(1).filter { it.trim().startsWith("Max-Age=", ignoreCase = true) }
+            .any { it.substringAfter('=').trim().toLongOrNull()?.let { age -> age <= 0 } != false })) return null
+    // The server's absolute deadline must not drift on every quiet poll due to
+    // Max-Age/receipt-time rounding, delay or process restart.
+    val wire = if (absoluteExpiry) parts.filterNot { it.trim().startsWith("Max-Age=", ignoreCase = true) }.joinToString(";") else serialized
+    val value = Cookie.parse(server.url(), wire) ?: return null
     val secure = server.origin.startsWith("https:")
     val expected = if (secure) "__Host-spofify_session" else "spofify_session"
     return value.takeIf {
         it.name == expected && it.value.isNotEmpty() && it.value.length <= 512 && it.hostOnly &&
             it.domain == server.url().host && it.path == "/" && it.httpOnly &&
-            it.secure == secure && it.persistent && it.expiresAt > System.currentTimeMillis()
+            it.secure == secure && it.persistent && (allowExpired || it.expiresAt > nowMillis)
     }
+}
+
+private const val ROLLING_SESSION_MODE = "rolling-v1"
+
+@Serializable
+private data class AuthenticationReply(val accountId: String, val username: String, val role: String,
+    val csrfToken: String, val sessionMode: String? = null) {
+    fun session() = Session(accountId, username, role, csrfToken)
 }
 
 private class OneShotBody(private val delegate: RequestBody) : RequestBody() {

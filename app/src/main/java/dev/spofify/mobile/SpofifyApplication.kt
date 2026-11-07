@@ -43,12 +43,15 @@ class SpofifyApplication : Application() {
 
 class AppGraph(private val context: Context, store: SessionStore = EncryptedSessionStore(context),
     private val logins: LoginStore = EncryptedLoginStore(context),
-    audioCacheLimits: SongCache.Limits = SongCache.Limits()) {
+    audioCacheLimits: SongCache.Limits = SongCache.Limits(),
+    private val authenticationTimeMillis: () -> Long = System::currentTimeMillis) {
     private val sessions = SessionStoreOwner(store)
     private val restoreMutex = Mutex()
     private val preferences = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
     private val expired = MutableStateFlow(false)
     val sessionExpired = expired.asStateFlow()
+    private val reconnectRequired = MutableStateFlow(false)
+    val sessionNeedsReconnect = reconnectRequired.asStateFlow()
     @Volatile var client: SpofifyClient? = null
         private set
     var imageLoader: ImageLoader? = null
@@ -67,6 +70,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     private val cacheAuthenticationLock = Any()
     @Volatile private var cacheSource: SpofifyClient? = null
     private var authenticationRevision = -1L
+    private var hadValidatedSession = false // Protected by cacheAuthenticationLock.
 
     // Never borrow the graph monitor: configure/clear hold it while releasing Media3,
     // whose loading thread can synchronously observe cookie expiry during a read.
@@ -77,20 +81,30 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
             AuthenticationChangeKind.VALIDATED -> {
                 val identity = change.identity ?: return@synchronized
                 if (source.validatedSessionIdentity() != identity) return@synchronized
+                hadValidatedSession = true
+                reconnectRequired.value = false
                 audioCache = runCatching { songCache.bind(identity.origin, identity.accountId) }.getOrNull()
             }
             AuthenticationChangeKind.DORMANT -> {
+                if (hadValidatedSession) reconnectRequired.value = true
                 audioCache?.suspend()
                 audioCache = null
                 songCache.fence()
+                // Dormant/local-deadline uncertainty is not logout, but cannot leave
+                // buffered output or an old receiver binding live until revalidation.
+                revokePlayback(source, signedOut = false)
             }
             AuthenticationChangeKind.RESET -> {
+                hadValidatedSession = false
+                reconnectRequired.value = false
                 // A cold explicit sign-in has no prior runtime authority. Leave dormant
                 // bytes alone until its immutable identity has been validated.
                 audioCache?.retire()
                 audioCache = null
             }
             AuthenticationChangeKind.INVALIDATED, AuthenticationChangeKind.EXPIRED -> {
+                hadValidatedSession = false
+                reconnectRequired.value = false
                 audioCache = null
                 songCache.retire()
                 if (change.kind == AuthenticationChangeKind.EXPIRED) {
@@ -101,7 +115,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         }
     }
 
-    private fun revokePlayback(source: SpofifyClient) {
+    private fun revokePlayback(source: SpofifyClient, signedOut: Boolean = true) {
         // Expiry is observed on audio/cache reads as well as API responses. Fence pending
         // starts synchronously; only player mutation is posted. The 401 callback must not
         // cancel its own call before the existing API error classifier sees the response.
@@ -114,7 +128,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
                 playbackCoordinator?.authLost()
                 PlaybackService.stopActivePlayback()
                 context.stopService(Intent(context, PlaybackService::class.java))
-                expired.value = true
+                if (signedOut) expired.value = true
             }
         }
     }
@@ -163,10 +177,12 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         // Ignore even an old false value. Best-effort removal cannot break manual authentication,
         // and must not recreate data already deleted through the former opt-out action.
         runCatching { preferences.edit().remove("remember_login").commit() }
-        sessions.read()?.let { saved ->
-            runCatching { configure(ServerAddress.parse(saved.server)) }
-                .onFailure { sessions.clear() }
-        }
+        var unavailable = false
+        val saved = try { sessions.read() } catch (_: Exception) { unavailable = true; null }
+        val origin = saved?.server ?: if (unavailable) lastServer else ""
+        if (origin.isNotEmpty()) runCatching { configure(ServerAddress.parse(origin)) }
+        // A transient read/configuration failure must not delete encrypted auth.
+        // restore() retries safely, without granting authority from this preference.
     }
 
     @Synchronized
@@ -174,6 +190,8 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         client?.onAuthenticationChanged = null
         synchronized(cacheAuthenticationLock) {
             cacheSource = null
+            hadValidatedSession = false
+            reconnectRequired.value = false
             audioCache?.suspend()
             audioCache = null
             songCache.fence()
@@ -188,7 +206,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         client?.httpClient?.dispatcher?.cancelAll()
         client?.clearSession()
         expired.value = false
-        val next = SpofifyClient(server, lease)
+        val next = SpofifyClient(server, lease, authenticationTimeMillis)
         next.onAuthenticationChanged = { authenticationChanged(next, it) }
         // Range/image requests can fail without an Activity or a player request. Stop
         // buffered audio too; stopService alone cannot destroy a still-bound service.
@@ -218,7 +236,8 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     }
 
     suspend fun restore(): Session? = restoreMutex.withLock {
-        val active = client ?: return@withLock null
+        val active = client ?: sessions.read()?.let { configure(ServerAddress.parse(it.server)) }
+            ?: return@withLock null
         // Reattaching a screen must not null out a session used by background audio.
         active.currentSession()?.let { return@withLock it }
         val restored = active.restore()
@@ -231,6 +250,8 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         client?.onAuthenticationChanged = null
         synchronized(cacheAuthenticationLock) {
             cacheSource = null
+            hadValidatedSession = false
+            reconnectRequired.value = false
             audioCache = null
             songCache.retire()
         }

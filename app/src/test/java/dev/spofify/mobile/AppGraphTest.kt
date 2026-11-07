@@ -121,6 +121,63 @@ class AppGraphTest {
         } finally { graph.clear() }
     }
 
+    @Test fun transientInitialSessionReadCanRecoverWithoutDeletingAuthOrReplayingPassword() = runBlocking {
+        context.getSharedPreferences("connection", Context.MODE_PRIVATE).edit().remove("server").commit()
+        val web = MockWebServer().apply { start() }
+        val saved = StoredSession("http://127.0.0.1:${web.port}",
+            "spofify_session=secret; Path=/; HttpOnly; Max-Age=3600", Session("id", "listener", "user", "csrf"))
+        val memory = MemoryStore(saved)
+        var unavailable = true
+        val store = object : SessionStore {
+            override fun read(): StoredSession? {
+                if (unavailable) throw IOException("Synthetic temporary Keystore failure")
+                return memory.read()
+            }
+            override fun write(value: StoredSession?) = memory.write(value)
+        }
+        val logins = MemoryLogins()
+        val graph = AppGraph(context, store, logins)
+        try {
+            assertNull(graph.client); assertSame(saved, memory.value)
+            try { graph.restore(); fail("Expected retryable storage failure") } catch (_: IOException) { }
+            assertSame(saved, memory.value)
+            unavailable = false
+            web.enqueue(response())
+            val restored = graph.restore()
+            assertNotNull(restored); assertSame(restored, graph.client!!.currentSession())
+            val request = web.takeRequest()
+            assertEquals("GET", request.method); assertEquals("/api/auth/session", request.path)
+            assertEquals(0L, request.bodySize); assertEquals(0, logins.writes)
+        } finally { graph.clear(); web.shutdown() }
+    }
+
+    @Test fun rollingDeadlinePublicationKeepsSameSessionCacheBindingAndNoNewPlaybackCoordination() = runBlocking {
+        val web = MockWebServer().apply { start() }
+        val memory = MemoryStore()
+        val graph = AppGraph(context, memory, MemoryLogins())
+        val initial = System.currentTimeMillis() / 1000 * 1000 + java.util.concurrent.TimeUnit.DAYS.toMillis(30)
+        fun rolling(deadline: Long, body: String) = MockResponse().setHeader("Content-Type", "application/json")
+            .setHeader("X-Spofify-Session-Mode", "rolling-v1")
+            .setHeader("Set-Cookie", "spofify_session=secret; Path=/; HttpOnly; Expires=" +
+                java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME.format(java.time.Instant.ofEpochMilli(deadline).atZone(java.time.ZoneOffset.UTC)))
+            .setBody(body)
+        try {
+            val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
+            web.enqueue(rolling(initial, summary().dropLast(1) + ",\"sessionMode\":\"rolling-v1\"}"))
+            val session = client.login("listener", "explicit-password")
+            val identity = client.validatedSessionIdentity()
+            val cache = graph.audioCache(client, session)
+            val coordinator = graph.playbackCoordinator
+            assertNotNull(cache)
+            web.enqueue(rolling(initial + 3_600_000, "{}"))
+            dev.spofify.mobile.core.ApiTransport(client).get(listOf("api", "library"))
+            assertSame(session, client.currentSession()); assertEquals(identity, client.validatedSessionIdentity())
+            assertSame(cache, graph.audioCache(client, session)); assertSame(coordinator, graph.playbackCoordinator)
+            assertSame(session, graph.restore()); assertEquals(2, web.requestCount)
+            assertEquals("rolling-v1", memory.value!!.sessionMode); assertFalse(graph.sessionExpired.value)
+        } finally { graph.clear(); web.shutdown() }
+    }
+
     @Test fun aNewScreenReusesTheValidatedSessionWithoutClearingBackgroundAuthentication() = runBlocking {
         val web = MockWebServer().apply { start() }
         val graph = AppGraph(context, MemoryStore())

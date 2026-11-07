@@ -166,15 +166,21 @@ class SpofifyClientAuthTest {
         assertEquals("spofify_session=cookie-secret", retried.getHeader("Cookie"))
     }
 
-    @Test fun incompatibleRestoreJsonStillPermanentlyInvalidatesSavedSession() = runBlocking {
-        store.value = StoredSession(client.server.origin,
+    @Test fun incompatibleRestoreJsonIsDormantAndCanRetryWithoutDeletingSavedSession() = runBlocking {
+        val saved = StoredSession(client.server.origin,
             "spofify_session=cookie-secret; Path=/; HttpOnly; Expires=Wed, 01 Jan 2031 00:00:00 GMT",
             Session("a1", "listener", "user", "old-csrf"))
+        store.value = saved
         web.enqueue(jsonResponse("""{"unexpected":"response"}"""))
         assertEquals(200, apiFailure { client.restore() }.status)
-        assertNull(store.value)
+        assertSame(saved, store.value)
         assertNull(client.currentSession())
+        assertNull(client.validatedSessionIdentity())
         assertTrue(client.httpClient.cookieJar.loadForRequest(client.server.url()).isEmpty())
+        web.takeRequest()
+        web.enqueue(jsonResponse(SESSION_JSON))
+        assertNotNull(client.restore())
+        assertEquals("GET", web.takeRequest().method)
     }
 
     @Test fun expiredOrMalformedRestoresNeverReachNetwork() = runBlocking {

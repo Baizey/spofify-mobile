@@ -256,14 +256,36 @@ class EncryptedStorageTest {
         assertLogin(login, logins(prefs).read())
     }
 
-    @Test fun unavailableKeysDuringReadRemoveOnlyTheAffectedBlob() {
+    @Test fun unavailableSessionKeyReadPreservesCiphertextAndRetriesWithoutAReplacementKey() {
         val prefs = preferences("shared-storage-test")
         sessions(prefs).write(session)
         logins(prefs).write(login)
-        assertNull(sessions(prefs) { throw GeneralSecurityException("Key unavailable") }.read())
+        val before = prefs.all.toMap()
+        var calls = 0
+        val error = assertThrows(java.io.IOException::class.java) {
+            sessions(prefs) { calls++; throw GeneralSecurityException("private provider detail") }.read()
+        }
+        assertEquals(1, calls)
+        assertFalse(error.toString().contains("private")); assertNull(error.cause)
+        assertEquals(before, prefs.all)
+        assertEquals(session, sessions(prefs).read())
         assertLogin(login, logins(prefs).read())
+        // Remembered-password policy is separate; this task never auto-submits it.
         assertNull(logins(prefs) { throw GeneralSecurityException("Key unavailable") }.read())
-        assertTrue(prefs.all.isEmpty())
+        assertFalse(prefs.contains(EncryptedLoginStore.BLOB_KEY))
+        assertEquals(session, sessions(prefs).read())
+    }
+
+    @Test fun negotiatedRollingMetadataRoundTripsInsideExistingEncryptedSessionNamespace() {
+        val rolling = session.copy(sessionMode = "rolling-v1")
+        sessions().write(rolling)
+        assertEquals(rolling, sessions().read())
+        val prefs = preferences(EncryptedSessionStore.PREFERENCES)
+        assertEquals(setOf(EncryptedSessionStore.BLOB_KEY), prefs.all.keys)
+        val json = JSONObject(decrypt(bytes(prefs, EncryptedSessionStore.BLOB_KEY)))
+        assertEquals("rolling-v1", json.getString("sessionMode"))
+        assertEquals(session.cookie, json.getString("cookie"))
+        assertEquals(session.session.csrfToken, json.getJSONObject("session").getString("csrfToken"))
     }
 
     private fun decrypt(bytes: ByteArray, aad: ByteArray? = null): String {

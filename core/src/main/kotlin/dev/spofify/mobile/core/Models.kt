@@ -18,9 +18,9 @@ interface SessionStore {
     fun write(value: StoredSession?)
 }
 
-/** Only the selected origin, expiring session cookie and public session summary are persisted. */
+/** Origin-bound encrypted auth record. Mode is negotiated authority metadata, not a new credential. */
 @Serializable
-data class StoredSession(val server: String, val cookie: String, val session: Session)
+data class StoredSession(val server: String, val cookie: String, val session: Session, val sessionMode: String? = null)
 
 @Serializable
 data class ArtistCredit(val id: String, val name: String)

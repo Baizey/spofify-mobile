@@ -16,6 +16,7 @@ internal class EncryptedValueStore(
     private val valueKey: String,
     private val keyProvider: () -> SecretKey,
     associatedData: ByteArray? = null,
+    private val preserveUnavailableReads: Boolean = false,
 ) {
     private val associatedData = associatedData?.copyOf()
 
@@ -28,12 +29,22 @@ internal class EncryptedValueStore(
             val bytes = Base64.decode(encoded, Base64.NO_WRAP)
             require(bytes.size >= IV_BYTES + TAG_BITS / 8)
             val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.DECRYPT_MODE, keyProvider(), GCMParameterSpec(TAG_BITS, bytes.copyOfRange(0, IV_BYTES)))
+            val key = try { keyProvider() } catch (error: Exception) {
+                if (preserveUnavailableReads) throw java.io.IOException("Saved sign-in storage is temporarily unavailable. Retry the connection.")
+                throw error
+            }
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, bytes.copyOfRange(0, IV_BYTES)))
             associatedData?.let { cipher.updateAAD(it) }
             decode(String(cipher.doFinal(bytes.copyOfRange(IV_BYTES, bytes.size)), Charsets.UTF_8))
         }
-    } catch (_: Exception) {
-        // Invalidated keys, malformed preferences/JSON, and tampering all require a fresh login.
+    } catch (error: Exception) {
+        if (preserveUnavailableReads && error !is IllegalArgumentException && error !is ClassCastException &&
+            error !is org.json.JSONException && error !is javax.crypto.AEADBadTagException) {
+            // A locked/unavailable Keystore, preference I/O or crypto service is not
+            // proof that the encrypted session is invalid. Never delete it on retry.
+            throw java.io.IOException("Saved sign-in storage is temporarily unavailable. Retry the connection.")
+        }
+        // Malformed preferences/JSON and authenticated ciphertext corruption fail closed.
         // Do not clear unrelated settings or delete/regenerate a key shared with another instance.
         try { preferences.edit().remove(valueKey).commit() } catch (_: Exception) { /* Still fail closed. */ }
         null
