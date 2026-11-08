@@ -68,6 +68,8 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     // authentication event can bind the origin/account namespace to a live session.
     internal val songCache = SongCache(context.cacheDir, audioCacheLimits ?: SongCache.Limits(),
         settingsStore = if (audioCacheLimits == null) AutoCacheSettingsStore(context.filesDir) else null)
+    internal val savedDownloads = dev.spofify.mobile.feature.playlists.SavedDownloadsOwner {
+        java.io.File(context.noBackupFilesDir, "saved-collections") }
     @Volatile private var audioCache: SongCache.SessionCache? = null
     private val cacheAuthenticationLock = Any()
     @Volatile private var cacheSource: SpofifyClient? = null
@@ -79,10 +81,12 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     private fun authenticationChanged(source: SpofifyClient, change: AuthenticationChange) = synchronized(cacheAuthenticationLock) {
         if (cacheSource !== source || client !== source || change.revision <= authenticationRevision) return@synchronized
         authenticationRevision = change.revision
+        if (change.kind != AuthenticationChangeKind.VALIDATED) savedDownloads.authenticationChanged(source, change)
         when (change.kind) {
             AuthenticationChangeKind.VALIDATED -> {
                 val identity = change.identity ?: return@synchronized
                 if (source.validatedSessionIdentity() != identity) return@synchronized
+                savedDownloads.authenticationChanged(source, change)
                 hadValidatedSession = true
                 reconnectRequired.value = false
                 audioCache = runCatching { songCache.bind(identity.origin, identity.accountId) }.getOrNull()
@@ -189,6 +193,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
 
     @Synchronized
     fun configure(server: ServerAddress): SpofifyClient {
+        savedDownloads.prepareConfigure(server.origin)
         client?.onAuthenticationChanged = null
         synchronized(cacheAuthenticationLock) {
             cacheSource = null
@@ -209,6 +214,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
         client?.clearSession()
         expired.value = false
         val next = SpofifyClient(server, lease, authenticationTimeMillis)
+        savedDownloads.configure(next)
         next.onAuthenticationChanged = { authenticationChanged(next, it) }
         // Range/image requests can fail without an Activity or a player request. Stop
         // buffered audio too; stopService alone cannot destroy a still-bound service.
@@ -249,6 +255,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     @Synchronized
     fun clear(expected: SpofifyClient? = client) {
         if (client !== expected) return
+        savedDownloads.retire()
         client?.onAuthenticationChanged = null
         synchronized(cacheAuthenticationLock) {
             cacheSource = null

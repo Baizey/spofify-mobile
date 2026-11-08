@@ -233,14 +233,36 @@ class PlaybackService : MediaSessionService() {
     private var songPrefetch: SongPrefetchScheduler<PrefetchRequest>? = null
     private var prefetchAllowed = false // Explicit local action only; never passive recovery/import.
     private val demandAudioOperations = AtomicInteger()
+    private val savedDemandPublication = SavedDemandPublication(demandAudioOperations)
     private val cachePriorityPosted = AtomicBoolean()
+    private data class SavedDemandBinding(val client: SpofifyClient,
+        val handle: dev.spofify.mobile.feature.playlists.SavedPlaybackDemand)
+    @Volatile private var savedDemandBinding: SavedDemandBinding? = null
     private val updateCachePriority = Runnable {
         cachePriorityPosted.set(false)
         if (active.get() === this) updatePrefetchPriority()
     }
+    // One captured client/service handle. Online factory rearming retains this binding.
+    private fun bindSavedPlaybackDemand(capturedClient: SpofifyClient): SavedDemandBinding? {
+        val graph = (application as SpofifyApplication).graph
+        if (active.get() !== this || graph.client !== capturedClient) return null
+        val next = SavedDemandBinding(capturedClient, graph.savedDownloads.playbackDemand(capturedClient))
+        val previous = savedDemandBinding
+        savedDemandBinding = next
+        previous?.handle?.close()
+        updatePrefetchPriority()
+        return next
+    }
+    private fun publishSavedPlaybackDemand(binding: SavedDemandBinding?, demanded: Boolean) {
+        if (binding != null && active.get() === this && savedDemandBinding === binding &&
+            (application as SpofifyApplication).graph.client === binding.client) binding.handle.setActive(demanded)
+    }
     private fun updatePrefetchPriority() {
-        songPrefetch?.setDemandActive(demandAudioOperations.get() > 0 || player?.isLoading == true ||
-            player?.playbackState == Player.STATE_BUFFERING)
+        val playerDemanded = player?.isLoading == true || player?.playbackState == Player.STATE_BUFFERING
+        savedDemandPublication.aggregate(playerDemanded) { demanded ->
+            songPrefetch?.setDemandActive(demanded)
+            publishSavedPlaybackDemand(savedDemandBinding, demanded)
+        }
     }
     private var promotionPending: Any? = null
     private var promotionOccurrence: String? = null
@@ -576,13 +598,16 @@ class PlaybackService : MediaSessionService() {
             cancellation.ensureActive()
             audioCache?.prefetch(request.trackId, request.spec, upstream, ::authorizeNetworkAudio, storeCancellation)
         }
+        val savedDemand = bindSavedPlaybackDemand(sharedClient)
         val dataSources = SongCache.authorizedFactory(audioCache, upstream, { it.key }, ::authorizeAudio, ::authorizeNetworkAudio) { active ->
             demandAudioOperations.addAndGet(if (active) 1 else -1)
             // Prioritize actual opens/reads, not an idle stream held by Media3's load control.
             // Aggregate concurrent operations and coalesce read completions to one main task;
             // player state stays main-thread-only without enqueueing work per audio chunk.
-            if (active) songPrefetch?.setDemandActive(true)
-            else if (cachePriorityPosted.compareAndSet(false, true)) handler.post(updateCachePriority)
+            if (active) savedDemandPublication.active { demanded ->
+                songPrefetch?.setDemandActive(demanded)
+                publishSavedPlaybackDemand(savedDemand, demanded)
+            } else if (cachePriorityPosted.compareAndSet(false, true)) handler.post(updateCachePriority)
         }
         val exo = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSources))
@@ -845,6 +870,9 @@ class PlaybackService : MediaSessionService() {
     private fun releasePlayback() {
         invalidatePreparedResume()
         retireRecoveryWitness()
+        val retiredDemand = savedDemandBinding
+        savedDemandBinding = null
+        retiredDemand?.handle?.close() // Idempotent token release cannot clear a successor service.
         if (active.get() === this) {
             onServiceActiveChanged?.invoke(false)
             active.clear()
