@@ -53,6 +53,7 @@ class PlaybackQueueIntentReceiverTest {
     private var started = false
     private var wantsPlay = false
     private var holdPlaying = false
+    private var onSyntheticPlay: (() -> Unit)? = null
     private var syntheticState = Player.STATE_IDLE
     private val playerField get() = PlaybackService::class.java.getDeclaredField("player").apply { isAccessible = true }
 
@@ -130,7 +131,7 @@ class PlaybackQueueIntentReceiverTest {
                 method.name in setOf("prepare", "play", "pause", "stop") && syntheticStart -> {
                     calls.add(method.name)
                     if (method.name == "prepare") syntheticState = if (holdStart) Player.STATE_BUFFERING else Player.STATE_READY
-                    if (method.name == "play") { wantsPlay = true; started = !holdPlaying }
+                    if (method.name == "play") { wantsPlay = true; started = !holdPlaying; onSyntheticPlay?.invoke() }
                     if (method.name == "pause" || method.name == "stop") { wantsPlay = false; started = false }
                     if (method.name == "stop") syntheticState = Player.STATE_IDLE
                     null
@@ -218,6 +219,48 @@ class PlaybackQueueIntentReceiverTest {
         assertEquals("legacy-reset", hopped.queueIntentState!!.provenance)
         assertTrue(hopped.queueIntentState!!.highKeys.isEmpty())
         assertTrue(hopped.queueIntentState!!.origins.all { it.intent == "legacy" })
+    }
+
+    @Test fun sanctionedUpcomingAppendKeepsPendingStartAndOnlyItsOwnFirstAudibleHistoryBaseline() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            background(false)
+            shadowOf(controller.get().getSystemService(AudioManager::class.java))
+                .setNextFocusRequestResponse(AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+            syntheticStart = true; holdStart = true; started = false; proxy(); calls.clear()
+            val pending = async { endpoint.activate(PlaybackSnapshot(queue = listOf(QueueIntentGolden.track("A", 1)),
+                position = 0, playing = true), permit) }
+            runCurrent()
+            assertFalse(pending.isCompleted)
+            val token = requireNotNull(serviceField("startAttempt"))
+            assertNull(endpoint.exportSnapshot().occurrence)
+            val held = requireNotNull(PlaybackService.interactionKey())
+            val added = endpoint.execute(PlaybackDeviceCommand.musical("enqueue", track = row("B").track, first = false), permit)
+            assertEquals("ok", added.status)
+            assertSame(token, serviceField("startAttemptValidity"))
+            assertNotSame("The start exception does not refresh a held action", held, PlaybackService.interactionKey())
+            val revision = requireNotNull(endpoint.exportQueueIntentState()).revision
+            onSyntheticPlay = {
+                // This suite's existing synthetic playing seam exercises first-audible history
+                // bookkeeping, not device/acoustic acceptance or a history POST/backfill.
+                PlaybackService::class.java.getDeclaredMethod("sampleHistory", androidx.media3.common.MediaItem::class.java,
+                    java.lang.Long.TYPE, java.lang.Boolean.TYPE).apply { isAccessible = true }
+                    .invoke(controller.get(), actual.currentMediaItem, 0L, true)
+                assertNotNull(endpoint.exportSnapshot().occurrence)
+                assertSame(token, serviceField("startAttemptValidity"))
+            }
+            syntheticState = Player.STATE_READY
+            advanceTimeBy(30); runCurrent()
+            val result = pending.await()
+            assertEquals("ok", result.status)
+            assertEquals(listOf("A", "B"), result.snapshot.queue.map { it.id })
+            assertNotNull(result.snapshot.occurrence)
+            assertEquals(revision + 1, requireNotNull(result.queueIntentState).revision)
+            assertSame(token, serviceField("startAttemptValidity"))
+            assertEquals(1, calls.count { it == "prepare" }); assertEquals(1, calls.count { it == "play" })
+            assertEquals("No progression was observed", 0.0, result.snapshot.occurrence!!.progress, 0.0)
+            assertFalse("First audible identity is not a history report/backfill", result.snapshot.occurrence!!.reported)
+        } finally { onSyntheticPlay = null; Dispatchers.resetMain() }
     }
 
     @Test fun heldChangedCurrentStartKeepsOwnReceiptWhenPauseOrSemanticEditSupersedes() = runTest {

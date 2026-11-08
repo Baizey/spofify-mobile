@@ -45,6 +45,9 @@ class RollingReconnectViewModelTest {
         override fun connect() { connects++ }
         override fun release() = Unit
         override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean, startEntryId: String?) { plays++ }
+        override fun playLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
+            mediaReferences: Map<String, OfflineMediaReference>, startEntryId: String?, shuffle: Boolean,
+            context: LibraryItem?, isCurrent: () -> Boolean) { plays++ }
         override fun toggle() = Unit
         override fun next() = Unit
         override fun previous() = Unit
@@ -59,6 +62,52 @@ class RollingReconnectViewModelTest {
         while (!condition() && System.nanoTime() < deadline) { runCurrent(); Thread.yield() }
         runCurrent()
         assertTrue("Timed out waiting for the controlled ViewModel boundary", condition())
+    }
+
+    @Test fun retainedLocalEntryFencesQueuedColdRestoreWithoutSessionProbeOrAutoplay() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val web = MockWebServer().apply { start(java.net.InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), 0) }
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        app.getSharedPreferences("connection", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+        val origin = "http://127.0.0.1:${web.port}"
+        val sessions = Sessions().apply {
+            value = StoredSession(origin, "spofify_session=synthetic; Path=/; HttpOnly; Max-Age=3600",
+                Session("id", "listener", "user", "synthetic-csrf"))
+        }
+        // Admission fixture only. Genuine authentication -> durable eligibility is separately
+        // exercised by OfflineEligibilityTest; this record is never installed as a live Session.
+        var retained: OfflineEligibility? = OfflineEligibility(origin, "id", "listener")
+        val local = object : OfflineEligibilityStore {
+            override fun read() = retained
+            override fun write(value: OfflineEligibility?) { retained = value }
+        }
+        val graph = AppGraph(app, sessions, offlineEligibilityStore = local)
+        val models = ViewModelStore()
+        val output = Output()
+        try {
+            val model = LibraryViewModel(app, graph, output)
+            models.put("cold-subject", model)
+            assertTrue(model.state.value.restoring)
+            assertTrue(model.state.value.busy)
+            assertNull(graph.client!!.currentSession())
+            model.setOfflineMode(true)
+            runCurrent()
+            shadowOf(Looper.getMainLooper()).idle()
+            runCurrent()
+            assertTrue(model.state.value.offline)
+            assertFalse(model.state.value.busy)
+            assertFalse(model.state.value.restoring)
+            assertNull(model.state.value.session)
+            assertSame(retained, model.state.value.localAccount)
+            assertTrue(graph.client!!.isOffline)
+            assertNull(graph.client!!.validatedSessionIdentity())
+            assertEquals(1, output.connects)
+            assertEquals(0, output.plays)
+            assertEquals(0, web.requestCount)
+        } finally {
+            models.clear(); graph.clear()
+            web.shutdown(); Dispatchers.resetMain()
+        }
     }
 
     @Test fun oneLiveViewModelExposesPasswordFreeRetryAfterDormancyAndRoutesReal401ToLogin() = runTest {

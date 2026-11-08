@@ -68,6 +68,7 @@ internal fun SignIn(
     rememberedLogin: RememberedLogin?,
     signIn: (String, String, String) -> Unit,
     reconnect: () -> Unit,
+    onOfflineMode: (() -> Unit)? = null,
 ) {
     // Initial prefill only. Busy/error/server publications must not replace an edited form.
     val form = remember { SignInForm(state.server, rememberedLogin) }
@@ -122,6 +123,11 @@ internal fun SignIn(
                 modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp)) {
                 if (state.busy) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                 else Text("Sign in")
+            }
+            onOfflineMode?.let { offline ->
+                TextButton(onClick = {
+                    form.clearPassword(); focus.clearFocus(); keyboard?.hide(); offline()
+                }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Offline mode") }
             }
         }
     }

@@ -81,6 +81,7 @@ fun MusicRow(
     actionsEnabled: Boolean = true,
     onShowScopedActions: ((LibraryItem, () -> Boolean) -> Unit)? = null,
     onPlayScoped: ((LibraryItem, () -> Boolean) -> Unit)? = null,
+    bodyActionsEnabled: Boolean = true,
     subtitleOverride: String? = null,
 ) {
     val typography = MaterialTheme.typography
@@ -155,12 +156,12 @@ fun MusicRow(
             Row(swipeModifier.fillMaxWidth().background(
                 if (current) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.background)
                 // Expose our captured guard directly, not the clickable node's mutable wrapper.
-                .semantics { onClick(bodyClickLabel) { activateBody(); true } }
-                .combinedClickable(
+                .semantics { if (bodyActionsEnabled) onClick(bodyClickLabel) { activateBody(); true } }
+                .then(if (bodyActionsEnabled) Modifier.combinedClickable(
                     onClickLabel = bodyClickLabel,
                     onClick = ::activateBody,
                     onLongClickLabel = if (actionsEnabled) "More actions for ${item.name}" else null,
-                    onLongClick = if (actionsEnabled) ({ more() }) else null)
+                    onLongClick = if (actionsEnabled) ({ more() }) else null) else Modifier)
                 .semantics {
                     if (current) stateDescription = if (playback.buffering) "Buffering" else if (playback.isPlaying) "Playing" else "Paused"
                     customActions = buildList {

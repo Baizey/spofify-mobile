@@ -21,6 +21,9 @@ import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.DataSource
+import dev.spofify.mobile.OfflineEligibility
+import dev.spofify.mobile.OfflineMediaReference
 import dev.spofify.mobile.playback.cache.SongCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
@@ -32,6 +35,7 @@ import dev.spofify.mobile.core.PlaybackOccurrence
 import dev.spofify.mobile.core.PlaybackContext
 import dev.spofify.mobile.core.PlaybackTrack
 import dev.spofify.mobile.core.PlaybackDeviceCommand
+import dev.spofify.mobile.core.QueueIntentIntent
 import dev.spofify.mobile.core.QueueIntentState
 import dev.spofify.mobile.core.QueueIntentResult
 import dev.spofify.mobile.core.PreparedPlaybackAuthority
@@ -92,9 +96,66 @@ class PlaybackService : MediaSessionService() {
             return service.requestReplacement(items, client, start, shuffle, play, context, notice, requestEpoch,
                 preparedState, selectionAuthority, isCurrent, admissionIsCurrent)
         }
+        /** Mode boundaries revoke output synchronously but never send a command to a remote. */
+        fun enterOfflineMode() { active.get()?.let { service ->
+            service.localOnlyQueue = true
+            if (service.localQueueEligibility == null)
+                service.localQueueEligibility = (service.application as SpofifyApplication).graph.localEligibility
+            service.localAuthority = null
+            service.suspendBufferedOutput()
+        } }
+        fun retireLocalEligibility(expected: OfflineEligibility? = null) { active.get()?.let { service ->
+            if (expected != null && service.localQueueEligibility !== expected) return@let
+            service.localAuthority = null
+            if (service.localOnlyQueue) service.suspendBufferedOutput()
+        } }
+        fun isLocalOnlyQueue(): Boolean = active.get()?.localOnlyQueue == true
+        fun localTransport(command: PlaybackDeviceCommand, isCurrent: () -> Boolean = { true }): Boolean =
+            active.get()?.dispatchLocalTransport(command, isCurrent) == true
+        fun localOccurrence(expectedKey: PlaybackInteractionKey, id: String, action: PlaybackListAction,
+            isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            val service = active.get()
+            if (service == null) onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE))
+            else service.editLocalOccurrence(expectedKey, id, action, isCurrent, onResult)
+        }
+        fun replaceLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
+            mediaReferences: Map<String, OfflineMediaReference>, start: Int, shuffle: Boolean,
+            context: LibraryItem? = null, isCurrent: () -> Boolean = { true }): String? {
+            val service = active.get() ?: return "Playback is unavailable. Choose saved music again."
+            return service.requestLocalReplacement(items, eligibility, mediaReferences, start, shuffle, context, isCurrent)
+        }
+        fun enqueueLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
+            mediaReferences: Map<String, OfflineMediaReference>, first: Boolean, isCurrent: () -> Boolean): String? {
+            val service = active.get() ?: return "Choose saved music before adding to its queue."
+            return service.requestLocalEnqueue(items, eligibility, mediaReferences,
+                if (first) QueueIntentIntent.NEXT else QueueIntentIntent.LOW, isCurrent)
+        }
+        fun enqueueLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
+            mediaReferences: Map<String, OfflineMediaReference>, intent: QueueIntentIntent, isCurrent: () -> Boolean): String? {
+            val service = active.get() ?: return "Choose saved music before adding to its queue."
+            return service.requestLocalEnqueue(items, eligibility, mediaReferences, intent, isCurrent)
+        }
+        /** Capture without Media3 reads; pending catalog work may outlive binding/mode changes. */
+        fun localQueueReplacementFence(): () -> Boolean {
+            val service = active.get()
+            val eligibility = service?.localQueueEligibility
+            val permit = service?.localAuthority
+            val request = PlaybackRequests.epoch
+            val queue = PlaybackRequests.queueEpoch
+            return { service != null && active.get() === service && service.localOnlyQueue &&
+                service.localQueueEligibility === eligibility && service.localAuthority === permit &&
+                PlaybackRequests.epoch == request && PlaybackRequests.queueEpoch == queue }
+        }
+        /** Fresh catalog Now only: retire local provenance before enabling receiver exports.
+         * This grants no lease/admission; the caller still uses the ordinary queue-intent path. */
+        fun rearmOnlinePlayNow(selection: dev.spofify.mobile.core.QueueIntentSelection, source: SpofifyClient,
+            login: Session, requestEpoch: Long, isCurrent: () -> Boolean): Boolean =
+            active.get()?.rearmLocalQueueForOnlineNow(selection, source, login, requestEpoch, isCurrent) == true
         /** Deliberate in-app Resume only. System transport never enters conditional admission. */
         fun resumePrepared(isCurrent: () -> Boolean, admissionIsCurrent: () -> Boolean = isCurrent): String? {
             val service = active.get() ?: return "Playback is unavailable. Choose music again."
+            if (service.dispatchLocalTransport(PlaybackDeviceCommand.transport("resume"), isCurrent))
+                return if (service.hasLocalAuthority()) null else "Choose saved music again while offline."
             if (service.dispatchCachedTransport(PlaybackDeviceCommand.transport("resume"), isCurrent)) return null
             return service.requestPreparedResume(isCurrent, admissionIsCurrent)
         }
@@ -116,12 +177,14 @@ class PlaybackService : MediaSessionService() {
             onResult: (PlaybackActionResult) -> Unit) {
             val service = active.get()
             if (service == null) onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE))
+            else if (service.localOnlyQueue) service.editLocalOccurrence(expectedKey, id, PlaybackListAction.QUEUE_HIGH, isCurrent, onResult)
             else service.requestContextualOccurrence(expectedKey, id, isCurrent, onResult)
         }
         fun playNextOccurrence(expectedKey: PlaybackInteractionKey, occurrenceId: String, isCurrent: () -> Boolean = { true },
             onResult: (PlaybackActionResult) -> Unit = {}) {
             val service = active.get()
             if (service == null) onResult(PlaybackActionResult(PlaybackActionStatus.UNAVAILABLE))
+            else if (service.localOnlyQueue) service.editLocalOccurrence(expectedKey, occurrenceId, PlaybackListAction.PLAY_NEXT, isCurrent, onResult)
             else service.requestPlayNextOccurrence(expectedKey, occurrenceId, isCurrent, onResult)
         }
         fun removeQueued(id: String) { active.get()?.localEdit { removeUpcoming(id) } }
@@ -156,21 +219,25 @@ class PlaybackService : MediaSessionService() {
             service.exportPrepared()
             service.player?.takeIf { index in 0 until it.mediaItemCount }?.getMediaItemAt(index)?.let(PlaybackMedia::occurrence)?.let { service.wireKeys[it] }
         }
-        fun upcomingEntries(): List<QueueEntry> = active.get()?.upcoming().orEmpty()
-        fun canUndoRemoval(): Boolean = active.get()?.validRemoval() == true
+        fun upcomingEntries(): List<QueueEntry> = active.get()?.takeIf { it.localNamespaceCurrent() }?.upcoming().orEmpty()
+        fun canUndoRemoval(): Boolean = active.get()?.takeIf { it.localNamespaceCurrent() }?.validRemoval() == true
         fun setQueueContext(value: LibraryItem?) { active.get()?.localEdit { contextIdentity = value?.copy(libraryPath = null); wireContext = wireContext(value) } }
-        fun queueContext(): LibraryItem? = active.get()?.let { service ->
+        fun queueContext(): LibraryItem? = active.get()?.takeIf { it.localNamespaceCurrent() }?.let { service ->
             (service.currentId()?.let { service.wireTracks[it]?.playbackContext } ?: service.wireContext)?.let { LibraryItem(it.kind, it.id, it.name) }
                 ?: service.contextIdentity
         }
         fun setQueueNotice(value: String?) { active.get()?.localEdit { queueMessage = value } }
-        fun queueNotice(): String? = active.get()?.let { it.currentTransportNotice() ?: it.queueMessage }
+        fun queueNotice(): String? = active.get()?.takeIf { it.localNamespaceCurrent() }?.let { it.currentTransportNotice() ?: it.queueMessage }
         fun restartCurrentTraversal() { active.get()?.localEdit { restartTraversal() } }
         fun captureLocalRevisionSync(): dev.spofify.mobile.feature.devices.PlaybackSyncCapture? = active.get()?.captureRevisionSync()
-        fun exportLocalSnapshot(): PlaybackSnapshot = active.get()?.exportPrepared() ?: PlaybackSnapshot()
-        fun exportLocalQueueIntentState(): QueueIntentState? = active.get()?.exportIntentState()
+        /** Receiver export must never adopt or publish an intentional local-only queue. */
+        fun exportLocalSnapshot(): PlaybackSnapshot = active.get()?.takeUnless { it.localOnlyQueue }?.exportPrepared() ?: PlaybackSnapshot()
+        fun displayLocalSnapshot(): PlaybackSnapshot = active.get()?.let {
+            if (it.localNamespaceCurrent()) it.exportPrepared() else PlaybackSnapshot()
+        } ?: PlaybackSnapshot()
+        fun exportLocalQueueIntentState(): QueueIntentState? = active.get()?.takeUnless { it.localOnlyQueue }?.exportIntentState()
         suspend fun activateSnapshot(snapshot: PlaybackSnapshot, queueIntentState: QueueIntentState?, authority: PlaybackAuthority): PlaybackEndpointResult =
-            active.get()?.importSnapshot(snapshot, authority, queueIntentState = queueIntentState)
+            active.get()?.takeUnless { it.localOnlyQueue }?.importSnapshot(snapshot, authority, queueIntentState = queueIntentState)
                 ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
         fun suspendLocalOutput() { active.get()?.suspendBufferedOutput() }
         fun cachedTransport(command: PlaybackDeviceCommand, isCurrent: () -> Boolean = { true }): Boolean =
@@ -183,12 +250,12 @@ class PlaybackService : MediaSessionService() {
             authority: PlaybackAuthority, witness: Any): Boolean = active.get()?.renewContinuingPlayback(permission, authority, witness) == true
         fun interruptLocalQueueIntentStart(): Boolean = active.get()?.interruptQueueIntentStart() == true
         suspend fun activateSnapshot(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult =
-            active.get()?.importSnapshot(snapshot, authority) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
+            active.get()?.takeUnless { it.localOnlyQueue }?.importSnapshot(snapshot, authority) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
         suspend fun activatePreparedResumeSnapshot(snapshot: PlaybackSnapshot, authority: PlaybackAuthority): PlaybackEndpointResult =
-            active.get()?.activatePreparedResume(snapshot, authority) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
+            active.get()?.takeUnless { it.localOnlyQueue }?.activatePreparedResume(snapshot, authority) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
         suspend fun executeCommand(command: PlaybackDeviceCommand, authority: PlaybackAuthority,
             isCurrent: () -> Boolean = { true }): PlaybackEndpointResult =
-            active.get()?.executeOwned(command, authority, isCurrent) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
+            active.get()?.takeUnless { it.localOnlyQueue }?.executeOwned(command, authority, isCurrent) ?: PlaybackEndpointResult("rejected", PlaybackSnapshot())
         /** App-owned callback, never installed by a composition. Wire before service startup. */
         var onServiceActiveChanged: ((Boolean) -> Unit)? = null
     }
@@ -215,6 +282,24 @@ class PlaybackService : MediaSessionService() {
     private val admissions = mutableMapOf<MediaSession.ControllerInfo, Admission>()
     private data class MediaButtonDown(val key: Int, val device: Int, val source: Int, val down: Long, val time: Long)
     private val mediaButtonDowns = linkedSetOf<MediaButtonDown>() // Bounded exact-event dedup, not tap debounce.
+    // Queue provenance outlives local access and mode changes. It is NEVER a receiver lease.
+    @Volatile private var localOnlyQueue = false
+    @Volatile private var localQueueEligibility: OfflineEligibility? = null
+    private fun localNamespaceCurrent(): Boolean {
+        if (!localOnlyQueue) return true
+        val expected = localQueueEligibility ?: return player?.mediaItemCount == 0
+        val graph = (application as SpofifyApplication).graph
+        return graph.localEligibility === expected && graph.client?.server?.origin == expected.origin
+    }
+    private class LocalAuthority(val eligibility: OfflineEligibility, @Volatile var epoch: Long, sources: Map<String, OfflineMediaReference>) {
+        val sources = ConcurrentHashMap(sources)
+    }
+    @Volatile private var localAuthority: LocalAuthority? = null
+    private var localCommandSerial = 0L
+    private fun hasLocalAuthority(): Boolean = localAuthority?.let {
+        localOnlyQueue && localQueueEligibility === it.eligibility && active.get() === this && it.epoch == PlaybackRequests.epoch &&
+            (application as SpofifyApplication).graph.localPlaybackIsCurrent(it.eligibility)
+    } == true
     @Volatile private var client: SpofifyClient? = null
     private val handler = Handler(Looper.getMainLooper())
     private val historyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -229,6 +314,29 @@ class PlaybackService : MediaSessionService() {
     private fun retireRecoveryWitness() { recoveryActionWitness = Any() }
     @Volatile private var authenticatedSession: Session? = null
     private var audioCache: SongCache.SessionCache? = null
+    @Volatile private var onlineSources: DataSource.Factory? = null
+    @Volatile private var onlineUpstream: DataSource.Factory? = null
+
+    /** Refresh only at service construction or a fresh validated ordinary online Play.
+     * The unchanged MediaSourceFactory reads this binding dynamically; no second player. */
+    private fun bindOnlineAudio(source: SpofifyClient, cache: SongCache.SessionCache?) {
+        val upstream = OkHttpDataSource.Factory(source.httpClient)
+        audioCache = cache
+        onlineUpstream = upstream
+        onlineSources = SongCache.authorizedFactory(cache, upstream, { spec -> spec.key },
+            ::authorizeAudio, ::authorizeNetworkAudio, ::onDemandAudioNetworkChanged)
+    }
+
+    private fun onDemandAudioNetworkChanged(active: Boolean) {
+        demandAudioOperations.addAndGet(if (active) 1 else -1)
+        // Prioritize actual opens/reads, not idle streams. Aggregate concurrent operations
+        // and coalesce completions; keep player-state sampling on main.
+        if (active) savedDemandPublication.active { demanded ->
+            songPrefetch?.setDemandActive(demanded)
+            publishSavedPlaybackDemand(savedDemandBinding, demanded)
+        } else if (cachePriorityPosted.compareAndSet(false, true)) handler.post(updateCachePriority)
+    }
+
     private data class PrefetchRequest(val trackId: String, val spec: DataSpec)
     private var songPrefetch: SongPrefetchScheduler<PrefetchRequest>? = null
     private var prefetchAllowed = false // Explicit local action only; never passive recovery/import.
@@ -290,7 +398,8 @@ class PlaybackService : MediaSessionService() {
         val source = client
         val login = authenticatedSession
         val id = spec.key
-        if (source == null || login == null || source !== (application as SpofifyApplication).graph.client ||
+        if (localOnlyQueue || (application as SpofifyApplication).graph.offlineMode.value ||
+            source == null || login == null || source !== (application as SpofifyApplication).graph.client ||
             !source.hasValidSession(login) || !hasOutputPermission() || spec.uri.toString() !in allowedAudioUrls ||
             id == null || source.audioUrl(LibraryItem("track", id, "", hasAudio = true)) != spec.uri.toString()) {
             throw IOException("Playback source is not in the authorized queue")
@@ -330,6 +439,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun promoteSuccessfulPlayback(startSucceeded: Boolean = false) {
+        if (localOnlyQueue) return
         if (promotionPending == null || (!startSucceeded && promotionPending === startAttempt) ||
             player?.isPlaying != true || !hasOutputPermission() || audioFocus?.isGranted != true) return
         promotionPending = null
@@ -360,6 +470,10 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun canSkip(forward: Boolean): Boolean {
+        if (localOnlyQueue) {
+            if (!hasLocalAuthority() || currentInteractionKey() == null) return false
+            return skipCapabilities().let { if (forward) it.first else it.second }
+        }
         val devices = (application as SpofifyApplication).graph.playbackCoordinator?.state?.value ?: return false
         if ((!devices.connected && !hasCachedPermission()) || devices.selectionUnconfirmed || devices.view?.transfer != null || devices.quarantineMs != 0L ||
             devices.deviceId.isEmpty() || devices.deviceId != devices.activeDeviceId ||
@@ -380,6 +494,10 @@ class PlaybackService : MediaSessionService() {
         // lend a held intent a fresh binding. Never sample history/authority recursively here.
         val semantic = preparedSemanticSnapshot()
         observePreparedSemantics(semantic)
+        if (localOnlyQueue) return interactionKeys.current(localAuthority?.takeIf { hasLocalAuthority() }?.let {
+            listOf(PlaybackReference(it), PlaybackRequests.epoch, PlaybackRequests.queueEpoch,
+                currentId(), traversalIds(), intentRevision.revision)
+        })
         // A connected, authoritatively empty local output has no imported Media3 authority yet.
         // Expose only a cancellation identity; the coordinator must still grant actual start
         // authority at dispatch. Unknown/restorable nonempty queues do not get this capability.
@@ -408,11 +526,13 @@ class PlaybackService : MediaSessionService() {
     }
     private var explicitBackgroundPermit: PlaybackAuthority? = null
     private var pendingStart: Any? = null
+    private var pendingStartIsCurrent: (() -> Boolean)? = null
+    private var upcomingStartPreservation: (() -> Boolean)? = null
     private var startAttempt: Any? = null // Actual resource/cleanup owner until drained or explicit successor takeover.
     private var startAttemptValidity: Any? = null // Semantic cancellation does NOT transfer resource ownership.
     private data class StartHistoryObservation(
-        val token: Any, val current: String?, val before: PlaybackSnapshot,
-        val metadata: PlaybackQueueIntents.Metadata, val revision: Long,
+        val token: Any, val current: String?, var before: PlaybackSnapshot,
+        var metadata: PlaybackQueueIntents.Metadata, var revision: Long,
         var createdEventId: String? = null,
     )
     private var startHistoryObservation: StartHistoryObservation? = null
@@ -540,6 +660,8 @@ class PlaybackService : MediaSessionService() {
         progressRemainders.keys.retainAll(activeOccurrences)
         manualTier.prune(traversalIds(), currentId())
         allowedAudioUrls.retainAll(activeUrls + pendingAudioUrls)
+        val undoUrl = removed?.second?.localConfiguration?.uri?.toString()
+        localAuthority?.sources?.keys?.retainAll(activeUrls + listOfNotNull(undoUrl))
         scheduleCachePlan()
     }
 
@@ -554,8 +676,8 @@ class PlaybackService : MediaSessionService() {
             val current = player ?: return
             // Parent auth callbacks may call stopService while a UI remains bound. Also
             // observe the shared session so already-buffered audio cannot outlive logout.
-            if (client !== (application as SpofifyApplication).graph.client ||
-                (current.mediaItemCount > 0 && client?.currentSession() == null)) {
+            if (!localNamespaceCurrent() || (!localOnlyQueue && (client !== (application as SpofifyApplication).graph.client ||
+                (current.mediaItemCount > 0 && client?.currentSession() == null)))) {
                 shutdownPlayback()
                 return
             }
@@ -573,14 +695,15 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
-        val sharedClient = (application as SpofifyApplication).graph.client
-        if (sharedClient == null) {
-            stopSelf()
-            return
-        }
+        val graph = (application as SpofifyApplication).graph
+        val sharedClient = graph.client
+        localOnlyQueue = graph.offlineMode.value
+        localQueueEligibility = if (localOnlyQueue) graph.localEligibility else null
         client = sharedClient
-        authenticatedSession = sharedClient.currentSession()
-        if (authenticatedSession == null) { stopSelf(); return }
+        authenticatedSession = sharedClient?.currentSession()
+        if (authenticatedSession == null && !(localOnlyQueue && graph.localEligibility?.let(graph::localPlaybackIsCurrent) == true)) {
+            stopSelf(); return
+        }
         active = WeakReference(this)
         setListener(object : Listener {
             override fun onForegroundServiceStartNotAllowedException() {
@@ -590,24 +713,29 @@ class PlaybackService : MediaSessionService() {
         })
         // Shared exact-origin authenticated upstream for all audio/ranges. Private audio
         // retention is separate from HTTP caching; authority checks surround even cache hits.
-        val upstream = OkHttpDataSource.Factory(sharedClient.httpClient)
-        audioCache = authenticatedSession?.let { (application as SpofifyApplication).graph.audioCache(sharedClient, it) }
+        audioCache = if (localOnlyQueue || sharedClient == null) null else authenticatedSession?.let { graph.audioCache(sharedClient, it) }
+        if (sharedClient != null) bindOnlineAudio(sharedClient, audioCache)
         songPrefetch = SongPrefetchScheduler(historyScope) { request, cancellation ->
             val storeCancellation = SongCache.Cancellation()
             cancellation.onCancel { storeCancellation.cancel() }
             cancellation.ensureActive()
-            audioCache?.prefetch(request.trackId, request.spec, upstream, ::authorizeNetworkAudio, storeCancellation)
+            onlineUpstream?.let { upstream ->
+                audioCache?.prefetch(request.trackId, request.spec, upstream, ::authorizeNetworkAudio, storeCancellation)
+            }
         }
-        val savedDemand = bindSavedPlaybackDemand(sharedClient)
-        val dataSources = SongCache.authorizedFactory(audioCache, upstream, { it.key }, ::authorizeAudio, ::authorizeNetworkAudio) { active ->
-            demandAudioOperations.addAndGet(if (active) 1 else -1)
-            // Prioritize actual opens/reads, not an idle stream held by Media3's load control.
-            // Aggregate concurrent operations and coalesce read completions to one main task;
-            // player state stays main-thread-only without enqueueing work per audio chunk.
-            if (active) savedDemandPublication.active { demanded ->
-                songPrefetch?.setDemandActive(demanded)
-                publishSavedPlaybackDemand(savedDemand, demanded)
-            } else if (cachePriorityPosted.compareAndSet(false, true)) handler.post(updateCachePriority)
+        sharedClient?.let { bindSavedPlaybackDemand(it) }
+        val dataSources = DataSource.Factory {
+            val online = onlineSources
+            if (localOnlyQueue || graph.offlineMode.value || online == null) {
+                val permit = localAuthority
+                VerifiedLocalPlaybackSource(
+                    isCurrent = { permit != null && localAuthority === permit && hasLocalAuthority() },
+                    referenceFor = { spec -> permit?.sources?.get(spec.uri.toString())?.takeIf {
+                        spec.key == spec.uri.toString() && spec.uri.toString() in allowedAudioUrls
+                    } },
+                    opener = { reference -> permit?.let { graph.openOfflineMedia(it.eligibility, reference) } },
+                )
+            } else online.createDataSource()
         }
         val exo = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSources))
@@ -825,9 +953,9 @@ class PlaybackService : MediaSessionService() {
         val admission = controller?.let(admissions::get)
         if (controller != null && android.os.Build.VERSION.SDK_INT in 31..32 && admission?.command == Player.COMMAND_PLAY_PAUSE) {
             if (admissions[controller] === admission) admissions.remove(controller)
-            if (admission.requestEpoch == PlaybackRequests.epoch && client != null &&
-                client === (application as SpofifyApplication).graph.client && authenticatedSession != null &&
-                client?.currentSession() === authenticatedSession && active.get() === this) {
+            if (admission.requestEpoch == PlaybackRequests.epoch && active.get() === this &&
+                (hasLocalAuthority() || (client != null && client === (application as SpofifyApplication).graph.client &&
+                    authenticatedSession != null && client?.currentSession() === authenticatedSession))) {
                 routeCommand(PlaybackDeviceCommand.transport("resume"), userInteraction = true)
             }
             // Media3 catches ordinary notification-future failure and resolves Play admission
@@ -880,6 +1008,8 @@ class PlaybackService : MediaSessionService() {
         cancelSongPrefetch()
         songPrefetch?.close(); songPrefetch = null
         audioCache = null
+        onlineSources = null
+        onlineUpstream = null
         promotionPending = null; promotionOccurrence = null
         cancelCloseDisposal()
         handler.removeCallbacksAndMessages(null)
@@ -898,6 +1028,9 @@ class PlaybackService : MediaSessionService() {
         player = null
         historyScope.cancel()
         authority = null
+        localAuthority = null
+        localOnlyQueue = false
+        localQueueEligibility = null
         authenticatedSession = null
         history.clear()
         manualTier.reset()
@@ -921,7 +1054,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun sampleHistory(media: MediaItem?, position: Long, playing: Boolean) {
-        if (importing || !hasOutputPermission()) return
+        if (localOnlyQueue || importing || !hasOutputPermission()) return
         val current = media ?: return
         val eventId = PlaybackMedia.occurrence(current) ?: return
         val sharedClient = client ?: return
@@ -967,6 +1100,7 @@ class PlaybackService : MediaSessionService() {
         if (active.get() !== this) return
         invalidatePreparedResume()
         retireRecoveryWitness()
+        if (localOnlyQueue) { pauseLocalOutput(); return }
         if (!hasAuthority() && cachedPermission != null) { PlaybackRequests.invalidate(); suspendBufferedOutput(); return }
         val owner = (application as SpofifyApplication).graph.playbackCoordinator
         // Both focus loss and noisy events cancel pending preparation as well as audible audio.
@@ -1057,11 +1191,58 @@ class PlaybackService : MediaSessionService() {
                 own.metadata == metadata && historyCreationSemantics(own.before) == historyCreationSemantics(snapshot)
             // Retire permission to complete, NOT the obligation to drain this attempt's
             // output/focus/FGS. Only explicit successor installation transfers that owner.
-            if (!ownAudibleHistoryCreation) startAttemptValidity = null
-            startHistoryObservation = null
+            val preservedUpcomingEdit = upcomingStartPreservation?.invoke() == true
+            if (!ownAudibleHistoryCreation && !preservedUpcomingEdit) startAttemptValidity = null
+            if (preservedUpcomingEdit && !ownAudibleHistoryCreation) {
+                // Only the attempt's own first-audible-history baseline follows this edit.
+                // Captured action/read/eligibility guards and their ABA identities never do.
+                own?.let { it.before = snapshot; it.metadata = metadata; it.revision = intentRevision.revision }
+            } else startHistoryObservation = null
         }
         preparedResumeSemantic.set(PreparedResumeSemantic(preparedResumeChange, intentRevision.revision,
             snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId))
+    }
+
+    /** A synchronous, sanctioned future-only edit can retain an ALREADY valid pending
+     * start. Install this witness BEFORE touching Media3: listeners may export inline.
+     * Never restore a cleared validity token or replace the start's original predicate. */
+    private fun <T> preservingUpcomingStart(edit: () -> T): T {
+        if (upcomingStartPreservation != null) return edit()
+        val attempt = pendingStart ?: return edit()
+        val originalGuard = pendingStartIsCurrent ?: return edit()
+        exportPrepared() // Observe any pre-existing semantic invalidation, never forgive it.
+        if (startAttempt !== attempt || startAttemptValidity !== attempt || !originalGuard()) return edit()
+        val current = player ?: return edit()
+        val media = current.currentMediaItem ?: return edit()
+        val before = preparedSemanticSnapshot()
+        val permit = authority
+        val localPermit = localAuthority
+        val cachedPermit = cachedPermission
+        val request = PlaybackRequests.epoch
+        val command = localCommandSerial
+        val local = localOnlyQueue
+        val wantsPlay = current.playWhenReady
+        val error = outputError
+        val mediaError = current.playerError
+        val witness = {
+            val now = preparedSemanticSnapshot()
+            active.get() === this && player === current && pendingStart === attempt &&
+                startAttempt === attempt && startAttemptValidity === attempt && originalGuard() && hasOutputPermission() &&
+                authority === permit && localAuthority === localPermit && cachedPermission === cachedPermit &&
+                PlaybackRequests.epoch == request && localCommandSerial == command && localOnlyQueue == local &&
+                current.currentMediaItem == media && current.playWhenReady == wantsPlay &&
+                outputError == error && current.playerError === mediaError &&
+                now.queue.getOrNull(now.position)?.copy(order = 0) == before.queue.getOrNull(before.position)?.copy(order = 0) &&
+                now.context == before.context && now.shuffle == before.shuffle && now.repeat == before.repeat &&
+                now.occurrence == before.occurrence && now.truncated == before.truncated && now.notice == before.notice
+        }
+        upcomingStartPreservation = witness
+        try { return edit() }
+        finally {
+            // Publish while the witness is still active, including unsampled final changes.
+            try { observePreparedSemantics(preparedSemanticSnapshot()) }
+            finally { upcomingStartPreservation = null }
+        }
     }
 
     private data class SyncTimelineStructure(val items: List<MediaItem>, val first: Int, val next: List<Int>)
@@ -1089,6 +1270,7 @@ class PlaybackService : MediaSessionService() {
     /** Main-thread coherent capture: only scalar/history reads on an unchanged queue. Full
      * immutable structure and sidecar are replaced once when a semantic fence changes. */
     private fun captureRevisionSync(): dev.spofify.mobile.feature.devices.PlaybackSyncCapture? {
+        if (localOnlyQueue || (application as SpofifyApplication).graph.offlineMode.value) return null
         val current = player ?: return null
         sampleHistory(current.currentMediaItem, current.currentPosition, current.isPlaying)
         if (syncStructure == null || syncFence != syncSemanticFence(current)) {
@@ -1148,6 +1330,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun retainCachedPlayback(permission: dev.spofify.mobile.feature.devices.CachedPlaybackPermission): Boolean {
+        if (localOnlyQueue || (application as SpofifyApplication).graph.offlineMode.value) return false
         if (cachedPermission === permission && hasCachedPermission()) return true
         val current = player ?: return false
         // Never turn preparation, an unfinished start or a paused/restored queue into admission.
@@ -1166,7 +1349,8 @@ class PlaybackService : MediaSessionService() {
         return true
     }
 
-    private fun hasCachedPermission(): Boolean = cachedPermission?.isValid() == true &&
+    private fun hasCachedPermission(): Boolean = !localOnlyQueue && !(application as SpofifyApplication).graph.offlineMode.value &&
+        cachedPermission?.isValid() == true &&
         cachedRequestEpoch == PlaybackRequests.epoch && cachedQueueEpoch == PlaybackRequests.queueEpoch && active.get() === this &&
         client === (application as SpofifyApplication).graph.client &&
         authenticatedSession?.let { client?.hasValidSession(it) } == true
@@ -1188,15 +1372,17 @@ class PlaybackService : MediaSessionService() {
     }
 
     /** Output/read-only state only. Never use for wire execution, publication or history POST. */
-    private fun hasOutputPermission(): Boolean = hasAuthority() || hasCachedPermission()
+    private fun hasOutputPermission(): Boolean = hasLocalAuthority() || hasAuthority() || hasCachedPermission()
 
-    private fun hasAuthority(): Boolean = authority?.isValid() == true &&
+    private fun hasAuthority(): Boolean = !localOnlyQueue && !(application as SpofifyApplication).graph.offlineMode.value &&
+        authority?.isValid() == true &&
         authorityRequestEpoch == PlaybackRequests.epoch && client != null &&
         client === (application as SpofifyApplication).graph.client &&
         authenticatedSession?.let { client?.hasValidSession(it) } == true
 
     private fun acceptAuthority(value: PlaybackAuthority): Boolean {
-        if (!value.isValid() || client !== (application as SpofifyApplication).graph.client ||
+        if (localOnlyQueue || (application as SpofifyApplication).graph.offlineMode.value ||
+            !value.isValid() || client !== (application as SpofifyApplication).graph.client ||
             authenticatedSession == null || client?.currentSession() !== authenticatedSession) return false
         // Merely accepting authority over an empty queue does not establish replacement
         // playback: a queued action may still reject. Keep the close cleanup obligation.
@@ -1212,12 +1398,14 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun remoteSessionSnapshot(): PlaybackSnapshot? {
+        if (localOnlyQueue || (application as SpofifyApplication).graph.offlineMode.value) return null
         val devices = (application as SpofifyApplication).graph.playbackCoordinator?.state?.value ?: return null
         return if (devices.activeDeviceId.isNotEmpty() && devices.activeDeviceId != devices.deviceId)
             devices.view?.state ?: PlaybackSnapshot() else null
     }
 
-    private fun sessionTransportSnapshot(): PlaybackSnapshot = remoteSessionSnapshot() ?: exportPrepared()
+    private fun sessionTransportSnapshot(): PlaybackSnapshot =
+        if (!localNamespaceCurrent()) PlaybackSnapshot() else remoteSessionSnapshot() ?: exportPrepared()
 
     private fun transportRejected(owner: PlaybackCoordinator, isCurrent: () -> Boolean) {
         if (!isCurrent()) return // An obsolete completion cannot annotate a successor's output.
@@ -1235,6 +1423,7 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun routeCommand(command: PlaybackDeviceCommand, userInteraction: Boolean = false) {
+        if (dispatchLocalTransport(command)) return
         val graph = (application as SpofifyApplication).graph
         val source = client ?: return
         val login = authenticatedSession ?: return
@@ -1294,6 +1483,260 @@ class PlaybackService : MediaSessionService() {
             }
         } else if (userInteraction) owner.preparedTransportCommand(command, isCurrent = isCurrent)
         else owner.remoteCommand(command, isCurrent = isCurrent)
+    }
+
+    private fun localReferencesMatch(eligibility: OfflineEligibility, references: List<OfflineMediaReference>): Boolean {
+        val graph = (application as SpofifyApplication).graph
+        val owner = graph.offlineLibrary ?: return false
+        return graph.localPlaybackIsCurrent(eligibility) && references.all {
+            it.owner === owner && it.origin == eligibility.origin && it.accountId == eligibility.accountId
+        }
+    }
+
+    private fun requestLocalReplacement(items: List<LibraryItem>, eligibility: OfflineEligibility,
+        mediaReferences: Map<String, OfflineMediaReference>, start: Int,
+        shuffle: Boolean, context: LibraryItem?, isCurrent: () -> Boolean): String? {
+        val graph = (application as SpofifyApplication).graph
+        if (!isCurrent() || active.get() !== this || !graph.localPlaybackIsCurrent(eligibility))
+            return "Saved playback access changed. Choose music again."
+        val current = player ?: return "Playback is unavailable. Try again."
+        val media: List<MediaItem>
+        val tracks: List<PlaybackTrack>
+        val references: List<OfflineMediaReference>
+        try {
+            require(items.isNotEmpty() && start in items.indices)
+            references = items.map { requireNotNull(mediaReferences[requireNotNull(it.entryId)]) }
+            require(wireSerial <= 9007199254740991L - items.size)
+            val queueId = UUID.randomUUID().toString()
+            media = items.map { PlaybackMedia.createLocal(it, queueId) }
+            tracks = items.mapIndexed { index, item -> PlaybackSnapshotCodec.track(item, wireSerial + index + 1L, index.toLong()) }
+            PlaybackSnapshot(queue = tracks, position = start, context = wireContext(context)).validated()
+            // Structural admission only: NEVER wait for the owner's suspend factory on main.
+            // Every selected row must carry its exact owner-scoped immutable reference. Actual
+            // verified availability is checked during Media3 open, including deletion races.
+            require(localReferencesMatch(eligibility, references))
+        } catch (_: Exception) { return "Saved audio is unavailable or incomplete. Choose music again." }
+        if (!isCurrent() || !localReferencesMatch(eligibility, references)) return "Saved playback access changed. Choose music again."
+        localOnlyQueue = true
+        localQueueEligibility = eligibility
+        localAuthority = null
+        suspendBufferedOutput()
+        cancelCloseDisposal()
+        PlaybackRequests.queueChanged()
+        val permit = LocalAuthority(eligibility, PlaybackRequests.epoch,
+            media.mapIndexed { index, item -> requireNotNull(item.localConfiguration).uri.toString() to references[index] }.toMap())
+        importing = true
+        try {
+            history.clear(); historyNonces.clear(); progressRemainders.clear(); wireKeys.clear(); wireTracks.clear()
+            allowedAudioUrls.clear(); pendingAudioUrls.clear(); manualTier.reset()
+            removed = null; removedTrack = null; removedWasManual = false
+            wireContext = wireContext(context); contextIdentity = context?.copy(libraryPath = null)
+            queueMessage = null; queueTruncated = false; queueNoticeCode = ""
+            importedDuration = null; importedElapsed = null; importedPositionMs = null; importedShuffle = shuffle
+            outputError = ""; historyWasPlaying = false
+            media.forEachIndexed { index, item ->
+                val id = requireNotNull(PlaybackMedia.occurrence(item))
+                wireKeys[id] = tracks[index].key; wireTracks[id] = tracks[index]
+                allowedAudioUrls.add(requireNotNull(item.localConfiguration).uri.toString())
+            }
+            wireSerial += tracks.size
+            localAuthority = permit
+            mediaButtonBoundaryUptime = SystemClock.uptimeMillis()
+            current.shuffleModeEnabled = false
+            current.repeatMode = Player.REPEAT_MODE_OFF
+            current.setMediaItems(media, start, 0)
+            if (shuffle) {
+                current.shuffleModeEnabled = true
+                val ids = physicalIds()
+                setTraversal(listOf(ids[start]) + ids.filterIndexed { index, _ -> index != start }.shuffled())
+            }
+        } finally { importing = false }
+        schedulePrune()
+        val serial = ++localCommandSerial
+        historyScope.launch {
+            val valid = { localAuthority === permit && localCommandSerial == serial && hasLocalAuthority() && isCurrent() }
+            if (!valid()) return@launch
+            val result = startLocalOutput(valid)
+            if (localAuthority === permit && localCommandSerial == serial && result.status != "ok" && result.status != "rejected")
+                queueMessage = if (result.status == "blocked") "Playback needs a tap in the app." else "Saved audio could not be played."
+        }
+        return null
+    }
+
+    private fun requestLocalEnqueue(items: List<LibraryItem>, eligibility: OfflineEligibility,
+        mediaReferences: Map<String, OfflineMediaReference>, intent: QueueIntentIntent, isCurrent: () -> Boolean): String? =
+        preservingUpcomingStart { enqueueLocalSelection(items, eligibility, mediaReferences, intent, isCurrent) }
+
+    private fun enqueueLocalSelection(items: List<LibraryItem>, eligibility: OfflineEligibility,
+        mediaReferences: Map<String, OfflineMediaReference>, intent: QueueIntentIntent, isCurrent: () -> Boolean): String? {
+        if (intent == QueueIntentIntent.NOW) return "Choose Play for a new saved selection."
+        val permit = localAuthority
+        val current = player ?: return "Choose saved music before adding to its queue."
+        fun valid() = isCurrent() && permit != null && localAuthority === permit && permit.eligibility === eligibility && hasLocalAuthority()
+        if (!valid() || current.currentMediaItem == null) return "Choose saved music before adding to its queue."
+        val media: List<MediaItem>
+        val tracks: List<PlaybackTrack>
+        val references: List<OfflineMediaReference>
+        try {
+            require(items.isNotEmpty() && wireSerial <= 9007199254740991L - items.size)
+            references = items.map { requireNotNull(mediaReferences[requireNotNull(it.entryId)]) }
+            val queueId = UUID.randomUUID().toString()
+            media = items.map { PlaybackMedia.createLocal(it, queueId) }
+            val nextOrder = (wireTracks.values.maxOfOrNull { it.order } ?: -1L) + 1L
+            tracks = items.mapIndexed { index, item -> PlaybackSnapshotCodec.track(item, wireSerial + index + 1L, nextOrder + index) }
+            val before = exportPrepared()
+            before.copy(queue = before.queue + tracks).validated()
+            require(localReferencesMatch(eligibility, references))
+        } catch (_: Exception) { return "Saved audio is unavailable or incomplete." }
+        if (!valid() || !localReferencesMatch(eligibility, references)) return "Saved playback access changed. Choose music again."
+        val previous = traversalIds()
+        val insertion = when (intent) {
+            QueueIntentIntent.LOW -> previous.size
+            QueueIntentIntent.HIGH -> manualTier.insertionIndex(previous, currentId())
+            QueueIntentIntent.NEXT -> previous.indexOf(currentId()) + 1
+            QueueIntentIntent.NOW -> return "Choose Play for a new saved selection."
+        }
+        val ids = media.map { requireNotNull(PlaybackMedia.occurrence(it)) }
+        media.forEachIndexed { index, item ->
+            val id = ids[index]
+            val uri = requireNotNull(item.localConfiguration).uri.toString()
+            wireKeys[id] = tracks[index].key; wireTracks[id] = tracks[index]
+            requireNotNull(permit).sources[uri] = references[index]
+            allowedAudioUrls.add(uri)
+        }
+        wireSerial += tracks.size
+        val order = previous.toMutableList().apply { addAll(insertion, ids) }
+        manualTier.tag(ids, intent.wire, intent != QueueIntentIntent.LOW)
+        PlaybackRequests.queueChanged()
+        current.addMediaItems(media)
+        preserveTraversal(order)
+        removed = null
+        schedulePrune()
+        // No prepare/focus/start: the exact current occurrence, elapsed and pause/error survive.
+        return null
+    }
+
+    /** Cancel deferred gestures globally while retaining ONLY this prepared local queue's
+     * access. No pending start may borrow the renewed cancellation epoch after the pause. */
+    private fun pauseLocalOutput() {
+        val permit = localAuthority
+        val retain = hasLocalAuthority()
+        localCommandSerial++
+        PlaybackRequests.invalidate()
+        if (retain && localAuthority === permit) permit?.epoch = PlaybackRequests.epoch
+        suspendBufferedOutput()
+    }
+
+    private fun editLocalOccurrence(expectedKey: PlaybackInteractionKey, id: String, action: PlaybackListAction,
+        isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+        if (!isCurrent() || !hasLocalAuthority() || currentInteractionKey() !== expectedKey ||
+            id !in PlaybackQueue.upcoming(traversalIds(), currentId())) {
+            onResult(PlaybackActionResult(PlaybackActionStatus.STALE)); return
+        }
+        if (action == PlaybackListAction.PLAY_NOW) {
+            val key = wireKeys[id] ?: run { onResult(PlaybackActionResult(PlaybackActionStatus.STALE)); return }
+            dispatchLocalTransport(PlaybackDeviceCommand.queue("jump", key), isCurrent, onResult)
+            return
+        }
+        val before = traversalIds()
+        preservingUpcomingStart { when (action) {
+            PlaybackListAction.PLAY_NOW -> Unit // Handled above, outside future-only preservation.
+            PlaybackListAction.PLAY_NEXT -> moveUpcoming(id, 0, playNext = true)
+            PlaybackListAction.QUEUE_LOW, PlaybackListAction.ADD_TO_QUEUE -> {
+                manualTier.tag(listOf(id), "low", false)
+                preserveTraversal(before.filterNot { it == id } + id)
+            }
+            PlaybackListAction.CONTEXTUAL, PlaybackListAction.QUEUE_HIGH -> {
+                val promoted = requireNotNull(manualTier.promoted(before, currentId(), id))
+                manualTier.tag(listOf(id), "high", true)
+                preserveTraversal(promoted)
+            }
+        } }
+        onResult(PlaybackActionResult(if (traversalIds() == before) PlaybackActionStatus.NO_OP else PlaybackActionStatus.ADDED, 1))
+    }
+
+    private suspend fun startLocalOutput(isCurrent: () -> Boolean): PlaybackEndpointResult = try {
+        startOutput(true, isCurrent, mayStart = { mayStartForegroundPlayback(null) })
+    } catch (cancelled: CancellationException) { throw cancelled }
+      catch (_: Exception) {
+        if (isCurrent()) { outputError = "media"; frozenResult("media") } else frozenResult("rejected")
+    }
+
+    /** Consumes every local/offline command, even when access has expired: never fall through
+     * to an online coordinator. Only fresh Play may change queue provenance back to online. */
+    private fun dispatchLocalTransport(command: PlaybackDeviceCommand, isCurrent: () -> Boolean = { true },
+        onResult: (PlaybackActionResult) -> Unit = {}): Boolean {
+        if (!localOnlyQueue && !(application as SpofifyApplication).graph.offlineMode.value) return false
+        if (!isCurrent()) return true
+        if (command.type in setOf("pause", "close")) {
+            pauseLocalOutput()
+            if (command.type == "close") {
+                localAuthority = null
+                PlaybackRequests.queueChanged()
+                player?.clearMediaItems()
+                history.clear(); historyNonces.clear(); wireKeys.clear(); wireTracks.clear(); progressRemainders.clear()
+                allowedAudioUrls.clear(); pendingAudioUrls.clear(); manualTier.reset()
+                removed = null; removedTrack = null; queueMessage = null
+            }
+            return true
+        }
+        if (!hasLocalAuthority()) return true
+        val permit = localAuthority
+        val current = player ?: return true
+        when (command.type) {
+            "seek" -> { current.seekTo((command.json.getValue("value").jsonPrimitive.double * 1000).toLong()); return true }
+            "shuffle" -> { toggleOwnedShuffle(); return true }
+            "repeat" -> {
+                current.repeatMode = when (current.repeatMode) {
+                    Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                    Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                    else -> Player.REPEAT_MODE_OFF
+                }
+                return true
+            }
+            "clear" -> { clearUpcoming(); return true }
+            "remove", "move", "jump" -> {
+                val key = command.json.getValue("key").jsonPrimitive.long
+                val id = wireKeys.entries.firstOrNull { it.value == key }?.key ?: return true
+                if (id !in PlaybackQueue.upcoming(traversalIds(), currentId())) return true
+                when (command.type) {
+                    "remove" -> { removeUpcoming(id); return true }
+                    "move" -> {
+                        val at = PlaybackQueue.upcoming(traversalIds(), currentId()).indexOf(id)
+                        val direction = command.json["direction"]?.jsonPrimitive?.content
+                        moveUpcoming(id, when (direction) { "next" -> 0; "up" -> at - 1; "down" -> at + 1; else -> return true }, direction == "next")
+                        return true
+                    }
+                    else -> current.seekToDefaultPosition(physicalIds().indexOf(id))
+                }
+            }
+            "next" -> if (current.hasNextMediaItem()) current.seekToNextMediaItem() else return true
+            "previous" -> current.seekToPrevious()
+            "resume", "retry" -> {
+                if (current.currentMediaItem == null) return true
+                if (current.playbackState == Player.STATE_ENDED) current.seekToDefaultPosition()
+            }
+            else -> return true
+        }
+        val serial = ++localCommandSerial
+        historyScope.launch {
+            val valid = { isCurrent() && localAuthority === permit && hasLocalAuthority() && localCommandSerial == serial }
+            var completed = false
+            try {
+                if (!valid()) return@launch
+                val result = startLocalOutput(valid)
+                completed = true
+                onResult(PlaybackActionResult(when (result.status) {
+                    "ok" -> PlaybackActionStatus.PLAYING
+                    "blocked" -> PlaybackActionStatus.BLOCKED
+                    "rejected" -> PlaybackActionStatus.STALE
+                    else -> PlaybackActionStatus.UNAVAILABLE
+                }, if (result.status == "ok") 1 else 0))
+            } finally {
+                if (!completed) onResult(PlaybackActionResult(PlaybackActionStatus.STALE))
+            }
+        }
+        return true
     }
 
     private fun dispatchCachedTransport(command: PlaybackDeviceCommand, isCurrent: () -> Boolean): Boolean {
@@ -1514,6 +1957,7 @@ class PlaybackService : MediaSessionService() {
         if (play) cancelSongPrefetch()
         val attempt = Any()
         pendingStart = attempt
+        pendingStartIsCurrent = isCurrent
         startAttempt = attempt
         startAttemptValidity = attempt
         if (play) promotionPending = attempt
@@ -1595,7 +2039,7 @@ class PlaybackService : MediaSessionService() {
         } finally {
             // Covers caller disposal, cancellation and thrown platform errors as well as every
             // early rejected return. A newer import/start/service changes the attempt identity.
-            if (pendingStart === attempt) pendingStart = null
+            if (pendingStart === attempt) { pendingStart = null; pendingStartIsCurrent = null }
             if (!completed) silenceAttempt()
         }
     }
@@ -1764,6 +2208,10 @@ class PlaybackService : MediaSessionService() {
 
     private fun guardedSkip(expectedKey: PlaybackInteractionKey, forward: Boolean, originCurrent: () -> Boolean): Boolean {
         if (Looper.myLooper() != Looper.getMainLooper()) return false
+        if (localOnlyQueue) {
+            if (!originCurrent() || currentInteractionKey() !== expectedKey || !canSkip(forward)) return false
+            return dispatchLocalTransport(PlaybackDeviceCommand.transport(if (forward) "next" else "previous"), originCurrent)
+        }
         if (!hasAuthority() && hasCachedPermission()) {
             if (!originCurrent() || currentInteractionKey() !== expectedKey || !canSkip(forward)) return false
             return dispatchCachedTransport(PlaybackDeviceCommand.transport(if (forward) "next" else "previous"), originCurrent)
@@ -1821,7 +2269,8 @@ class PlaybackService : MediaSessionService() {
         fun reject(status: PlaybackActionStatus) = onResult(PlaybackActionResult(status))
         val request = PlaybackRequests.epoch
         val login = authenticatedSession
-        if (requestedClient !== client || login == null || requestedClient.currentSession() !== login) {
+        if (localOnlyQueue || (application as SpofifyApplication).graph.offlineMode.value ||
+            requestedClient !== client || login == null || requestedClient.currentSession() !== login) {
             reject(PlaybackActionStatus.STALE); return
         }
         if (action == PlaybackListAction.CONTEXTUAL && expectedKey == null || !expectedKeyIsCurrent()) {
@@ -2032,7 +2481,7 @@ class PlaybackService : MediaSessionService() {
         val current = player ?: return
         val shuffle = importedShuffle ?: current.shuffleModeEnabled
         arranging = true
-        try { current.shuffleModeEnabled = true; setTraversal(ids); importedShuffle = shuffle }
+        try { importedShuffle = shuffle; current.shuffleModeEnabled = true; setTraversal(ids) }
         finally { arranging = false }
     }
 
@@ -2041,6 +2490,7 @@ class PlaybackService : MediaSessionService() {
         // coordinator's serialized wait; it must validate AGAIN before accepting authority
         // or editing. In particular, it must not reacquire a stale gesture's permission.
         if (currentInteractionKey() !== expectedKey) return
+        if (localOnlyQueue) { if (hasLocalAuthority()) moveUpcoming(id, to); return }
         if (PlaybackQueue.move(traversalIds(), currentId(), id, to) == null) return
         (application as SpofifyApplication).graph.playbackCoordinator?.editPreparedQueue(
             isCurrent = { currentInteractionKey() === expectedKey },
@@ -2058,6 +2508,8 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun localEdit(edit: PlaybackService.() -> Unit) {
+        if (localOnlyQueue) { if (hasLocalAuthority()) edit(); return }
+        if ((application as SpofifyApplication).graph.offlineMode.value) return
         val request = PlaybackRequests.epoch
         (application as SpofifyApplication).graph.playbackCoordinator?.localAction { permit ->
             if (request != PlaybackRequests.epoch || !acceptAuthority(permit)) frozenResult("rejected")
@@ -2069,8 +2521,13 @@ class PlaybackService : MediaSessionService() {
         shuffle: Boolean, play: Boolean, context: LibraryItem?, notice: String?, requestEpoch: Long,
         preparedState: PlaybackSnapshot?, selectionAuthority: PreparedPlaybackAuthority?, isCurrent: () -> Boolean,
         admissionIsCurrent: () -> Boolean): String? {
-        if (!admissionIsCurrent() || !isCurrent() || requestEpoch != PlaybackRequests.epoch || requestedClient !== client ||
-            requestedClient.currentSession() !== authenticatedSession) return "Playback request cancelled after the session changed."
+        val graph = (application as SpofifyApplication).graph
+        if (graph.offlineMode.value) return "Choose saved music for offline playback."
+        val requestedLogin = requestedClient.currentSession()
+        if (!admissionIsCurrent() || !isCurrent() || requestEpoch != PlaybackRequests.epoch || requestedClient !== graph.client ||
+            requestedLogin == null || (!localOnlyQueue && (requestedClient !== client || requestedLogin !== authenticatedSession)))
+            return "Playback request cancelled after the session changed."
+        if (localOnlyQueue && !play) return "Press Play on an online selection before editing this output."
         val prepared = try {
             require(items.isNotEmpty() && start in items.indices)
             require(wireSerial <= 9007199254740991L - items.size)
@@ -2098,8 +2555,9 @@ class PlaybackService : MediaSessionService() {
             ?: prepared.context?.takeIf { it.kind == "derived" }
         if (derivedContext != null && selectionAuthority?.isValidFor(requestedClient, prepared) != true)
             return "This prepared selection expired. Reload the collection and choose again."
-        val graph = (application as SpofifyApplication).graph
         val coordinator = graph.playbackCoordinator ?: return "Playback devices are unavailable."
+        if (localOnlyQueue && !retireLocalQueueForOnlinePlay(requestedClient, requestedLogin))
+            return "Playback request cancelled after the session changed."
         val login = authenticatedSession
         fun lifetimeCurrent() = admissionIsCurrent() && active.get() === this && graph.playbackCoordinator === coordinator &&
             requestEpoch == PlaybackRequests.epoch && requestedClient === client && requestedClient === graph.client &&
@@ -2160,6 +2618,50 @@ class PlaybackService : MediaSessionService() {
             else coordinator.localAction(isCurrent = ::current, action = replace)
         }
         return null
+    }
+
+    private fun rearmLocalQueueForOnlineNow(selection: dev.spofify.mobile.core.QueueIntentSelection,
+        source: SpofifyClient, login: Session, requestEpoch: Long, isCurrent: () -> Boolean): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        val graph = (application as SpofifyApplication).graph
+        // An occurrence/queue edit cannot convert saved music into server authority. Validate
+        // the exact catalog envelope BEFORE clearing anything or waking receiver registration.
+        if (selection is dev.spofify.mobile.core.QueueIntentSelection.Occurrence) return false
+        try { selection.toJson() } catch (_: IllegalArgumentException) { return false }
+        if (!localOnlyQueue || graph.offlineMode.value || active.get() !== this || player == null ||
+            source !== graph.client || source.currentSession() !== login || !source.hasValidSession(login) ||
+            graph.playbackCoordinator == null || requestEpoch != PlaybackRequests.epoch || !isCurrent()) return false
+        return retireLocalQueueForOnlinePlay(source, login)
+    }
+
+    private fun retireLocalQueueForOnlinePlay(source: SpofifyClient, login: Session): Boolean {
+        val graph = (application as SpofifyApplication).graph
+        val owner = graph.playbackCoordinator ?: return false
+        val output = player ?: return false
+        val request = PlaybackRequests.epoch
+        fun lifetime() = active.get() === this && player === output && localOnlyQueue && !graph.offlineMode.value &&
+            graph.playbackCoordinator === owner && source === graph.client && source.currentSession() === login &&
+            source.hasValidSession(login) && PlaybackRequests.epoch == request
+        if (!lifetime()) return false
+        // Remain local-only throughout synchronous Media3 callbacks. Only an EMPTY output may
+        // become receiver-visible; no saved references, occurrences or history cross this line.
+        localAuthority = null
+        suspendBufferedOutput()
+        player?.clearMediaItems()
+        history.clear(); historyNonces.clear(); wireKeys.clear(); wireTracks.clear(); progressRemainders.clear()
+        manualTier.reset(); allowedAudioUrls.clear(); pendingAudioUrls.clear()
+        removed = null; removedTrack = null; wireContext = null; contextIdentity = null
+        queueMessage = null; importedDuration = null; importedElapsed = null; importedPositionMs = null; importedShuffle = null
+        queueTruncated = false; queueNoticeCode = ""; outputError = ""
+        PlaybackRequests.queueChanged()
+        client = source
+        authenticatedSession = login
+        bindOnlineAudio(source, graph.audioCache(source, login))
+        if (!lifetime()) return false // A concurrent auth fence cannot expose/rearm this output.
+        localOnlyQueue = false
+        localQueueEligibility = null
+        onServiceActiveChanged?.invoke(true)
+        return true
     }
 
     private fun requestPreparedResume(isCurrent: () -> Boolean, admissionIsCurrent: () -> Boolean): String? {
@@ -2228,6 +2730,8 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun requestEnqueue(items: List<LibraryItem>, requestedClient: SpofifyClient, first: Boolean): String? {
+        if (localOnlyQueue || (application as SpofifyApplication).graph.offlineMode.value)
+            return "Online queue unavailable."
         if (requestedClient !== client || requestedClient.currentSession() !== authenticatedSession) return "Sign in again before adding music."
         val coordinator = (application as SpofifyApplication).graph.playbackCoordinator ?: return "Playback devices are unavailable."
         val tracks = items.filter { it.kind == "track" && it.playable }
@@ -2446,7 +2950,12 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun enqueueWire(tracks: List<PlaybackTrack>, first: Boolean, placement: String = "legacy",
-        onAccepted: (Int, Boolean) -> Unit = { _, _ -> }): String? {
+        onAccepted: (Int, Boolean) -> Unit = { _, _ -> }): String? = preservingUpcomingStart {
+        enqueueWireNow(tracks, first, placement, onAccepted)
+    }
+
+    private fun enqueueWireNow(tracks: List<PlaybackTrack>, first: Boolean, placement: String,
+        onAccepted: (Int, Boolean) -> Unit): String? {
         val source = client ?: return "Playback is unavailable."
         val current = player ?: return "Playback is unavailable."
         if (!hasAuthority()) return "Playback permission expired."
@@ -2583,7 +3092,9 @@ class PlaybackService : MediaSessionService() {
         } finally { arranging = false }
     }
 
-    private fun removeUpcoming(id: String) {
+    private fun removeUpcoming(id: String) = preservingUpcomingStart { removeUpcomingNow(id) }
+
+    private fun removeUpcomingNow(id: String) {
         val current = player ?: return
         val order = traversalIds()
         val removal = PlaybackQueue.removal(order, currentId(), id) ?: return
@@ -2603,7 +3114,9 @@ class PlaybackService : MediaSessionService() {
 
     private fun validRemoval(): Boolean = removed?.first?.canUndo(traversalIds(), currentId()) == true
 
-    private fun undoRemoval() {
+    private fun undoRemoval() = preservingUpcomingStart { undoRemovalNow() }
+
+    private fun undoRemovalNow() {
         val current = player ?: return
         val (removal, media) = removed ?: return
         val restored = removal.undo(traversalIds(), currentId()) ?: run { removed = null; return }
@@ -2631,7 +3144,11 @@ class PlaybackService : MediaSessionService() {
         schedulePrune()
     }
 
-    private fun moveUpcoming(id: String, to: Int, playNext: Boolean = false) {
+    private fun moveUpcoming(id: String, to: Int, playNext: Boolean = false) = preservingUpcomingStart {
+        moveUpcomingNow(id, to, playNext)
+    }
+
+    private fun moveUpcomingNow(id: String, to: Int, playNext: Boolean) {
         val moved = PlaybackQueue.move(traversalIds(), currentId(), id, to)
         if (moved == null) {
             if (playNext && id in PlaybackQueue.upcoming(traversalIds(), currentId())) manualTier.add(listOf(id))
@@ -2642,7 +3159,9 @@ class PlaybackService : MediaSessionService() {
         adoptDisplayedOrder(moved)
     }
 
-    private fun clearUpcoming() {
+    private fun clearUpcoming() = preservingUpcomingStart { clearUpcomingNow() }
+
+    private fun clearUpcomingNow() {
         val current = player ?: return
         val future = PlaybackQueue.upcoming(traversalIds(), currentId()).toSet()
         if (future.isEmpty()) return
@@ -2658,12 +3177,16 @@ class PlaybackService : MediaSessionService() {
         enableSongPrefetch()
     }
 
-    private inner class SessionCallback(private val sharedClient: SpofifyClient) : MediaSession.Callback {
+    private inner class SessionCallback(private val sharedClient: SpofifyClient?) : MediaSession.Callback {
+        private fun callerHasAccess(): Boolean = if (localOnlyQueue) hasLocalAuthority()
+            else sharedClient != null && sharedClient === client && sharedClient === (application as SpofifyApplication).graph.client &&
+                authenticatedSession != null && sharedClient.currentSession() === authenticatedSession
         override fun onPlayerCommandRequest(mediaSession: MediaSession, controller: MediaSession.ControllerInfo, playerCommand: Int): Int {
-            if (!trusted(controller) || sharedClient !== client || authenticatedSession == null || sharedClient.currentSession() !== authenticatedSession)
+            if (!trusted(controller) || !localNamespaceCurrent() || (!localOnlyQueue && !callerHasAccess()))
                 return SessionResult.RESULT_ERROR_PERMISSION_DENIED
             if (playerCommand in setOf(Player.COMMAND_GET_CURRENT_MEDIA_ITEM, Player.COMMAND_GET_TIMELINE, Player.COMMAND_GET_METADATA))
                 return SessionResult.RESULT_SUCCESS
+            if (!callerHasAccess()) return SessionResult.RESULT_ERROR_PERMISSION_DENIED
             if (playerCommand == Player.COMMAND_PREPARE) return SessionResult.RESULT_ERROR_NOT_SUPPORTED
             if (admissions.containsKey(controller)) {
                 // Do not overwrite a possibly pending Play with an uncorrelatable Play/Pause
@@ -2682,9 +3205,8 @@ class PlaybackService : MediaSessionService() {
         override fun onDisconnected(mediaSession: MediaSession, controller: MediaSession.ControllerInfo) { admissions.remove(controller) }
 
         override fun onMediaButtonEvent(mediaSession: MediaSession, controller: MediaSession.ControllerInfo, mediaButtonIntent: Intent): Boolean {
-            if (mediaSession !== session || active.get() !== this@PlaybackService || sharedClient !== client ||
-                sharedClient !== (application as SpofifyApplication).graph.client || authenticatedSession == null ||
-                sharedClient.currentSession() !== authenticatedSession || !PlaybackMediaButtonTrust.accepts(this@PlaybackService, controller)) return true
+            if (mediaSession !== session || active.get() !== this@PlaybackService || !callerHasAccess() ||
+                !PlaybackMediaButtonTrust.accepts(this@PlaybackService, controller)) return true
             if (mediaButtonIntent.action != Intent.ACTION_MEDIA_BUTTON) return false
             val event = try {
                 IntentCompat.getParcelableExtra(mediaButtonIntent, Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
@@ -2805,6 +3327,7 @@ class PlaybackService : MediaSessionService() {
             require(false) { "Use the coordinated playback bridge" }
             require(controller.uid == Process.myUid())
             require(sharedClient === (application as SpofifyApplication).graph.client)
+            requireNotNull(sharedClient)
             require(sharedClient.currentSession() != null)
             return items.map { supplied ->
                 val track = requireNotNull(PlaybackMedia.libraryItem(supplied))

@@ -47,10 +47,21 @@ import kotlin.coroutines.resumeWithException
  * incarnation is not persistent authority and must never be restored from disk. */
 data class ValidatedSessionIdentity(val origin: String, val accountId: String, val incarnation: Long)
 
+/** Credential-free, process-local DENIAL-ONLY history of genuine validated account scopes.
+ * Compare only within the same client. This is NOT a live Session, credential, playback/receiver
+ * authority or permission to grant local eligibility. A revision change can retire an older
+ * scope even after cookie expiry or an account A -> B -> A transition hides the intermediate B. */
+data class ObservedAuthenticatedScope internal constructor(
+    val origin: String,
+    val accountId: String,
+    val scopeRevision: Long,
+)
+
 enum class AuthenticationChangeKind { DORMANT, VALIDATED, RESET, INVALIDATED, EXPIRED }
 
 /** DORMANT fences access without proving saved auth invalid (for example an offline restore).
- * RESET, INVALIDATED and EXPIRED retire authorization; consumers may wipe retired storage.
+ * RESET/INVALIDATED retire authorization. EXPIRED retires live server authority only: elapsed
+ * cookie expiry is NOT an observed 401 and need not retire separately approved local eligibility.
  * revision orders notifications within ONE client, including notifications racing across threads. */
 data class AuthenticationChange(
     val revision: Long,
@@ -67,6 +78,29 @@ class SpofifyClient(
     constructor(server: ServerAddress, store: SessionStore) : this(server, store, System::currentTimeMillis)
     private val json = Json { ignoreUnknownKeys = true }
     private val lock = Any()
+    private val admission = NetworkAdmission(lock)
+
+    /** Explicit, process-local zero-network admission. The app owns persistence and local-media
+     * eligibility. Mode changes neither authenticate nor clear/replace a live Session, and do
+     * not send logout/leave. Both edges permanently fence earlier calls and response parsing. */
+    val isOffline: Boolean get() = admission.isOffline
+    fun setOffline(offline: Boolean) {
+        var retired: List<Call> = emptyList()
+        try {
+            changingAuthentication {
+                retired = admission.setOffline(offline) {
+                    // Fence a restore's provisional cookie NOW, not from its eventual failure
+                    // callback. Validated live Sessions remain unchanged by the mode edge.
+                    if (offline && cookie != null && authentication.identity == null) forgetRestoreLocked()
+                }
+            }
+        } finally {
+            // Cancel only captured calls, outside the shared lock. Dispatcher-wide cancellation
+            // could accidentally cancel a fresh online successor racing an entry/exit ABA.
+            retired.forEach { it.cancel() }
+        }
+    }
+
     private var cookie: Cookie? = null
     private var session: Session? = null
     private var generation: Long = 0
@@ -77,7 +111,7 @@ class SpofifyClient(
     private var nextPersistenceAttempt: Long = 0
     private class RestoreProbe(val generation: Long)
     private class TerminalLogout(val auth: RequestAuthentication)
-    private class RequestAuthentication(val generation: Long, val revision: Long, val cookie: Cookie?,
+    private class RequestAuthentication(val generation: Long, val revision: Long, val admissionEpoch: Long, val cookie: Cookie?,
         val session: Session?, val restoring: Boolean = false, val terminal: Boolean = false) {
         @Volatile var dispatchedRevision = revision
     }
@@ -85,6 +119,7 @@ class SpofifyClient(
     // Weak keys also retire never-executed Calls; completed Calls remove themselves.
     private val requests = java.util.WeakHashMap<Call, RequestAuthentication>()
     private var authentication = AuthenticationChange(0, AuthenticationChangeKind.DORMANT, null)
+    @Volatile private var observedScope: ObservedAuthenticatedScope? = null
 
     /** Synchronous fencing notification, always OUTSIDE the client lock, including disk failures.
      * Install before starting auth operations. Listeners must be nonthrowing, fence access/cancel
@@ -109,14 +144,26 @@ class SpofifyClient(
     val httpClient: OkHttpClient = OkHttpClient.Builder()
         .eventListenerFactory { call ->
             val captured = requestAuthentication(call.request())
-            synchronized(lock) { requests[call] = captured }
+            synchronized(lock) {
+                admission.track(call, captured.admissionEpoch)
+                requests[call] = captured
+            }
             object : EventListener() {
                 override fun connectionAcquired(call: Call, connection: Connection) {
                     val route = connection.route()
-                    recordPlaybackLeaveRoute(captured.generation, call.request().url, route.address.url, route.proxy.type(), route.socketAddress)
+                    synchronized(lock) {
+                        if (admission.isCurrent(captured.admissionEpoch))
+                            recordPlaybackLeaveRoute(captured.generation, call.request().url, route.address.url, route.proxy.type(), route.socketAddress)
+                    }
                 }
-                override fun callEnd(call: Call) { synchronized(lock) { requests.remove(call) } }
-                override fun callFailed(call: Call, ioe: IOException) { synchronized(lock) { requests.remove(call) } }
+                override fun callEnd(call: Call) {
+                    synchronized(lock) { requests.remove(call) }
+                    admission.finished(call)
+                }
+                override fun callFailed(call: Call, ioe: IOException) {
+                    synchronized(lock) { requests.remove(call) }
+                    admission.finished(call)
+                }
             }
         }
         .followRedirects(false)
@@ -127,7 +174,7 @@ class SpofifyClient(
             override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) = Unit
             override fun loadForRequest(url: HttpUrl): List<Cookie> = changingAuthentication {
                 expireSessionLocked()
-                if (!server.contains(url)) emptyList()
+                if (isOffline || !server.contains(url)) emptyList()
                 else cookie?.takeIf { it.expiresAt > authenticationTimeMillis() }?.let { listOf(it) } ?: emptyList()
             }
         })
@@ -152,13 +199,15 @@ class SpofifyClient(
             }
             val response = chain.proceed(builder.build())
             try {
+                admission.requireCurrent(auth.admissionEpoch)
                 if (!login && !auth.terminal) {
                     if (response.code == 401 && auth.cookie != null)
-                        invalidate(auth.generation, notifyUnauthorized = true, expectedCredentialRevision = auth.dispatchedRevision)
+                        invalidate(auth.generation, notifyUnauthorized = true, expectedCredentialRevision = auth.dispatchedRevision,
+                            expectedAdmission = auth.admissionEpoch)
                     else if (!auth.restoring && (response.isSuccessful || response.code == 304))
                         acceptRollingDeadline(response, auth)
                 }
-                response
+                admission.guard(response, auth.admissionEpoch)
             } catch (error: Exception) {
                 // The response is not handed to a caller when invalidation/storage fails.
                 response.close()
@@ -192,6 +241,11 @@ class SpofifyClient(
         expireSessionLocked()
         authentication.identity
     }
+
+    /** Pure lock-free denial-only observation: no expiry checks, storage, callbacks or authority
+     * acquisition. Survives RESET/EXPIRED/DORMANT/INVALIDATED/logout; consumers must revoke those
+     * events separately. Null and a matching witness never establish new local/live authority. */
+    fun observedAuthenticatedScope(): ObservedAuthenticatedScope? = observedScope
 
     /** Match the actual captured Session, not structural account equality (including account ABA).
      * Suitable for each cached read alongside the caller's client/origin/output-authority checks. */
@@ -257,14 +311,14 @@ class SpofifyClient(
 
     /** Call only after a confirmed personal mutation, never after optimistic UI changes or reads. */
     fun notifyPersonalChange(collection: PersonalCollection) = synchronized(lock) {
-        notifyPersonalChange(collection, generation)
+        notifyPersonalChange(collection, personalMutationGeneration())
     }
 
     /** Capture before an external API mutation and pass back only after its confirmed success. */
-    internal fun personalMutationGeneration(): Long = synchronized(lock) { generation }
+    internal fun personalMutationGeneration(): Long = synchronized(lock) { generation + admission.revision }
 
     internal fun notifyPersonalChange(collection: PersonalCollection, expectedGeneration: Long) = synchronized(lock) {
-        if (generation == expectedGeneration && authentication.identity != null && session != null && cookie?.let { it.expiresAt > authenticationTimeMillis() } == true) {
+        if (!isOffline && personalMutationGeneration() == expectedGeneration && authentication.identity != null && session != null && cookie?.let { it.expiresAt > authenticationTimeMillis() } == true) {
             val previous = mutablePersonalRevision.value
             mutablePersonalRevision.value = when (collection) {
                 PersonalCollection.LIKES -> previous.copy(likes = previous.likes + 1)
@@ -276,8 +330,9 @@ class SpofifyClient(
 
     fun clearSession() { resetSession() }
 
-    /** Only the fixed player leave may outlive clearSession/cancelAll. No client, store, session
-     * object or mutable auth provider escapes. The clock seam is per capability, for core tests. */
+    /** Only the fixed player leave may outlive clearSession/cancelAll, never an offline edge.
+     * No client, store, Session or mutable auth provider escapes; only the credential-free
+     * admission gate is shared. The clock seam is per capability, for core tests. */
     internal fun preparePlaybackLeave(deviceId: String, nanoTime: () -> Long = System::nanoTime): suspend () -> Unit =
         preparePlaybackLeave(deviceId, registrationGeneration = null, nanoTime = nanoTime)
 
@@ -285,11 +340,12 @@ class SpofifyClient(
         require(registrationGeneration == null || validPlaybackProtocolId(registrationGeneration))
         require(validPlaybackProtocolId(deviceId)) { "Invalid playback device identifier" }
         val capturedAt = nanoTime()
+        val admissionEpoch = admission.revision
         val request = synchronized(lock) {
             val oldCookie = cookie
             val oldSession = session
             val oldAddress = playbackLeaveAddress
-            if (authentication.identity == null || oldCookie == null || oldSession == null || oldAddress == null || oldCookie.expiresAt <= authenticationTimeMillis()) null
+            if (!admission.isCurrent(admissionEpoch) || authentication.identity == null || oldCookie == null || oldSession == null || oldAddress == null || oldCookie.expiresAt <= authenticationTimeMillis()) null
             else {
                 val body = buildJsonObject {
                     put("action", "leave"); put("deviceId", deviceId)
@@ -308,7 +364,7 @@ class SpofifyClient(
                 )
             }
         }
-        return PreparedPlaybackLeave(request, capturedAt, nanoTime)::invoke
+        return PreparedPlaybackLeave(request, capturedAt, nanoTime, admission, admissionEpoch)::invoke
     }
 
     private fun resetSession(): Long = changingAuthentication { resetSessionLocked(AuthenticationChangeKind.RESET) }
@@ -330,9 +386,10 @@ class SpofifyClient(
 
     /** Old requests must not clear or resurrect a newer account session. */
     private fun invalidate(expectedGeneration: Long, notifyUnauthorized: Boolean = false,
-        expectedCredentialRevision: Long? = null): Boolean = changingAuthentication {
-        if (generation != expectedGeneration || (expectedCredentialRevision != null && credentialRevision != expectedCredentialRevision)) false
-        else {
+        expectedCredentialRevision: Long? = null, expectedAdmission: Long): Boolean = changingAuthentication {
+        if (generation != expectedGeneration || (expectedCredentialRevision != null && credentialRevision != expectedCredentialRevision) ||
+            !admission.isCurrent(expectedAdmission)) false
+        else admission.publish(expectedAdmission) {
             val invalidatedGeneration = generation + 1
             try { resetSessionLocked(AuthenticationChangeKind.INVALIDATED) }
             finally {
@@ -346,10 +403,13 @@ class SpofifyClient(
     }
 
     suspend fun login(username: String, password: String): Session {
-        val loginGeneration = resetSession()
+        val (loginGeneration, loginAdmission) = changingAuthentication {
+            val epoch = admission.capture()
+            admission.publish(epoch) { resetSessionLocked(AuthenticationChangeKind.RESET) to epoch }
+        }
         val body = buildJsonObject { put("username", username); put("password", password) }.toString()
         return try {
-            response(request(server.url("api", "auth", "login"), "POST", body)) { result ->
+            response(request(server.url("api", "auth", "login"), "POST", body, loginAdmission)) { result ->
                 val reply = decode<AuthenticationReply>(result)
                 val mode = if (reply.sessionMode == ROLLING_SESSION_MODE && rollingResponse(result)) ROLLING_SESSION_MODE
                     else if (reply.sessionMode == null && result.headers.values("X-Spofify-Session-Mode").isEmpty()) null
@@ -359,18 +419,19 @@ class SpofifyClient(
                 }
                 val summary = reply.session()
                 if (candidates.size != 1) throw ApiException(result.code, "The server did not issue a valid session cookie")
-                install(summary, candidates.single(), loginGeneration, mode)
+                install(summary, candidates.single(), loginGeneration, loginAdmission, mode)
                 summary
             }
         } catch (error: CancellationException) {
-            invalidate(loginGeneration)
+            invalidate(loginGeneration, expectedAdmission = loginAdmission)
             throw error
         }
     }
 
     /** Revalidates persisted origin and cookie before contacting the server; no optimistic authentication. */
     suspend fun restore(): Session? {
-        val (restoreGeneration, saved) = changingAuthentication {
+        val restoreAdmission = admission.capture()
+        val (restoreGeneration, saved) = changingAuthentication { admission.publish(restoreAdmission) {
             generation++
             credentialRevision++
             cookie = null
@@ -381,19 +442,29 @@ class SpofifyClient(
             playbackLeaveAddress = null
             authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
             generation to store.read()
-        }
+        } }
         if (saved == null) return null
         val candidate = if (saved.server == server.origin && saved.sessionMode in setOf(null, ROLLING_SESSION_MODE))
             parseSessionCookie(server, saved.cookie, authenticationTimeMillis(),
                 allowExpired = saved.sessionMode == ROLLING_SESSION_MODE, absoluteExpiry = saved.sessionMode != null) else null
-        if (candidate == null) { invalidate(restoreGeneration); return null }
-        synchronized(lock) {
+        if (candidate == null) {
+            // A syntactically valid, merely elapsed legacy cookie is expiry, not observed401.
+            val expired = saved.server == server.origin && saved.sessionMode == null &&
+                parseSessionCookie(server, saved.cookie, authenticationTimeMillis(), allowExpired = true)
+                    ?.let { it.expiresAt <= authenticationTimeMillis() } == true
+            changingAuthentication { admission.publish(restoreAdmission) {
+                requireCurrentGeneration(restoreGeneration)
+                resetSessionLocked(if (expired) AuthenticationChangeKind.EXPIRED else AuthenticationChangeKind.INVALIDATED)
+            } }
+            return null
+        }
+        synchronized(lock) { admission.publish(restoreAdmission) {
             requireCurrentGeneration(restoreGeneration)
             cookie = candidate
             sessionMode = saved.sessionMode
-        }
+        } }
         return try {
-            val probe = request(server.url("api", "auth", "session")).newBuilder()
+            val probe = request(server.url("api", "auth", "session"), admissionEpoch = restoreAdmission).newBuilder()
                 .tag(RestoreProbe::class.java, RestoreProbe(restoreGeneration)).build()
             response(probe) { result ->
                 val summary = decode<Session>(result)
@@ -402,51 +473,59 @@ class SpofifyClient(
                     throw ApiException(result.code, "The server returned an incompatible session mode")
                 val validated = if (mode != null) rollingCookie(result, candidate)
                     ?: throw ApiException(result.code, "The server did not return a valid rolling deadline") else candidate
-                install(summary, validated, restoreGeneration, mode)
+                install(summary, validated, restoreGeneration, restoreAdmission, mode)
                 summary
             }
         } catch (error: ApiException) {
             // Rate limits and temporary server failures do not prove the saved session
             // invalid. Drop unvalidated runtime auth, but allow an explicit later retry.
-            if (error.status == 401) invalidate(restoreGeneration)
-            else forgetRestore(restoreGeneration)
+            if (error.status == 401) invalidate(restoreGeneration, expectedAdmission = restoreAdmission)
+            else forgetRestore(restoreGeneration, restoreAdmission)
             if (error.status == 401) null else throw error
         } catch (error: IOException) {
-            forgetRestore(restoreGeneration)
+            forgetRestore(restoreGeneration, restoreAdmission)
             throw error
         } catch (error: CancellationException) {
-            forgetRestore(restoreGeneration)
+            forgetRestore(restoreGeneration, restoreAdmission)
             throw error
         }
     }
 
     // A transport failure or cancellation must not leave an unvalidated cookie usable by media.
-    // Keep the persisted copy for a later explicit restoration attempt.
-    private fun forgetRestore(expectedGeneration: Long) = changingAuthentication {
-        if (generation == expectedGeneration) {
-            cookie = null
-            session = null
-            sessionMode = null
-            persistedDeadline = 0
-            nextPersistenceAttempt = 0
-            playbackLeaveAddress = null
-            generation++
-            credentialRevision++
-            authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
-        }
+    // Keep the persisted copy for a later explicit restoration attempt. If install linearized
+    // before an offline edge, a stale return must not erase that already validated live Session.
+    private fun forgetRestore(expectedGeneration: Long, expectedAdmission: Long) = changingAuthentication {
+        if (generation == expectedGeneration && admission.isCurrent(expectedAdmission) && authentication.identity == null)
+            forgetRestoreLocked()
+    }
+
+    private fun forgetRestoreLocked() {
+        cookie = null
+        session = null
+        sessionMode = null
+        persistedDeadline = 0
+        nextPersistenceAttempt = 0
+        playbackLeaveAddress = null
+        generation++
+        credentialRevision++
+        authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
     }
 
     suspend fun logout() {
         var clearFailure: IOException? = null
         val captured = changingAuthentication {
-            val retired = RequestAuthentication(generation, credentialRevision, cookie, session, terminal = true)
+            val retired = RequestAuthentication(generation, credentialRevision, admission.revision, cookie, session, terminal = true)
             try { resetSessionLocked(AuthenticationChangeKind.INVALIDATED) }
             catch (error: IOException) { clearFailure = error }
             retired
         }
+        if (!admission.isCurrent(captured.admissionEpoch)) {
+            clearFailure?.let { throw it }
+            return // Offline logout is local-only, including a mode change racing retirement.
+        }
         // Local retirement precedes network suspension. Only this fixed one-shot logout
         // may use the captured old credential; no late reply can mutate successor auth.
-        val logout = request(server.url("api", "auth", "logout"), "POST", "{}").newBuilder()
+        val logout = request(server.url("api", "auth", "logout"), "POST", "{}", captured.admissionEpoch).newBuilder()
             .tag(TerminalLogout::class.java, TerminalLogout(captured)).build()
         try { response(logout) { Unit } }
         finally { clearFailure?.let { throw it } }
@@ -480,7 +559,7 @@ class SpofifyClient(
     suspend fun playlistPlayback(id: String): PlaybackQueue = get(server.url("api", "me", "playlists", id, "playback"))
 
     suspend fun setLiked(trackId: String, liked: Boolean) {
-        val writeGeneration = synchronized(lock) { generation }
+        val writeGeneration = personalMutationGeneration()
         mutate(server.url("api", "me", "likes"), "PUT", buildJsonObject { put("trackId", validId(trackId)); put("liked", liked) }.toString())
         notifyPersonalChange(PersonalCollection.LIKES, writeGeneration)
     }
@@ -495,7 +574,7 @@ class SpofifyClient(
 
     suspend fun recent(): LibraryPage = get<TrackPage>(server.url("api", "me", "recent").newBuilder().addQueryParameter("limit", "40").build()).flatten()
     suspend fun recordHistory(eventId: String, trackId: String) {
-        val writeGeneration = synchronized(lock) { generation }
+        val writeGeneration = personalMutationGeneration()
         mutate(server.url("api", "me", "history"), "POST", buildJsonObject { put("eventId", validId(eventId)); put("trackId", validId(trackId)) }.toString())
         notifyPersonalChange(PersonalCollection.HISTORY, writeGeneration)
     }
@@ -521,7 +600,7 @@ class SpofifyClient(
     private fun requireCurrentGeneration(expectedGeneration: Long) {
         if (generation != expectedGeneration) throw IOException("The account session changed while the request was in progress")
     }
-    private fun install(summary: Session, value: Cookie, expectedGeneration: Long, mode: String? = null) = changingAuthentication {
+    private fun install(summary: Session, value: Cookie, expectedGeneration: Long, expectedAdmission: Long, mode: String? = null) = changingAuthentication { admission.publish(expectedAdmission) {
         if (value.expiresAt <= authenticationTimeMillis()) throw ApiException(200, "The server returned an expired session cookie")
         if (summary.accountId.isBlank() || summary.username.isBlank() || summary.role !in setOf("admin", "user") || summary.csrfToken.isBlank())
             throw ApiException(200, "The server returned an invalid session")
@@ -534,26 +613,36 @@ class SpofifyClient(
         nextPersistenceAttempt = 0
         credentialRevision++
         authenticationChangedLocked(AuthenticationChangeKind.VALIDATED)
-    }
+        // Publish inside the genuine VALIDATED commit, before changingAuthentication releases
+        // the lock and invokes Graph callbacks. Expiry/callback delays cannot hide this scope.
+        val previous = observedScope
+        if (previous == null || previous.origin != server.origin || previous.accountId != summary.accountId)
+            observedScope = ObservedAuthenticatedScope(server.origin, summary.accountId,
+                (previous?.scopeRevision ?: 0L) + 1L)
+    } }
     private fun requestAuthentication(request: Request): RequestAuthentication {
         if (!server.contains(request.url)) throw IOException("Off-origin requests are not allowed")
         request.tag(TerminalLogout::class.java)?.let { terminal ->
             if (request.method != "POST" || request.url != server.url("api", "auth", "logout"))
                 throw IOException("Invalid sign-out request")
+            admission.requireCurrent(terminal.auth.admissionEpoch)
             return terminal.auth
         }
         return changingAuthentication {
+            val epoch = request.tag(NetworkAdmissionEpoch::class.java)?.value ?: admission.capture()
+            admission.requireCurrent(epoch)
             expireSessionLocked()
             val restoring = request.tag(RestoreProbe::class.java)?.let {
                 it.generation == generation && request.method == "GET" && request.url == server.url("api", "auth", "session")
             } == true
             if (cookie != null && authentication.identity == null && !restoring)
                 throw IOException("The saved connection needs validation. Retry the connection.")
-            RequestAuthentication(generation, credentialRevision, cookie, session, restoring)
+            RequestAuthentication(generation, credentialRevision, epoch, cookie, session, restoring)
         }
     }
 
     private fun requireLiveDispatch(captured: RequestAuthentication) = changingAuthentication {
+        admission.requireCurrent(captured.admissionEpoch)
         if (captured.terminal) return@changingAuthentication
         requireCurrentGeneration(captured.generation)
         if (!captured.restoring && captured.cookie != null) {
@@ -577,11 +666,11 @@ class SpofifyClient(
         return candidates.singleOrNull()?.takeIf { it.name == expected.name && it.value == expected.value }
     }
 
-    private fun acceptRollingDeadline(result: Response, captured: RequestAuthentication) = changingAuthentication {
-        if (generation != captured.generation || sessionMode != ROLLING_SESSION_MODE || session == null) return@changingAuthentication
-        val previous = cookie ?: return@changingAuthentication
-        if (captured.cookie?.value != previous.value) return@changingAuthentication
-        val validated = rollingCookie(result, previous) ?: return@changingAuthentication
+    private fun acceptRollingDeadline(result: Response, captured: RequestAuthentication) = changingAuthentication { admission.publish(captured.admissionEpoch) {
+        if (generation != captured.generation || sessionMode != ROLLING_SESSION_MODE || session == null) return@publish
+        val previous = cookie ?: return@publish
+        if (captured.cookie?.value != previous.value) return@publish
+        val validated = rollingCookie(result, previous) ?: return@publish
         if (validated.expiresAt > previous.expiresAt) {
             cookie = validated
             credentialRevision++ // Fence old 401s WITHOUT retiring a healthy logical Session.
@@ -600,9 +689,11 @@ class SpofifyClient(
                 nextPersistenceAttempt = authenticationTimeMillis() + 60_000L
             }
         }
-    }
+    } }
 
-    private fun request(url: HttpUrl, method: String = "GET", body: String? = null): Request = Request.Builder().url(url)
+    private fun request(url: HttpUrl, method: String = "GET", body: String? = null,
+        admissionEpoch: Long = admission.capture()): Request = Request.Builder().url(url)
+        .tag(NetworkAdmissionEpoch::class.java, NetworkAdmissionEpoch(admissionEpoch))
         .method(method, body?.toRequestBody("application/json; charset=utf-8".toMediaType())).build()
     private suspend inline fun <reified T> get(url: HttpUrl): T = response(request(url)) { decode<T>(it) }
     private suspend fun mutate(url: HttpUrl, method: String, body: String) { response(request(url, method, body)) { Unit } }
@@ -610,10 +701,15 @@ class SpofifyClient(
         request: Request,
         errorFactory: ((Response) -> ApiException)? = null,
         block: (Response) -> T,
-    ): T = httpClient.newCall(request).awaitResponse(
-        errorFactory ?: { ApiException(it.code, safeError(it.code, request.url.encodedPath == "/api/auth/login")) },
-        block,
-    )
+    ): T {
+        val epoch = request.tag(NetworkAdmissionEpoch::class.java)?.value ?: admission.capture()
+        admission.requireCurrent(epoch)
+        val bound = request.newBuilder().tag(NetworkAdmissionEpoch::class.java, NetworkAdmissionEpoch(epoch)).build()
+        return httpClient.newCall(bound).awaitResponse(
+            errorFactory ?: { ApiException(it.code, safeError(it.code, request.url.encodedPath == "/api/auth/login")) },
+            block, admission, epoch,
+        )
+    }
     private inline fun <reified T> decode(response: Response): T {
         val mediaType = response.body?.contentType()
         if (mediaType?.subtype != "json" && mediaType?.subtype?.endsWith("+json") != true)
@@ -649,11 +745,14 @@ internal class PlaybackLeaveDns(private val host: String, private val address: I
 
 /** Not an authenticated client clone: the only reachable operation is this captured POST.
  * Unused auth is dropped by the timer, and claiming the capability removes it from the closure.
- * Transport resources are created only on invocation and never share ordinary cancellation. */
+ * Transport resources are created only on invocation and never share ordinary cancellation.
+ * Explicit offline admission is the exception: it fences/cancels this transport as well. */
 private class PreparedPlaybackLeave(
     authority: PlaybackLeaveAuthority?,
     private val capturedAt: Long,
     private val nanoTime: () -> Long,
+    private val admission: NetworkAdmission,
+    private val admissionEpoch: Long,
 ) {
     private val pending = AtomicReference(authority)
     private val expiry = if (authority == null) null else CoroutineScope(Dispatchers.Default).launch(start = CoroutineStart.UNDISPATCHED) {
@@ -674,6 +773,7 @@ private class PreparedPlaybackLeave(
         val authority = pending.getAndSet(null) ?: throw leaveUnavailable()
         expiry?.cancel()
         currentCoroutineContext().ensureActive()
+        admission.requireCurrent(admissionEpoch)
         remainingNanos()
         if (authority.cookieExpiresAt <= System.currentTimeMillis()) throw leaveUnavailable()
         val dispatcher = Dispatcher()
@@ -686,11 +786,25 @@ private class PreparedPlaybackLeave(
             // interrupt those calls. Use only the captured, previously connected direct route.
             val transport = OkHttpClient.Builder()
                 .dispatcher(dispatcher).connectionPool(pool)
+                .eventListenerFactory { created ->
+                    admission.track(created, admissionEpoch)
+                    object : EventListener() {
+                        override fun callEnd(call: Call) { admission.finished(call) }
+                        override fun callFailed(call: Call, ioe: IOException) { admission.finished(call) }
+                    }
+                }
+                .addInterceptor { chain ->
+                    admission.requireCurrent(admissionEpoch)
+                    val response = chain.proceed(chain.request())
+                    try { admission.guard(response, admissionEpoch) }
+                    catch (error: Exception) { response.close(); throw error }
+                }
                 .proxy(Proxy.NO_PROXY)
                 .dns(PlaybackLeaveDns(authority.request.url.host, authority.address))
                 .followRedirects(false).followSslRedirects(false)
                 .retryOnConnectionFailure(false)
                 .addNetworkInterceptor { chain ->
+                    admission.requireCurrent(admissionEpoch)
                     remainingNanos()
                     if (authority.cookieExpiresAt <= System.currentTimeMillis()) throw leaveUnavailable()
                     chain.proceed(chain.request())
@@ -699,7 +813,8 @@ private class PreparedPlaybackLeave(
             currentCoroutineContext().ensureActive()
             call = transport.newCall(authority.request)
             call.timeout().deadlineNanoTime(System.nanoTime() + remainingNanos())
-            call.awaitResponse({ ApiException(it.code, "The server refused playback cleanup (HTTP ${it.code})") }) { Unit }
+            call.awaitResponse({ ApiException(it.code, "The server refused playback cleanup (HTTP ${it.code})") },
+                { Unit }, admission, admissionEpoch)
         } finally {
             call?.cancel()
             pool.evictAll()
@@ -709,31 +824,46 @@ private class PreparedPlaybackLeave(
 }
 
 private fun leaveUnavailable() = IOException("Playback cleanup is unavailable or expired")
-private fun networkError() = IOException("Unable to reach the server. Check your connection and server address.")
 
 /** Keep cancellation attached through response consumption, not merely header delivery. */
-private suspend fun <T> Call.awaitResponse(errorFactory: (Response) -> ApiException, block: (Response) -> T): T =
-    suspendCancellableCoroutine { continuation ->
+private suspend fun <T> Call.awaitResponse(errorFactory: (Response) -> ApiException, block: (Response) -> T,
+    admission: NetworkAdmission, admissionEpoch: Long): T {
+    val result = try { suspendCancellableCoroutine<T> { continuation ->
         continuation.invokeOnCancellation { cancel() }
         enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                if (!continuation.isCancelled) continuation.resumeWithException(networkError())
+                if (!continuation.isCancelled)
+                    continuation.resumeWithException(networkError(e, TransportFailurePhase.CALL))
             }
             override fun onResponse(call: Call, response: Response) {
                 try {
-                    val result = response.use {
+                    val parsed = response.use {
+                        admission.requireCurrent(admissionEpoch)
                         if (!it.isSuccessful) throw errorFactory(it)
                         block(it)
                     }
-                    continuation.resume(result) { _, _, _ -> }
+                    admission.requireCurrent(admissionEpoch)
+                    continuation.resume(parsed) { _, _, _ -> }
                 } catch (error: Exception) {
                     if (!continuation.isCancelled) {
-                        continuation.resumeWithException(if (error is IOException && error !is ApiException) networkError() else error)
+                        continuation.resumeWithException(if (error is IOException && error !is ApiException)
+                            networkError(error, TransportFailurePhase.RESPONSE_CONSUMER) else error)
                     }
                 }
             }
         })
+    } } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        // A queued stale error (especially 401) is not a newly observed invalidation.
+        admission.requireCurrent(admissionEpoch)
+        throw error
     }
+    // A completed parse may have resumed onto a dispatcher that was still queued at entry.
+    // Check again in the receiving coroutine; neither cancellation nor an exit ABA revives it.
+    admission.requireCurrent(admissionEpoch)
+    return result
+}
 
 /** Cookie policy is shared by login and restore; parsing does not install or trust the cookie. */
 internal fun parseSessionCookie(server: ServerAddress, serialized: String, nowMillis: Long = System.currentTimeMillis(),

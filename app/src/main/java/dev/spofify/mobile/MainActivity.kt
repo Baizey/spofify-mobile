@@ -106,6 +106,17 @@ class MainActivity : ComponentActivity() {
 internal fun SpofifyApp(model: LibraryViewModel) {
     val state by model.state.collectAsStateWithLifecycle()
     val player by model.playback.state.collectAsStateWithLifecycle()
+    val retainedAccount by model.graph.localEligibilityState.collectAsStateWithLifecycle()
+    val coldClient = model.graph.client
+    val rootFocus = LocalFocusManager.current
+    val rootKeyboard = LocalSoftwareKeyboardController.current
+    val enterOffline: (() -> Unit)? = retainedAccount?.takeIf {
+        !state.offline && (!state.busy || state.restoring)
+    }?.let { account -> {
+        if (model.graph.localEligibility === account && model.graph.client === coldClient) {
+            rootFocus.clearFocus(); rootKeyboard?.hide(); model.setOfflineMode(true)
+        }
+    } }
     var expanded by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(state.session) { if (state.session == null) expanded = false }
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
@@ -113,12 +124,21 @@ internal fun SpofifyApp(model: LibraryViewModel) {
 
     if (state.restoring) {
         Box(Modifier.fillMaxSize().background(Background), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(Modifier.size(32.dp))
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                CircularProgressIndicator(Modifier.size(32.dp))
+                enterOffline?.let { offline ->
+                    TextButton(onClick = offline, modifier = Modifier.heightIn(min = 48.dp)) { Text("Offline mode") }
+                }
+            }
         }
         return
     }
+    if (state.offline) {
+        OfflineListeningApp(model)
+        return
+    }
     if (state.session == null) {
-        SignIn(state, model.rememberedLogin, model::signIn, model::reconnect)
+        SignIn(state, model.rememberedLogin, model::signIn, model::reconnect, onOfflineMode = enterOffline)
         return
     }
     val client = model.graph.client ?: return
@@ -355,8 +375,10 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                                 model.open(when (destination) {
                                     SettingsDestination.ACCOUNT -> Page.Profile
                                     SettingsDestination.CREDITS -> Page.Credits
+                                    SettingsDestination.OFFLINE -> Page.Settings
                                 })
-                            }, modifier = contentModifier)
+                            }, modifier = contentModifier, offlineMode = state.offline,
+                            onOfflineModeChanged = model::setOfflineMode)
                         Page.Profile -> ProfileScreen(
                             username = state.session?.username.orEmpty(), origin = client.server.origin,
                             busy = state.busy,

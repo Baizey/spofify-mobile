@@ -65,6 +65,8 @@ data class LibraryState(
     val rememberLogin: Boolean = true,
     val hasSavedLogin: Boolean = false,
     val session: Session? = null,
+    val offline: Boolean = false,
+    val localAccount: OfflineEligibility? = null,
     val tab: Tab = Tab.HOME,
     val page: Page = Page.Home,
     val canGoBack: Boolean = false,
@@ -103,9 +105,11 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private val listActionTickets = mutableSetOf<ListActionTicket>()
     private fun freshState(restoring: Boolean = false, server: String = remembered?.server ?: graph.lastServer,
         session: Session? = null, busy: Boolean = false, error: String? = null, notice: String? = null) =
-        LibraryState(restoring = restoring, server = server, session = session, busy = busy, error = error, notice = notice,
+        LibraryState(restoring = restoring, server = server, session = session, busy = busy, error = error,
+            notice = notice ?: if (graph.offlineStorageFailed.value) "Could not securely clear saved local access." else null,
             rememberLogin = graph.rememberLoginEnabled, hasSavedLogin = remembered != null,
-            playbackIntentGeneration = queueGeneration)
+            playbackIntentGeneration = queueGeneration, offline = graph.offlineMode.value,
+            localAccount = graph.localEligibility)
     private val mutable = MutableStateFlow(freshState(restoring = true))
     val state = mutable.asStateFlow()
     private val stack = mutableListOf<Page>(Page.Home)
@@ -214,12 +218,14 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     private fun captureExplicitPlayOrigin(): () -> Boolean {
         val client = graph.client
         val session = client?.currentSession()
+        val local = graph.localEligibility
         val account = state.value.session?.accountId
         val route = state.value.page
         val routeGeneration = generation
         val playbackEpoch = PlaybackRequests.epoch
-        return { !cleared && client != null && session != null && account != null &&
-            graph.client === client && client.currentSession() === session && state.value.session?.accountId == account &&
+        return { !cleared && client != null && graph.client === client &&
+            (if (graph.offlineMode.value) local != null && graph.localPlaybackIsCurrent(local)
+            else session != null && account != null && client.currentSession() === session && state.value.session?.accountId == account) &&
             state.value.page == route && generation == routeGeneration && playbackEpoch == PlaybackRequests.epoch }
     }
     private val likeOperations = LikeOperations(viewModelScope, { graph.client },
@@ -233,8 +239,13 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
     init {
         playback.bindExplicitPlayOrigin(::captureExplicitPlayOrigin)
         viewModelScope.launch {
+            graph.offlineStorageFailed.collect { failed ->
+                if (failed) mutable.update { it.copy(notice = "Could not securely clear saved local access.") }
+            }
+        }
+        viewModelScope.launch {
             graph.sessionNeedsReconnect.collect { needsReconnect ->
-                if (needsReconnect && graph.sessionNeedsReconnect.value && !signingOut &&
+                if (!graph.offlineMode.value && needsReconnect && graph.sessionNeedsReconnect.value && !signingOut &&
                     state.value.session != null && graph.client?.currentSession() == null) {
                     generation++
                     queueGeneration++
@@ -268,8 +279,32 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
         reconnect()
     }
 
+    fun setOfflineMode(value: Boolean) {
+        if (cleared || value == graph.offlineMode.value) return
+        // A genuine retained account can explicitly fence an in-flight cold online restore.
+        // Busy sign-out/foreign-origin attempts with no eligibility cannot borrow that access.
+        if (state.value.busy && (!value || !state.value.restoring || graph.localEligibility == null)) return
+        authenticationSerial++; generation++; queueGeneration++
+        loadJob?.cancel(); queueJob?.cancel()
+        listPreparationJobs.forEach { it.cancel() }
+        clearFeatureState(); tabStacks.clear()
+        stack.clear(); stack.add(Page.Home)
+        val saved = graph.setOfflineMode(value)
+        playback.modeChanged()
+        mutable.value = freshState(session = if (value) null else graph.client?.currentSession(),
+            notice = if (saved) null else "Could not save offline mode.")
+        if (value) {
+            if (graph.localEligibility != null) playback.connect()
+        } else reconnect()
+    }
+
     fun reconnect() {
         if (state.value.busy) return
+        if (graph.offlineMode.value) {
+            mutable.value = freshState()
+            if (graph.localEligibility != null) playback.connect()
+            return
+        }
         val attempt = ++authenticationSerial
         val client = graph.client
         mutable.update { it.copy(busy = true, error = null) }
@@ -334,21 +369,24 @@ class LibraryViewModel(application: Application, val graph: AppGraph, val playba
 
     fun logout() {
         if (state.value.busy) return
+        val client = graph.client
+        // Stop output before any potentially blocking retained-data/storage cleanup.
+        playback.stop()
+        graph.fenceForLogout(client)
         authenticationSerial++
         generation++; queueGeneration++
         loadJob?.cancel(); queueJob?.cancel()
         clearFeatureState(); tabStacks.clear()
-        playback.stop()
-        val client = graph.client
         signingOut = true
         mutable.value = freshState(server = state.value.server, busy = true)
         viewModelScope.launch {
             var failure: String? = null
-            try { client?.logout() } catch (error: Exception) {
+            try { if (!graph.offlineMode.value) client?.logout() } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                failure = "Signed out on this device. The server could not be reached to revoke the session; it will expire automatically."
+                failure = "Signed out locally. Server sign-out failed."
             } finally {
-                graph.clear(client)
+                try { graph.clear(client) }
+                catch (_: Exception) { failure = "Signed out locally. Could not securely clear saved local access." }
                 stack.clear(); stack.add(Page.Home)
                 signingOut = false
                 mutable.value = freshState(error = failure)

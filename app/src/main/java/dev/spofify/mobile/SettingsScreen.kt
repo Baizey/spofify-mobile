@@ -1,6 +1,7 @@
 package dev.spofify.mobile
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -20,6 +21,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
@@ -27,7 +29,7 @@ import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.playback.cache.AutoCacheSettings
 import java.util.Locale
 
-internal enum class SettingsDestination { ACCOUNT, CREDITS }
+internal enum class SettingsDestination { ACCOUNT, CREDITS, OFFLINE }
 
 /**
  * Only implemented destinations are indexed here. Inline automatic-cache controls have their own
@@ -43,6 +45,8 @@ internal data class SettingsEntry(
 )
 
 internal fun settingsEntries(username: String, origin: String) = listOf(
+    SettingsEntry(SettingsDestination.OFFLINE, "Listening", "Offline mode", "",
+        "local saved downloaded music network connection"),
     SettingsEntry(SettingsDestination.ACCOUNT, "Account", "Account and server", username,
         "profile username server connection sign out $username $origin"),
     SettingsEntry(SettingsDestination.CREDITS, "About", "Credits", "JetBrains Mono · SIL Open Font License 1.1",
@@ -67,6 +71,8 @@ internal fun SettingsScreen(
     modifier: Modifier = Modifier,
     cacheSettings: AutoCacheSettings? = null,
     onSaveCacheSettings: suspend (AutoCacheSettings) -> String? = { "Couldn’t save. Try again." },
+    offlineMode: Boolean = false,
+    onOfflineModeChanged: (Boolean) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val focus = LocalFocusManager.current
@@ -107,7 +113,12 @@ internal fun SettingsScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp).semantics { heading() })
             }
             items(rows, key = { it.destination }) { entry ->
-                SettingsPreferenceRow(entry.title, entry.summary,
+                if (entry.destination == SettingsDestination.OFFLINE) {
+                    ListItem(headlineContent = { Text(entry.title) }, trailingContent = {
+                        Switch(checked = offlineMode, onCheckedChange = null)
+                    }, modifier = Modifier.testTag("offline-mode-switch").toggleable(
+                        value = offlineMode, role = Role.Switch, onValueChange = onOfflineModeChanged))
+                } else SettingsPreferenceRow(entry.title, entry.summary,
                     if (entry.destination == SettingsDestination.ACCOUNT) Icons.Default.AccountCircle else Icons.Default.Info,
                     onClick = { onOpen(entry.destination) })
             }

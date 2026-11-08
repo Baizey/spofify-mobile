@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -90,6 +91,7 @@ private fun UpcomingOccurrenceActions(
     canMoveUp: Boolean, canMoveDown: Boolean, onDismiss: () -> Unit,
     onOpenItem: (LibraryItem) -> Unit, onMoveUp: () -> Unit, onMoveDown: () -> Unit, onRemove: () -> Unit,
     artwork: (@Composable (LibraryItem, Modifier) -> Unit)? = null,
+    localNavigation: ((LibraryItem) -> Boolean)? = null,
 ) {
     val actions = intents.toMap()
     fun perform(action: () -> Unit) { onDismiss(); action() }
@@ -99,9 +101,23 @@ private fun UpcomingOccurrenceActions(
             onPlayNext = { perform(actions.getValue("Play next")) },
             onQueue = { perform(actions.getValue("Queue")) },
             playbackEnabled = entry.item.playable && state.interactionKey != null,
-            onOpenItem = { item -> perform { onOpenItem(item) } },
+            onOpenItem = if (localNavigation == null) ({ item -> perform { onOpenItem(item) } }) else null,
             artwork = artwork,
             contextualContent = {
+                if (localNavigation != null) {
+                    val targets = buildList {
+                        state.context?.let(::add)
+                        entry.item.artists.forEach { add(LibraryItem("artist", it.id, it.name)) }
+                        entry.item.albumName?.let { add(LibraryItem("album", entry.item.albumId.orEmpty(), it)) }
+                    }.distinctBy { it.kind to it.id }
+                    if (targets.isNotEmpty()) SongActionGroup("Navigation") {
+                        targets.forEach { target ->
+                            SongActionRow(target.name, Icons.Default.Info, localNavigation(target)) {
+                                perform { onOpenItem(target) }
+                            }
+                        }
+                    }
+                }
                 SongActionGroup("This queue") {
                     SongActionRow("Move up", Icons.Default.KeyboardArrowUp, canMoveUp, onClick = { perform(onMoveUp) })
                     SongActionRow("Move down", Icons.Default.KeyboardArrowDown, canMoveDown, onClick = { perform(onMoveDown) })
@@ -138,12 +154,13 @@ internal fun ColumnScope.NativeUpcomingQueue(
     showStatus: Boolean = true,
     onClose: (() -> Unit)? = null,
     listState: LazyListState = rememberLazyListState(),
+    localNavigation: ((LibraryItem) -> Boolean)? = null,
 ) {
     val actionIsCurrent = rememberUpcomingQueueActionIsCurrent(controls)
     UpcomingQueueHeader(state, controls, compact, showStatus, onClose)
     LazyColumn(Modifier.fillMaxWidth().weight(1f).testTag("now-playing-queue")
         .semantics { contentDescription = "Upcoming queue" }, state = listState) {
-        nativeUpcomingQueueItems(state, controls, onOpenItem, artwork, listState, actionIsCurrent, compact)
+        nativeUpcomingQueueItems(state, controls, onOpenItem, artwork, listState, actionIsCurrent, compact, localNavigation)
     }
 }
 
@@ -184,14 +201,15 @@ internal fun LazyListScope.nativeUpcomingQueueItems(
     listState: LazyListState,
     actionIsCurrent: () -> Boolean,
     compact: Boolean = false,
+    localNavigation: ((LibraryItem) -> Boolean)? = null,
 ) {
     if (state.upcoming.isEmpty()) item(key = QueueContentKey.EMPTY) {
         Text("No upcoming songs", Modifier.fillMaxWidth().padding(vertical = 16.dp),
             style = MaterialTheme.typography.bodyMedium)
     }
     itemsIndexed(state.upcoming, key = { _, entry -> entry.occurrenceId }) { index, entry ->
-        if (compact) CompactUpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, state, actionIsCurrent)
-        else UpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, artwork, state, actionIsCurrent)
+        if (compact) CompactUpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, state, actionIsCurrent, localNavigation)
+        else UpcomingRow(entry, index, state.upcoming.size, controls, onOpenItem, artwork, state, actionIsCurrent, localNavigation)
     }
 }
 
@@ -267,6 +285,7 @@ private fun CompactUpcomingRow(
     onOpenItem: (LibraryItem) -> Unit,
     state: PlaybackState,
     actionIsCurrent: () -> Boolean,
+    localNavigation: ((LibraryItem) -> Boolean)?,
 ) {
     // An open action menu belongs to the rendered queue binding, not a later publication.
     // Progress keeps the key; queue/output/session replacement disposes the old menu.
@@ -304,7 +323,7 @@ private fun CompactUpcomingRow(
                     onDismiss = { menuOpen = false }, onOpenItem = onOpenItem,
                     onMoveUp = { controls.moveUpcoming(entry.occurrenceId, index - 1) },
                     onMoveDown = { controls.moveUpcoming(entry.occurrenceId, index + 1) },
-                    onRemove = { controls.removeUpcoming(entry.occurrenceId) })
+                    onRemove = { controls.removeUpcoming(entry.occurrenceId) }, localNavigation = localNavigation)
             }
         }
     }
@@ -320,6 +339,7 @@ private fun UpcomingRow(
     artwork: @Composable (LibraryItem, Modifier) -> Unit,
     state: PlaybackState,
     actionIsCurrent: () -> Boolean,
+    localNavigation: ((LibraryItem) -> Boolean)?,
 ) {
     // Progress preserves this menu; a new queue/output/session binding dismisses it.
     var menuOpen by remember(entry.occurrenceId, state.interactionKey) { mutableStateOf(false) }
@@ -395,7 +415,8 @@ private fun UpcomingRow(
             }
             if (menuOpen) UpcomingOccurrenceActions(entry, state, intents, index > 0, index < count - 1,
                 onDismiss = { menuOpen = false }, onOpenItem = onOpenItem,
-                onMoveUp = moveUp, onMoveDown = moveDown, onRemove = remove, artwork = artwork)
+                onMoveUp = moveUp, onMoveDown = moveDown, onRemove = remove, artwork = artwork,
+                localNavigation = localNavigation)
         }
     }
     }

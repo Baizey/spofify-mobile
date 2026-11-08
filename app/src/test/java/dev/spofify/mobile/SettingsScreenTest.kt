@@ -41,7 +41,8 @@ class SettingsScreenTest {
         assertEquals(listOf(SettingsDestination.ACCOUNT), matchingSettings(entries, "SIGN OUT").map { it.destination })
         assertEquals(listOf(SettingsDestination.ACCOUNT), matchingSettings(entries, "music.example Listener").map { it.destination })
         assertEquals(listOf(SettingsDestination.CREDITS), matchingSettings(entries, "font license").map { it.destination })
-        listOf("cache", "download", "unlimited", "volume", "wifi").forEach { assertTrue(matchingSettings(entries, it).isEmpty()) }
+        assertEquals(listOf(SettingsDestination.OFFLINE), matchingSettings(entries, "offline mode").map { it.destination })
+        listOf("cache", "unlimited", "volume", "wifi").forEach { assertTrue(matchingSettings(entries, it).isEmpty()) }
         assertEquals(entries, matchingSettings(entries, " \n "))
     }
 
@@ -66,6 +67,20 @@ class SettingsScreenTest {
         assertEquals(listOf(SettingsDestination.CREDITS, SettingsDestination.ACCOUNT), opened)
         compose.onNodeWithTag("settings-query").performTextReplacement("no such preference")
         compose.onNodeWithText("No matching settings").assertIsDisplayed()
+    }
+
+    @Test fun offlineSwitchUsesItsRealBoundStateAndOneDeliberateChange() {
+        val changed = mutableListOf<Boolean>()
+        compose.setContent {
+            MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
+                SettingsScreen("Listener", "https://music.example", {}, Modifier.fillMaxSize(),
+                    offlineMode = true, onOfflineModeChanged = changed::add)
+            }
+        }
+        compose.onNodeWithTag("offline-mode-switch").assertIsOn().performClick()
+        assertEquals(listOf(false), changed)
+        // Presentation cannot invent application persistence or change the value by itself.
+        compose.onNodeWithTag("offline-mode-switch").assertIsOn()
     }
 
     @Test fun automaticCacheIndexMatchesOnlySuppliedControlsAndCurrentValues() {

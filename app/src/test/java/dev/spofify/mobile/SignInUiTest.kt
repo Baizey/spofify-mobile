@@ -42,7 +42,7 @@ class SignInUiTest {
         SemanticsMatcher.keyIsDefined(SemanticsProperties.EditableText))
     private fun password() = field("Password")
 
-    private fun mount(fontScale: Float = 1f, completeSynchronously: Boolean = false) {
+    private fun mount(fontScale: Float = 1f, completeSynchronously: Boolean = false, offline: (() -> Unit)? = null) {
         compose.setContent {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale)) {
@@ -59,7 +59,7 @@ class SignInUiTest {
                         }, reconnect = {
                             reconnects++
                             state.value = state.value.copy(busy = true)
-                        })
+                        }, onOfflineMode = offline)
                     }
                 }
             }
@@ -96,6 +96,20 @@ class SignInUiTest {
         assertMasked()
         assertNoClutter()
         compose.runOnIdle { assertTrue(submissions.isEmpty()); assertEquals(0, reconnects) }
+    }
+
+    @Test fun retainedOfflineRecoveryIsASeparateNonSigningActionAndClearsEphemeralPassword() {
+        state.value = LibraryState(restoring = false, busy = true, server = "https://music.example")
+        saved.value = RememberedLogin("https://music.example", "listener", "synthetic-secret")
+        var offlineEntries = 0
+        mount(offline = { offlineEntries++ })
+        compose.onNodeWithText("Offline mode").performScrollTo().assertIsEnabled().assertHeightIsAtLeast(48.dp).performClick()
+        compose.runOnIdle {
+            assertEquals(1, offlineEntries)
+            assertTrue(submissions.isEmpty())
+            assertEquals(0, reconnects)
+        }
+        password().performScrollTo().assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
     }
 
     @Test fun explicitHttpAndHttpsNeedNoWarningCheckboxOrExtraAction() {

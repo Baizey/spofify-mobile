@@ -1,6 +1,7 @@
 package dev.spofify.mobile.core
 
 import java.io.IOException
+import java.net.InetAddress
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -31,7 +32,7 @@ class SpofifyClientAuthenticationLifetimeTest {
     private val changes = Collections.synchronizedList(mutableListOf<AuthenticationChange>())
 
     @Before fun setup() {
-        web = MockWebServer().also { it.start() }
+        web = MockWebServer().also { it.start(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), 0) }
         store = MemorySessionStore()
         client = SpofifyClient(ServerAddress.parse("http://127.0.0.1:${web.port}"), store, now::get)
         client.onAuthenticationChanged = { changes.add(it) }
@@ -39,6 +40,8 @@ class SpofifyClientAuthenticationLifetimeTest {
 
     @After fun teardown() {
         client.httpClient.dispatcher.cancelAll()
+        client.httpClient.connectionPool.evictAll()
+        client.httpClient.dispatcher.executorService.shutdown()
         web.shutdown()
     }
 
@@ -64,6 +67,173 @@ class SpofifyClientAuthenticationLifetimeTest {
             assertFalse(identity.toString().contains(it))
             assertFalse(changes.toString().contains(it))
         }
+    }
+
+    @Test fun observedScopeCannotBeMintedBySavedSummaryOrProvisionalRestore() = runBlocking {
+        store.value = StoredSession(client.server.origin,
+            "spofify_session=saved-cookie; Path=/; HttpOnly; Max-Age=3600",
+            Session("saved-summary-account", "saved-name", "user", "saved-csrf"))
+        assertNull(client.observedAuthenticatedScope())
+        web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val pending = async(Dispatchers.IO) { client.restore() }
+        try {
+            assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
+            assertNull(client.validatedSessionIdentity())
+            assertNull(client.observedAuthenticatedScope())
+        } finally { pending.cancelAndJoin() }
+        assertNull(client.observedAuthenticatedScope())
+        assertNotNull(store.value)
+
+        web.enqueue(jsonResponse(SESSION_JSON))
+        val restored = requireNotNull(client.restore())
+        assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
+        val observed = requireNotNull(client.observedAuthenticatedScope())
+        assertEquals(restored.accountId, observed.accountId)
+        assertEquals("a1", observed.accountId) // The genuine reply, not the saved summary.
+        assertEquals(client.server.origin, observed.origin)
+        assertEquals(1L, observed.scopeRevision)
+        listOf("saved-cookie", "saved-name", "saved-csrf", "csrf-secret", "listener").forEach {
+            assertFalse(observed.toString().contains(it))
+        }
+    }
+
+    @Test fun observedScopeSurvivesSameAccountValidationExpiryResetDormancyInvalidationAndLogout() = runBlocking {
+        login()
+        val observed = requireNotNull(client.observedAuthenticatedScope())
+        assertEquals(1L, observed.scopeRevision)
+        login()
+        assertSame(observed, client.observedAuthenticatedScope())
+        val saved = store.value
+        val expiry = client.httpClient.cookieJar.loadForRequest(client.server.url()).single().expiresAt
+        changes.clear()
+        now.set(expiry)
+        repeat(5) { assertSame(observed, client.observedAuthenticatedScope()) }
+        assertTrue(changes.isEmpty()) // The witness read itself must not expire live auth.
+        assertEquals(saved, store.value)
+        assertNull(client.validatedSessionIdentity())
+        assertEquals(AuthenticationChangeKind.EXPIRED, changes.single().kind)
+        assertSame(observed, client.observedAuthenticatedScope())
+        client.clearSession()
+        assertSame(observed, client.observedAuthenticatedScope())
+        assertNull(client.currentSession()) // A retained witness never restores live authority.
+
+        now.set(System.currentTimeMillis())
+        store.value = saved
+        web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val pending = async(Dispatchers.IO) { client.restore() }
+        try {
+            assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
+            assertEquals(AuthenticationChangeKind.DORMANT, changes.last().kind)
+            assertSame(observed, client.observedAuthenticatedScope())
+        } finally { pending.cancelAndJoin() }
+        assertSame(observed, client.observedAuthenticatedScope())
+        web.enqueue(jsonResponse(SESSION_JSON))
+        assertNotNull(client.restore())
+        assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
+        assertSame(observed, client.observedAuthenticatedScope())
+        web.enqueue(jsonResponse("{}", 401))
+        client.httpClient.newCall(Request.Builder().url(client.server.url("audio")).build()).execute().close()
+        assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
+        assertEquals(AuthenticationChangeKind.INVALIDATED, changes.last().kind)
+        assertSame(observed, client.observedAuthenticatedScope())
+        web.enqueue(MockResponse().setResponseCode(204))
+        client.logout()
+        assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
+        assertSame(observed, client.observedAuthenticatedScope())
+        assertNull(client.validatedSessionIdentity())
+    }
+
+    @Test fun observedScopeRevisionRecordsGenuineAccountAbaWithoutBorrowingSessionIncarnation() = runBlocking {
+        login()
+        val firstA = requireNotNull(client.observedAuthenticatedScope())
+        login("b2")
+        val b = requireNotNull(client.observedAuthenticatedScope())
+        login()
+        val nextA = requireNotNull(client.observedAuthenticatedScope())
+        assertEquals(listOf("a1", "b2", "a1"), listOf(firstA.accountId, b.accountId, nextA.accountId))
+        assertEquals(listOf(1L, 2L, 3L), listOf(firstA.scopeRevision, b.scopeRevision, nextA.scopeRevision))
+        assertNotSame(firstA, nextA)
+        assertNotEquals(firstA, nextA)
+        login()
+        assertSame(nextA, client.observedAuthenticatedScope())
+        client.setOffline(true)
+        client.setOffline(false)
+        assertSame(nextA, client.observedAuthenticatedScope())
+    }
+
+    @Test fun observedScopeIsPublishedBeforeParkedValidatedCallbackAndSurvivesSuccessorExpiry() = runBlocking {
+        login()
+        val a = requireNotNull(client.observedAuthenticatedScope())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        client.onAuthenticationChanged = { change ->
+            changes.add(change)
+            if (change.kind == AuthenticationChangeKind.VALIDATED && change.identity?.accountId == "b2") {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+            }
+        }
+        web.enqueue(loginResponse().setBody(SESSION_JSON.replace("\"a1\"", "\"b2\"")))
+        val pending = async(Dispatchers.IO) { runCatching { client.login("listener", "password") } }
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
+            val b = requireNotNull(client.observedAuthenticatedScope())
+            assertEquals("b2", b.accountId)
+            assertEquals(a.scopeRevision + 1, b.scopeRevision)
+            val expiry = client.httpClient.cookieJar.loadForRequest(client.server.url()).single().expiresAt
+            now.set(expiry)
+            assertNull(client.validatedSessionIdentity())
+            client.setOffline(true)
+            assertSame(b, client.observedAuthenticatedScope())
+            assertEquals(AuthenticationChangeKind.EXPIRED, changes.last().kind)
+        } finally { release.countDown() }
+        assertTrue(pending.await().exceptionOrNull() is IOException) // Earlier admission is still fenced.
+        assertEquals("b2", client.observedAuthenticatedScope()!!.accountId)
+        assertNull(client.currentSession())
+    }
+
+    @Test fun observedScopeReadIsLockFreeAndDoesNotConsultClockOrStorage() = runBlocking {
+        val holdClear = AtomicBoolean(false)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val clockReads = AtomicLong()
+        val storeReads = AtomicLong()
+        val storeWrites = AtomicLong()
+        val blockingStore = object : SessionStore {
+            override fun read(): StoredSession? { storeReads.incrementAndGet(); return store.value }
+            override fun write(value: StoredSession?) {
+                storeWrites.incrementAndGet()
+                if (value == null && holdClear.get()) {
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+                store.write(value)
+            }
+        }
+        client = SpofifyClient(client.server, blockingStore) { clockReads.incrementAndGet(); now.get() }
+        login()
+        val observed = requireNotNull(client.observedAuthenticatedScope())
+        val reader = Executors.newSingleThreadExecutor()
+        holdClear.set(true)
+        val reset = async(Dispatchers.IO) { client.clearSession() }
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS)) // Reset owns the client lock inside store.write.
+            val clockBefore = clockReads.get()
+            val readsBefore = storeReads.get()
+            val writesBefore = storeWrites.get()
+            assertSame(observed, reader.submit<ObservedAuthenticatedScope?> {
+                client.observedAuthenticatedScope()
+            }.get(1, TimeUnit.SECONDS))
+            assertEquals(clockBefore, clockReads.get())
+            assertEquals(readsBefore, storeReads.get())
+            assertEquals(writesBefore, storeWrites.get())
+        } finally {
+            release.countDown()
+            reset.await()
+            reader.shutdownNow()
+        }
+        assertSame(observed, client.observedAuthenticatedScope())
     }
 
     @Test fun equalValuedReloginAndAccountAbaCannotReviveCapturedSession() = runBlocking {
@@ -153,14 +323,14 @@ class SpofifyClientAuthenticationLifetimeTest {
         }
     }
 
-    @Test fun expiredSavedCookieInvalidatesWithoutContactingServer() = runBlocking {
+    @Test fun expiredSavedCookieReportsExpiryNotObservedInvalidationWithoutContactingServer() = runBlocking {
         store.value = StoredSession(client.server.origin,
             "spofify_session=old; Path=/; HttpOnly; Expires=Thu, 01 Jan 1970 00:00:01 GMT",
             Session("a1", "listener", "user", "saved-csrf"))
         assertNull(client.restore())
         assertNull(client.validatedSessionIdentity())
         assertNull(store.value)
-        assertEquals(listOf(AuthenticationChangeKind.DORMANT, AuthenticationChangeKind.INVALIDATED), changes.map { it.kind })
+        assertEquals(listOf(AuthenticationChangeKind.DORMANT, AuthenticationChangeKind.EXPIRED), changes.map { it.kind })
         assertEquals(0, web.requestCount)
     }
 
@@ -405,8 +575,13 @@ class SpofifyClientAuthenticationLifetimeTest {
 
     private suspend fun login(accountId: String = "a1"): Session {
         web.enqueue(loginResponse().setBody(SESSION_JSON.replace("\"a1\"", "\"$accountId\"")))
-        val session = client.login("listener", "password")
-        web.takeRequest()
+        val session = try { client.login("listener", "password") }
+        catch (error: IOException) {
+            throw AssertionError("Synthetic login transport failed; received=${web.requestCount}, " +
+                "queued=${client.httpClient.dispatcher.queuedCallsCount()}, " +
+                "running=${client.httpClient.dispatcher.runningCallsCount()}", error)
+        }
+        assertNotNull(web.takeRequest(5, TimeUnit.SECONDS))
         return session
     }
 }

@@ -1,6 +1,9 @@
 package dev.spofify.mobile.playback
 
+import dev.spofify.mobile.OfflineEligibility
+import dev.spofify.mobile.OfflineMediaReference
 import dev.spofify.mobile.core.LibraryItem
+import dev.spofify.mobile.core.QueueIntentIntent
 import dev.spofify.mobile.core.SpofifyClient
 import kotlinx.coroutines.flow.StateFlow
 
@@ -11,11 +14,26 @@ interface PlaybackControls {
     fun consumeFeedback(id: Long) {}
     fun connect()
     fun release()
+    /** Presentation/request retirement after the graph's synchronous mode/epoch boundary. */
+    fun modeChanged() {}
     /** Capture an immutable host-origin fence for deliberate in-app Play/Resume at gesture
      * time. No screen ownership of audio; existing controls need not implement this hook. */
     fun bindExplicitPlayOrigin(capture: () -> (() -> Boolean)) {}
     fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String? = null,
         shuffle: Boolean = false, startEntryId: String? = null)
+    /** Deliberate saved selection only. The entire list is used in order, including duplicate
+     * entries; callers must explicitly choose Play available before passing a partial selection.
+     * Eligibility is an incarnation fence, not a Session/receiver. Unknown controls fail closed. */
+    fun playLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
+        mediaReferences: Map<String, OfflineMediaReference>, startEntryId: String? = null, shuffle: Boolean = false, context: LibraryItem? = null,
+        isCurrent: () -> Boolean = { true }) {}
+    /** Verified local append/immediate-next against an existing local queue. Never starts. */
+    fun enqueueLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
+        mediaReferences: Map<String, OfflineMediaReference>, playNext: Boolean = false, isCurrent: () -> Boolean = { true }) {}
+    /** Named local priorities; High is FIFO after pending High, Low appends, Next is immediate.
+     * Never starts or admits a receiver. Unknown implementations fail closed. */
+    fun enqueueLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
+        mediaReferences: Map<String, OfflineMediaReference>, intent: QueueIntentIntent, isCurrent: () -> Boolean = { true }) {}
     /** Already server-prepared musical intent. Production preserves the optional exact wire
      * envelope; the default keeps existing test/host implementations source-compatible. */
     fun playPrepared(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,

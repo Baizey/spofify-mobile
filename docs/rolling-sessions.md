@@ -57,9 +57,12 @@ clear a successor login. Origin/account switches retain their existing fences.
 Headers already committed by the server before logout may arrive later; these
 client fences are required rather than assuming wire arrival order.
 
-A persisted summary is not live authority. Restore validates the saved origin
-and cookie against `/api/auth/session` before installing a Session. Offline,
-5xx and incompatible/partial responses retain dormant saved auth for retry.
+A persisted summary is not live authority. Ordinary online restore validates the
+saved origin and cookie against `/api/auth/session` before installing a Session.
+An unreachable server, 5xx and incompatible/partial responses retain dormant saved
+auth for retry. Deliberate offline mode instead makes no restore request and may
+use its separate retained-library eligibility, never a live Session; see
+[Deliberate local listening](offline-listening.md).
 A locally stale rolling deadline may result from a lost response or interrupted
 save: it is fenced dormant and may send the original cookie **only for server
 revalidation**, without granting cached/media authority while waiting. The same

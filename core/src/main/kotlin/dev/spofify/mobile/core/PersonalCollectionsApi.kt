@@ -136,25 +136,28 @@ class PersonalCollectionsApi(client: SpofifyClient) {
 
     suspend fun createPlaylist(name: String, description: String? = null): PersonalPlaylistSummary {
         validatePlaylistMetadata(name, description ?: "")
+        val writeGeneration = transport.client.personalMutationGeneration()
         return confirmedPlaylistMutation(transport.client, transport.send("POST", personalPlaylistsPath, buildJsonObject {
             put("name", name)
             description?.let { put("description", it) }
-        }, emptyMap()))
+        }, emptyMap()), writeGeneration)
     }
 
     suspend fun updatePlaylist(id: String, name: String, description: String, expectedRevision: Long): PersonalPlaylistSummary {
         validatePlaylistMetadata(name, description)
         requirePersonalRevision(expectedRevision)
+        val writeGeneration = transport.client.personalMutationGeneration()
         return confirmedPlaylistMutation(transport.client, transport.send("PATCH", personalPlaylistPath(id), buildJsonObject {
             put("name", name); put("description", description); put("expectedRevision", expectedRevision)
-        }, emptyMap()))
+        }, emptyMap()), writeGeneration)
     }
 
     suspend fun deletePlaylist(id: String, expectedRevision: Long) {
+        val writeGeneration = transport.client.personalMutationGeneration()
         if (transport.send("DELETE", personalPlaylistPath(id), revisionBody(expectedRevision), emptyMap()) != null) {
             throw incompatiblePersonalResponse()
         }
-        transport.client.notifyPersonalChange(PersonalCollection.PLAYLISTS)
+        transport.client.notifyPersonalChange(PersonalCollection.PLAYLISTS, writeGeneration)
     }
 
     suspend fun entries(id: String, limit: Int = 40, offset: Int = 0): PersonalEntriesPage {
@@ -193,15 +196,18 @@ class PersonalCollectionsApi(client: SpofifyClient) {
     suspend fun addEntry(id: String, trackId: String, expectedRevision: Long): PersonalPlaylistSummary {
         requirePersonalId(trackId)
         requirePersonalRevision(expectedRevision)
+        val writeGeneration = transport.client.personalMutationGeneration()
         return confirmedPlaylistMutation(transport.client, transport.send("POST", personalPlaylistPath(id) + "entries", buildJsonObject {
             put("trackId", trackId); put("expectedRevision", expectedRevision)
-        }, emptyMap()))
+        }, emptyMap()), writeGeneration)
     }
 
     /** Removes exactly one occurrence, never every copy of a track. */
-    suspend fun removeEntry(id: String, entryId: String, expectedRevision: Long): PersonalPlaylistSummary =
-        confirmedPlaylistMutation(transport.client, transport.send("DELETE", personalPlaylistPath(id) + listOf("entries", requirePersonalId(entryId)),
-            revisionBody(expectedRevision), emptyMap()))
+    suspend fun removeEntry(id: String, entryId: String, expectedRevision: Long): PersonalPlaylistSummary {
+        val writeGeneration = transport.client.personalMutationGeneration()
+        return confirmedPlaylistMutation(transport.client, transport.send("DELETE", personalPlaylistPath(id) + listOf("entries", requirePersonalId(entryId)),
+            revisionBody(expectedRevision), emptyMap()), writeGeneration)
+    }
 
     suspend fun reorder(snapshot: ManualPlaylistSnapshot, entryIds: List<String>): PersonalPlaylistSummary {
         val original = snapshot.entryIds
@@ -210,13 +216,14 @@ class PersonalCollectionsApi(client: SpofifyClient) {
             "Reorder requires an exact permutation of the complete occurrence order"
         }
         requirePersonalRevision(snapshot.playlist.revision)
+        val writeGeneration = transport.client.personalMutationGeneration()
         val body = buildJsonObject {
             putJsonArray("entryIds") { entryIds.forEach { add(JsonPrimitive(requirePersonalId(it))) } }
             put("expectedRevision", snapshot.playlist.revision)
         }
         // Match the server's JSON request-byte admission before dispatching any mutation.
         require(body.toString().toByteArray(Charsets.UTF_8).size <= MANUAL_ORDER_REQUEST_BYTES) { "The playlist order is too large to save" }
-        return confirmedPlaylistMutation(transport.client, transport.send("PUT", personalPlaylistPath(snapshot.playlist.id) + "order", body, emptyMap()))
+        return confirmedPlaylistMutation(transport.client, transport.send("PUT", personalPlaylistPath(snapshot.playlist.id) + "order", body, emptyMap()), writeGeneration)
     }
 
     suspend fun playback(id: String): PersonalPlayback = personalDecode(transport.get(personalPlaylistPath(id) + "playback", emptyMap()))
@@ -260,10 +267,11 @@ internal inline fun <reified T> personalDecode(value: JsonObject): T = try {
 } catch (_: IllegalArgumentException) {
     throw incompatiblePersonalResponse()
 }
-/** Publish only after the entire successful mutation acknowledgement has been decoded and validated. */
-internal fun confirmedPlaylistMutation(client: SpofifyClient, value: JsonObject?): PersonalPlaylistSummary {
+/** Publish only after decoding/validation, using authority captured BEFORE the external send.
+ * Never capture fresh authority here: parsing can span an account switch or offline ABA. */
+internal fun confirmedPlaylistMutation(client: SpofifyClient, value: JsonObject?, expectedGeneration: Long): PersonalPlaylistSummary {
     val summary: PersonalPlaylistSummary = personalDecode(personalRequired(value))
-    client.notifyPersonalChange(PersonalCollection.PLAYLISTS)
+    client.notifyPersonalChange(PersonalCollection.PLAYLISTS, expectedGeneration)
     return summary
 }
 internal fun personalRequired(value: JsonObject?): JsonObject = value ?: throw incompatiblePersonalResponse()

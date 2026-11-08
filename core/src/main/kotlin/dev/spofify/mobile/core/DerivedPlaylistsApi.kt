@@ -208,18 +208,20 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
 
     suspend fun updateDefinition(id: String, definition: JsonObject, expectedRevision: Long): PersonalPlaylistSummary {
         requirePersonalRevision(expectedRevision)
+        val writeGeneration = transport.client.personalMutationGeneration()
         return confirmedPlaylistMutation(transport.client, transport.send("PUT", derivedPath(id, "definition"), buildJsonObject {
             put("definition", definition); put("expectedRevision", expectedRevision)
-        }, emptyMap()))
+        }, emptyMap()), writeGeneration)
     }
 
     suspend fun create(name: String, description: String? = null, definition: JsonObject): PersonalPlaylistSummary {
         validatePlaylistMetadata(name, description ?: "")
+        val writeGeneration = transport.client.personalMutationGeneration()
         return confirmedPlaylistMutation(transport.client, transport.send("POST", personalPlaylistsPath, buildJsonObject {
             put("kind", "derived"); put("name", name)
             description?.let { put("description", it) }
             put("definition", definition)
-        }, emptyMap()))
+        }, emptyMap()), writeGeneration)
     }
 
     /** Normal saved-playlist read: the server owns maintenance and its bounded wait. */
@@ -292,10 +294,11 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
     suspend fun copy(id: String, name: String, description: String? = null, expectedRevision: Long, fence: String): PersonalPlaylistSummary {
         validatePlaylistMetadata(name, description ?: "")
         requirePersonalRevision(expectedRevision); requireOpaqueToken(fence, 4096)
+        val writeGeneration = transport.client.personalMutationGeneration()
         return confirmedPlaylistMutation(transport.client, transport.send("POST", derivedPath(id, "copy"), buildJsonObject {
             put("name", name); description?.let { put("description", it) }
             put("expectedRevision", expectedRevision); put("fence", fence)
-        }, emptyMap()))
+        }, emptyMap()), writeGeneration)
     }
 
     suspend fun create(name: String, description: String? = null, definition: Recipe) = create(name, description, definition.toJson())

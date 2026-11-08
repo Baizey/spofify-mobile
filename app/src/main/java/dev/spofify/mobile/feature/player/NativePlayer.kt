@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Pause
@@ -224,6 +225,8 @@ fun NativeNowPlaying(
     onPlaybackDevices: (() -> Unit)? = null,
     selectedOutputLabel: String = "No output selected",
     queueFeedback: @Composable () -> Unit = {},
+    onlineActionsAvailable: Boolean = true,
+    canOpenItem: (LibraryItem) -> Boolean = { true },
 ) {
     val item = state.item ?: return
     BoxWithConstraints(modifier.fillMaxSize().testTag("now-playing")
@@ -247,15 +250,17 @@ fun NativeNowPlaying(
                 Column(Modifier.fillMaxWidth().testTag("now-playing-essential")) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f).heightIn(min = 48.dp)
-                            .clickable(role = Role.Button, onClickLabel = "Open song details") { onOpenItem(item) }
+                            .clickable(enabled = canOpenItem(item), role = Role.Button,
+                                onClickLabel = "Open song details") { onOpenItem(item) }
                             .padding(vertical = 4.dp)) {
                             Text(item.name, style = MaterialTheme.typography.titleMedium,
                                 maxLines = 2, overflow = TextOverflow.Ellipsis)
                             Text(item.subtitle, color = MaterialTheme.colorScheme.onSurface,
                                 style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         }
-                        LikeButton(liked, likePending, likeFailed, onToggleLike, onRetryLike)
-                        PlayerMore(state, controls, onAddToPlaylist, onOpenItem)
+                        if (onlineActionsAvailable) LikeButton(liked, likePending, likeFailed, onToggleLike, onRetryLike)
+                        else IconButton(onClick = {}, enabled = false) { Icon(Icons.Default.FavoriteBorder, "Like unavailable offline") }
+                        PlayerMore(state, controls, onAddToPlaylist, onOpenItem, onlineActionsAvailable, canOpenItem)
                     }
                     PlaybackSeekBar(state, controls)
                     CenteredTransport(state, controls)
@@ -303,7 +308,8 @@ fun NativeNowPlaying(
                     .padding(horizontal = 8.dp, vertical = 8.dp).testTag("now-playing-queue-view")
                     .semantics { paneTitle = "Queue" }) {
                     // Existing queue owns occurrence actions, reorder/removal/Undo and its sole scroller.
-                    NativeUpcomingQueue(state, controls, onOpenItem, artwork, showStatus = false)
+                    NativeUpcomingQueue(state, controls, onOpenItem, artwork, showStatus = false,
+                        localNavigation = if (onlineActionsAvailable) null else canOpenItem)
                     // Same presentation owner/timer as the player; never hide queue action results
                     // behind this opaque window or cover the last occurrence's controls.
                     queueFeedback()
@@ -369,6 +375,8 @@ private fun PlayerMore(
     controls: PlaybackControls,
     onAddToPlaylist: (LibraryItem) -> Unit,
     onOpenItem: (LibraryItem) -> Unit,
+    onlineActionsAvailable: Boolean,
+    canOpenItem: (LibraryItem) -> Boolean,
 ) {
     val item = state.item ?: return
     var expanded by remember { mutableStateOf(false) }
@@ -378,19 +386,21 @@ private fun PlayerMore(
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             state.context?.let { context ->
-                DropdownMenuItem(text = { Text("Playing from ${context.name}") },
+                DropdownMenuItem(text = { Text("Playing from ${context.name}") }, enabled = canOpenItem(context),
                     onClick = { expanded = false; onOpenItem(context) })
             }
             item.artists.forEach { credit ->
-                DropdownMenuItem(text = { Text(credit.name) }, enabled = credit.id.isNotBlank(),
+                DropdownMenuItem(text = { Text(credit.name) }, enabled = credit.id.isNotBlank() &&
+                    canOpenItem(LibraryItem("artist", credit.id, credit.name)),
                     onClick = { expanded = false; onOpenItem(LibraryItem("artist", credit.id, credit.name)) })
             }
             if (!item.albumId.isNullOrBlank() || !item.albumName.isNullOrBlank()) {
                 val name = item.albumName?.takeIf { it.isNotBlank() } ?: "Open album"
-                DropdownMenuItem(text = { Text(name) }, enabled = !item.albumId.isNullOrBlank(),
+                DropdownMenuItem(text = { Text(name) }, enabled = !item.albumId.isNullOrBlank() &&
+                    canOpenItem(LibraryItem("album", item.albumId.orEmpty(), name)),
                     onClick = { expanded = false; onOpenItem(LibraryItem("album", item.albumId!!, name, artists = item.artists)) })
             }
-            DropdownMenuItem(text = { Text("Add to playlist") },
+            DropdownMenuItem(text = { Text("Add to playlist") }, enabled = onlineActionsAvailable,
                 onClick = { expanded = false; onAddToPlaylist(item) })
             DropdownMenuItem(text = { Text(if (state.shuffle) "Shuffle: on" else "Shuffle: off") },
                 leadingIcon = { Icon(Icons.Default.Shuffle, null) },
