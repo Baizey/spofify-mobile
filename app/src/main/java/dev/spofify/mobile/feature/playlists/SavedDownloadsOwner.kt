@@ -178,12 +178,17 @@ class SavedDownloadsOwner private constructor(private val root: () -> File, ioDi
         playbackHandler.value = handler
     }
 
-    fun playAvailable(snapshot: SavedCollectionSnapshot, occurrenceId: String? = null) {
-        val active = binding.get() ?: return
+    fun playAvailable(snapshot: SavedCollectionSnapshot, occurrenceId: String? = null,
+        expectedBindingRevision: Long? = null) {
+        val active = synchronized(lifecycleLock) {
+            binding.get()?.takeIf { presentationCurrent(expectedBindingRevision) }
+        } ?: return
         val visible = state.value.collections.firstOrNull { it.target == snapshot.target && it.generation == snapshot.generation } ?: return
         val current = {
-            binding.get() === active && eligible(active.scope) && !removing(active.scope, snapshot.target) &&
-                state.value.collections.any { it.target == snapshot.target && it.generation == snapshot.generation } && binding.get() === active
+            presentationCurrent(expectedBindingRevision) && binding.get() === active && eligible(active.scope) &&
+                !removing(active.scope, snapshot.target) &&
+                state.value.collections.any { it.target == snapshot.target && it.generation == snapshot.generation } &&
+                binding.get() === active && presentationCurrent(expectedBindingRevision)
         }
         if (!current() || visible.occurrences.none { it.available && (occurrenceId == null || it.occurrence.occurrenceId == occurrenceId) }) return
         playbackHandler.value?.invoke(active.scope, visible, occurrenceId, current)
@@ -355,9 +360,17 @@ class SavedDownloadsOwner private constructor(private val root: () -> File, ioDi
         finally { commands.close(); io.cancel() }
     }
 
-    internal fun captureAction(): () -> Boolean {
-        val captured = binding.get()
-        return { captured != null && binding.get() === captured && eligible(captured.scope) && binding.get() === captured }
+    private fun presentationCurrent(expectedBindingRevision: Long?): Boolean =
+        expectedBindingRevision == null || mutableState.value.bindingRevision == expectedBindingRevision
+
+    /** UI callers retain the revision of their displayed frame, never sample new authority beside
+     * old metadata. Mutations must also carry that revision through the intent commit below. */
+    internal fun captureAction(expectedBindingRevision: Long? = null): () -> Boolean {
+        val captured = synchronized(lifecycleLock) {
+            binding.get()?.takeIf { presentationCurrent(expectedBindingRevision) }
+        }
+        return { captured != null && presentationCurrent(expectedBindingRevision) && binding.get() === captured &&
+            eligible(captured.scope) && binding.get() === captured && presentationCurrent(expectedBindingRevision) }
     }
 
     init {
@@ -674,12 +687,12 @@ class SavedDownloadsOwner private constructor(private val root: () -> File, ioDi
         }
     }
 
-    fun save(target: SavedTarget, title: String) {
+    fun save(target: SavedTarget, title: String, expectedBindingRevision: Long? = null) {
         val captured = captureLifecycle()
         val active = captured.binding ?: return
         if (!networkCurrent(active)) return
         synchronized(lifecycleLock) {
-            if (!lifecycleCurrent(captured)) return@synchronized
+            if (!lifecycleCurrent(captured) || !presentationCurrent(expectedBindingRevision)) return@synchronized
             val key = RetentionKey(active.scope, target)
             discardPlan(key)
             val intent = RetentionIntent(retentionEpoch(active.scope), saved = true)
@@ -854,12 +867,12 @@ class SavedDownloadsOwner private constructor(private val root: () -> File, ioDi
         }
     }
 
-    fun cancel(target: SavedTarget) {
+    fun cancel(target: SavedTarget, expectedBindingRevision: Long? = null) {
         val captured = captureLifecycle()
         val active = captured.binding ?: return
         if (!eligible(active.scope)) return
         synchronized(lifecycleLock) {
-            if (!lifecycleCurrent(captured)) return@synchronized
+            if (!lifecycleCurrent(captured) || !presentationCurrent(expectedBindingRevision)) return@synchronized
             discardPlan(RetentionKey(active.scope, target))
             mutableState.update { it.copy(working = it.working - target,
                 activeTarget = it.activeTarget?.takeUnless { selected -> selected == target }) }
@@ -869,12 +882,12 @@ class SavedDownloadsOwner private constructor(private val root: () -> File, ioDi
         }
     }
 
-    fun unsave(target: SavedTarget) {
+    fun unsave(target: SavedTarget, expectedBindingRevision: Long? = null) {
         val captured = captureLifecycle()
         val active = captured.binding ?: return
         if (!eligible(active.scope)) return
         synchronized(lifecycleLock) {
-            if (!lifecycleCurrent(captured)) return@synchronized
+            if (!lifecycleCurrent(captured) || !presentationCurrent(expectedBindingRevision)) return@synchronized
             val key = RetentionKey(active.scope, target)
             val intent = RetentionIntent(retentionEpoch(active.scope), saved = false)
             retentionIntents[key] = intent

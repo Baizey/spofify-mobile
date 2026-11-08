@@ -81,6 +81,7 @@ fun MusicRow(
     actionsEnabled: Boolean = true,
     onShowScopedActions: ((LibraryItem, () -> Boolean) -> Unit)? = null,
     onPlayScoped: ((LibraryItem, () -> Boolean) -> Unit)? = null,
+    subtitleOverride: String? = null,
 ) {
     val typography = MaterialTheme.typography
     val titleStyle = typography.bodyMedium.copy(fontWeight = FontWeight.Medium)
@@ -103,7 +104,7 @@ fun MusicRow(
             maxOf(subtitleStyle.lineHeight.roundToPx(), lineHeights[1]).toDp() + 2.dp
     }
     val rowHeight = maxOf(72.dp, copyHeight + 20.dp)
-    val subtitle = compactMusicSubtitle(item)
+    val subtitle = subtitleOverride ?: compactMusicSubtitle(item)
     val current = currentOccurrence ?: (item.kind == "track" && playback.trackId == item.id)
     val canPlay = playbackEnabled && item.playable
     val latestCanPlay by rememberUpdatedState(canPlay)
@@ -208,6 +209,8 @@ fun MusicRow(
 internal fun musicTypeLabel(kind: String): String = when (kind) {
     "artist" -> "Artist"
     "album" -> "Album"
+    "playlist" -> "Playlist"
+    "derived" -> "Derived playlist"
     else -> "Song"
 }
 

@@ -44,6 +44,8 @@ import dev.spofify.mobile.feature.player.NativeNowPlayingDialog
 import dev.spofify.mobile.feature.player.selectedOutputLabel
 import dev.spofify.mobile.feature.playlists.AddToPlaylistSheet
 import dev.spofify.mobile.feature.playlists.PlaylistsRoute
+import dev.spofify.mobile.feature.playlists.SavedCollectionControl
+import dev.spofify.mobile.feature.playlists.savedTarget
 import dev.spofify.mobile.ui.PlaybackFeedbackPresentation
 import dev.spofify.mobile.ui.PlaybackFeedbackTimer
 import dev.spofify.mobile.ui.PlaybackFeedbackHost
@@ -75,6 +77,7 @@ private data class CatalogMoreSelection(
     val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding?,
     val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin?,
     val sourceCurrent: () -> Boolean,
+    val savedBindingRevision: Long,
 )
 
 internal fun listeningColorScheme() = darkColorScheme(
@@ -233,8 +236,11 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             val rowSourceCurrent = { sourceCurrent() && (likesSource == null || model.state.value.let {
                 it.page == Page.Likes && it.likesGeneration == likesSource && !it.likesStale
             }) }
-            if (rowSourceCurrent()) more = CatalogMoreSelection(item, player.interactionKey, actionLifetime,
-                player.queueIntentBinding, player.unselectedQueueOrigin, rowSourceCurrent)
+            if (rowSourceCurrent()) {
+                val savedBindingRevision = model.graph.savedDownloads.state.value.bindingRevision
+                if (rowSourceCurrent()) more = CatalogMoreSelection(item, player.interactionKey, actionLifetime,
+                    player.queueIntentBinding, player.unselectedQueueOrigin, rowSourceCurrent, savedBindingRevision)
+            }
         }
         val openExternal: (LibraryItem) -> Unit = { item ->
             if (sourceCurrent()) {
@@ -332,7 +338,8 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                                 if (sourceCurrent()) model.preparedListAction(client, accountId, prepared, trackId, entryId, action, binding,
                                     preparedGeneration, { sourceCurrent() && isCurrent() })
                             },
-                            browseMemory = playlistBrowse, sourceEpoch = sourceEpoch)
+                            browseMemory = playlistBrowse, sourceEpoch = sourceEpoch,
+                            savedDownloads = model.graph.savedDownloads)
                         Page.Likes -> LikedSongs(state, model, openExternal, play, showMore, queue, art,
                             feedback, likeStates, contentModifier)
                         Page.Settings -> SettingsScreen(
@@ -412,7 +419,12 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                     onToggleLike = { if (isCurrent()) model.likeAction(item) },
                     onRetryLike = { if (isCurrent()) model.checkLike(item) },
                     onAddToPlaylist = { if (isCurrent()) { more = null; addToPlaylist = item } },
-                    onOpenItem = { target -> if (isCurrent()) { more = null; openExternal(target) } }, artwork = art)
+                    onOpenItem = { target -> if (isCurrent()) { more = null; openExternal(target) } }, artwork = art,
+                    libraryContent = if (item.savedTarget() != null) ({
+                        SavedCollectionControl(model.graph.savedDownloads, checkNotNull(item.savedTarget()), item.name,
+                            actionsEnabled = isCurrent(), isCurrent = isCurrent,
+                            expectedBindingRevision = selection.savedBindingRevision)
+                    }) else null)
             }
         }
         addToPlaylist?.let { item -> AddToPlaylistSheet(client, item, onDismiss = {

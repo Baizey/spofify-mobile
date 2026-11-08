@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.geometry.Rect
@@ -169,6 +170,10 @@ internal class PlaylistIndexBrowseMemory {
 
 internal data class PlaylistScrollAnchor(val key: Any?, val index: Int, val offset: Int)
 
+/** One successful server read keeps its original retention frame; it is not local authority. */
+internal data class SavedPlaylistControlFrame(val summary: PersonalPlaylistSummary,
+    val source: PlaylistSourceStamp, val bindingRevision: Long)
+
 internal class PlaylistDetailBrowseMemory(change: Long,
     projectionDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default) {
     val initialized = mutableStateOf(false)
@@ -176,6 +181,20 @@ internal class PlaylistDetailBrowseMemory(change: Long,
     val entries = mutableStateOf<PersonalEntriesPage?>(null)
     val evaluation = mutableStateOf<DerivedEvaluationPage?>(null)
     val readSource = mutableStateOf<PlaylistSourceStamp?>(null)
+    val savedControlFrame = mutableStateOf<SavedPlaylistControlFrame?>(null)
+
+    internal fun publishRead(response: PersonalPlaylistSummary, source: PlaylistSourceStamp, bindingRevision: Long?) {
+        Snapshot.withMutableSnapshot {
+            summary.value = response
+            readSource.value = source
+            // Structural state equality can retain an older equal object. Pair with the value
+            // actually published, not the fresh response reference that state did not install.
+            savedControlFrame.value = bindingRevision?.let {
+                SavedPlaylistControlFrame(checkNotNull(summary.value), source, it)
+            }
+        }
+    }
+
     val manualEntries = mutableStateOf<List<PersonalPlaylistEntry>>(emptyList())
     val derivedEntries = mutableStateOf<List<DerivedEvaluationEntry>>(emptyList())
     val offset = mutableIntStateOf(0)
@@ -220,6 +239,7 @@ fun PlaylistsRoute(
     artwork: @Composable (LibraryItem, Modifier) -> Unit = { _, artModifier -> Icon(Icons.Default.MusicNote, null, artModifier) },
     browseMemory: PlaylistBrowseMemory? = null,
     sourceEpoch: Any? = null,
+    savedDownloads: SavedDownloadsOwner? = null,
 ) {
     key(client, PlaylistSessionIdentity(client.currentSession())) {
         val memory = remember(browseMemory) { browseMemory ?: PlaylistBrowseMemory() }
@@ -230,6 +250,9 @@ fun PlaylistsRoute(
         var creating by remember { mutableStateOf(false) }
         var newDraft by remember { mutableStateOf(PlaylistEditorDraft()) }
         val index = memory.index
+        val savedLibrary = savedDownloads?.state?.collectAsState()?.value
+        val savedPlaylistIds = savedLibrary?.collections.orEmpty()
+            .filter { it.target.matchesPlaylist(it.target.id) }.mapTo(hashSetOf()) { it.target.id }
         var refresh by index.refresh
         var offset by index.offset
         var page by index.page
@@ -306,9 +329,11 @@ fun PlaylistsRoute(
             onDispose { requests.invalidate(); indexJob?.cancel(); loading = false; appending = false }
         }
         val indexChanged = page != null && (changes.playlists != baselineChange || changes.likes != baselineLikes)
+        val renderedServerPlaylists = page?.items.orEmpty().filterNot { it.id in savedPlaylistIds }
         if (selectedId == null && !creating) AutomaticListDemand(listState, refresh,
-            page?.items.orEmpty().takeLast(3).map { it.id },
-            !loading && !appending && appendError == null && message == null && !indexChanged && offset < (page?.total ?: 0)) { loadIndex() }
+            savedIndexFrontier(renderedServerPlaylists.map { it.id }, savedLibrary?.collections?.lastOrNull()?.target),
+            frontierProgress = Triple(offset, baselineChange, baselineLikes),
+            enabled = !loading && !appending && appendError == null && message == null && !indexChanged && offset < (page?.total ?: 0)) { loadIndex() }
         when {
             creating -> PlaylistEditor(client, null, newDraft, onBack = { creating = false }, onSaved = {
                 creating = false; newDraft = PlaylistEditorDraft(); selectedId = it.id; refresh++
@@ -322,7 +347,7 @@ fun PlaylistsRoute(
                     playbackEntryId = playbackEntryId, playbackContext = playbackContext, onQueueIntent = onQueueIntent,
                     onUnselectedHigh = onUnselectedHigh, browse = memory.detail(detailId, changes.playlists),
                     navigationCurrent = { memory.navigationVersion.longValue == navigation && selectedId == detailId },
-                    sourceEpoch = sourceEpoch, artwork = artwork)
+                    sourceEpoch = sourceEpoch, artwork = artwork, savedDownloads = savedDownloads)
             }
             else -> LazyColumn(modifier.fillMaxSize(), state = listState,
                 contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -334,13 +359,20 @@ fun PlaylistsRoute(
                     message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     if (indexChanged && loading) Text("Playlists changed. Updating list…")
                 }
-                items(page?.items.orEmpty(), key = { it.id }) { playlist ->
+                // Saved identities have stable keys/positions as further server pages arrive.
+                items(savedLibrary?.collections.orEmpty(), key = { "saved:${it.target.kind}:${it.target.id}" }) { saved ->
+                    if (savedDownloads != null) SavedCollectionIndexRow(saved, savedDownloads,
+                        bindingRevision = checkNotNull(savedLibrary).bindingRevision,
+                        onOpenServerPlaylist = if (saved.target.matchesPlaylist(saved.target.id))
+                            ({ memory.openPlaylist(saved.target.id) }) else null)
+                }
+                items(renderedServerPlaylists, key = { it.id }) { playlist ->
                     PlaylistCard(playlist, onClick = { memory.openPlaylist(playlist.id) })
                 }
                 item {
                     AppendStatus(appending, if (loading || appending) null else appendError,
                         onRetry = { loadIndex(reset = failedIndexReset, retry = true) }, loadingLabel = "Loading more playlists")
-                    if (!loading && page?.total == 0) Text("No playlists yet.")
+                    if (!loading && page?.total == 0 && savedLibrary?.collections.isNullOrEmpty()) Text("No playlists yet.")
                 }
             }
         }
@@ -394,6 +426,7 @@ private fun PlaylistDetail(
     browse: PlaylistDetailBrowseMemory,
     navigationCurrent: () -> Boolean,
     sourceEpoch: Any?,
+    savedDownloads: SavedDownloadsOwner?,
 ) {
     val api = remember(client) { PersonalCollectionsApi(client) }
     val derived = remember(client) { DerivedPlaylistsApi(client) }
@@ -552,6 +585,7 @@ private fun PlaylistDetail(
         val reconcilesBlockedWrite = reconcileOnNextRead
         reconcileOnNextRead = false
         val source = PlaylistSourceStamp(client)
+        val savedBindingRevision = savedDownloads?.state?.value?.bindingRevision
         appendJob?.cancel(); appending = false; usedCursors = emptySet()
         val ticket = generation.invalidate()
         val request = browseRequests.invalidate()
@@ -575,8 +609,8 @@ private fun PlaylistDetail(
             }
             if (change != client.personalRevision.value.playlists) throw playlistBrowseChanged()
             if (current()) {
-                summary = saved; entries = manual; evaluation = result
-                readSource = source
+                browse.publishRead(saved, source, savedBindingRevision)
+                entries = manual; evaluation = result
                 manualEntries = manual?.items.orEmpty()
                 derivedEntries = if (result == null) emptyList() else if (result.current || result.items.isNotEmpty()) result.items
                     else derivedEntries.map { it.copy(selectionToken = null) }
@@ -690,6 +724,7 @@ private fun PlaylistDetail(
         if (!busy) when { editing -> editing = false; copying -> copying = false; snapshot != null -> refreshAll(); else -> onBack() }
     }
     val saved = summary
+    val savedControlFrame = browse.savedControlFrame.value?.takeIf { it.summary === saved && it.source === readSource }
     fun captureCurrent(rowCurrent: () -> Boolean = { true }): () -> Boolean {
         val ticket = generation.ticket()
         val source = readSource
@@ -997,6 +1032,18 @@ private fun PlaylistDetail(
                     }, modifier = Modifier.size(48.dp)) {
                         Icon(Icons.Default.MoreVert, "More actions for ${saved?.name ?: "playlist"}")
                     }
+                }
+                if (savedDownloads != null && saved != null && savedControlFrame != null) {
+                    val sourceCurrent = sourceLifetime(captureCurrent())
+                    val downloadCurrent = {
+                        browse.summary.value === savedControlFrame.summary && browse.readSource.value === savedControlFrame.source &&
+                            savedControlFrame.source.isCurrent() && sourceCurrent()
+                    }
+                    SavedCollectionControl(savedDownloads, dev.spofify.mobile.core.saved.SavedTarget(
+                        if (saved.kind == PlaylistKind.DERIVED) dev.spofify.mobile.core.saved.SavedTargetKind.DERIVED_PLAYLIST
+                        else dev.spofify.mobile.core.saved.SavedTargetKind.MANUAL_PLAYLIST, id), saved.name,
+                        actionsEnabled = downloadCurrent(), isCurrent = downloadCurrent,
+                        expectedBindingRevision = savedControlFrame.bindingRevision)
                 }
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 message?.let { Text(it, color = MaterialTheme.colorScheme.error) }

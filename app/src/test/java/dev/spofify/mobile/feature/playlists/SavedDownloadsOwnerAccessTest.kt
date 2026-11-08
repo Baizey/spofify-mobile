@@ -89,6 +89,161 @@ class SavedDownloadsOwnerAccessTest {
         media
     }
 
+    @Test fun staleFrameCannotCaptureSuccessorOrRecaptureSameScopeABA() = runTest {
+        val root = temporary.newFolder("frame-capture")
+        val nextScope = scope.copy(accountId = "next-account")
+        seed(root)
+        seed(root, nextScope)
+        val owner = SavedDownloadsOwner(StandardTestDispatcher(testScheduler)) { root }
+        val source = client()
+        try {
+            owner.configure(source)
+            owner.setLocalEligibility(SavedLocalEligibility { it == scope || it == nextScope })
+            assertTrue(owner.bindLocal(source, scope))
+            assertEquals(1, requireNotNull(owner.access { true }).collections().size)
+            val revisionA = owner.state.value.bindingRevision
+            val guardA = owner.captureAction(revisionA)
+            assertTrue(guardA())
+            assertTrue(owner.bindLocal(source, nextScope))
+            assertEquals(1, requireNotNull(owner.access { true }).collections().size)
+            assertFalse(guardA())
+            assertTrue("A fresh unscoped capture would authorize B", owner.captureAction()())
+            assertFalse("An old collected frame cannot capture B", owner.captureAction(revisionA)())
+            val revisionB = owner.state.value.bindingRevision
+            val guardB = owner.captureAction(revisionB)
+            assertTrue(guardB())
+            assertTrue(owner.bindLocal(source, nextScope))
+            owner.access { true }
+            assertFalse("Same-scope binding ABA still changes the frame incarnation", guardB())
+            assertFalse(owner.captureAction(revisionB)())
+            assertTrue(owner.captureAction(owner.state.value.bindingRevision)())
+        } finally { owner.close() }
+    }
+
+    @Test fun staleFrameUnsaveCannotRemoveSuccessorEvenAfterOldGuardAlreadyPassed() = runTest {
+        val root = temporary.newFolder("frame-unsave")
+        val nextScope = scope.copy(accountId = "next-account")
+        seed(root)
+        seed(root, nextScope)
+        val owner = SavedDownloadsOwner(StandardTestDispatcher(testScheduler)) { root }
+        val source = client()
+        var closed = false
+        try {
+            owner.configure(source)
+            owner.setLocalEligibility(SavedLocalEligibility { it == scope || it == nextScope })
+            assertTrue(owner.bindLocal(source, scope))
+            owner.access { true }
+            val revisionA = owner.state.value.bindingRevision
+            assertTrue(owner.captureAction(revisionA)()) // The UI check already passed before the switch.
+            assertTrue(owner.bindLocal(source, nextScope))
+            val successor = requireNotNull(owner.access { true }).collections().single()
+            assertEquals(target, successor.target)
+            owner.unsave(target, expectedBindingRevision = revisionA)
+            owner.ownedBytes()
+            assertEquals(listOf(target), requireNotNull(owner.access { true }).collections().map { it.target })
+            val revisionB = owner.state.value.bindingRevision
+            owner.unsave(target, expectedBindingRevision = revisionB)
+            owner.ownedBytes()
+            assertTrue(requireNotNull(owner.access { true }).collections().isEmpty())
+            owner.close()
+            closed = true
+            SavedLibraryStore(root, SavedLocalEligibility { it == nextScope }).use { store ->
+                store.bind(nextScope)
+                assertTrue("Only the fresh B intent durably removes B", store.snapshots(nextScope).isEmpty())
+            }
+        } finally { if (!closed) owner.close() }
+    }
+
+    @Test fun staleFrameCannotSaveOrCancelValidatedSuccessorPlans() = runTest {
+        val web = MockWebServer()
+        web.start()
+        val origin = "http://127.0.0.1:${web.port}"
+        val scopeA = SavedScope(origin, "account-a")
+        val scopeB = SavedScope(origin, "account-b")
+        val root = temporary.newFolder("frame-network-intents")
+        seed(root, scopeA)
+        seed(root, scopeB)
+        val owner = SavedDownloadsOwner(StandardTestDispatcher(testScheduler)) { root }
+        val source = client(origin)
+        var demand: SavedPlaybackDemand? = null
+        try {
+            owner.configure(source)
+            owner.setLocalEligibility(SavedLocalEligibility { it == scopeA || it == scopeB })
+            assertTrue(owner.bindLocal(source, scopeA))
+            owner.access { true }
+            val revisionA = owner.state.value.bindingRevision
+            assertTrue(owner.captureAction(revisionA)())
+            source.onAuthenticationChanged = { owner.authenticationChanged(source, it) }
+            web.enqueue(MockResponse().setHeader("Content-Type", "application/json")
+                .addHeader("Set-Cookie", "spofify_session=synthetic-b; Path=/; HttpOnly; Max-Age=3600")
+                .setBody("""{"accountId":"account-b","username":"listener-b","role":"user","csrfToken":"synthetic-b"}"""))
+            source.login("listener-b", "synthetic-password")
+            assertEquals("/api/auth/login", web.takeRequest(5, TimeUnit.SECONDS)?.path)
+            assertEquals(1, requireNotNull(owner.access { true }).collections().size)
+            assertEquals(scopeB, owner.currentScope())
+            demand = owner.playbackDemand(source).also { it.setActive(true) }
+            val revisionB = owner.state.value.bindingRevision
+            owner.save(target, "Accepted B", expectedBindingRevision = revisionB)
+            owner.ownedBytes()
+            assertEquals(setOf(target), owner.state.value.working)
+            val staleOnlyTarget = SavedTarget(SavedTargetKind.ALBUM, "old-a-only")
+            owner.save(staleOnlyTarget, "Wrong A intent", expectedBindingRevision = revisionA)
+            assertEquals("An old Save cannot add a plan under B", setOf(target), owner.state.value.working)
+            owner.cancel(target, expectedBindingRevision = revisionA)
+            assertEquals("An old Cancel cannot discard B's accepted plan", setOf(target), owner.state.value.working)
+            owner.cancel(target, expectedBindingRevision = revisionB)
+            assertTrue(owner.state.value.working.isEmpty())
+            owner.save(staleOnlyTarget, "Fresh B intent", expectedBindingRevision = revisionB)
+            owner.ownedBytes()
+            assertEquals(setOf(staleOnlyTarget), owner.state.value.working)
+            assertEquals("Playback priority keeps all accepted plans network-deferred", 1, web.requestCount)
+        } finally {
+            source.onAuthenticationChanged = null
+            owner.close()
+            demand?.close()
+            source.httpClient.dispatcher.cancelAll()
+            source.httpClient.connectionPool.evictAll()
+            source.httpClient.dispatcher.executorService.shutdown()
+            web.shutdown()
+        }
+    }
+
+    @Test fun staleFramePlayCannotReauthorizeSameGenerationAfterBindingABA() = runTest {
+        val root = temporary.newFolder("frame-play")
+        seedVerified(root)
+        val owner = SavedDownloadsOwner(StandardTestDispatcher(testScheduler)) { root }
+        val source = client()
+        try {
+            owner.configure(source)
+            owner.setLocalEligibility(SavedLocalEligibility { it == scope })
+            assertTrue(owner.bindLocal(source, scope))
+            val snapshotA = requireNotNull(owner.access { true }).collections().single()
+            val revisionA = owner.state.value.bindingRevision
+            assertTrue(owner.captureAction(revisionA)())
+            assertTrue(owner.bindLocal(source, scope))
+            val snapshotB = requireNotNull(owner.access { true }).collections().single()
+            val revisionB = owner.state.value.bindingRevision
+            assertEquals(snapshotA.generation, snapshotB.generation)
+            assertEquals(snapshotA.occurrences, snapshotB.occurrences)
+            var calls = 0
+            var acceptedGuard: (() -> Boolean)? = null
+            owner.setPlaybackHandler { admittedScope, _, _, isCurrent ->
+                assertEquals(scope, admittedScope)
+                assertTrue(isCurrent())
+                calls++
+                acceptedGuard = isCurrent
+            }
+            owner.playAvailable(snapshotA, expectedBindingRevision = revisionA)
+            assertEquals("Matching generation/media must not recapture a successor", 0, calls)
+            owner.playAvailable(snapshotB, expectedBindingRevision = revisionB)
+            assertEquals(1, calls)
+            assertTrue(requireNotNull(acceptedGuard)())
+            assertTrue(owner.bindLocal(source, scope))
+            owner.access { true }
+            assertFalse("The consumer retains the captured frame guard through later waits", requireNotNull(acceptedGuard)())
+        } finally { owner.close() }
+    }
+
     @Test fun staleLocalAdmissionCannotRetireOrStompNewValidatedAccountAndAcceptedDownload() = runTest {
         val web = MockWebServer()
         web.start()
