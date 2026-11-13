@@ -73,7 +73,8 @@ class SpofifyClientOfflineTest {
         val changes = mutableListOf<AuthenticationChange>()
         client.onAuthenticationChanged = { changes.add(it) }
         ioFailure { client.library() }
-        ioFailure { ApiTransport(client).get(listOf("api", "me", "player")) }
+        ioFailure { ApiTransport(client).get(listOf("api", "me", "playlists")) }
+        ioFailure { client.openLibraryPlayback(this@runBlocking, "Phone", "phone", true).close() }
         ioFailure { client.login("listener", "synthetic-password") }
         ioFailure { client.restore() }
         for (path in listOf("artwork", "audio")) {
@@ -112,31 +113,39 @@ class SpofifyClientOfflineTest {
         assertEquals(1, web.requestCount)
     }
 
-    @Test fun offlineLogoutRetiresLocallyWithoutLogoutOrLeaveTraffic() = runBlocking {
+    @Test fun offlineLogoutRetiresLocallyWithoutLogoutOrPlaybackAdmissionTraffic() = runBlocking {
         val live = login()
-        val leave = client.preparePlaybackLeave("phone")
         client.setOffline(true)
         client.logout()
-        ioFailure { leave() }
+        ioFailure { client.openLibraryPlayback(this@runBlocking, "Phone", "phone", true).close() }
         assertNull(client.currentSession())
         assertFalse(client.hasValidSession(live))
         assertNull(store.value)
         assertEquals(1, web.requestCount)
     }
 
-    @Test fun capturedCallAndPreparedLeaveCannotReviveAcrossOfflineAba() = runBlocking {
+    @Test fun capturedCallAndPendingPlaybackAdmissionCannotReviveAcrossOfflineAba() = runBlocking {
         login()
         val call = client.httpClient.newCall(Request.Builder().url(client.server.url("old-artwork")).build())
-        val leave = client.preparePlaybackLeave("phone")
-        client.setOffline(true)
-        client.setOffline(false)
-        assertTrue(call.isCanceled())
-        ioFailure { call.execute().close() }
-        ioFailure { leave() }
-        assertEquals(1, web.requestCount)
-        web.enqueue(jsonResponse("{\"items\":[],\"total\":0}"))
+        val release = CountDownLatch(1)
+        delayed(release, jsonResponse("""{"ticket":"${"a".repeat(64)}"}"""))
+        val pending = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
+            runCatching { client.openLibraryPlayback(this@runBlocking, "Phone", "phone", true).close() }
+        }
+        try {
+            takeRequest()
+            client.setOffline(true)
+            client.setOffline(false)
+            assertTrue(call.isCanceled())
+            ioFailure { call.execute().close() }
+            assertTrue(withTimeout(5000) { pending.await() }.exceptionOrNull() is IOException)
+        } finally { release.countDown() }
+        assertEquals(2, web.requestCount) // Login + original ticket only: no upgrade/replay.
+        web.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest) = jsonResponse("{\"items\":[],\"total\":0}")
+        }
         assertTrue(client.library().items.isEmpty())
-        assertEquals(2, web.requestCount) // Only fresh explicit online work is admitted.
+        assertEquals(3, web.requestCount) // Only fresh explicit online work is admitted.
     }
 
     @Test fun unchangedOnlineSettingDoesNotCancelFreshWork() = runBlocking {
@@ -369,25 +378,31 @@ class SpofifyClientOfflineTest {
         assertEquals(2, web.requestCount)
     }
 
-    @Test fun isolatedInflightLeaveIsCancelledByEntryButNotOrdinaryCancelAll() = runBlocking {
-        login()
-        val leave = client.preparePlaybackLeave("phone")
-        client.clearSession()
-        client.httpClient.dispatcher.cancelAll()
-        web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
-        val pending = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) { runCatching { leave() } }
-        takeRequest()
-        client.setOffline(true)
-        assertTrue(withTimeout(5000) { pending.await() }.exceptionOrNull() is IOException)
-        assertEquals(2, web.requestCount)
+    @Test fun inflightPlaybackAdmissionIsCancelledByOfflineEntryWithoutAnUpgrade() = runBlocking {
+        val live = login()
+        val saved = store.value
+        val release = CountDownLatch(1)
+        delayed(release, jsonResponse("""{"ticket":"${"a".repeat(64)}"}"""))
+        val pending = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
+            runCatching { client.openLibraryPlayback(this@runBlocking, "Phone", "phone", true).close() }
+        }
+        try {
+            takeRequest()
+            client.setOffline(true)
+            assertTrue(withTimeout(5000) { pending.await() }.exceptionOrNull() is IOException)
+        } finally { release.countDown() }
+        assertSame(live, client.currentSession())
+        assertEquals(saved, store.value)
+        assertEquals(2, web.requestCount) // Login + canceled ticket; no socket or cleanup request.
     }
 
-    @Test fun offlinePreparedLeaveDoesNotBecomeUsableOnExit() = runBlocking {
-        login()
+    @Test fun offlinePlaybackAdmissionIsRejectedRatherThanDeferredUntilExit() = runBlocking {
+        val live = login()
         client.setOffline(true)
-        val leave = client.preparePlaybackLeave("phone")
+        ioFailure { client.openLibraryPlayback(this@runBlocking, "Phone", "phone", true).close() }
+        assertEquals(1, web.requestCount)
         client.setOffline(false)
-        ioFailure { leave() }
+        assertSame(live, client.currentSession())
         assertEquals(1, web.requestCount)
     }
 

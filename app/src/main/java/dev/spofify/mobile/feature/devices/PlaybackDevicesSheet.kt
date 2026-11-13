@@ -21,7 +21,7 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.spofify.mobile.core.PlaybackDevice
+import dev.spofify.mobile.core.LibraryPlaybackDevice
 import dev.spofify.mobile.ui.LoadingRing
 
 /** Presentation only: dismissing the picker never tears down output ownership or heartbeats. */
@@ -29,8 +29,6 @@ import dev.spofify.mobile.ui.LoadingRing
 @Composable
 fun PlaybackDevicesSheet(coordinator: PlaybackCoordinator, onDismiss: () -> Unit) {
     val state by coordinator.state.collectAsStateWithLifecycle()
-    // One authenticated read is presentation, not a receiving service heartbeat/registration.
-    LaunchedEffect(coordinator) { if (coordinator.state.value.view == null) coordinator.retry() }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         key(coordinator) {
             PlaybackDevicesContent(state, onDismiss, coordinator::retry, coordinator::continuePlaybackHere,
@@ -49,22 +47,17 @@ internal fun ColumnScope.PlaybackDevicesContent(
     onRename: (String, String) -> Unit,
 ) {
     val viewOnly = state.deviceId.isEmpty()
-    val checkingConnection = state.connecting || state.verifyingConnection
-    // A heartbeat checks authority, not whether an accepted device view is usable.
-    val showConnectionProgress = checkingConnection &&
-        (state.view == null || state.recovery == PlaybackConnectionRecovery.VERIFICATION_NEEDED)
+    val showConnectionProgress = state.connecting && state.snapshot == null
     var editing by remember { mutableStateOf<String?>(null) }
     var draft by remember { mutableStateOf("") }
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
         Text("Playback devices", style = MaterialTheme.typography.titleLarge)
-        if (viewOnly) Text("Playback transfer unavailable on this phone.",
-            Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.bodyMedium)
         if (state.message.isNotEmpty() && state.messagePurpose == PlaybackDevicesMessagePurpose.GUIDANCE) Text(state.message,
             Modifier.padding(vertical = 12.dp).semantics { liveRegion = LiveRegionMode.Polite })
         if (showConnectionProgress) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (state.retryAvailable) TextButton(onClick = onRetry) { Text("Retry connection") }
         if (!viewOnly && state.needsTap) Button(onClick = onContinue) { Text("Continue playback here") }
-        if (state.view != null && state.devices.isEmpty()) Text("No devices available.")
+        if (state.snapshot != null && state.devices.isEmpty()) Text("No devices available.")
         LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).testTag("Playback device list")) {
             items(state.devices, key = { it.deviceId }) { device ->
                 PlaybackDeviceCard(state, device, editing == device.deviceId && !viewOnly, draft,
@@ -80,24 +73,31 @@ internal fun ColumnScope.PlaybackDevicesContent(
 
 @Composable
 internal fun PlaybackDeviceCard(
-    state: PlaybackDevicesState, device: PlaybackDevice, editing: Boolean, draft: String,
+    state: PlaybackDevicesState, device: LibraryPlaybackDevice, editing: Boolean, draft: String,
     onDraft: (String) -> Unit, onSelect: () -> Unit, onEdit: () -> Unit,
     onSave: () -> Unit, onCancel: () -> Unit,
 ) {
-    val active = device.deviceId == state.activeDeviceId
     val selected = device.deviceId == state.selectedDeviceId
+    val active = selected && state.snapshot?.transfer == null
     val viewOnly = state.deviceId.isEmpty()
-    val musical = state.view?.state
+    val musical = state.snapshot?.playback?.takeIf { it.hasReportedPlayback }
     val status = listOfNotNull(
         "This device".takeIf { device.deviceId == state.deviceId },
-        when { !device.available -> "Unavailable"; !active -> null; musical?.error == "blocked" -> "Needs a tap"; musical?.playing == true -> "Active output · Playing"; else -> "Active output · Paused" },
+        when {
+            !device.available -> "Unavailable"
+            !active -> null
+            musical?.error == "blocked" -> "Needs a tap"
+            musical?.isPlaying == true -> "Selected output · Playing"
+            musical != null -> "Selected output · Paused"
+            else -> "Selected output"
+        },
     ).joinToString(" · ")
     val measurer = rememberTextMeasurer()
     val density = LocalDensity.current
     val actionStyle = MaterialTheme.typography.labelLarge
     // A stable trailing slot, measured with production scaled typography, never competes with identity.
     val renameWidth = with(density) { measurer.measure("Rename", actionStyle, softWrap = false).size.width.toDp() } + 24.dp
-    val canSelect = device.available && !viewOnly && !selected && (!active || state.selectedDeviceId.isNotEmpty())
+    val canSelect = device.available && !viewOnly && !selected
     val pending = state.pendingSelection?.deviceId == device.deviceId
     val ringSize = with(density) { MaterialTheme.typography.bodyMedium.fontSize.toDp() }
     val selectionModifier = if (editing) Modifier else Modifier.clickable(
@@ -144,6 +144,6 @@ private fun RenameDeviceButton(name: String, width: androidx.compose.ui.unit.Dp,
 @Composable
 fun DevicePickerButton(coordinator: PlaybackCoordinator, onClick: () -> Unit, modifier: Modifier = Modifier) {
     val state by coordinator.state.collectAsStateWithLifecycle()
-    val active = state.devices.find { it.deviceId == state.activeDeviceId }
+    val active = state.devices.find { it.deviceId == state.selectedDeviceId }
     TextButton(onClick = onClick, modifier = modifier) { Text(active?.let { "Devices · ${it.name}" } ?: "Playback devices") }
 }

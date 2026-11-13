@@ -348,7 +348,7 @@ class PlaylistManagementHostTest {
                 MaterialTheme(colorScheme = dev.spofify.mobile.listeningColorScheme(),
                     typography = dev.spofify.mobile.ui.theme.AppTypography) {
                     androidx.compose.material3.Surface {
-                    if (shown.value) PlaylistsRoute(fixture.client, {}, { _, _, _ -> fail("Browsing/management must not prepare playback") }, {},
+                    if (shown.value) PlaylistsRoute(fixture.client, {}, {},
                         initialPlaylistId = initialPlaylistId) // Intentionally no onQueueIntent or prepared-action callback.
                     }
                 }

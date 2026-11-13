@@ -69,22 +69,20 @@ class LikedSongsHostTest {
         }
     }
     private data class Pending(
-        val selection: QueueIntentSelection, val action: PlaybackListAction,
-        val key: PlaybackInteractionKey?, val binding: QueueIntentBinding?,
+        val selection: LibraryPlaybackSelection, val action: PlaybackListAction,
+        val key: PlaybackInteractionKey?, val binding: dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding?,
         val current: () -> Boolean, val complete: (PlaybackActionResult) -> Unit,
     )
     private class Controls : PlaybackControls {
         override val state = MutableStateFlow(PlaybackState(interactionKey = PlaybackInteractionKey(),
-            queueIntentBinding = QueueIntentBinding("phone", "receiver", 7, 1, "synthetic-history"), canQueueIntent = true))
+            queueIntentBinding = dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding("phone", "receiver", 7, 1, 1), canQueueIntent = true))
         val pending = mutableListOf<Pending>()
-        override fun queueIntent(selection: QueueIntentSelection, client: SpofifyClient, action: PlaybackListAction,
-            expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?, isCurrent: () -> Boolean,
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient, action: PlaybackListAction,
+            expectedKey: PlaybackInteractionKey?, expectedBinding: dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding?, shuffle: Boolean?, isCurrent: () -> Boolean,
             onResult: (PlaybackActionResult) -> Unit) {
             pending += Pending(selection, action, expectedKey, expectedBinding, isCurrent, onResult)
         }
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean,
-            startEntryId: String?) = error("Browsing must not replace playback")
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) = error("No legacy enqueue fallback")
+
         override fun connect() = Unit
         override fun release() = Unit
         override fun toggle() = error("Browsing must not toggle playback")
@@ -311,9 +309,9 @@ class LikedSongsHostTest {
             assertEquals(PlaybackListAction.PLAY_NOW, pending.action)
             assertSame(rendered.interactionKey, pending.key)
             assertEquals(rendered.queueIntentBinding, pending.binding)
-            val selected = pending.selection as QueueIntentSelection.Track
-            assertEquals(retained.title, selected.track.getValue("name").jsonPrimitive.content)
-            assertEquals(PlaybackContext("likes", "likes", "Liked songs"), selected.context)
+            val selected = pending.selection as LibraryPlaybackSelection.Track
+            assertEquals("song-${retained.title.substringAfter("Song ").toInt()}", selected.track.id)
+            assertEquals(LibraryPlaybackContext("likes", "liked-songs", "Liked songs"), selected.context)
             assertTrue(pending.current())
             assertEquals(Page.Likes, model.state.value.page)
             pending.complete(PlaybackActionResult(PlaybackActionStatus.PLAYING, 1))
@@ -401,8 +399,8 @@ class LikedSongsHostTest {
         val pending = compose.runOnIdle { controls.pending.single() }
         compose.runOnIdle {
             assertTrue("Unchanged prefix action is valid while the read is held", pending.current())
-            val selected = pending.selection as QueueIntentSelection.Track
-            assertEquals(retained.title, selected.track.getValue("name").jsonPrimitive.content)
+            val selected = pending.selection as LibraryPlaybackSelection.Track
+            assertEquals("song-${retained.title.substringAfter("Song ").toInt()}", selected.track.id)
             assertEquals(PlaybackListAction.QUEUE_LOW, pending.action)
         }
         // Hold a second, real physical-right gesture across the detected source change.
@@ -648,9 +646,9 @@ class LikedSongsHostTest {
             val pending = controls.pending.single()
             assertEquals(PlaybackListAction.QUEUE_HIGH, pending.action)
             assertSame(key, pending.key); assertEquals(binding, pending.binding)
-            val selection = pending.selection as QueueIntentSelection.Track
-            assertEquals(retained.title, selection.track.getValue("name").jsonPrimitive.content)
-            assertEquals(PlaybackContext("likes", "likes", "Liked songs"), selection.context)
+            val selection = pending.selection as LibraryPlaybackSelection.Track
+            assertEquals("song-${retained.title.substringAfter("Song ").toInt()}", selection.track.id)
+            assertEquals(LibraryPlaybackContext("likes", "liked-songs", "Liked songs"), selection.context)
             assertTrue(pending.current())
             pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
         }
@@ -682,9 +680,9 @@ class LikedSongsHostTest {
         compose.runOnIdle {
             assertTrue("Append cannot expire an already open unchanged row More", pending.current())
             assertSame(key, pending.key); assertEquals(binding, pending.binding)
-            val selection = pending.selection as QueueIntentSelection.Track
-            assertEquals(retained.title, selection.track.getValue("name").jsonPrimitive.content)
-            assertEquals(PlaybackContext("likes", "likes", "Liked songs"), selection.context)
+            val selection = pending.selection as LibraryPlaybackSelection.Track
+            assertEquals("song-${retained.title.substringAfter("Song ").toInt()}", selection.track.id)
+            assertEquals(LibraryPlaybackContext("likes", "liked-songs", "Liked songs"), selection.context)
             assertNull("Submission is not acceptance", model.state.value.notice)
         }
         touchUntil { model.state.value.offset == 120 && !model.state.value.loading }

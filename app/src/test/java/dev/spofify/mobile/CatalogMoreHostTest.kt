@@ -49,21 +49,19 @@ class CatalogMoreHostTest {
         val registry = LifecycleRegistry(this)
         override val lifecycle: Lifecycle get() = registry
     }
-    private data class Pending(val selection: QueueIntentSelection, val action: PlaybackListAction,
-        val key: PlaybackInteractionKey?, val binding: QueueIntentBinding?, val current: () -> Boolean,
+    private data class Pending(val selection: LibraryPlaybackSelection, val action: PlaybackListAction,
+        val key: PlaybackInteractionKey?, val binding: dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding?, val current: () -> Boolean,
         val complete: (PlaybackActionResult) -> Unit)
     private class Controls : PlaybackControls {
         override val state = MutableStateFlow(PlaybackState(interactionKey = PlaybackInteractionKey(),
-            queueIntentBinding = QueueIntentBinding("pc", "receiver", 7, 1, "history-A"), canQueueIntent = true))
+            queueIntentBinding = dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding("pc", "receiver", 7, 1, 1), canQueueIntent = true))
         val pending = mutableListOf<Pending>()
-        override fun queueIntent(selection: QueueIntentSelection, client: SpofifyClient, action: PlaybackListAction,
-            expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?, isCurrent: () -> Boolean,
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient, action: PlaybackListAction,
+            expectedKey: PlaybackInteractionKey?, expectedBinding: dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding?, shuffle: Boolean?, isCurrent: () -> Boolean,
             onResult: (PlaybackActionResult) -> Unit) {
             pending += Pending(selection, action, expectedKey, expectedBinding, isCurrent, onResult)
         }
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean,
-            startEntryId: String?) = error("More must not use legacy replacement")
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) = error("No legacy fallback")
+
         override fun connect() = Unit
         override fun release() = Unit
         override fun toggle() = Unit
@@ -179,8 +177,8 @@ class CatalogMoreHostTest {
                     assertEquals(action, pending.action)
                     assertSame(controls.state.value.interactionKey, pending.key)
                     assertEquals(controls.state.value.queueIntentBinding, pending.binding)
-                    val row = pending.selection as QueueIntentSelection.Track
-                    assertEquals("song", row.track.getValue("id").jsonPrimitive.content)
+                    val row = pending.selection as LibraryPlaybackSelection.Track
+                    assertEquals("song", row.track.id)
                     assertNull(row.context)
                     assertTrue(pending.current())
                     pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
@@ -210,14 +208,14 @@ class CatalogMoreHostTest {
         } }
         openMore(); val search = choose("Queue High")
         compose.runOnIdle {
-            assertTrue(search.selection is QueueIntentSelection.Track)
+            assertTrue(search.selection is LibraryPlaybackSelection.Track)
             search.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
             model.open(Page.Detail(LibraryItem("album", "album", "Synthetic album", coverage = Coverage(inLibrary = 2))))
         }
         compose.onNodeWithContentDescription("More actions for Synthetic album").performClick()
         val collection = choose("Queue Low")
         compose.runOnIdle {
-            assertEquals(QueueIntentSelection.Collection(PlaybackContext("album", "album", "Synthetic album")), collection.selection)
+            assertEquals(LibraryPlaybackSelection.Collection(LibraryPlaybackContext("album", "album", "Synthetic album")), collection.selection)
             assertEquals(0, playbackReads.get())
             collection.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
         }
@@ -243,7 +241,7 @@ class CatalogMoreHostTest {
         compose.runOnIdle {
             assertEquals(version, holder.navigationVersion)
             assertTrue("Appending another row must not revoke accepted source authority", pending.current())
-            assertEquals("song", (pending.selection as QueueIntentSelection.Track).track.getValue("id").jsonPrimitive.content)
+            assertEquals("song", (pending.selection as LibraryPlaybackSelection.Track).track.id)
             pending.complete(PlaybackActionResult(PlaybackActionStatus.NO_OP))
             assertEquals(0, playbackReads.get())
         }
@@ -271,7 +269,7 @@ class CatalogMoreHostTest {
             assertEquals(PlaybackListAction.QUEUE_HIGH, pending.action)
             assertSame(playerKey, pending.key)
             assertEquals(binding, pending.binding)
-            assertEquals("song", (pending.selection as QueueIntentSelection.Track).track.getValue("id").jsonPrimitive.content)
+            assertEquals("song", (pending.selection as LibraryPlaybackSelection.Track).track.id)
             assertTrue("The same source/row gesture remains current through append", pending.current())
             holder.commitQuery("other", immediate = true)
             holder.commitQuery("Synthetic", immediate = true)
@@ -283,14 +281,14 @@ class CatalogMoreHostTest {
     @Test fun openMoreDoesNotRetargetReplacementOutput() {
         openMore()
         compose.runOnIdle { controls.state.value = controls.state.value.copy(interactionKey = PlaybackInteractionKey(),
-            queueIntentBinding = QueueIntentBinding("new", "newReceiver", 1, null, null)) }
+            queueIntentBinding = dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding("new", "newReceiver", 1, 0, 2)) }
         compose.onNodeWithText("Queue Low").performScrollTo().performClick()
         compose.runOnIdle { assertTrue(controls.pending.isEmpty()) }
     }
     @Test fun acceptedQueueWithUnchangedPausedCurrentNeverClaimsPlaying() {
         openMore(); val pending = choose("Queue Low")
         compose.runOnIdle {
-            pending.complete(queueIntentActionResult(QueueIntentResult("queued", 2, 8, "low", "unchanged", null, ""), pending.action))
+            pending.complete(libraryPlaybackActionResult(LibraryPlaybackResult("1", "accepted", "", 8, 2, "low", "unchanged", true), pending.action))
         }
         compose.onNodeWithText("2 tracks queued").assertExists()
         compose.runOnIdle { assertFalse(controls.state.value.isPlaying) }
@@ -298,12 +296,11 @@ class CatalogMoreHostTest {
     @Test fun playNowBlockedMediaAndSupersededReceiptsNeverCreatePopups() {
         for (playback in listOf("blocked", "media", "superseded")) {
             openMore(); val pending = choose("Play now")
-            val receipt = QueueIntentResult(if (playback == "superseded") "queued" else playback, 2, 8,
-                "replace", playback, if (playback == "superseded") null else 22, "")
-            compose.runOnIdle { pending.complete(queueIntentActionResult(receipt, pending.action)) }
+            val receipt = LibraryPlaybackResult("1", "accepted", "", 8, 2, "replace", playback, true)
+            compose.runOnIdle { pending.complete(libraryPlaybackActionResult(receipt, pending.action)) }
             await { !model.state.value.preparing }
             compose.runOnIdle { assertNull(model.state.value.feedback) }
-            compose.onNodeWithText(queueIntentActionResult(receipt, pending.action).userMessage).assertDoesNotExist()
+            compose.onNodeWithText(libraryPlaybackActionResult(receipt, pending.action).userMessage).assertDoesNotExist()
         }
     }
     @Test fun rootHasNoLegacyNoticeFallback() = queueOnlyFeedbackInWindow(false)
@@ -339,14 +336,14 @@ class CatalogMoreHostTest {
             }
             compose.onNodeWithText(result.userMessage).assertDoesNotExist()
         }
-        for (effect in listOf("started", "resumed")) {
-            complete(PlaybackListAction.PLAY_NOW, queueIntentActionResult(
-                QueueIntentResult("playing", 2, 8, "replace", effect, 22, ""), PlaybackListAction.PLAY_NOW))
+        for (execution in listOf("pending", "confirmed")) {
+            complete(PlaybackListAction.PLAY_NOW, libraryPlaybackActionResult(
+                LibraryPlaybackResult("1", "accepted", "", 8, 2, "replace", execution, true), PlaybackListAction.PLAY_NOW))
             compose.runOnIdle { assertNull(model.state.value.feedback); assertNull(model.state.value.notice) }
             compose.onNodeWithText("Playing · 2 tracks queued").assertDoesNotExist()
         }
-        complete(PlaybackListAction.QUEUE_HIGH, queueIntentActionResult(
-            QueueIntentResult("playing", 1, 8, "high", "started", 22, ""), PlaybackListAction.QUEUE_HIGH))
+        complete(PlaybackListAction.QUEUE_HIGH, libraryPlaybackActionResult(
+            LibraryPlaybackResult("1", "accepted", "", 8, 1, "high", "confirmed", true), PlaybackListAction.QUEUE_HIGH))
         compose.onAllNodesWithText("Track queued").assertCountEquals(1)
         compose.runOnIdle { assertNull(model.state.value.notice) }
     }
@@ -383,7 +380,7 @@ class CatalogMoreHostTest {
             assertTrue("Progress/buffering/transport-only key churn cannot retire a held list action", pending.current())
             assertSame(key, pending.key); assertEquals(binding, pending.binding)
             assertNull(model.state.value.notice)
-            pending.complete(queueIntentActionResult(QueueIntentResult("queued", 1, 8, "high", "unchanged", null, ""), pending.action))
+            pending.complete(libraryPlaybackActionResult(LibraryPlaybackResult("1", "accepted", "", 8, 1, "high", "unchanged", true), pending.action))
         }
         compose.onNodeWithText("Track queued").assertExists()
         compose.runOnIdle { assertEquals(1, controls.pending.size); assertEquals(0, playbackReads.get()) }

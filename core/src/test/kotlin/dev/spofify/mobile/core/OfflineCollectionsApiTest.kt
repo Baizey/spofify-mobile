@@ -162,7 +162,11 @@ class OfflineCollectionsApiTest {
         val oversized = failure { api.currentMedia("track") } as ApiException
         assertEquals(429, oversized.status)
         assertNull(oversized.code)
-        assertNull(oversized.responseBody)
+        assertEquals("Too many requests. Please try again later.", oversized.message)
+        assertFalse(oversized.toString().contains("/private"))
+        assertFalse(oversized.toString().contains("cookie-secret"))
+        assertNull(oversized.cause)
+        assertTrue(oversized.suppressed.isEmpty())
     }
 
     @Test fun currentDescriptorRejectsMaliciousUrlsDigestVersionsLengthsAndTypesBeforeAudio() = runBlocking {

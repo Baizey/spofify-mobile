@@ -54,17 +54,17 @@ class PlaylistSourceStampTest {
         }
     }
 
-    @Test fun readGenerationNeverRenewsCapturedCopyAndPreparationCannotRetireItsOwnSource() {
+    @Test fun readGenerationNeverRenewsCapturedCopyOrSelection() {
         val source = PlaylistRequestGeneration()
         val ticket = source.ticket()
         val captured = PlaylistCopySource(7, "original-fence") { source.accepts(ticket) }
-        val preparation = PlaylistPlaybackRequest(PlaylistRequestGeneration(), captured.isCurrent)
         var deliveries = 0
-        preparation.deliver { deliveries++ }
+        fun deliver() { if (captured.isCurrent()) deliveries++ }
+        deliver()
         assertEquals(1, deliveries)
         assertTrue(captured.isCurrent())
         source.invalidate() // The production route does this before every new read.
-        preparation.deliver { deliveries++ }
+        deliver()
         assertEquals(1, deliveries)
         assertFalse(captured.isCurrent())
         assertEquals("original-fence", captured.fence)

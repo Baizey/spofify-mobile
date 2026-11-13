@@ -12,14 +12,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import okhttp3.mockwebserver.MockResponse
@@ -122,105 +116,21 @@ class ApiTransportTest {
         }
     }
 
-    @Test fun device404And409PreserveOnlyStrictlyValidatedReconciliationViews() = runBlocking {
-        val view = """{"devices":[],"activeDeviceId":"","epoch":1,"leaseMs":0,"state":null,"stateSeq":0,"stateAgeMs":0,"transfer":null,"directives":[],"commands":[],"error":"/private/secret"}"""
+    @Test fun notFoundAndConflictBodiesNeverExposePrivateDiagnostics() = runBlocking {
         for (status in listOf(404, 409)) {
-            web.enqueue(jsonResponse(view, status))
-            val error = apiFailure { api.send("POST", listOf("api", "me", "player"), buildJsonObject { put("action", "poll") }) }
-            val safe = error.responseBody!!
-            assertEquals(1L, PlaybackDevicesView.fromJson(safe).epoch)
-            assertFalse(safe.toString().contains("private"))
-            assertFalse(safe.toString().contains("secret"))
-            assertFalse(error.message.contains("private"))
-            assertFalse(error.toString().contains("secret"))
-        }
-        // 404/409 views do not deliver directives. Reject command-bearing data before any
-        // command parsing, including malformed commands and nested private JSON masquerading
-        // as a track key or selection token.
-        for (command in listOf(
-            "{}",
-            """{"type":"seek"}""",
-            """{"type":"play","track":{"id":"t","name":"Song","artists":[],"albumName":"","albumId":"","duration":1,"key":{"libraryPath":"/private/secret"},"order":0,"selectionToken":{"libraryPath":"/private/secret"}}}""",
-        )) {
-            val withDirective = view.replace("\"directives\":[]", "\"directives\":[{\"deliveryId\":\"d\",\"epoch\":1,\"type\":\"command\",\"command\":$command}]")
-            web.enqueue(jsonResponse(withDirective, 409))
-            val rejected = apiFailure { api.get(listOf("api", "me", "player")) }
-            assertEquals(409, rejected.status)
-            assertNull(rejected.responseBody)
-            assertFalse(rejected.message.contains("private"))
-        }
-        for ((path, status, body) in listOf(
-            Triple(listOf("api", "me", "playlists"), 409, view),
-            Triple(listOf("api", "me", "player", "other"), 409, view),
-            Triple(listOf("api", "me", "player"), 500, view),
-            Triple(listOf("api", "me", "player"), 409, view.dropLast(1) + ",\"libraryPath\":\"/private/secret\"}"),
-            Triple(listOf("api", "me", "player"), 409, view.replace("\"epoch\":1", "\"epoch\":-1")),
-        )) {
-            web.enqueue(jsonResponse(body, status))
-            assertNull(apiFailure { api.get(path) }.responseBody)
-        }
-    }
-
-    @Test fun staleEpochReasonRequiresExact409ValidatedPlayerViewAndNegotiatedSidecars() = runBlocking {
-        web.enqueue(loginResponse()); client.login("listener", "password"); web.takeRequest()
-        val path = listOf("api", "me", "player")
-        val base = PlaybackDevicesView("phone", listOf(PlaybackDevice("phone", "Phone", true), PlaybackDevice("pc", "PC", true)),
-            "pc", 2, 8000, state = null, stateSeq = 0, stateAgeMs = 0, transfer = null,
-            directives = emptyList(), commands = emptyList()).toJson()
-        fun body(error: JsonElement = JsonPrimitive("stale epoch"), view: JsonObject = base) =
-            JsonObject(view + ("error" to error)).toString()
-        val sidecar = QueueIntentsView(1, listOf(QueueIntentReceiver("phone", 1)), null, null, emptyList(), emptyList())
-        val negotiated = JsonObject(base + ("queueIntents" to sidecar.let {
-            PlaybackDevicesView.fromJson(base).copy(queueIntents = it).toJson().getValue("queueIntents")
-        }))
-        val sidecarWithInbox = JsonObject(negotiated.getValue("queueIntents").jsonObject +
-            ("directives" to JsonArray(listOf(buildJsonObject { put("deliveryId", "unexpected"); put("state", JsonNull) }))))
-        val invalidStateView = JsonObject(base + ("state" to
-            JsonObject(PlaybackSnapshot().toJson() + ("position" to JsonPrimitive(0)))))
-        data class Case(val label: String, val status: Int = 409, val endpoint: List<String> = path,
-            val raw: String = body(), val extensions: Boolean = false, val recognized: Boolean = false)
-        val cases = listOf(
-            Case("exact legacy player conflict", recognized = true),
-            Case("exact negotiated player conflict", raw = body(view = negotiated), extensions = true, recognized = true),
-            Case("404 is not stale-epoch admission", status = 404),
-            Case("503 is not stale-epoch admission", status = 503),
-            Case("nonplayer", endpoint = listOf("api", "me", "playlists")),
-            Case("player child path", endpoint = path + "other"),
-            Case("other string", raw = body(JsonPrimitive("other conflict /private/cookie-secret"))),
-            Case("wrong case", raw = body(JsonPrimitive("Stale epoch"))),
-            Case("not exact", raw = body(JsonPrimitive("stale epoch "))),
-            Case("numeric error", raw = body(JsonPrimitive(409))),
-            Case("null error", raw = body(JsonNull)),
-            Case("object is not protocol string", raw = body(buildJsonObject { put("code", "STALE_EPOCH"); put("message", "/private/cookie-secret") })),
-            Case("missing error", raw = JsonObject(base.filterKeys { it != "error" }).toString()),
-            Case("missing view", raw = "{}"),
-            Case("empty body", raw = ""),
-            Case("malformed JSON", raw = body().dropLast(1)),
-            Case("invalid view epoch", raw = body(view = JsonObject(base + ("epoch" to JsonPrimitive(-1))))),
-            Case("invalid musical state", raw = body(view = invalidStateView)),
-            Case("unknown private field", raw = body(view = JsonObject(base + ("libraryPath" to JsonPrimitive("/private/cookie-secret"))))),
-            Case("nonempty inbox", raw = body(view = PlaybackDevicesView.fromJson(base).copy(
-                directives = listOf(PlaybackDirective("delivery", 2, "activate", "selection"))).toJson())),
-            Case("negotiated missing extension", extensions = true),
-            Case("unnegotiated extension", raw = body(view = negotiated)),
-            Case("negotiated invalid version", raw = body(view = negotiated).replace("\"version\":1", "\"version\":2"), extensions = true),
-            Case("negotiated missing members", raw = body(view = JsonObject(base + ("queueIntents" to buildJsonObject { put("version", 1) }))), extensions = true),
-            Case("negotiated nonempty sidecar inbox", raw = body(view = JsonObject(base + ("queueIntents" to sidecarWithInbox))), extensions = true),
-        )
-        for (case in cases) {
-            web.enqueue(jsonResponse(case.raw, case.status))
-            val error = apiFailure { api.send("POST", case.endpoint, buildJsonObject { put("action", "poll") }, playbackExtensions = case.extensions) }
-            assertEquals(case.label, if (case.recognized) PlaybackConflictReason.STALE_EPOCH else null, error.playbackConflictReason)
-            assertNull("Playback reason must not be invented as generic code: ${case.label}", error.code)
-            if (case.recognized) {
-                val safe = requireNotNull(error.responseBody)
-                assertEquals("", PlaybackDevicesView.fromJson(safe).error)
-                assertFalse(safe.toString().contains("stale epoch"))
+            for (body in listOf(
+                """{"error":"/private/cookie-secret","state":{"libraryPath":"/private/music"}}""",
+                """{"error":{"code":"UNKNOWN_PRIVATE_CODE","message":"/private/cookie-secret"}}""",
+                """{"error":"/private/cookie-secret" """,
+            )) {
+                web.enqueue(jsonResponse(body, status))
+                val error = apiFailure { api.get(listOf("api", "me", "playlists")) }
+                assertEquals(status, error.status)
+                assertNull(error.code)
+                assertFalse(error.message.contains("private"))
+                assertFalse(error.toString().contains("cookie-secret"))
+                assertNull(error.cause)
             }
-            for (visible in listOf(error.message, error.toString(), error.responseBody?.toString().orEmpty())) {
-                assertFalse(case.label, visible.contains("cookie-secret")); assertFalse(case.label, visible.contains("/private"))
-            }
-            assertNull(case.label, error.cause)
         }
     }
 
@@ -243,12 +153,15 @@ class ApiTransportTest {
         assertTrue(api.get(listOf("api", "library")).isEmpty())
     }
 
-    @Test fun allowsAThousandTrackQueueWithinTheResponseBound() = runBlocking {
-        val items = (1..1000).joinToString(",") { """{"kind":"track","id":"$it","name":"Song $it","hasAudio":true}""" }
-        web.enqueue(jsonResponse("""{"items":[$items],"total":1000,"limit":1000,"truncated":false}"""))
-        val response = api.get(listOf("api", "me", "likes", "playback"))
-        assertEquals(1000, response["items"]!!.jsonArray.size)
-        assertEquals("1000", response["total"]!!.jsonPrimitive.content)
+    @Test fun allowsCompleteLargeBrowseResponsesAboveThePlaybackStateBudget() = runBlocking {
+        val items = (1..5000).joinToString(",") { """{"kind":"track","id":"$it","name":"${"x".repeat(512)}","hasAudio":true}""" }
+        val body = """{"items":[$items],"total":5000,"limit":5000,"offset":0}"""
+        assertTrue(body.toByteArray(Charsets.UTF_8).size > 2 * 1024 * 1024)
+        assertTrue(body.toByteArray(Charsets.UTF_8).size < 16 * 1024 * 1024)
+        web.enqueue(jsonResponse(body))
+        val response = api.get(listOf("api", "library"))
+        assertEquals(5000, response["items"]!!.jsonArray.size)
+        assertEquals("5000", response["total"]!!.jsonPrimitive.content)
     }
 
     @Test fun redirectsAreNotFollowedAndRetryableMutationsAreNeverReplayed() = runBlocking {
@@ -268,7 +181,7 @@ class ApiTransportTest {
         web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
         web.enqueue(jsonResponse("{}"))
         try {
-            api.send("POST", listOf("api", "me", "history"), buildJsonObject { put("eventId", "event") })
+            api.send("POST", listOf("api", "me", "playlists"), buildJsonObject { put("name", "Mix") })
             fail("Expected a network error")
         } catch (error: IOException) {
             val safeMessage = "Unable to reach the server. Check your connection and server address."
@@ -276,14 +189,25 @@ class ApiTransportTest {
             // safe IOException as its cause. Inspect every cause rather than forbidding that
             // wrapper: no raw OkHttp exception, request URL, or private detail may survive.
             var current: Throwable? = error
+            var sawDiagnostic = false
             repeat(8) {
                 current?.let {
                     assertTrue(it is IOException)
-                    assertEquals(safeMessage, it.message)
+                    if (it is TransportFailureDiagnostic) {
+                        sawDiagnostic = true
+                        assertEquals(TransportFailurePhase.CALL, it.phase)
+                        assertTrue(it.throwableClasses.size in 1..4)
+                        assertTrue(it.throwableClasses.all { name -> name.length <= 128 &&
+                            (name == "[omitted]" || name.matches(Regex("[A-Za-z0-9_.$]+"))) })
+                        assertNull(it.cause)
+                        assertTrue(it.suppressed.isEmpty())
+                        assertTrue(it.stackTrace.isEmpty())
+                    } else assertEquals(safeMessage, it.message)
                     assertFalse(it.toString().contains(client.server.origin))
                     current = it.cause
                 }
             }
+            assertTrue("Only bounded class/phase metadata may explain the network failure", sawDiagnostic)
             assertNull("Unexpected exception cause cycle or excessive wrapping", current)
         }
         assertEquals(1, web.requestCount)

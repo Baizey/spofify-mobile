@@ -186,13 +186,12 @@ class CatalogApiTest {
         }
     }
 
-    @Test fun queueContextAndRevisionAreOptionalAndLegacyAvailabilityRemainsCompatible() = runBlocking {
-        web.enqueue(jsonResponse("""{"context":{"kind":"album","id":"a","name":"Album"},"items":[$track],"total":1,"limit":1000,"truncated":false,"revision":4294967296}"""))
-        val queue = client.playback(LibraryItem("album", "a", "Album"))
-        assertEquals(LibraryPlaybackContext("album", "a", "Album"), queue.context)
-        assertEquals(4294967296L, queue.revision)
-        assertTrue(queue.items.single().playable)
-        assertNull(queue.items.single().libraryPath)
+    @Test fun browseRevisionAndLegacyAvailabilityRemainCompatible() = runBlocking {
+        web.enqueue(jsonResponse("""{"items":[$track],"total":1,"limit":40,"offset":0,"revision":4294967296}"""))
+        val result = catalog.browse(kind = "tracks")
+        assertEquals(4294967296L, result.revision)
+        assertTrue(result.items.single().playable)
+        assertNull(result.items.single().libraryPath)
         assertTrue(LibraryItem("track", "legacy", "Legacy", libraryPath = "/private/legacy.flac").playable)
     }
 }

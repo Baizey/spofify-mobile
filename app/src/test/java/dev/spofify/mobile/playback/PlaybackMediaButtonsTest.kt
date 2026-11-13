@@ -21,9 +21,11 @@ import dev.spofify.mobile.LoginStore
 import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
 import dev.spofify.mobile.core.*
-import dev.spofify.mobile.feature.devices.PlaybackAuthority
 import dev.spofify.mobile.feature.devices.PlaybackCoordinator
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.serialization.json.*
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
@@ -77,10 +79,9 @@ class PlaybackMediaButtonsTest {
     private lateinit var graph: AppGraph
     private lateinit var client: SpofifyClient
     private var serviceController: ServiceController<PlaybackService>? = null
-    private val endpoint = Media3PlaybackEndpoint()
-    private val requests = mutableListOf<PlaybackDeviceCommand>()
-    private val published = mutableListOf<PlaybackSnapshot>()
-    private var remoteSnapshot: PlaybackSnapshot? = null
+    private val endpoint = Media3PlaybackEndpoint(ApplicationProvider.getApplicationContext())
+    private val requests = mutableListOf<LibraryPlaybackCommand>()
+    private var remoteSnapshot: LibraryPlaybackSnapshot? = null
     private var remotePlaying = false
     private var remoteElapsed = 41.0
     private var remoteDuration = 120.0
@@ -116,7 +117,6 @@ class PlaybackMediaButtonsTest {
         client.login("listener", "synthetic-password")
         assertEquals("/api/auth/login", web.takeRequest(1, TimeUnit.SECONDS)?.path)
         serviceController = Robolectric.buildService(PlaybackService::class.java).create()
-        assertEquals("ok", endpoint.activate(prepared(), PlaybackAuthority(23, 4) { true }).status)
     }
 
     @After fun tearDown() {
@@ -140,42 +140,70 @@ class PlaybackMediaButtonsTest {
     private fun controller(uid: Int = Process.myUid(), trusted: Boolean = false) =
         MediaSession.ControllerInfo.createTestOnlyControllerInfo("synthetic.controller", 100, uid, 0, 0, trusted, Bundle.EMPTY, true)
 
-    private fun prepared() = PlaybackSnapshot(
-        queue = listOf(91L to 2L, 7L to 0L, 32L to 1L).map { (key, order) ->
-            PlaybackTrack("duplicate-track", "Occurrence $key", emptyList(), "Album", "album", 120.0, key = key, order = order)
-        }, position = 1, elapsed = 17.25, duration = 120.0, shuffle = true,
-        occurrence = PlaybackOccurrence(7, "duplicate-track", "retained-history", 3.25, false),
-    ).validated()
 
-    private fun TestScope.remoteOwner(output: String = "speaker", initial: PlaybackSnapshot? = null): PlaybackCoordinator {
-        graph.playbackCoordinator!!.close()
-        fun view(outcome: PlaybackOutcome? = null) = PlaybackDevicesView("phone",
-            listOf(PlaybackDevice("phone", "Phone", true), PlaybackDevice("speaker", "Speaker", true)),
-            output, 1, 8000, state = initial ?: remoteSnapshot ?: prepared().copy(playing = remotePlaying, elapsed = remoteElapsed, duration = remoteDuration),
-            stateSeq = 1, stateAgeMs = 0, transfer = null, directives = emptyList(), commands = listOfNotNull(outcome))
-        val protocol = object : PlaybackDevicesProtocol {
-            override suspend fun register(name: String) = view()
-            override suspend fun view() = view()
-            override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>): PlaybackDevicesView {
-                state?.let(published::add)
-                return view()
-            }
-            override suspend fun rename(deviceId: String, name: String) = view()
-            override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand): PlaybackDevicesView {
-                requests += command
-                return view(PlaybackOutcome(commandId, "ok"))
-            }
-            override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long) = view()
-            override suspend fun leave(deviceId: String) = Unit
+    private lateinit var socket: Socket
+    private var structuralVersion = 1L
+    private var scalarSequence = 1L
+    private class Socket(private val record: (LibraryPlaybackCommand) -> Unit) : LibraryPlaybackTransport {
+        override val identity = ValidatedSessionIdentity("http://localhost", "fixture-account", 1)
+        override var isCurrent = true
+        val incoming = Channel<LibraryPlaybackEvent>(32)
+        override val events = incoming.receiveAsFlow()
+        private var command = 0L
+        override fun send(message: LibraryPlaybackClientMessage): LibraryPlaybackSend? {
+            if (!isCurrent) return null
+            check(message is LibraryPlaybackClientMessage.Command) { "Remote display must never emit executor facts" }
+            record(message.command)
+            return LibraryPlaybackSend(0, commandId = (++command).toString())
         }
-        val owner = PlaybackCoordinator(protocol, endpoint, backgroundScope, clockMs = { testScheduler.currentTime },
-            mediaEventUptimeMs = { SystemClock.uptimeMillis() })
+        override fun close() { isCurrent = false; incoming.close() }
+        fun message(value: LibraryPlaybackServerMessage) {
+            incoming.trySend(LibraryPlaybackEvent.Message(value)).getOrThrow()
+        }
+    }
+    private val LibraryPlaybackCommand.type: String get() = Json.parseToJsonElement(
+        LibraryPlaybackCodec.encode(LibraryPlaybackClientMessage.Command(this), commandId = "1"))
+        .jsonObject.getValue("command").jsonObject.getValue("type").jsonPrimitive.content
+    private fun physical() = (0 until output.mediaItemCount).map { output.getMediaItemAt(it) } to endpoint.observe()
+    private fun prepared(): LibraryPlaybackSnapshot {
+        val base = testLibrarySnapshot(devices = listOf(
+            LibraryPlaybackDevice("phone", "Phone", true, true),
+            LibraryPlaybackDevice("speaker", "Speaker", true, true)), selected = "speaker")
+        return base.copy(state = base.state.copy(
+            queue = listOf(91L to 2L, 7L to 0L, 32L to 1L).map { (key, order) ->
+                LibraryPlaybackTrack("duplicate-track", "Occurrence $key", emptyList(), "Album", "album",
+                    120.0, key, order, "now")
+            }, position = 1, shuffle = true, desiredPlaying = remotePlaying,
+            occurrence = LibraryPlaybackOccurrence(7, "duplicate-track", "retained-event", 3.25, false)),
+            playback = base.playback.copy(eventId = "retained-event", isPlaying = remotePlaying,
+                elapsed = remoteElapsed, duration = remoteDuration))
+    }
+    private fun TestScope.remoteOwner(output: String = "speaker",
+        initial: LibraryPlaybackSnapshot? = null): PlaybackCoordinator {
+        graph.playbackCoordinator!!.close()
+        socket = Socket(requests::add)
+        val snapshot = (initial ?: remoteSnapshot ?: prepared()).copy(selectedDeviceId = output,
+            selectedConnectionId = "socket-$output")
+        val owner = PlaybackCoordinator(client, endpoint, backgroundScope,
+            clockMs = { testScheduler.currentTime }, mediaEventUptimeMs = { SystemClock.uptimeMillis() },
+            openTransport = { _, _, _, _ -> socket }, authenticationIdentity = { client.validatedSessionIdentity() },
+            deviceIdentity = { "phone" to "Phone" })
         AppGraph::class.java.getDeclaredField("playbackCoordinator").apply { isAccessible = true; set(graph, owner) }
-        owner.setServiceActive(true)
+        owner.setServiceActive(true); runCurrent()
+        socket.message(LibraryPlaybackServerMessage("snapshot", "room", "socket-phone", "phone", snapshot = snapshot))
         runCurrent()
         return owner
     }
-
+    private fun TestScope.publishRemote(replacement: Boolean = false) {
+        if (replacement) structuralVersion++
+        scalarSequence++
+        val next = remoteSnapshot ?: prepared()
+        socket.message(LibraryPlaybackServerMessage("state", "room", snapshot = next.copy(
+            stateVersion = structuralVersion, playback = next.playback.copy(
+                stateVersion = structuralVersion, playbackSequence = scalarSequence))))
+        runCurrent()
+    }
+    private fun replacement() = prepared().let { it.copy(state = it.state.copy(queue = it.state.queue.reversed())) }
     private fun event(code: Int, action: Int = KeyEvent.ACTION_DOWN, repeat: Int = 0): KeyEvent {
         SystemClock.sleep(1) // A genuinely fresh event, never a manufactured future timestamp.
         val now = SystemClock.uptimeMillis()
@@ -184,12 +212,12 @@ class PlaybackMediaButtonsTest {
     private fun send(event: KeyEvent, who: MediaSession.ControllerInfo = controller()): Boolean =
         callback.onMediaButtonEvent(session, who, Intent(Intent.ACTION_MEDIA_BUTTON).putExtra(Intent.EXTRA_KEY_EVENT, event))
     private fun TestScope.assertRemoteCommand(code: Int, type: String, who: MediaSession.ControllerInfo = controller()) {
-        val before = endpoint.exportSnapshot()
+        val before = physical()
         val count = requests.size
         assertTrue(send(event(code), who)); runCurrent()
         assertEquals("Exactly one authoritative command for key $code", count + 1, requests.size)
         assertEquals(type, requests.last().type)
-        assertEquals("Remote key must not change local queue/elapsed/history", before, endpoint.exportSnapshot())
+        assertEquals("Remote key must not change local queue/elapsed/history", before, physical())
         assertFalse(output.playWhenReady)
     }
 
@@ -283,15 +311,15 @@ class PlaybackMediaButtonsTest {
 
     @Test fun eventAtTheExactSuspensionTimeCannotBeReadmittedAsFreshPlay() = runTest {
         remoteOwner()
-        endpoint.suspendOutput()
+        PlaybackService.suspendLocalOutput()
         val stoppedAt = PlaybackService::class.java.getDeclaredField("lastSuspendedUptime").let {
             it.isAccessible = true; it.getLong(service)
         }
-        val before = endpoint.exportSnapshot()
+        val before = physical()
         assertTrue(send(KeyEvent(stoppedAt, stoppedAt, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY, 0)))
         runCurrent()
         assertTrue("Timestamp equality is stale, not permission for a fresh remote start", requests.isEmpty())
-        assertEquals(before, endpoint.exportSnapshot())
+        assertEquals(before, physical())
         assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_PLAY, "resume")
     }
 
@@ -299,7 +327,7 @@ class PlaybackMediaButtonsTest {
         remoteElapsed = 119.0
         remoteOwner()
         assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, "seek")
-        assertEquals(PlaybackDeviceCommand.seek(120.0).json, requests.last().json)
+        assertEquals(LibraryPlaybackCommand.Seek(120.0), requests.last())
     }
 
     @Test fun seekKeysUseKnownTrackDurationWhenSnapshotDurationIsUnknown() = runTest {
@@ -307,23 +335,23 @@ class PlaybackMediaButtonsTest {
         remoteElapsed = 119.0
         val owner = remoteOwner()
         assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, "seek")
-        assertEquals(PlaybackDeviceCommand.seek(120.0).json, requests.last().json)
+        assertEquals(LibraryPlaybackCommand.Seek(120.0), requests.last())
         remoteElapsed = 130.0 // Clamp the sampled position before applying a relative seek too.
-        owner.retry(); runCurrent()
+        publishRemote(replacement = true)
         assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, "seek")
-        assertEquals(PlaybackDeviceCommand.seek(120.0).json, requests.last().json)
+        assertEquals(LibraryPlaybackCommand.Seek(120.0), requests.last())
     }
 
     @Test fun rewindNeverSeeksBeforeStart() = runTest {
         remoteElapsed = 1.0
         remoteOwner()
         assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_REWIND, "seek")
-        assertEquals(PlaybackDeviceCommand.seek(0.0).json, requests.last().json)
+        assertEquals(LibraryPlaybackCommand.Seek(0.0), requests.last())
     }
 
     @Test fun volumeUnknownAndMalformedIntentsDelegateOnlyForTrustedControllersWithoutMusicalCommands() = runTest {
         remoteOwner()
-        val before = endpoint.exportSnapshot()
+        val before = physical()
         val gain = output.volume
         for (key in listOf(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_VOLUME_MUTE, KeyEvent.KEYCODE_A)) {
             assertFalse("Unmapped keys must retain platform handling", send(event(key)))
@@ -333,7 +361,7 @@ class PlaybackMediaButtonsTest {
         assertTrue(callback.onMediaButtonEvent(session, controller(), Intent(Intent.ACTION_MEDIA_BUTTON).putExtra(Intent.EXTRA_KEY_EVENT, "not a KeyEvent")))
         runCurrent()
         assertTrue(requests.isEmpty())
-        assertEquals(before, endpoint.exportSnapshot())
+        assertEquals(before, physical())
         assertEquals(gain, output.volume, 0f)
     }
 
@@ -352,104 +380,28 @@ class PlaybackMediaButtonsTest {
         assertFalse(output.playWhenReady)
     }
 
-    @Test fun queuedRemoteMediaPlayCannotSurviveCancellationOrSameAccountReauthentication() = runTest {
+
+    @Test fun authenticationLossFencesHeldMediaPressAndCannotBorrowEqualAccountReauthentication() = runTest {
         remoteOwner()
-        val before = endpoint.exportSnapshot()
-        assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_PLAY)))
-        PlaybackRequests.invalidate() // Before the coordinator's actual serialized dispatch.
-        runCurrent()
-        assertTrue("Old media intent must not become a fresh remote Play", requests.isEmpty())
-        assertEquals(before, endpoint.exportSnapshot())
-        assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_PLAY, "resume")
-        assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_PLAY)))
+        val old = event(KeyEvent.KEYCODE_MEDIA_PLAY)
         client.login("listener", "synthetic-password")
-        runCurrent()
-        assertEquals("Same-account values cannot upgrade an old session's Play", 1, requests.size)
-    }
-
-    @Test fun mediaPlayAndPauseNeverInitializeOrImportAServerQueue() = runTest {
-        assertEquals("ok", endpoint.activate(PlaybackSnapshot(), PlaybackAuthority(23, 4) { true }).status)
-        remoteOwner(output = "phone", initial = prepared())
-        val before = endpoint.exportSnapshot()
-        val queueEpoch = PlaybackRequests.queueEpoch
-        assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_PLAY))); runCurrent()
-        assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_PAUSE))); runCurrent()
-        assertEquals("No prepared item: even a server snapshot is not permission to restore it", before, endpoint.exportSnapshot())
-        assertEquals("Rejected system transport must not even import a paused queue", queueEpoch, PlaybackRequests.queueEpoch)
-        assertTrue(published.isEmpty())
+        assertTrue(send(old)); runCurrent()
         assertTrue(requests.isEmpty())
         assertFalse(output.playWhenReady)
+        assertEquals(0, output.mediaItemCount)
+        remoteOwner()
+        assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_PLAY, "resume")
     }
 
-    @Test fun preparedLocalPlayPreservesPositionQueueAndHistoryAndForegroundDenialStaysBlocked() = runTest {
-        val owner = remoteOwner(output = "phone", initial = prepared())
-        // Model an already prepared, coordinator-activated local output, not a restored queue.
-        owner.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
-        published.clear()
-        val before = endpoint.exportSnapshot()
-        val queueEpoch = PlaybackRequests.queueEpoch
-        shadowOf(service).setThrowInStartForeground(android.app.ForegroundServiceStartNotAllowedException("Synthetic user-start denial"))
-        assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_PLAY))); runCurrent()
-        val after = endpoint.exportSnapshot()
-        assertEquals(before.queue, after.queue)
-        assertEquals(before.position, after.position)
-        assertEquals(before.elapsed, after.elapsed, 0.0)
-        assertEquals(before.occurrence, after.occurrence)
-        assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
-        assertEquals("blocked", after.error)
+    @Test fun systemTransportWithRetainedServerQueueNeverImportsOrStartsLocalMedia() = runTest {
+        remoteOwner(output = "phone")
+        val before = physical()
+        assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_PLAY, "resume")
+        assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_PAUSE, "pause")
+        assertEquals(before, physical())
+        assertEquals(0, output.mediaItemCount)
         assertFalse(output.playWhenReady)
-        assertEquals(1, published.size)
-        assertTrue(requests.isEmpty())
-        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.SECONDS); runCurrent()
-        assertFalse("No delayed retry after foreground denial", output.playWhenReady)
-    }
-
-    @Test fun preparedMediaStartWaitingForReadinessCannotSurviveASameCurrentQueueEdit() = runTest {
-        val owner = remoteOwner(output = "phone")
-        owner.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
-        val real = output
-        val field = PlaybackService::class.java.getDeclaredField("player").apply { isAccessible = true }
-        var state = Player.STATE_IDLE
-        var wantsPlay = false
-        var plays = 0
-        // Timing alone is synthetic; queue/current/position remain the actual service output.
-        val controlled = Proxy.newProxyInstance(ExoPlayer::class.java.classLoader,
-            arrayOf(ExoPlayer::class.java)) { proxy, method, args ->
-            when (method.name) {
-                "equals" -> proxy === args?.get(0)
-                "hashCode" -> System.identityHashCode(proxy)
-                "toString" -> "Media readiness fixture"
-                "prepare" -> { state = Player.STATE_BUFFERING; Unit }
-                "getPlaybackState" -> state
-                "getPlayWhenReady", "isPlaying" -> wantsPlay
-                "getPlayerError" -> null
-                "setPlayWhenReady" -> { wantsPlay = args!![0] as Boolean; Unit }
-                "play" -> { plays++; wantsPlay = true; Unit }
-                "pause" -> { wantsPlay = false; Unit }
-                "stop" -> { wantsPlay = false; state = Player.STATE_IDLE; Unit }
-                else -> try { method.invoke(real, *(args ?: emptyArray())) }
-                    catch (failure: InvocationTargetException) { throw failure.targetException }
-            }
-        } as ExoPlayer
-        shadowOf(service.getSystemService(android.media.AudioManager::class.java))
-            .setNextFocusRequestResponse(android.media.AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
-        field.set(service, controlled)
-        try {
-            assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_PLAY))); runCurrent()
-            assertEquals("Real media admission must reach asynchronous readiness", Player.STATE_BUFFERING, state)
-            val permit = PlaybackService::class.java.getDeclaredField("authority").let {
-                it.isAccessible = true; it.get(service) as PlaybackAuthority
-            }
-            val before = endpoint.exportSnapshot()
-            val future = before.queue[before.position + 1]
-            assertEquals("ok", endpoint.execute(PlaybackDeviceCommand.queue("remove", future.key), permit).status)
-            assertEquals(before.queue[before.position].key, endpoint.exportSnapshot().queue[endpoint.exportSnapshot().position].key)
-            state = Player.STATE_READY
-            advanceTimeBy(30); runCurrent()
-            assertEquals("The held system start must recheck its queue admission after readiness", 0, plays)
-            assertFalse(wantsPlay)
-            assertEquals(1, web.requestCount)
-        } finally { field.set(service, real) }
+        assertEquals(1, web.requestCount)
     }
 
     @Test fun impossibleAndFutureMediaEventTimesCannotBecomeTransport() = runTest {
@@ -462,41 +414,13 @@ class PlaybackMediaButtonsTest {
         assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_PLAY, "resume")
     }
 
-    @Test fun firstDeliveryAfterLocalReplacementCannotTargetTheNewQueue() = runTest {
-        remoteOwner()
-        val old = event(KeyEvent.KEYCODE_MEDIA_NEXT)
-        SystemClock.sleep(1)
-        assertEquals("ok", endpoint.activate(prepared().copy(queue = prepared().queue.reversed()), PlaybackAuthority(23, 4) { true }).status)
-        val before = endpoint.exportSnapshot()
-        assertTrue(send(old)); runCurrent()
-        assertTrue(requests.isEmpty())
-        assertEquals(before, endpoint.exportSnapshot())
-        assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_NEXT, "next")
-    }
-
-    @Test fun firstDeliveryAfterSelectedLocalReplacementCannotSeekItsSuccessor() = runTest {
-        val owner = remoteOwner(output = "phone")
-        owner.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
-        val old = event(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)
-        SystemClock.sleep(1)
-        assertEquals("ok", endpoint.activate(prepared().copy(queue = prepared().queue.reversed()),
-            checkNotNull(owner.currentAuthority())).status)
-        val before = endpoint.exportSnapshot()
-        assertTrue(send(old)); runCurrent()
-        assertEquals(before, endpoint.exportSnapshot())
-        assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD))); runCurrent()
-        assertEquals(before.queue, endpoint.exportSnapshot().queue)
-        assertTrue("A fresh local seek must remain usable", endpoint.exportSnapshot().elapsed > before.elapsed)
-        assertTrue(requests.isEmpty())
-    }
-
     @Test fun firstDeliveryAfterRemoteReplacementCannotTargetTheNewQueue() = runTest {
         val owner = remoteOwner()
         val old = event(KeyEvent.KEYCODE_MEDIA_PLAY)
         val epochs = PlaybackRequests.epoch to PlaybackRequests.queueEpoch
         SystemClock.sleep(1)
-        remoteSnapshot = prepared().copy(queue = prepared().queue.reversed())
-        owner.retry(); runCurrent()
+        remoteSnapshot = replacement()
+        publishRemote(replacement = true)
         assertEquals("Remote replacement need not change local generations", epochs, PlaybackRequests.epoch to PlaybackRequests.queueEpoch)
         assertTrue(send(old)); runCurrent()
         assertTrue(requests.isEmpty())
@@ -508,32 +432,32 @@ class PlaybackMediaButtonsTest {
         val make = PlaybackService::class.java.getDeclaredMethod("notificationIntent", String::class.java).apply { isAccessible = true }
         val old = make.invoke(service, "resume") as android.app.PendingIntent
         val epochs = PlaybackRequests.epoch to PlaybackRequests.queueEpoch
-        remoteSnapshot = prepared().copy(queue = prepared().queue.reversed())
-        owner.retry(); runCurrent()
+        remoteSnapshot = replacement()
+        publishRemote(replacement = true)
         assertEquals(epochs, PlaybackRequests.epoch to PlaybackRequests.queueEpoch)
         val fresh = make.invoke(service, "resume") as android.app.PendingIntent
         assertNotEquals("PendingIntent identity, not just extras, must bind the remote queue", old, fresh)
-        val before = endpoint.exportSnapshot()
+        val before = physical()
         old.send()
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 1)
         runCurrent()
         assertTrue(requests.isEmpty())
-        assertEquals(before, endpoint.exportSnapshot())
+        assertEquals(before, physical())
         fresh.send()
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 2)
         runCurrent()
         assertEquals(listOf("resume"), requests.map { it.type })
-        assertEquals(before, endpoint.exportSnapshot())
+        assertEquals(before, physical())
     }
 
     @Test fun remoteNotificationRejectsUnsampledAToBToAWithoutMintingAReplacement() = runTest {
         val owner = remoteOwner()
         val make = PlaybackService::class.java.getDeclaredMethod("notificationIntent", String::class.java).apply { isAccessible = true }
         val old = make.invoke(service, "resume") as android.app.PendingIntent
-        remoteSnapshot = prepared().copy(queue = prepared().queue.reversed())
-        owner.retry(); runCurrent()
-        remoteSnapshot = prepared().copy(elapsed = remoteElapsed)
-        owner.retry(); runCurrent()
+        remoteSnapshot = replacement()
+        publishRemote(replacement = true)
+        remoteSnapshot = prepared()
+        publishRemote(replacement = true)
         old.send() // No intervening mint: delivery itself must observe the changed incarnation.
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 1)
         runCurrent()
@@ -545,50 +469,17 @@ class PlaybackMediaButtonsTest {
         assertEquals(listOf("resume"), requests.map { it.type })
     }
 
-    @Test fun localNotificationRemainsUsableAfterItsResultIsEchoedByCoordinator() = runTest {
-        val owner = remoteOwner(output = "phone")
-        owner.remoteCommand(PlaybackDeviceCommand.transport("pause")); runCurrent()
-        assertEquals("ok", endpoint.activate(prepared().copy(queue = prepared().queue.reversed()),
-            checkNotNull(owner.currentAuthority())).status)
-        service.onUpdateNotificationAsync(session, false).get(1, TimeUnit.SECONDS)
-        val notification = shadowOf(service.getSystemService(android.app.NotificationManager::class.java)).allNotifications.single()
-        val posted = notification.actions.single { it.title.toString() == "Next" }.actionIntent
-        val before = endpoint.exportSnapshot()
-        remoteSnapshot = before
-        owner.retry(); runCurrent() // Server echo changes its binding only after local notification.
-        shadowOf(service).setThrowInStartForeground(android.app.ForegroundServiceStartNotAllowedException("Synthetic denial"))
-        published.clear()
-        posted.send()
-        service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 1)
-        runCurrent()
-        assertNotEquals("The posted Next must survive its own later result echo", before.position, endpoint.exportSnapshot().position)
-        assertEquals(1, published.size)
-        assertFalse(output.playWhenReady)
-    }
-
     @Test fun remoteProgressHeartbeatDoesNotRetireAPreparedNotification() = runTest {
         val owner = remoteOwner()
         val make = PlaybackService::class.java.getDeclaredMethod("notificationIntent", String::class.java).apply { isAccessible = true }
         val old = make.invoke(service, "resume") as android.app.PendingIntent
         remoteElapsed += 1.0
-        owner.retry(); runCurrent()
+        publishRemote()
         assertEquals(old, make.invoke(service, "resume"))
         old.send()
         service.onStartCommand(requireNotNull(shadowOf(service).nextStartedService), 0, 1)
         runCurrent()
         assertEquals(listOf("resume"), requests.map { it.type })
-    }
-
-    @Test fun queuedRemoteRequestCannotSurviveQueueReplacementAndFreshRequestRemainsUsable() = runTest {
-        remoteOwner()
-        assertTrue(send(event(KeyEvent.KEYCODE_MEDIA_NEXT)))
-        val changed = prepared().copy(queue = prepared().queue.reversed(), position = 1)
-        assertEquals("ok", endpoint.activate(changed, PlaybackAuthority(23, 4) { true }).status)
-        val before = endpoint.exportSnapshot()
-        runCurrent()
-        assertTrue(requests.isEmpty())
-        assertEquals(before, endpoint.exportSnapshot())
-        assertRemoteCommand(KeyEvent.KEYCODE_MEDIA_NEXT, "next")
     }
 
     @Test fun firstDeliveryToSuccessorRejectsAPressFromBeforeServiceCreation() = runTest {
@@ -626,12 +517,12 @@ class PlaybackMediaButtonsTest {
                 Player.COMMAND_SET_SPEED_AND_PITCH, Player.COMMAND_SET_VOLUME,
                 Player.COMMAND_SET_DEVICE_VOLUME, Player.COMMAND_ADJUST_DEVICE_VOLUME)
             forbidden.forEach { assertFalse("Raw mutator must remain unavailable: $it", media.isCommandAvailable(it)) }
-            val before = endpoint.exportSnapshot()
+            val before = physical()
             media.play(); shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
             assertEquals(listOf("resume"), requests.map { it.type })
             media.pause(); shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
             assertEquals(listOf("resume", "pause"), requests.map { it.type })
-            assertEquals(before, endpoint.exportSnapshot())
+            assertEquals(before, physical())
             assertFalse(output.playWhenReady)
             // Media3 always adds RELEASE to a MediaController: it disconnects this observer,
             // not the service-owned output. The wrapper's own RELEASE remains unavailable.
@@ -639,8 +530,8 @@ class PlaybackMediaButtonsTest {
             assertFalse(session.player.isCommandAvailable(Player.COMMAND_RELEASE))
             media.release()
             shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS); runCurrent()
-            assertEquals("Controller release must not empty/release the service output", before, endpoint.exportSnapshot())
-            assertEquals(before.queue.size, output.mediaItemCount)
+            assertEquals("Controller release must not empty/release the service output", before, physical())
+            assertEquals(before.first.size, output.mediaItemCount)
         } finally { media.release() }
     }
 }

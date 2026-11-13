@@ -1,5 +1,10 @@
 package dev.spofify.mobile
 
+import dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding
+import dev.spofify.mobile.playback.PlaybackActionResult
+import dev.spofify.mobile.playback.PlaybackActionStatus
+import dev.spofify.mobile.playback.PlaybackInteractionKey
+import dev.spofify.mobile.playback.PlaybackListAction
 import android.app.Application
 import android.graphics.Bitmap
 import androidx.activity.ComponentDialog
@@ -157,8 +162,11 @@ class PlaylistArtworkHostTest {
     private inline fun <reified T> typed(value: T) = json(ApiJson.encodeToString(value))
     private class NoPlayback : PlaybackControls {
         override val state = MutableStateFlow(PlaybackState())
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean, startEntryId: String?) = error("Opening More cannot play")
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) = error("Opening More cannot queue")
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: LibraryPlaybackActionBinding?,
+            shuffle: Boolean?, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            error("Opening More cannot play or queue")
+        }
         override fun connect() = Unit
         override fun release() = Unit
         override fun toggle() = Unit

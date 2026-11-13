@@ -1,5 +1,11 @@
 package dev.spofify.mobile
 
+import dev.spofify.mobile.core.LibraryPlaybackSelection
+import dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding
+import dev.spofify.mobile.playback.PlaybackActionResult
+import dev.spofify.mobile.playback.PlaybackActionStatus
+import dev.spofify.mobile.playback.PlaybackInteractionKey
+import dev.spofify.mobile.playback.PlaybackListAction
 import android.app.Application
 import androidx.activity.OnBackPressedDispatcher
 import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
@@ -59,8 +65,11 @@ class RootCopyHostTest {
         override val state = MutableStateFlow(PlaybackState())
         override fun connect() = Unit
         override fun release() = Unit
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean, startEntryId: String?) = Unit
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) = Unit
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: LibraryPlaybackActionBinding?,
+            shuffle: Boolean?, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+        }
         override fun setContext(context: LibraryItem?) = Unit
         override fun toggle() = Unit
         override fun next() = Unit

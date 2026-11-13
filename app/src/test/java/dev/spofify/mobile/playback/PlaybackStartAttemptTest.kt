@@ -18,15 +18,12 @@ import dev.spofify.mobile.AppGraph
 import dev.spofify.mobile.LoginStore
 import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
-import dev.spofify.mobile.core.PlaybackDeviceCommand
-import dev.spofify.mobile.core.PlaybackOccurrence
-import dev.spofify.mobile.core.PlaybackSnapshot
-import dev.spofify.mobile.core.PlaybackTrack
 import dev.spofify.mobile.core.ServerAddress
 import dev.spofify.mobile.core.SessionStore
 import dev.spofify.mobile.core.StoredSession
-import dev.spofify.mobile.feature.devices.PlaybackAuthority
-import dev.spofify.mobile.feature.devices.PlaybackEndpointResult
+import dev.spofify.mobile.core.LibraryPlaybackInstruction
+import dev.spofify.mobile.core.LibraryPlaybackTrack
+import dev.spofify.mobile.feature.devices.LibraryPlaybackAuthority
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -54,9 +51,8 @@ import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
 
-/** Actual private service start coroutine, real auth/focus/foreground, controlled output timing.
+/** Actual server-instruction service start coroutine, real auth/focus/foreground, controlled output timing.
  * Synthetic JVM regressions only; these do not establish native or acoustic playback.
  */
 @RunWith(RobolectricTestRunner::class)
@@ -69,7 +65,7 @@ class PlaybackStartAttemptTest {
     private lateinit var graph: AppGraph
     private lateinit var fixture: Fixture
     private val fixtures = mutableListOf<Fixture>()
-    private val endpoint = Media3PlaybackEndpoint()
+    private val endpoint = Media3PlaybackEndpoint(ApplicationProvider.getApplicationContext())
 
     @Before fun setUp() = runBlocking {
         System.getenv("SPOFIFY_TEST_TMPDIR")?.let { expected ->
@@ -98,7 +94,7 @@ class PlaybackStartAttemptTest {
             start(InetAddress.getByName("127.0.0.1"), 0)
         }
         val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
-        PlaybackService.onServiceActiveChanged = null // Never register/poll a real player backend.
+        PlaybackService.onServiceActiveChanged = null // No playback transport is launched by this fixture.
         client.login("listener", "synthetic-password")
         assertEquals("/api/auth/login", web.takeRequest(1, TimeUnit.SECONDS)?.path)
         fixture = createFixture()
@@ -111,21 +107,6 @@ class PlaybackStartAttemptTest {
             try { if (::graph.isInitialized) graph.clear() }
             finally { if (::web.isInitialized) web.shutdown() }
         }
-    }
-
-    private fun prepared() = PlaybackSnapshot(
-        queue = listOf(PlaybackTrack("same-track", "First occurrence", emptyList(), "Album", "album", 120.0, key = 7, order = 0),
-            PlaybackTrack("same-track", "Second occurrence", emptyList(), "Album", "album", 120.0, key = 91, order = 1)),
-        position = 0, elapsed = 17.25, duration = 120.0,
-        occurrence = PlaybackOccurrence(7, "same-track", "retained-history", 3.25, false),
-    ).validated()
-
-    private suspend fun createFixture(): Fixture {
-        val next = Fixture(Robolectric.buildService(PlaybackService::class.java).create())
-        fixtures += next
-        assertEquals("ok", endpoint.activate(prepared(), PlaybackAuthority(23, 4) { true }).status)
-        next.install()
-        return next
     }
 
     private class Fixture(val controller: ServiceController<PlaybackService>) {
@@ -142,8 +123,6 @@ class PlaybackStartAttemptTest {
             setField(service, "player", output.player)
         }
 
-        fun permit(value: PlaybackAuthority) { setField(service, "explicitBackgroundPermit", value) }
-        fun token(): Any = requireNotNull(field(service, "startAttempt"))
 
         fun close() {
             if (closed) return
@@ -209,489 +188,276 @@ class PlaybackStartAttemptTest {
         }
     }
 
-    /** Pass the caller's continuation through the JVM suspend ABI, retaining runTest's scheduler.
-     * No extracted replica of startOwned and no runBlocking around its readiness loops.
-     */
-    private suspend fun start(target: Fixture, permit: PlaybackAuthority, guard: () -> Boolean): PlaybackEndpointResult =
-        suspendCoroutineUninterceptedOrReturn { continuation ->
-            val method = PlaybackService::class.java.declaredMethods.single { it.name == "startOwned" }
-            method.isAccessible = true
-            try { method.invoke(target.service, permit, true, guard, continuation) }
-            catch (failure: InvocationTargetException) { throw failure.targetException }
+
+    private suspend fun createFixture(): Fixture =
+        Fixture(Robolectric.buildService(PlaybackService::class.java).create()).also {
+            fixtures += it
+            assertEquals("ok", endpoint.prepare(instruction("fixture-bind", playing = false, track = false).copy(type = "prepare")) { true })
+            it.install()
         }
 
-    private suspend fun importGuarded(snapshot: PlaybackSnapshot, permit: PlaybackAuthority,
-        guard: () -> Boolean): PlaybackEndpointResult = suspendCoroutineUninterceptedOrReturn { continuation ->
-        val method = PlaybackService::class.java.declaredMethods.single { it.name == "importSnapshot" }
-        method.isAccessible = true
-        // Exact suspend ABI: snapshot, lease, start guard, installation observer,
-        // nullable provenance sidecar, continuation. Generic/legacy import opts out of both.
-        assertEquals(6, method.parameterCount)
-        try { method.invoke(fixture.service, snapshot, permit, guard, null, null, continuation) }
-        catch (failure: InvocationTargetException) { throw failure.targetException }
-    }
+    private fun instruction(id: String = "execute", playing: Boolean = true, track: Boolean = true) =
+        LibraryPlaybackInstruction(id, "execute", 23, "event", 17.25, playing,
+            track = if (track) LibraryPlaybackTrack("same-track", "First occurrence", emptyList(),
+                "Album", "album", 120.0, 7, 0, "now") else null)
 
-    private fun assertPendingOwnership(target: Fixture) {
-        assertEquals(1, target.output.prepares)
-        assertTrue(target.focus.isGranted)
-        assertTrue(target.foreground.foregroundConfirmed)
-        assertFalse(shadowOf(target.service).isForegroundStopped)
-        assertNotNull(target.token())
-    }
+    private suspend fun execute(value: LibraryPlaybackInstruction = instruction(),
+        current: () -> Boolean = { true }): String =
+        endpoint.execute(value, LibraryPlaybackAuthority(current))
 
-    private fun assertSilenced(target: Fixture, result: PlaybackEndpointResult, before: PlaybackSnapshot,
-        status: String = "rejected") {
-        assertEquals(status, result.status)
-        assertTrue("Rejected caller must pause its actual output", target.output.pauses > 0)
-        assertTrue("Rejected caller must discard its buffered output", target.output.stops > 0)
-        assertFalse("A paused snapshot alone must not hide raw playing output", target.output.player.isPlaying)
+    private fun assertSilenced(target: Fixture = fixture) {
+        assertTrue("Cancel pending native work before returning its receipt", target.output.pauses > 0)
+        assertTrue("Drain buffered output, not merely a presentation flag", target.output.stops > 0)
+        assertFalse(target.output.player.isPlaying)
         assertFalse(target.output.player.playWhenReady)
-        assertFalse(result.snapshot.playing)
-        assertEquals("Rejected snapshot must agree with raw output", target.output.player.isPlaying, result.snapshot.playing)
         assertFalse(target.focus.isGranted)
-        assertNull(field(target.service, "startAttempt"))
         assertFalse(target.foreground.foregroundConfirmed)
         assertTrue(shadowOf(target.service).isForegroundStopped)
-        assertFalse(shadowOf(target.service).isLastForegroundNotificationAttached)
-        val notification = shadowOf(target.service.getSystemService(NotificationManager::class.java)).allNotifications.single()
-        assertEquals("Resume", notification.actions[1].title)
-        assertEquals(0, notification.flags and Notification.FLAG_ONGOING_EVENT)
-        assertEquals(before.queue, result.snapshot.queue)
-        assertEquals(before.position, result.snapshot.position)
-        assertEquals(before.elapsed, result.snapshot.elapsed, 0.0)
-        assertEquals(before.occurrence, result.snapshot.occurrence)
-        assertEquals("Only synthetic login may reach HTTP", 1, web.requestCount)
+        assertEquals("Neither history POST nor catalog preparation HTTP is permitted", 1, web.requestCount)
     }
 
-    @Test fun retiredOriginBeforeImportCannotReplacePreparedQueueHistoryOrSuccessorAttempt() = runTest {
-        val before = endpoint.exportSnapshot()
-        val queueEpoch = PlaybackRequests.queueEpoch
-        val replacement = before.copy(queue = before.queue.map { it.copy(id = "obsolete-selection") }, occurrence = null, playing = true)
-        val result = importGuarded(replacement, PlaybackAuthority(24, 5) { true }) { false }
-        assertEquals("rejected", result.status)
-        assertEquals(before, endpoint.exportSnapshot())
-        assertEquals(queueEpoch, PlaybackRequests.queueEpoch)
-        assertEquals(0, fixture.output.prepares)
+    @Test fun prepareIsSilentAndCannotAcquireFocusForegroundOrPlayback() = runTest {
+        fixture.output.readyOnPrepare = true
+        assertEquals("ok", endpoint.prepare(instruction().copy(type = "prepare")) { true })
+        assertEquals(1, fixture.output.prepares)
         assertEquals(0, fixture.output.plays)
         assertFalse(fixture.focus.isGranted)
+        assertFalse(fixture.foreground.foregroundConfirmed)
+        assertFalse(fixture.output.wantsPlay)
         assertEquals(1, web.requestCount)
     }
 
-    @Test fun callerBecomesFalseWhileAwaitingReadyDrainsOwnedOutputFocusAndForeground() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        var current = true
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { current } }
-        assertFalse("Hold the actual start coroutine in its READY loop", pending.isCompleted)
-        assertPendingOwnership(fixture)
+    @Test fun retiredOriginBeforePreparationCannotInstallOrReplaceMedia() = runTest {
+        assertEquals("rejected", endpoint.prepare(instruction().copy(type = "prepare")) { false })
+        assertEquals(0, fixture.real.mediaItemCount)
+        assertEquals(0, fixture.output.prepares)
         assertEquals(0, fixture.output.plays)
-        val focusRequest = requireNotNull(fixture.audio.lastAudioFocusRequest).audioFocusRequest
-        current = false // Change ONLY the caller predicate, not global authority/epoch/focus.
-        assertFalse(pending.isCompleted)
+        assertEquals(1, web.requestCount)
+    }
+
+    @Test fun revokedAuthorityCannotInstallOrExecuteEvenStoppedMedia() = runTest {
+        assertEquals("rejected", execute(instruction(playing = false)) { false })
+        assertEquals(0, fixture.real.mediaItemCount)
+        assertEquals(0, fixture.output.prepares)
+        assertEquals(0, fixture.output.plays)
+    }
+
+    @Test fun callerBecomesFalseWhileAwaitingReadyDrainsOutputFocusAndForeground() = runTest {
+        var current = true
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute(current = { current }) }
+        assertEquals(1, fixture.output.prepares)
         assertTrue(fixture.focus.isGranted)
+        assertTrue(fixture.foreground.foregroundConfirmed)
+        current = false
         advanceTimeBy(20); runCurrent()
-        assertTrue(pending.isCompleted)
-        assertSilenced(fixture, pending.await(), before)
-        assertSame(focusRequest, fixture.audio.lastAbandonedAudioFocusRequest)
+        assertEquals("rejected", pending.await())
+        assertEquals(0, fixture.output.plays)
+        assertSilenced()
     }
 
-    @Test fun callerBecomesFalseAfterRawPlayBeginsCannotReturnAPausedLie() = runTest {
+    @Test fun callerBecomesFalseAfterRawPlayCannotReturnAPausedLie() = runTest {
         fixture.output.readyOnPrepare = true
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
         var current = true
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { current } }
-        assertFalse("Hold the actual start coroutine in its isPlaying loop", pending.isCompleted)
-        assertPendingOwnership(fixture)
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute(current = { current }) }
         assertEquals(1, fixture.output.plays)
-        assertTrue(fixture.output.player.playWhenReady)
-        val focusRequest = requireNotNull(fixture.audio.lastAudioFocusRequest).audioFocusRequest
         fixture.output.rawPlaying = true
-        current = false // Raw isPlaying changes before the suspended coroutine observes disposal.
-        assertTrue("Regression precondition: raw output really reports playing", fixture.output.player.isPlaying)
-        assertFalse(pending.isCompleted)
+        current = false
         advanceTimeBy(10); runCurrent()
-        assertTrue(pending.isCompleted)
-        assertSilenced(fixture, pending.await(), before)
-        assertSame(focusRequest, fixture.audio.lastAbandonedAudioFocusRequest)
+        assertEquals("rejected", pending.await())
+        assertSilenced()
     }
 
-    @Test fun independentSemanticEditCancelsGenericStartAndRetainsCleanupOwnerBeforeRawPlay() =
-        semanticEditRetainsCleanupOwner(afterRawPlay = false)
-
-    @Test fun independentSemanticEditCancelsGenericStartAndRetainsCleanupOwnerAfterRawPlay() =
-        semanticEditRetainsCleanupOwner(afterRawPlay = true)
-
-    // Each @Test owns its normal setup fixture/session; do not create a second live
-    // production MediaSession with the same ID just to exercise the second timing phase.
-    private fun semanticEditRetainsCleanupOwner(afterRawPlay: Boolean) = runTest {
-        val target = fixture
-        target.output.readyOnPrepare = afterRawPlay
-        val permit = PlaybackAuthority(23, 4) { true }
-        target.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(target, permit) { true } }
-        assertFalse(pending.isCompleted)
-        assertPendingOwnership(target)
-        assertEquals(if (afterRawPlay) 1 else 0, target.output.plays)
-        assertEquals(afterRawPlay, target.output.wantsPlay)
-        val token = target.token()
-        val focusRequest = requireNotNull(target.audio.lastAudioFocusRequest).audioFocusRequest
-        // Same lease, distinct permit object: a nonstarting edit is NOT resource takeover.
-        endpoint.execute(PlaybackDeviceCommand.transport("repeat"), PlaybackAuthority(23, 4) { true })
-        assertSame(token, target.token())
-        assertNull(field(target.service, "startAttemptValidity"))
-        advanceTimeBy(30); runCurrent()
-        val result = pending.await()
-        assertEquals("all", result.snapshot.repeat)
-        assertSilenced(target, result, before)
-        assertSame(focusRequest, target.audio.lastAbandonedAudioFocusRequest)
-        target.output.rawPlaying = target.output.wantsPlay && target.output.state == Player.STATE_READY
-        advanceTimeBy(600); runCurrent()
-        assertFalse(target.output.rawPlaying)
-        assertEquals(if (afterRawPlay) 1 else 0, target.output.plays)
+    private fun successor(afterRawPlay: Boolean, cancelOld: Boolean, empty: Boolean = false) = runTest {
+        fixture.output.readyOnPrepare = afterRawPlay
+        val old = async(start = CoroutineStart.UNDISPATCHED) { execute() }
+        if (afterRawPlay) assertEquals(1, fixture.output.plays)
+        else assertEquals(0, fixture.output.plays)
+        val newer = instruction("successor", playing = false, track = !empty)
+        assertEquals("ok", execute(newer))
+        val pauses = fixture.output.pauses
+        val stops = fixture.output.stops
+        if (cancelOld) old.cancelAndJoin() else {
+            advanceTimeBy(20); runCurrent()
+            assertEquals("rejected", old.await())
+        }
+        assertEquals("Obsolete completion must not clean its successor", pauses, fixture.output.pauses)
+        assertEquals(stops, fixture.output.stops)
+        assertEquals(if (empty) 0 else 1, fixture.real.mediaItemCount)
+        assertFalse(fixture.output.wantsPlay)
+        assertFalse(fixture.focus.isGranted)
     }
 
-    @Test fun oldCompletionCannotSilenceSuccessorStartEvenWithSamePermitAndOccurrence() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        var current = true
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { current } }
-        assertFalse(pending.isCompleted)
-        val oldToken = fixture.token()
-        current = false
+    @Test fun replacementBeforeReadinessCancelsOnlyPredecessor() = successor(false, false)
+    @Test fun replacementAfterRawPlayCancelsOnlyPredecessor() = successor(true, false)
+    @Test fun cancelledOldStartCannotCleanSameTrackSuccessor() = successor(false, true)
+    @Test fun cancelledOldPlayCannotCleanPausedSuccessor() = successor(true, true)
+    @Test fun tracklessStoppedSuccessorOwnsDemotion() = successor(true, true, empty = true)
+
+    @Test fun oldCompletionCannotSilencePlayingSuccessorUsingSameAuthorityObject() = runTest {
+        val permit = LibraryPlaybackAuthority { true }
+        val old = async(start = CoroutineStart.UNDISPATCHED) { endpoint.execute(instruction(), permit) }
         fixture.output.readyOnPrepare = true
         fixture.output.playingOnPlay = true
-        val successor = start(fixture, permit) { true }
-        assertEquals("ok", successor.status)
-        val successorToken = fixture.token()
-        assertNotSame("Same authority/current occurrence still needs a fresh attempt identity", oldToken, successorToken)
-        val focusRequest = requireNotNull(fixture.audio.lastAudioFocusRequest).audioFocusRequest
-        val abandoned = fixture.audio.lastAbandonedAudioFocusRequest
+        assertEquals("ok", endpoint.execute(instruction("successor"), permit))
         val pauses = fixture.output.pauses
         val stops = fixture.output.stops
         advanceTimeBy(20); runCurrent()
-        assertTrue(pending.isCompleted)
-        val rejected = pending.await()
-        assertEquals("rejected", rejected.status)
-        assertTrue("Old result must truthfully expose the now-playing successor", rejected.snapshot.playing)
-        assertSuccessor(fixture, successorToken, successor.snapshot, pauses, stops)
-        assertSame(focusRequest, requireNotNull(fixture.audio.lastAudioFocusRequest).audioFocusRequest)
-        assertSame(abandoned, fixture.audio.lastAbandonedAudioFocusRequest)
+        assertEquals("rejected", old.await())
+        assertEquals(pauses, fixture.output.pauses)
+        assertEquals(stops, fixture.output.stops)
+        assertTrue(fixture.output.rawPlaying)
+        assertTrue(fixture.focus.isGranted)
     }
 
-    @Test fun oldCompletionCannotSilenceSuccessorImportReusingPermitAndCurrentOccurrence() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        var current = true
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { current } }
-        assertFalse(pending.isCompleted)
-        val oldToken = fixture.token()
-        current = false
+    @Test fun oldCompletionCannotBorrowSuccessorServiceIdentity() = runTest {
+        val previous = fixture
+        val old = async(start = CoroutineStart.UNDISPATCHED) { execute() }
+        previous.close()
+        fixture = createFixture()
         fixture.output.readyOnPrepare = true
         fixture.output.playingOnPlay = true
-        val replacement = prepared().copy(queue = prepared().queue.map { it.copy(name = "Imported successor") }, playing = true)
-        val successor = endpoint.activate(replacement, permit)
-        assertEquals("ok", successor.status)
-        val successorToken = fixture.token()
-        assertNotSame(oldToken, successorToken)
-        val pauses = fixture.output.pauses
-        val stops = fixture.output.stops
+        assertEquals("ok", execute(instruction("successor-service")))
         advanceTimeBy(20); runCurrent()
-        assertTrue(pending.isCompleted)
-        assertEquals("rejected", pending.await().status)
-        assertSuccessor(fixture, successorToken, successor.snapshot, pauses, stops)
+        assertEquals("rejected", old.await())
+        assertTrue(fixture.output.rawPlaying)
+        assertTrue(fixture.focus.isGranted)
     }
 
-    @Test fun oldCompletionCannotStopSuccessorServiceOutputOrBorrowItsAttemptIdentity() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        var current = true
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { current } }
-        assertFalse(pending.isCompleted)
-        val oldToken = fixture.token()
-        current = false
-        fixture.close() // Restores/releases the real output through normal service cleanup.
-        val successorFixture = createFixture()
-        successorFixture.permit(permit)
-        successorFixture.output.readyOnPrepare = true
-        successorFixture.output.playingOnPlay = true
-        val successor = start(successorFixture, permit) { true }
-        assertEquals("ok", successor.status)
-        val successorToken = successorFixture.token()
-        assertNotSame(oldToken, successorToken)
-        val pauses = successorFixture.output.pauses
-        val stops = successorFixture.output.stops
-        advanceTimeBy(20); runCurrent()
-        assertTrue(pending.isCompleted)
-        assertEquals("rejected", pending.await().status)
-        assertSuccessor(successorFixture, successorToken, successor.snapshot, pauses, stops)
-        assertTrue(fixture.output.released)
-    }
-
-    @Test fun cancellationWhileAwaitingReadyDrainsOwnedOutputFocusAndForeground() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        assertPendingOwnership(fixture)
+    private fun cancellation(afterRawPlay: Boolean) = runTest {
+        fixture.output.readyOnPrepare = afterRawPlay
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute() }
+        if (afterRawPlay) fixture.output.rawPlaying = true
         pending.cancelAndJoin()
-        assertTrue(pending.isCancelled)
-        assertSilenced(fixture, PlaybackEndpointResult("rejected", endpoint.exportSnapshot()), before)
+        assertSilenced()
     }
+    @Test fun cancellationWhileAwaitingReadyDrainsOutputFocusAndForeground() = cancellation(false)
+    @Test fun cancellationAfterRawPlayDrainsActualOutput() = cancellation(true)
 
-    @Test fun cancellationAfterRawPlayDrainsActualOutputNotJustSnapshot() = runTest {
-        fixture.output.readyOnPrepare = true
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        assertEquals(1, fixture.output.plays)
-        fixture.output.rawPlaying = true
-        pending.cancelAndJoin()
-        assertSilenced(fixture, PlaybackEndpointResult("rejected", endpoint.exportSnapshot()), before)
-    }
-
-    @Test fun cancelledOldStartDoesNotCleanSameValuedSuccessor() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        val old = fixture.token()
-        fixture.output.readyOnPrepare = true
-        fixture.output.playingOnPlay = true
-        val equalValuedPermit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(equalValuedPermit)
-        val successor = start(fixture, equalValuedPermit) { true }
-        val token = fixture.token()
-        assertNotSame(old, token)
-        val pauses = fixture.output.pauses
-        val stops = fixture.output.stops
-        val abandoned = fixture.audio.lastAbandonedAudioFocusRequest
-        pending.cancelAndJoin()
-        assertSuccessor(fixture, token, successor.snapshot, pauses, stops)
-        assertSame(abandoned, fixture.audio.lastAbandonedAudioFocusRequest)
-    }
-
-    @Test fun deniedFocusStopsOwnedOutputAndDemotesForegroundWithoutPreparing() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
+    @Test fun deniedFocusStopsOutputWithoutPreparing() = runTest {
         fixture.audio.setNextFocusRequestResponse(AudioManager.AUDIOFOCUS_REQUEST_FAILED)
-        val before = endpoint.exportSnapshot()
-        val result = start(fixture, permit) { true }
-        assertSilenced(fixture, result, before, "blocked")
-        assertEquals("blocked", result.snapshot.error)
+        assertEquals("blocked", execute())
         assertEquals(0, fixture.output.prepares)
         assertEquals(0, fixture.output.plays)
+        assertSilenced()
     }
 
-    @Test fun deniedForegroundStopsOutputWithoutAcquiringFocusOrPreparing() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
+    @Test fun deniedForegroundStopsWithoutAcquiringFocusOrPreparing() = runTest {
         shadowOf(fixture.service).setThrowInStartForeground(
-            ForegroundServiceStartNotAllowedException("Synthetic start rejection"))
-        val before = endpoint.exportSnapshot()
-        val result = start(fixture, permit) { true }
-        assertSilenced(fixture, result, before, "blocked")
-        assertNull(fixture.audio.lastAudioFocusRequest)
+            ForegroundServiceStartNotAllowedException("Synthetic denial"))
+        assertEquals("blocked", execute())
         assertEquals(0, fixture.output.prepares)
+        assertEquals(0, fixture.output.plays)
+        assertSilenced()
     }
 
-    @Test fun mediaErrorDuringReadinessCleansOutputFocusAndForeground() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        assertPendingOwnership(fixture)
+    private fun mediaError(afterRawPlay: Boolean) = runTest {
+        fixture.output.readyOnPrepare = afterRawPlay
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute() }
         fixture.output.error = ExoPlaybackException.createForSource(
-            java.io.IOException("Synthetic media failure"), PlaybackException.ERROR_CODE_IO_UNSPECIFIED)
+            java.io.IOException("Synthetic failure"), PlaybackException.ERROR_CODE_IO_UNSPECIFIED)
         advanceTimeBy(20); runCurrent()
-        assertSilenced(fixture, pending.await(), before, "media")
+        assertEquals("media", pending.await())
+        assertSilenced()
     }
-
-    @Test fun mediaErrorAfterRawPlayCleansOutputFocusAndForeground() = runTest {
-        fixture.output.readyOnPrepare = true
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        assertEquals(1, fixture.output.plays)
-        fixture.output.rawPlaying = true
-        fixture.output.error = ExoPlaybackException.createForSource(
-            java.io.IOException("Synthetic post-play media failure"), PlaybackException.ERROR_CODE_IO_UNSPECIFIED)
-        advanceTimeBy(10); runCurrent()
-        assertSilenced(fixture, pending.await(), before, "media")
-    }
+    @Test fun mediaErrorDuringReadinessCleansOutputFocusAndForeground() = mediaError(false)
+    @Test fun mediaErrorAfterRawPlayCleansOutputFocusAndForeground() = mediaError(true)
 
     @Test fun readinessTimeoutDoesNotKeepFocusOrForeground() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        assertPendingOwnership(fixture)
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute() }
         advanceTimeBy(3_000); runCurrent()
-        assertSilenced(fixture, pending.await(), before, "media")
+        assertEquals("media", pending.await())
+        assertEquals(0, fixture.output.plays)
+        assertSilenced()
     }
 
     @Test fun rawPlayTimeoutDoesNotLeavePreparedOutputOrFocus() = runTest {
         fixture.output.readyOnPrepare = true
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        assertEquals(1, fixture.output.plays)
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute() }
         advanceTimeBy(500); runCurrent()
-        assertSilenced(fixture, pending.await(), before, "blocked")
+        assertEquals("blocked", pending.await())
+        assertEquals(1, fixture.output.plays)
+        assertSilenced()
     }
 
     @Test fun thrownPrepareFailureStillCleansOwnedOutputFocusAndForeground() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val failure = IllegalStateException("Synthetic prepare failure")
-        fixture.output.prepareFailure = failure
-        try {
-            start(fixture, permit) { true }
-            fail("The original media exception must propagate")
-        } catch (actual: IllegalStateException) { assertSame(failure, actual) }
-        assertSilenced(fixture, PlaybackEndpointResult("rejected", endpoint.exportSnapshot()), before)
+        fixture.output.prepareFailure = IllegalStateException("Synthetic prepare failure")
+        assertEquals("media", execute())
+        assertSilenced()
+    }
+
+    @Test fun thrownPlayFailureStillReleasesOwnedResources() = runTest {
+        fixture.output.readyOnPrepare = true
+        fixture.output.playFailure = IllegalStateException("Synthetic play failure")
+        assertEquals("media", execute())
+        assertSilenced()
     }
 
     @Test fun focusLossCancelsPendingStartAndGainNeverRestarts() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-        assertPendingOwnership(fixture)
-        val listener = requireNotNull(requireNotNull(fixture.audio.lastAudioFocusRequest).listener)
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute() }
+        val request = requireNotNull(fixture.audio.lastAudioFocusRequest?.audioFocusRequest)
+        val listener = android.media.AudioFocusRequest::class.java.getDeclaredMethod("getOnAudioFocusChangeListener")
+            .apply { isAccessible = true }.invoke(request) as AudioManager.OnAudioFocusChangeListener
         listener.onAudioFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        shadowOf(Looper.getMainLooper()).idle()
         advanceTimeBy(20); runCurrent()
-        assertEquals("rejected", pending.await().status)
-        assertFalse(fixture.output.wantsPlay)
-        assertFalse(fixture.focus.isGranted)
-        assertFalse(fixture.foreground.foregroundConfirmed)
-        val prepares = fixture.output.prepares
+        assertEquals("rejected", pending.await())
+        assertSilenced()
         listener.onAudioFocusChange(AudioManager.AUDIOFOCUS_GAIN)
-        assertFalse(fixture.output.wantsPlay)
-        assertEquals(prepares, fixture.output.prepares)
+        shadowOf(Looper.getMainLooper()).idle()
+        advanceTimeBy(3_500); runCurrent()
         assertEquals(0, fixture.output.plays)
+        assertFalse(fixture.output.wantsPlay)
     }
 
-    @Test fun importForwardsNonDefaultGuardAndCleansItsRejectedStart() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        var current = true
-        val before = prepared()
-        val pending = async(start = CoroutineStart.UNDISPATCHED) {
-            importGuarded(before.copy(playing = true), permit) { current }
-        }
-        assertPendingOwnership(fixture)
-        current = false
-        advanceTimeBy(20); runCurrent()
-        assertSilenced(fixture, pending.await(), before)
-    }
-
-    @Test fun pausedSuccessorImportOwnsDemotionAndOldCancellationCannotAlterIt() = runTest {
-        assertSilentSuccessorImport(prepared())
-    }
-
-    @Test fun emptySuccessorImportOwnsDemotionAndOldCancellationCannotAlterIt() = runTest {
-        assertSilentSuccessorImport(PlaybackSnapshot())
-    }
-
-    private suspend fun assertSilentSuccessorImport(replacement: PlaybackSnapshot) {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        // UNDISPATCHED enters the real coroutine until its first readiness delay.
-        kotlinx.coroutines.coroutineScope {
-            val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-            assertPendingOwnership(fixture)
-            val successor = endpoint.activate(replacement, permit)
-            assertEquals("ok", successor.status)
-            assertFalse(successor.snapshot.playing)
-            assertFalse(fixture.output.rawPlaying)
-            assertFalse(fixture.output.wantsPlay)
-            assertFalse(fixture.focus.isGranted)
-            assertFalse(fixture.foreground.foregroundConfirmed)
-            assertTrue(shadowOf(fixture.service).isForegroundStopped)
-            val pauses = fixture.output.pauses
-            val stops = fixture.output.stops
-            val abandoned = fixture.audio.lastAbandonedAudioFocusRequest
-            pending.cancelAndJoin()
-            assertEquals(pauses, fixture.output.pauses)
-            assertEquals(stops, fixture.output.stops)
-            assertSame(abandoned, fixture.audio.lastAbandonedAudioFocusRequest)
-            assertEquals(successor.snapshot, endpoint.exportSnapshot())
-        }
+    @Test fun releaseCancelsPendingStartBeforeReturningStoppedProof() = runTest {
+        fixture.output.readyOnPrepare = true
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute() }
+        fixture.output.rawPlaying = true
+        assertTrue(endpoint.release())
+        assertSilenced()
+        advanceTimeBy(10); runCurrent()
+        assertEquals("rejected", pending.await())
     }
 
     @Test fun keepAlivePlatformRejectionIsBlockedAndReleasesFocusAndForeground() = runTest {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val original = fixture.service.baseContext
-        val rejecting = object : ContextWrapper(original) {
+        val context = fixture.service.baseContext
+        val wrapper = object : ContextWrapper(context) {
             override fun startService(service: Intent): ComponentName? {
-                throw IllegalStateException("Synthetic background keepalive rejection")
+                throw ForegroundServiceStartNotAllowedException("Synthetic keep-alive denial")
             }
         }
-        val base = ContextWrapper::class.java.getDeclaredField("mBase").apply { isAccessible = true }
-        base.set(fixture.service, rejecting)
+        val base = android.content.ContextWrapper::class.java.getDeclaredField("mBase").apply { isAccessible = true }
+        base.set(fixture.service, wrapper)
         try {
-            assertSilenced(fixture, start(fixture, permit) { true }, before, "blocked")
+            assertEquals("blocked", execute())
             assertEquals(0, fixture.output.prepares)
-        } finally { base.set(fixture.service, original) }
+            assertSilenced()
+        } finally { base.set(fixture.service, context) }
     }
 
-    @Test fun thrownPlayFailurePropagatesButStillReleasesOwnedResources() = runTest {
+    private fun cleanupFailure(pause: Boolean) = runTest {
+        // A revoked active operation must drain even if one native cleanup method throws.
         fixture.output.readyOnPrepare = true
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        val failure = IllegalStateException("Synthetic play failure")
-        fixture.output.playFailure = failure
-        try {
-            start(fixture, permit) { true }
-            fail("The original play exception must propagate")
-        } catch (actual: IllegalStateException) { assertSame(failure, actual) }
-        assertSilenced(fixture, PlaybackEndpointResult("rejected", endpoint.exportSnapshot()), before)
+        var current = true
+        val pending = async(start = CoroutineStart.UNDISPATCHED) { execute(current = { current }) }
+        fixture.output.rawPlaying = true
+        if (pause) fixture.output.pauseFailure = IllegalStateException("Synthetic pause failure")
+        else fixture.output.stopFailure = IllegalStateException("Synthetic stop failure")
+        current = false
+        advanceTimeBy(10); runCurrent()
+        assertEquals("rejected", pending.await())
+        assertSilenced()
     }
+    @Test fun throwingPauseCleanupStillStopsOutputAndReleasesFocusAndForeground() = cleanupFailure(true)
+    @Test fun throwingStopCleanupStillPausesOutputAndReleasesFocusAndForeground() = cleanupFailure(false)
 
-    @Test fun throwingPauseCleanupStillStopsOutputAndReleasesFocusAndForeground() = runTest {
-        assertCleanupFailure(pause = true)
-    }
-
-    @Test fun throwingStopCleanupStillPausesOutputAndReleasesFocusAndForeground() = runTest {
-        assertCleanupFailure(pause = false)
-    }
-
-    private suspend fun assertCleanupFailure(pause: Boolean) {
-        val permit = PlaybackAuthority(23, 4) { true }
-        fixture.permit(permit)
-        val before = endpoint.exportSnapshot()
-        kotlinx.coroutines.coroutineScope {
-            val pending = async(start = CoroutineStart.UNDISPATCHED) { start(fixture, permit) { true } }
-            assertPendingOwnership(fixture)
-            if (pause) fixture.output.pauseFailure = IllegalStateException("Synthetic cleanup pause failure")
-            else fixture.output.stopFailure = IllegalStateException("Synthetic cleanup stop failure")
-            pending.cancelAndJoin()
-            assertSilenced(fixture, PlaybackEndpointResult("rejected", endpoint.exportSnapshot()), before)
-        }
-    }
-
-    private fun assertSuccessor(target: Fixture, token: Any, snapshot: PlaybackSnapshot, pauses: Int, stops: Int) {
-        assertSame("Old completion must not clear a successor's token", token, target.token())
-        assertEquals("Old completion must not pause successor output", pauses, target.output.pauses)
-        assertEquals("Old completion must not stop successor output", stops, target.output.stops)
-        assertTrue(target.output.player.isPlaying)
-        assertTrue(target.output.player.playWhenReady)
-        assertTrue(target.focus.isGranted)
-        assertTrue(target.foreground.foregroundConfirmed)
-        assertFalse(shadowOf(target.service).isForegroundStopped)
-        assertEquals(snapshot, endpoint.exportSnapshot())
+    @Test fun observedPositionDurationAndPlayingComeFromMediaNotInstructionIntent() = runTest {
+        assertEquals("ok", execute(instruction(playing = false)))
+        val observed = endpoint.observe()
+        assertFalse(observed.isPlaying)
+        assertEquals(fixture.output.player.currentPosition / 1000.0, observed.elapsed, 0.0)
+        assertEquals(1, fixture.output.player.mediaItemCount)
+        assertEquals(0, fixture.output.plays)
         assertEquals(1, web.requestCount)
-        // Do not idleFor/advanceUntilIdle: the service's recurring 100ms history tick can
-        // conceal broken start cleanup. Pump only due main messages after the assertions.
-        shadowOf(Looper.getMainLooper()).idle()
     }
 }

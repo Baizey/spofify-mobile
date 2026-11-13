@@ -5,11 +5,15 @@ import dev.spofify.mobile.core.PlaybackContext
 import dev.spofify.mobile.core.PlaybackSnapshot
 import dev.spofify.mobile.core.PlaybackTrack
 import dev.spofify.mobile.core.ServerAddress
-import dev.spofify.mobile.core.Session
 import dev.spofify.mobile.core.SessionStore
 import dev.spofify.mobile.core.SpofifyClient
 import dev.spofify.mobile.core.StoredSession
 import org.junit.Assert.*
+import kotlinx.coroutines.runBlocking
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import java.net.InetAddress
+import java.util.concurrent.TimeUnit
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -18,19 +22,10 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = Application::class)
 class PlaybackSnapshotMediaTest {
-    private fun client(authenticated: Boolean) = SpofifyClient(
-        ServerAddress.parse("https://music.example.test"),
-        object : SessionStore {
-            override fun read(): StoredSession? = null
-            override fun write(value: StoredSession?) = Unit
-        },
-    ).also { client ->
-        // Offline synthetic auth fixture only: no login, DNS, socket, audio source, or player.
-        if (authenticated) SpofifyClient::class.java.getDeclaredField("session").apply {
-            isAccessible = true
-            set(client, Session("fixture-account", "fixture-listener", "user", "fixture-csrf"))
-        }
-    }
+    private fun client(origin: String) = SpofifyClient(ServerAddress.parse(origin), object : SessionStore {
+        override fun read(): StoredSession? = null
+        override fun write(value: StoredSession?) = Unit
+    })
 
     private fun snapshot(): PlaybackSnapshot {
         val track = PlaybackTrack(
@@ -44,28 +39,43 @@ class PlaybackSnapshotMediaTest {
     }
 
     @Test fun mediaConstructionUsesAuthenticatedOriginAndSyntheticInternalOccurrenceOnly() {
-        val snapshot = snapshot()
-        val plan = PlaybackSnapshotCodec.plan(snapshot)
-        val media = plan.mediaItems(client(authenticated = true))
-        assertEquals(listOf("wire-4", "wire-9"), media.map(PlaybackMedia::occurrence))
-        assertEquals(listOf("song/a%", "song/a%"), media.map { it.mediaId })
-        media.forEach {
-            assertEquals("https://music.example.test/api/library/tracks/song%2Fa%25/audio",
-                it.localConfiguration!!.uri.toString())
-            assertNull(it.mediaMetadata.artworkUri)
-            assertEquals("saved-entry", PlaybackMedia.libraryItem(it)!!.entryId)
-            assertEquals(30_125L, PlaybackMedia.libraryItem(it)!!.durationMs)
-        }
-        assertEquals(snapshot, plan.snapshot)
-        assertEquals(snapshot.queue, plan.traversalIndices.map { plan.physicalTracks[it] })
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setHeader("Content-Type", "application/json")
+            .setHeader("Set-Cookie", "spofify_session=synthetic-cookie; Path=/; HttpOnly; Max-Age=3600")
+            .setBody("""{"accountId":"fixture-account","username":"fixture-listener","role":"user","csrfToken":"fixture-csrf"}"""))
+        server.start(InetAddress.getByName("127.0.0.1"), 0)
+        try {
+            val origin = "http://127.0.0.1:${server.port}"
+            val client = client(origin)
+            runBlocking { client.login("fixture-listener", "synthetic-password") }
+            assertEquals("/api/auth/login", server.takeRequest(1, TimeUnit.SECONDS)?.path)
+            assertNotNull(client.validatedSessionIdentity())
+            val snapshot = snapshot()
+            val media = snapshot.queue.map { track -> PlaybackMedia.create(
+                PlaybackSnapshotCodec.libraryItem(track), client, PlaybackSnapshotCodec.occurrenceId(track)) }
+            assertEquals(listOf("wire-9", "wire-4"), media.map(PlaybackMedia::occurrence))
+            assertEquals(listOf("song/a%", "song/a%"), media.map { it.mediaId })
+            media.forEach {
+                assertEquals("$origin/api/library/tracks/song%2Fa%25/audio", it.localConfiguration!!.uri.toString())
+                assertNull(it.mediaMetadata.artworkUri)
+                assertEquals("saved-entry", PlaybackMedia.libraryItem(it)!!.entryId)
+                assertEquals(30_125L, PlaybackMedia.libraryItem(it)!!.durationMs)
+            }
+            assertEquals(listOf(9L, 4L), snapshot.queue.map { it.key })
+            assertEquals(listOf(50L, 0L), snapshot.queue.map { it.order })
+            assertEquals(2, media.map(PlaybackMedia::occurrence).toSet().size)
+            assertTrue(media.none { it.localConfiguration!!.uri.toString().contains("untrusted.invalid") })
+            assertEquals("Projection constructs media but never opens audio or fetches a context", 1, server.requestCount)
+        } finally { server.shutdown() }
     }
 
-    @Test fun preparationPlanIsOfflineButMaterializingEvenAnEmptyQueueRequiresAuthentication() {
-        val signedOut = client(authenticated = false)
-        val plan = PlaybackSnapshotCodec.plan(snapshot())
-        assertThrows(IllegalArgumentException::class.java) { plan.mediaItems(signedOut) }
+    @Test fun localMetadataProjectionIsOfflineButOnlineAudioMaterializationRequiresAuthentication() {
+        val signedOut = client("https://music.example.test")
+        val projected = PlaybackSnapshotCodec.libraryItem(snapshot().queue.first())
+        assertEquals("song/a%", projected.id)
+        assertNull(projected.libraryPath)
         assertThrows(IllegalArgumentException::class.java) {
-            PlaybackSnapshotCodec.plan(PlaybackSnapshot()).mediaItems(signedOut)
+            PlaybackMedia.create(projected, signedOut, "wire-9")
         }
     }
 }

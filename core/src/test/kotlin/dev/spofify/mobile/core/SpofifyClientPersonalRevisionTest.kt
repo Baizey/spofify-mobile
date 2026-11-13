@@ -36,8 +36,7 @@ class SpofifyClientPersonalRevisionTest {
         web.enqueue(MockResponse().setResponseCode(204))
         client.setLiked("track", true)
         assertEquals(PersonalRevision(likes = 1), client.personalRevision.value)
-        web.enqueue(MockResponse().setResponseCode(204))
-        client.recordHistory("event", "track")
+        client.notifyPersonalChange(PersonalCollection.HISTORY)
         assertEquals(PersonalRevision(likes = 1, history = 1), client.personalRevision.value)
         client.notifyPersonalChange(PersonalCollection.PLAYLISTS)
         assertEquals(PersonalRevision(likes = 1, history = 1, playlists = 1), client.personalRevision.value)
@@ -52,7 +51,7 @@ class SpofifyClientPersonalRevisionTest {
         web.enqueue(jsonResponse("{}", 503))
         assertEquals(503, apiFailure { client.setLiked("track", true) }.status)
         web.enqueue(jsonResponse("{}", 429))
-        assertEquals(429, apiFailure { client.recordHistory("event", "track") }.status)
+        assertEquals(429, apiFailure { client.setLiked("track", false) }.status)
         assertEquals(PersonalRevision(), client.personalRevision.value)
         assertNotNull(client.currentSession())
     }

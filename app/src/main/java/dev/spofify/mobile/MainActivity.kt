@@ -74,8 +74,7 @@ private data class CatalogMoreSelection(
     val item: LibraryItem,
     val interactionKey: PlaybackInteractionKey?,
     val lifetime: RowActionLifetime,
-    val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding?,
-    val unselectedOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin?,
+    val queueIntentBinding: dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding?,
     val sourceCurrent: () -> Boolean,
     val savedBindingRevision: Long,
 )
@@ -208,7 +207,6 @@ internal fun SpofifyApp(model: LibraryViewModel) {
         val accountId = state.session?.accountId
         val sourceCurrent = model.captureBrowseSource(client)
         val sourceEpoch = model.browseSourceEpoch
-        val preparedGeneration = state.playbackIntentGeneration
         val art: @Composable (LibraryItem, Modifier) -> Unit = { item, modifier -> Artwork(item, model, modifier) }
         // Freeze values now: reading the delegated player inside a retained callback could
         // otherwise borrow a successor publication before the row recomposes.
@@ -227,11 +225,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                     { sourceCurrent() && isCurrent() }, player.queueIntentBinding)
             },
             queueIntentBinding = player.queueIntentBinding,
-            unselectedQueueOrigin = player.unselectedQueueOrigin,
-            onUnselectedHigh = { item, origin, isCurrent ->
-                if (sourceCurrent() && item.kind == "track") model.queueIntentFrom(client, item,
-                    item.defaultQueueAction(), null, { sourceCurrent() && isCurrent() }, null, origin)
-            })
+        )
         val likeStates = state.likes.mapValues { (id, liked) ->
             CatalogLikeState(liked, id in state.pendingLikes, id in state.failedLikeStatus)
         } + state.failedLikeStatus.filterNot { it in state.likes }.associateWith { CatalogLikeState(failed = true) }
@@ -259,7 +253,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
             if (rowSourceCurrent()) {
                 val savedBindingRevision = model.graph.savedDownloads.state.value.bindingRevision
                 if (rowSourceCurrent()) more = CatalogMoreSelection(item, player.interactionKey, actionLifetime,
-                    player.queueIntentBinding, player.unselectedQueueOrigin, rowSourceCurrent, savedBindingRevision)
+                    player.queueIntentBinding, rowSourceCurrent, savedBindingRevision)
             }
         }
         val openExternal: (LibraryItem) -> Unit = { item ->
@@ -341,23 +335,12 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                             stateHolder = model.catalogHolder(page.item, page.navigationId), sourceEpoch = sourceEpoch)
                         Page.Playlists, is Page.Playlist -> PlaylistsRoute(client,
                             onOpenTrack = openExternal,
-                            onPlayQueue = { prepared, trackId, entryId ->
-                                if (sourceCurrent()) model.playPrepared(client, accountId, prepared, trackId, entryId, preparedGeneration)
-                            },
                             onShowTrackActions = showMore, modifier = contentModifier, playback = feedback, artwork = art,
                             onQueueIntent = { selection, action, binding, expectedBinding, isCurrent ->
                                 if (sourceCurrent()) model.queueIntentSelectionFrom(client, selection, action, binding,
                                     { sourceCurrent() && isCurrent() }, expectedBinding)
                             },
-                            onUnselectedHigh = { selection, origin, isCurrent ->
-                                if (sourceCurrent()) model.queueIntentSelectionFrom(client, selection, dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH,
-                                    null, { sourceCurrent() && isCurrent() }, null, origin)
-                            },
                             playbackEntryId = player.item?.entryId, playbackContext = player.context,
-                            onPreparedAction = { prepared, trackId, entryId, action, binding, isCurrent ->
-                                if (sourceCurrent()) model.preparedListAction(client, accountId, prepared, trackId, entryId, action, binding,
-                                    preparedGeneration, { sourceCurrent() && isCurrent() })
-                            },
                             browseMemory = playlistBrowse, sourceEpoch = sourceEpoch,
                             savedDownloads = model.graph.savedDownloads)
                         Page.Likes -> LikedSongs(state, model, openExternal, play, showMore, queue, art,
@@ -434,9 +417,7 @@ internal fun SpofifyApp(model: LibraryViewModel) {
                     onQueue = {
                         more = null
                         model.queueIntentFrom(client, item, item.defaultQueueAction(), binding, isCurrent,
-                            selection.queueIntentBinding, selection.unselectedOrigin.takeIf {
-                                item.defaultQueueAction() == dev.spofify.mobile.playback.PlaybackListAction.QUEUE_HIGH
-                            })
+                            selection.queueIntentBinding)
                     },
                     onToggleLike = { if (isCurrent()) model.likeAction(item) },
                     onRetryLike = { if (isCurrent()) model.checkLike(item) },
@@ -474,9 +455,6 @@ internal fun LikedSongs(
         } },
         onContextual = feedback.onContextual?.let { action -> { item, binding, rowCurrent ->
             if (sourceCurrent()) action(item, binding, { sourceCurrent() && rowCurrent() })
-        } },
-        onUnselectedHigh = feedback.onUnselectedHigh?.let { action -> { item, origin, rowCurrent ->
-            if (sourceCurrent()) action(item, origin, { sourceCurrent() && rowCurrent() })
         } },
     )
     AutomaticListDemand(list, model to state.likesGeneration, state.items.takeLast(3).map { "liked:${it.id}" },

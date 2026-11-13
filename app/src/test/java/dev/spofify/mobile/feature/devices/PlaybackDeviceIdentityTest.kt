@@ -6,6 +6,7 @@ import dev.spofify.mobile.core.*
 import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.*
@@ -107,43 +108,61 @@ class PlaybackDeviceIdentityTest {
         assertThrows(IllegalArgumentException::class.java) { store(account = "") }
     }
 
-    @Test fun coordinatorResolvesIdentityLazilyAndPersistsOwnConfirmedNameFromAcceptedViews() = runTest {
+    @Test fun coordinatorResolvesIdentityLazilyAndPersistsOnlyServerConfirmedName() = runTest {
         val identity = store().readOrCreate("Saved phone")
         var providerCalls = 0
-        var registeredName = ""
-        var current = PlaybackDevicesView("session-phone", listOf(PlaybackDevice("session-phone", "Saved phone", true)),
-            "session-phone", 1, 8000, state = null, stateSeq = 0, stateAgeMs = 0, transfer = null,
-            directives = emptyList(), commands = emptyList())
-        val api = object : PlaybackDevicesProtocol {
-            override suspend fun view() = current
-            override suspend fun register(name: String): PlaybackDevicesView { registeredName = name; return current }
-            override suspend fun poll(deviceId: String, epoch: Long, stateSeq: Long?, state: PlaybackSnapshot?, acks: List<PlaybackAck>) = current
-            override suspend fun rename(deviceId: String, name: String): PlaybackDevicesView = error("Unconfirmed rename")
-            override suspend fun command(deviceId: String, epoch: Long, commandId: String, command: PlaybackDeviceCommand) = current
-            override suspend fun transfer(deviceId: String, epoch: Long, commandId: String, targetDeviceId: String, selectionSeq: Long) = current
-            override suspend fun leave(deviceId: String) = Unit
+        var helloName = ""
+        val incoming = kotlinx.coroutines.channels.Channel<LibraryPlaybackEvent>(8)
+        val socket = object : LibraryPlaybackTransport {
+            override val identity = ValidatedSessionIdentity("https://music.example", "account-one", 1)
+            override var isCurrent = true
+            override val events = incoming.receiveAsFlow()
+            override fun send(message: LibraryPlaybackClientMessage) = LibraryPlaybackSend(0, commandId = "1")
+            override fun close() { isCurrent = false; incoming.close() }
         }
         val endpoint = object : NativePlaybackEndpoint {
-            override val supportsExactHandoff = true
+            override var onObservation: ((String, Boolean) -> Unit)? = null
             override fun suspendOutput() = Unit
-            override fun exportSnapshot() = PlaybackSnapshot()
-            override suspend fun prepare(snapshot: PlaybackSnapshot) = true
-            override suspend fun activate(snapshot: PlaybackSnapshot, authority: PlaybackAuthority) = PlaybackEndpointResult("ok", snapshot)
-            override suspend fun execute(command: PlaybackDeviceCommand, authority: PlaybackAuthority) = PlaybackEndpointResult("ok", PlaybackSnapshot())
+            override suspend fun prepare(instruction: LibraryPlaybackInstruction, isCurrent: () -> Boolean) = "ok"
+            override fun release() = true
+            override suspend fun execute(instruction: LibraryPlaybackInstruction, authority: LibraryPlaybackAuthority) = "ok"
+            override fun observe() = LibraryPlaybackObservation()
         }
-        val c = PlaybackCoordinator(api, endpoint, backgroundScope, clockMs = { testScheduler.currentTime },
-            identity = { providerCalls++; store() })
-        runCurrent(); assertEquals(0, providerCalls)
-        c.retry(); runCurrent(); assertEquals(0, providerCalls)
-        c.setServiceActive(true); runCurrent()
-        assertEquals("Saved phone", registeredName)
-        assertNotEquals(identity.installationId, c.state.value.deviceId)
-        current = current.copy(devices = listOf(PlaybackDevice("session-phone", "Renamed remotely", true)))
-        c.retry(); runCurrent()
-        assertEquals("Renamed remotely", store().readOrCreate().name)
-        assertEquals(identity.installationId, store().readOrCreate().installationId)
-        c.rename("session-phone", "Unconfirmed draft"); runCurrent()
-        assertEquals("Renamed remotely", store().readOrCreate().name)
-        c.close()
+        val client = SpofifyClient(ServerAddress.parse("https://music.example"), object : SessionStore {
+            override fun read(): StoredSession? = null
+            override fun write(value: StoredSession?) = Unit
+        })
+        val c = PlaybackCoordinator(client, endpoint, backgroundScope,
+            clockMs = { testScheduler.currentTime }, mediaEventUptimeMs = { testScheduler.currentTime },
+            identity = { providerCalls++; store() }, authenticationIdentity = { "authenticated-incarnation" },
+            openTransport = { _, name, id, capable ->
+                helloName = name
+                assertEquals(identity.stableDeviceId, id)
+                assertTrue(capable)
+                socket
+            })
+        try {
+            runCurrent()
+            assertEquals(0, providerCalls)
+            c.setServiceActive(true); runCurrent()
+            assertEquals(1, providerCalls)
+            assertEquals("Saved phone", helloName)
+            val snapshot = dev.spofify.mobile.playback.testLibrarySnapshot(
+                devices = listOf(LibraryPlaybackDevice(identity.stableDeviceId, "Saved phone", true, true)))
+            incoming.send(LibraryPlaybackEvent.Message(LibraryPlaybackServerMessage(
+                "snapshot", "room", "connection", identity.stableDeviceId, snapshot = snapshot)))
+            runCurrent()
+            assertEquals(identity.stableDeviceId, c.state.value.deviceId)
+            incoming.send(LibraryPlaybackEvent.Message(LibraryPlaybackServerMessage(
+                "state", "room", snapshot = snapshot.copy(devices = listOf(
+                    LibraryPlaybackDevice(identity.stableDeviceId, "Renamed remotely", true, true))))))
+            runCurrent()
+            assertEquals("Renamed remotely", store().readOrCreate().name)
+            assertEquals(identity.installationId, store().readOrCreate().installationId)
+            c.rename(identity.stableDeviceId, "Unconfirmed draft"); runCurrent()
+            assertEquals("Renamed remotely", store().readOrCreate().name)
+            c.retry(); runCurrent()
+            assertEquals("A healthy socket is not readmitted", 1, providerCalls)
+        } finally { c.close() }
     }
 }

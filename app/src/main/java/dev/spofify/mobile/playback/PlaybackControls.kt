@@ -1,5 +1,7 @@
 package dev.spofify.mobile.playback
 
+import dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding
+
 import dev.spofify.mobile.OfflineEligibility
 import dev.spofify.mobile.OfflineMediaReference
 import dev.spofify.mobile.core.LibraryItem
@@ -7,7 +9,7 @@ import dev.spofify.mobile.core.QueueIntentIntent
 import dev.spofify.mobile.core.SpofifyClient
 import kotlinx.coroutines.flow.StateFlow
 
-/** UI-facing transport boundary; the implementation delegates lifetime to Media3. */
+/** UI controls: server-owned online selections and separately guarded saved-media playback. */
 interface PlaybackControls {
     val state: StateFlow<PlaybackState>
     /** Presentation acknowledgement only; never mutates the musical queue. */
@@ -19,8 +21,6 @@ interface PlaybackControls {
     /** Capture an immutable host-origin fence for deliberate in-app Play/Resume at gesture
      * time. No screen ownership of audio; existing controls need not implement this hook. */
     fun bindExplicitPlayOrigin(capture: () -> (() -> Boolean)) {}
-    fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String? = null,
-        shuffle: Boolean = false, startEntryId: String? = null)
     /** Deliberate saved selection only. The entire list is used in order, including duplicate
      * entries; callers must explicitly choose Play available before passing a partial selection.
      * Eligibility is an incarnation fence, not a Session/receiver. Unknown controls fail closed. */
@@ -34,40 +34,11 @@ interface PlaybackControls {
      * Never starts or admits a receiver. Unknown implementations fail closed. */
     fun enqueueLocal(items: List<LibraryItem>, eligibility: OfflineEligibility,
         mediaReferences: Map<String, OfflineMediaReference>, intent: QueueIntentIntent, isCurrent: () -> Boolean = { true }) {}
-    /** Already server-prepared musical intent. Production preserves the optional exact wire
-     * envelope; the default keeps existing test/host implementations source-compatible. */
-    fun playPrepared(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
-        startTrackId: String? = null, shuffle: Boolean = false, startEntryId: String? = null,
-        context: LibraryItem? = null) {
-        play(queue.items, client, startTrackId, shuffle, startEntryId)
-        setContext(queue.context?.let { LibraryItem(it.kind, it.id, it.name) } ?: context)
-    }
-    /** Explicit originating selection. The predicate survives forwarding/binding/admission;
-     * it is not a screen-attachment flag or permission to replay after reconnect. Legacy
-     * synchronous controls remain source-compatible and check it before delegating. */
-    fun playPreparedGuarded(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
-        startTrackId: String? = null, shuffle: Boolean = false, startEntryId: String? = null,
-        context: LibraryItem? = null, isCurrent: () -> Boolean, admissionIsCurrent: () -> Boolean = isCurrent) {
-        if (admissionIsCurrent() && isCurrent()) playPrepared(queue, client, startTrackId, shuffle, startEntryId, context)
-    }
-    /** Captured expectedKey must precede asynchronous preparation. Unknown controls fail closed. */
-    fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
-        action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String? = null,
-        startEntryId: String? = null, context: LibraryItem? = null, isCurrent: () -> Boolean = { true },
-        onResult: (PlaybackActionResult) -> Unit) {
-        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
-    }
-    /** One receiver-authoritative transaction. Binding/key are captured before any await;
-     * unknown controls fail closed, never downgrade to legacy Play/enqueue commands. */
-    fun queueIntent(selection: dev.spofify.mobile.core.QueueIntentSelection, client: SpofifyClient,
+    /** One identifier-only server transaction. Capture binding before any await. */
+    fun queueIntent(selection: dev.spofify.mobile.core.LibraryPlaybackSelection, client: SpofifyClient,
         action: PlaybackListAction, expectedKey: PlaybackInteractionKey?,
-        expectedBinding: dev.spofify.mobile.core.QueueIntentBinding?,
+        expectedBinding: LibraryPlaybackActionBinding?, shuffle: Boolean? = null,
         isCurrent: () -> Boolean = { true }, onResult: (PlaybackActionResult) -> Unit) {
-        onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
-    }
-    /** Explicit unselected High origin captured by the real host before forwarding. */
-    fun queueHighFromUnselected(selection: dev.spofify.mobile.core.QueueIntentSelection, client: SpofifyClient,
-        origin: PlaybackQueueOrigin, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
         onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
     }
     /** Exact upcoming key selection. No duplicate, context refetch or positional jump. */
@@ -89,18 +60,15 @@ interface PlaybackControls {
         isCurrent: () -> Boolean = { true }, onResult: (PlaybackActionResult) -> Unit = {}) {
         onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
     }
-    /** Prepared items only: fetching a collection remains an explicit host action. Never autoplays. */
-    fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean = false) {}
-    fun removeUpcoming(occurrenceId: String) {}
-    /** Captured queue binding; unknown implementations fail closed. */
+    /** Exact rendered queue binding and owning presentation lifetime; unknown implementations fail closed. */
     fun removeUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, isCurrent: () -> Boolean) {}
-    /** Zero-based index within the displayed upcoming list. Manual moves exit shuffle. */
-    fun moveUpcoming(occurrenceId: String, toIndex: Int) {}
-    /** Guarded at serialized service/coordinator dispatch. Local: arbitrary upcoming index.
-     * Remote: one up/down/Play-next command only; never an absolute drag or a step chain.
+    /** Guarded at service/coordinator dispatch. toIndex is zero-based in the captured upcoming
+     * traversal. Online moves send one exact anchored command; saved local queues use their
+     * own arbitrary upcoming index. Pass the originating row/host lifetime guard.
      * Check state.canMoveUpcomingAbsolutely before enabling drag. Capture expectedKey at
      * gesture start; preview, cancel and same-index drops do not edit. No legacy fallback. */
-    fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int) {}
+    fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int,
+        isCurrent: () -> Boolean = { true }) {}
     fun clearUpcoming() {}
     fun undoQueueRemoval() {}
     fun selectOccurrence(occurrenceId: String) {}

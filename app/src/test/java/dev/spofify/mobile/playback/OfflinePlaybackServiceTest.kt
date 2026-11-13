@@ -26,22 +26,10 @@ import dev.spofify.mobile.OfflineMediaReference
 import dev.spofify.mobile.OfflineSavedCollection
 import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
-import dev.spofify.mobile.core.LibraryItem
-import dev.spofify.mobile.core.PlaybackDeviceCommand
-import dev.spofify.mobile.core.PlaybackSnapshot
-import dev.spofify.mobile.core.QueueIntentIntent
-import dev.spofify.mobile.core.QueueIntentSelection
-import dev.spofify.mobile.core.QueueIntentState
-import dev.spofify.mobile.core.QueueIntentsView
-import dev.spofify.mobile.core.QueueIntentReceiver
-import dev.spofify.mobile.core.QueueIntentBinding
-import dev.spofify.mobile.core.PlaybackContext
-import dev.spofify.mobile.core.PlaybackDevice
-import dev.spofify.mobile.core.PlaybackDevicesView
-import kotlinx.serialization.json.*
-import dev.spofify.mobile.core.SessionStore
-import dev.spofify.mobile.core.StoredSession
-import dev.spofify.mobile.feature.devices.PlaybackAuthority
+import dev.spofify.mobile.core.*
+import dev.spofify.mobile.feature.devices.LibraryPlaybackAuthority
+import dev.spofify.mobile.feature.devices.LibraryPlaybackObservation
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -97,7 +85,7 @@ class OfflinePlaybackServiceTest {
     private lateinit var savedOwner: OfflineLibraryAccess
     private val target = LibraryItem("playlist", "saved-playlist", "Exact saved context")
     private val rows = listOf(track("A", "first"), track("A", "duplicate"), track("B", "last"))
-    private val endpoint = Media3PlaybackEndpoint()
+    private val endpoint = Media3PlaybackEndpoint(ApplicationProvider.getApplicationContext())
 
     private fun track(id: String, entry: String) = LibraryItem("track", id, "Track $id", durationMs = 12000,
         hasAudio = true, entryId = entry)
@@ -216,7 +204,7 @@ class OfflinePlaybackServiceTest {
     }
 
     private fun command(type: String) {
-        assertTrue(PlaybackService.localTransport(PlaybackDeviceCommand.transport(type)))
+        assertTrue(PlaybackService.localTransport(LocalPlaybackCommand.transport(type)))
         if (type in setOf("pause", "close")) {
             assertFalse("Actual service output is drained synchronously", mediaSession!!.player.playWhenReady)
             await("controller observes $type drainage") {
@@ -282,7 +270,7 @@ class OfflinePlaybackServiceTest {
         assertEquals(Player.REPEAT_MODE_ALL, controller!!.repeatMode)
         command("repeat")
         assertEquals(Player.REPEAT_MODE_ONE, controller!!.repeatMode)
-        assertTrue(PlaybackService.localTransport(PlaybackDeviceCommand.seek(2.0)))
+        assertTrue(PlaybackService.localTransport(LocalPlaybackCommand.seek(2.0)))
         assertEquals(2000L, mediaSession!!.player.currentPosition)
         await("controller observes paused seek") { controller!!.currentPosition == 2000L }
         assertEquals(2000L, controller!!.currentPosition)
@@ -389,7 +377,7 @@ class OfflinePlaybackServiceTest {
             assertNull(PlaybackService.replaceLocal(rows, eligibility, references, 0, false, target))
             await("real saved loader held in open") { entered.count == 0L && serviceField("pendingStart") != null }
             val attempt = requireNotNull(serviceField("startAttempt"))
-            repeat(3) { assertTrue(PlaybackService.localTransport(PlaybackDeviceCommand.transport("repeat"))) }
+            repeat(3) { assertTrue(PlaybackService.localTransport(LocalPlaybackCommand.transport("repeat"))) }
             assertEquals("off", PlaybackService.displayLocalSnapshot().repeat)
             assertSame(attempt, serviceField("startAttempt"))
             assertNull(serviceField("startAttemptValidity"))
@@ -431,7 +419,7 @@ class OfflinePlaybackServiceTest {
     @Test fun connectionAddsNewHighSelectionsFifoAmongPendingHighWithoutStartingPausedCurrent() {
         play()
         command("pause")
-        assertTrue(PlaybackService.localTransport(PlaybackDeviceCommand.seek(2.0)))
+        assertTrue(PlaybackService.localTransport(LocalPlaybackCommand.seek(2.0)))
         val before = PlaybackService.displayLocalSnapshot()
         val media = mediaSession!!.player.currentMediaItem
         val opened = opens.get()
@@ -679,7 +667,7 @@ class OfflinePlaybackServiceTest {
         } finally { oldSource.close() }
     }
 
-    @Test fun onlyFreshValidatedOrdinaryOnlinePlayRearmsServiceAfterErasingLocalQueueAndHistory() = runBlocking {
+    @Test fun onlyFreshValidatedTargetedPreparationRearmsServiceAfterErasingLocalQueueAndHistory() = runBlocking {
         play()
         val actual = requireNotNull(service).get()
         val cacheField = PlaybackService::class.java.getDeclaredField("audioCache").apply { isAccessible = true }
@@ -689,7 +677,7 @@ class OfflinePlaybackServiceTest {
         val coldFactory = requireNotNull(factoryField.get(actual))
         assertNull("A cold offline service has no automatic-cache binding", cacheField.get(actual))
         graph.setOfflineMode(false)
-        assertTrue(PlaybackService.isLocalOnlyQueue())
+        assertFalse(PlaybackService.isLocalOnlyQueue())
         await("controller observes mode exit pause") { !controller!!.playWhenReady }
         assertNoTraffic()
         web.dispatcher = object : Dispatcher() {
@@ -707,25 +695,18 @@ class OfflinePlaybackServiceTest {
         val genuineCache = requireNotNull(graph.audioCache(client, genuineSession))
         assertNull("Login/mode exit alone must not rearm the retained local service", cacheField.get(actual))
         assertSame(coldFactory, factoryField.get(actual))
-        assertTrue(PlaybackService.isLocalOnlyQueue())
+        assertFalse(PlaybackService.isLocalOnlyQueue())
         assertFalse(controller!!.playWhenReady)
         assertEquals(1, web.requestCount)
-        val rearmed = mutableListOf<PlaybackSnapshot>()
-        PlaybackService.onServiceActiveChanged = { active -> if (active) {
-            assertFalse(PlaybackService.isLocalOnlyQueue())
-            rearmed += PlaybackService.exportLocalSnapshot()
-        } }
-        assertNotNull(PlaybackService.replacePrepared(emptyList(), client, 0, false, true))
-        assertTrue(PlaybackService.isLocalOnlyQueue())
-        assertTrue(rearmed.isEmpty())
-        assertNull("Invalid ordinary Play must not rebind automatic retention", cacheField.get(actual))
-        assertNull(PlaybackService.replacePrepared(listOf(PlaybackMedia.create(track("C", "online-selection"), client)),
-            client, 0, false, true))
-        assertEquals(1, rearmed.size)
-        assertEquals(PlaybackSnapshot(), rearmed.single())
+        val instruction = LibraryPlaybackInstruction("targeted-prepare", "prepare", 2, "", 0.0, false)
+        assertEquals("rejected", endpoint.prepare(instruction) { false })
+        assertFalse(PlaybackService.isLocalOnlyQueue())
+        assertNull("Stale preparation must not rebind automatic retention", cacheField.get(actual))
+        assertEquals("ok", endpoint.prepare(instruction) { true })
+        assertEquals("Targeted online setup exposes no saved queue", PlaybackSnapshot(), PlaybackService.displayLocalSnapshot())
         assertSame("Same real service-owned player across local-to-online transition", solePlayer, playerField.get(actual))
         assertSame(genuineSession, client.currentSession())
-        assertSame("Fresh ordinary Play binds the graph's genuinely validated cache", genuineCache, cacheField.get(actual))
+        assertSame("Fresh authenticated preparation binds the graph's genuinely validated cache", genuineCache, cacheField.get(actual))
         assertNotSame(coldFactory, factoryField.get(actual))
         // Inspect the actual existing production MediaSourceFactory's new data source, not
         // merely the service field. It must no longer capture the cold-start null cache.
@@ -735,128 +716,169 @@ class OfflinePlaybackServiceTest {
             assertSame(genuineCache, capturedCache)
         } finally { rebound.close() } // Unopened: no lease, focus, prepare, or audible acceptance.
         assertTrue(PlaybackService.displayLocalSnapshot().queue.none { it.entryId in setOf("first", "duplicate", "last") })
-        // No online start/lease success is fabricated here. Existing online authority tests
-        // cover admission; this regression observes the exact empty-before-rearm boundary.
+        assertFalse(controller!!.playWhenReady)
+        assertEquals("Preparation is not autoplay, audio open or a history write", 1, web.requestCount)
     }
 
-    @Test fun ordinaryOnlineCollectionNowUsesGenuineAuthenticatedAdmissionAfterRetiringLocalProvenance() = runBlocking {
+
+    @Test fun ordinaryOnlineCollectionNowUsesAuthenticatedSocketAfterRetiringLocalProvenance() = runBlocking {
         play()
+        val retiredLocalKey = requireNotNull(PlaybackService.interactionKey())
         graph.setOfflineMode(false)
         await("mode exit pauses saved output") { !controller!!.playWhenReady }
         assertNoTraffic()
-        val publications = CopyOnWriteArrayList<PlaybackSnapshot>()
-        val registrations = AtomicInteger()
-        val collectionReads = AtomicInteger()
         val unexpected = CopyOnWriteArrayList<String>()
+        val collectionReads = AtomicInteger()
         web.dispatcher = object : Dispatcher() {
-            private var device = ""
-            private var snapshot = PlaybackSnapshot()
-            private var metadata = QueueIntentState("server-empty", 1, "tracked", emptyList(), emptyList())
-            private var sequence = 0L
-            private var published = false
-            private fun response(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
-            private fun view() = PlaybackDevicesView(device,
-                if (device.isEmpty()) emptyList() else listOf(PlaybackDevice(device, "Synthetic online phone", true)),
-                device, 1, if (device.isEmpty()) 0 else 8000, state = snapshot, stateSeq = sequence, stateAgeMs = 0,
-                transfer = null, directives = emptyList(), commands = emptyList(), queueIntents = QueueIntentsView(1,
-                    if (device.isEmpty()) emptyList() else listOf(QueueIntentReceiver(device, 1)),
-                    if (!published || device.isEmpty()) null else QueueIntentBinding(device, metadata.receiverId,
-                        metadata.revision, snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId),
-                    metadata, emptyList(), emptyList()))
-            @Synchronized override fun dispatch(request: RecordedRequest): MockResponse {
-                if (request.path == "/api/auth/login" && request.method == "POST") return response(
-                    """{"accountId":"saved-account","username":"listener","role":"user","csrfToken":"online-csrf"}""")
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path == "/api/auth/login" && request.method == "POST") return MockResponse()
+                    .setHeader("Content-Type", "application/json")
                     .setHeader("Set-Cookie", "spofify_session=online-cookie; Path=/; HttpOnly; Max-Age=3600")
+                    .setBody("""{"accountId":"saved-account","username":"listener","role":"user","csrfToken":"online-csrf"}""")
                 assertEquals("spofify_session=online-cookie", request.getHeader("Cookie"))
-                if (request.method == "POST") assertEquals("online-csrf", request.getHeader("X-CSRF-Token"))
-                if (request.path == "/api/library/albums/online-album/playback") {
-                    collectionReads.incrementAndGet()
-                    return response("""{"context":{"kind":"album","id":"online-album","name":"Online album"},"items":[{"kind":"track","id":"online-track","name":"Online track","artists":[],"hasAudio":true,"durationMs":12000}],"total":1,"limit":1,"truncated":false}""")
-                }
+                if (request.path == "/api/library/albums/online-album/playback") collectionReads.incrementAndGet()
                 if (request.path == "/api/library/tracks/online-track/audio") return MockResponse()
                     .setHeader("Content-Type", "audio/wav").setBody(okio.Buffer().write(wav(0x7777)))
-                if (request.path != "/api/me/player") {
-                    unexpected += "${request.method} ${request.path}"
-                    return MockResponse().setResponseCode(500)
-                }
-                if (request.method == "GET") return response(view().toJson().toString())
-                val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
-                return when (body.getValue("action").jsonPrimitive.content) {
-                    "register" -> {
-                        assertEquals(JsonPrimitive(1), body["queueIntentsVersion"])
-                        registrations.incrementAndGet()
-                        device = "online-phone"
-                        response(view().toJson().toString())
-                    }
-                    "poll" -> {
-                        body["state"]?.let {
-                            snapshot = PlaybackSnapshot.fromJson(it.jsonObject)
-                            metadata = QueueIntentState.fromJson(body.getValue("queueIntentState").jsonObject, snapshot)
-                            publications += snapshot
-                            published = true
-                        }
-                        body["stateSeq"]?.let { sequence = it.jsonPrimitive.long }
-                        response(view().toJson().toString())
-                    }
-                    "leave" -> response(view().toJson().toString())
-                    else -> { unexpected += "Unexpected player action"; MockResponse().setResponseCode(500) }
-                }
+                unexpected += "${request.method} ${request.path}"
+                return MockResponse().setResponseCode(500)
             }
         }
         val client = requireNotNull(graph.client)
-        client.login("listener", "synthetic-password") // Production API creates and validates the Session.
+        client.login("listener", "synthetic-password")
         val login = requireNotNull(client.currentSession())
-        assertTrue(PlaybackService.isLocalOnlyQueue())
+        assertFalse(PlaybackService.isLocalOnlyQueue())
         assertNull(serviceField("audioCache"))
-        assertEquals(0, registrations.get())
         val solePlayer = requireNotNull(serviceField("player"))
-        val receiverCallback = PlaybackService.onServiceActiveChanged
-        val rearmed = mutableListOf<PlaybackSnapshot>()
-        PlaybackService.onServiceActiveChanged = { active ->
-            if (active) {
-                assertFalse(PlaybackService.isLocalOnlyQueue())
-                rearmed += PlaybackService.exportLocalSnapshot()
-                assertEquals("No saved work may be receiver-visible, even inline", PlaybackSnapshot(), rearmed.last())
-            }
-            receiverCallback?.invoke(active)
-        }
+        // Delay initial output setup until the deliberate action. Admission itself is never
+        // authorization to import the retained saved queue; only targeted work crosses it.
+        val room = SongCacheProtocolRoom(prepareOnJoin = false)
+        val context = room.catalog(listOf(LibraryItem("track", "online-track", "Online track", hasAudio = true, durationMs = 12000)))
+        graph.playbackCoordinator?.close()
+        val scope = AppGraph::class.java.getDeclaredField("coordinationScope").apply { isAccessible = true }.get(graph) as kotlinx.coroutines.CoroutineScope
+        val owner = dev.spofify.mobile.feature.devices.PlaybackCoordinator(client, endpoint, scope,
+            deviceIdentity = { "phone" to "Phone" },
+            openTransport = { _, _, id, _ -> room.open(requireNotNull(client.validatedSessionIdentity()), id) })
+        AppGraph::class.java.getDeclaredField("playbackCoordinator").apply { isAccessible = true; set(graph, owner) }
+        owner.retry()
+        await("authenticated current socket admission without saved-queue adoption") { owner.state.value.connected }
+        assertEquals(1, room.admissions.get())
+        assertFalse(PlaybackService.isLocalOnlyQueue())
+        assertNull(serviceField("audioCache"))
         val connection = PlaybackConnection(app)
         connection.connect()
         val bound = PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true }
         await("real online control binding") { bound.get(connection) != null }
-        val selection = QueueIntentSelection.Collection(PlaybackContext("album", "online-album", "Online album"))
+        val selection = LibraryPlaybackSelection.Collection(context)
         try {
             var low: PlaybackActionResult? = null
-            connection.queueIntent(selection, client, PlaybackListAction.QUEUE_LOW, null, null, { true }) { low = it }
-            assertEquals(PlaybackActionStatus.UNAVAILABLE, low?.status)
-            var stale: PlaybackActionResult? = null
-            connection.queueIntent(selection, client, PlaybackListAction.PLAY_NOW, null, null, { false }) { stale = it }
-            await("obsolete online Play is refused without rearming") { stale != null }
-            assertEquals(PlaybackActionStatus.STALE, stale?.status)
-            assertTrue(PlaybackService.isLocalOnlyQueue())
-            assertTrue(rearmed.isEmpty())
-            var result: PlaybackActionResult? = null
-            var delayed: PlaybackActionResult? = null
-            connection.queueIntent(selection, client, PlaybackListAction.PLAY_NOW, null, null, { true }) { result = it }
-            // A second captured local incarnation cannot borrow the first action's handoff.
-            connection.queueIntent(selection, client, PlaybackListAction.PLAY_NOW, null, null, { true }) { delayed = it }
-            await("ordinary Now finishes production registration, execution and PCM") {
+            connection.queueIntent(selection, client, PlaybackListAction.QUEUE_LOW, retiredLocalKey, null, isCurrent = { true }) { low = it }
+            assertEquals(PlaybackActionStatus.STALE, low?.status)
+            var stale: LibraryPlaybackResult? = null
+            assertFalse(owner.queueIntent("now", selection, isCurrent = { false }) { stale = it })
+            assertNull(stale)
+            assertFalse(PlaybackService.isLocalOnlyQueue())
+            assertTrue(room.messages.isEmpty())
+            var result: LibraryPlaybackResult? = null
+            var delayed: LibraryPlaybackResult? = null
+            owner.queueIntent("now", selection) { result = it }
+            owner.queueIntent("now", selection) { delayed = it }
+            await("single targeted online execution reaches actual PCM") {
                 result != null && delayed != null && controller!!.isPlaying && SongCachePlaybackMedia.bytes(0x7777) > 0
             }
-            assertEquals(PlaybackActionStatus.PLAYING, result?.status)
-            assertEquals(PlaybackActionStatus.STALE, delayed?.status)
-            assertEquals(1, registrations.get())
-            assertEquals(1, collectionReads.get())
-            assertEquals(listOf(PlaybackSnapshot()), rearmed)
+            assertEquals("confirmed", result?.execution) // setup receipt is not the PCM oracle above
+            assertEquals("stale_state_version", delayed?.code)
+            assertEquals(1, room.admissions.get())
+            assertEquals(1, room.resolutions.get())
+            assertEquals("No removed collection playback REST read", 0, collectionReads.get())
             assertSame(solePlayer, serviceField("player"))
             assertSame(login, client.currentSession())
             assertSame(graph.audioCache(client, login), serviceField("audioCache"))
-            assertEquals(listOf("online-track"), PlaybackService.exportLocalSnapshot().queue.map { it.id })
-            assertTrue(publications.isNotEmpty())
-            assertTrue(publications.all { state -> state.queue.all { it.id == "online-track" } })
+            assertEquals(listOf("online-track"), owner.state.value.snapshot!!.state.queue.map { it.id })
+            assertEquals(PlaybackSnapshot(), PlaybackService.displayLocalSnapshot())
+            assertTrue(room.messages.any { it is LibraryPlaybackClientMessage.Report })
             assertTrue(unexpected.toString(), unexpected.isEmpty())
             assertFalse(PlaybackService.isLocalOnlyQueue())
-        } finally { connection.release() }
+        } finally { connection.release(); owner.close() }
+    }
+
+    @Test fun onlineSavedOnlineCycleReinstallsExactAAfterBWithoutBorrowingPreparedMarkers() {
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate)
+        val network = CopyOnWriteArrayList<String>()
+        web.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                network += "${request.method} ${request.path}"
+                if (request.path == "/api/auth/login" && request.method == "POST") return MockResponse()
+                    .setHeader("Content-Type", "application/json")
+                    .setHeader("Set-Cookie", "spofify_session=online-cookie; Path=/; HttpOnly; Max-Age=3600")
+                    .setBody("""{"accountId":"saved-account","username":"listener","role":"user","csrfToken":"online-csrf"}""")
+                if (request.path == "/api/library/tracks/online-A/audio" && request.method == "GET") return MockResponse()
+                    .setHeader("Content-Type", "audio/wav").setBody(okio.Buffer().write(wav(0x7777)))
+                return MockResponse().setResponseCode(500)
+            }
+        }
+        val source = requireNotNull(graph.client)
+        fun suppressUnrelatedAdmission() {
+            // Direct service contract test: socket admission/leases have their own suite.
+            // A non-started coordinator prevents AppGraph opening a real ticket here.
+            val quiet = dev.spofify.mobile.feature.devices.PlaybackCoordinator(source, endpoint, scope,
+                deviceIdentity = { "phone" to "Phone" }, openTransport = { _, _, _, _ -> error("No admission in a direct service test") })
+            AppGraph::class.java.getDeclaredField("playbackCoordinator").apply { isAccessible = true; set(graph, quiet) }
+            PlaybackService.onServiceActiveChanged = null
+        }
+        val a = LibraryPlaybackTrack("online-A", "Online A", emptyList(), "Album", "album", 12.0, 7, 7, "now")
+        val preparation = LibraryPlaybackInstruction("prepare-A", "prepare", 2, "event-A", 0.0, false, track = a)
+        fun prepareA(): String {
+            val operation = scope.async { endpoint.prepare(preparation) { true } }
+            await("silent authoritative A preparation") { operation.isCompleted }
+            return runBlocking { operation.await() }
+        }
+        try {
+            graph.setOfflineMode(false)
+            runBlocking { source.login("listener", "synthetic-password") }
+            eligibility = requireNotNull(graph.localEligibility)
+            assertEquals("ok", prepareA())
+            val firstA = requireNotNull(mediaSession!!.player.currentMediaItem)
+            val solePlayer = serviceField("player")
+            assertEquals("online-A", firstA.mediaId)
+            assertEquals("library-7", PlaybackMedia.occurrence(firstA))
+            assertEquals("${source.server.origin}/api/library/tracks/online-A/audio", firstA.localConfiguration!!.uri.toString())
+            graph.setOfflineMode(true)
+            val beforeSaved = network.size
+            assertNull(PlaybackService.replaceLocal(rows.takeLast(1), eligibility, references, 0, false, target))
+            await("actual B saved bytes") { controller!!.isPlaying && SongCachePlaybackMedia.bytes(0x2222) > 0 }
+            val savedB = requireNotNull(mediaSession!!.player.currentMediaItem)
+            assertEquals("B", savedB.mediaId)
+            assertEquals("spofify-local", savedB.localConfiguration!!.uri.scheme)
+            assertNull(serviceField("libraryPreparedTrack"))
+            assertNull(serviceField("libraryPreparedEvent"))
+            assertEquals(beforeSaved, network.size)
+            suppressUnrelatedAdmission()
+            graph.setOfflineMode(false)
+            pump(150)
+            assertFalse(PlaybackService.isLocalOnlyQueue())
+            assertFalse(controller!!.playWhenReady)
+            assertSame(savedB, mediaSession!!.player.currentMediaItem)
+            assertEquals(beforeSaved, network.size) // Mode exit does not read, adopt or play.
+            assertEquals("ok", prepareA()) // Same original track/key/event after intervening B.
+            val secondA = requireNotNull(mediaSession!!.player.currentMediaItem)
+            assertNotSame(savedB, secondA)
+            assertNotSame(firstA, secondA)
+            assertEquals(firstA.mediaId, secondA.mediaId)
+            assertEquals(firstA.localConfiguration!!.uri, secondA.localConfiguration!!.uri)
+            assertEquals("library-7", PlaybackMedia.occurrence(secondA))
+            assertSame(source, serviceField("libraryPreparedClient"))
+            assertSame(source.currentSession(), serviceField("libraryPreparedSession"))
+            assertSame(solePlayer, serviceField("player"))
+            assertFalse(controller!!.playWhenReady)
+            assertEquals(PlaybackSnapshot(), PlaybackService.displayLocalSnapshot())
+            assertTrue(network.toString(), network.all { it == "POST /api/auth/login" || it == "GET /api/library/tracks/online-A/audio" })
+            graph.setOfflineMode(true)
+            assertNull(PlaybackService.replaceLocal(rows.takeLast(1), eligibility, references, 0, false, target))
+            await("healthy saved B still available") { controller!!.isPlaying && mediaSession!!.player.currentMediaItem?.mediaId == "B" }
+        } finally {
+            graph.playbackCoordinator?.close()
+            scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        }
     }
 
     @Test fun localCloseStaysStoppedAcrossModeChangesWithoutPassiveSourceReads() {
@@ -875,31 +897,41 @@ class OfflinePlaybackServiceTest {
         assertNoTraffic()
     }
 
-    @Test fun modeExitRetainsLocalProvenanceAndBlocksEveryReceiverAdoptionAndRecoveryBridge() = runBlocking {
+    @Test fun modeExitRetiresLocalTransportAndFencesDormantMediaWithoutAdoptionOrNetwork() = runBlocking {
         play()
         val retained = PlaybackService.displayLocalSnapshot().queue
+        val media = mediaSession!!.player.currentMediaItem
+        val fence = PlaybackService.localQueueReplacementFence()
+        val opened = opens.get()
+        val started = SongCachePlaybackMedia.starts.get()
         graph.setOfflineMode(false)
         pump(250)
-        assertTrue(PlaybackService.isLocalOnlyQueue())
+        assertFalse(PlaybackService.isLocalOnlyQueue())
+        assertFalse(fence())
+        assertSame("Dormant media retain their original namespace, never a fresh playback grant",
+            eligibility, serviceField("localQueueEligibility"))
+        assertNull(serviceField("localAuthority"))
         assertFalse(controller!!.playWhenReady)
-        assertEquals(retained, PlaybackService.displayLocalSnapshot().queue)
-        assertEquals(PlaybackSnapshot(), endpoint.exportSnapshot())
-        assertNull(endpoint.exportQueueIntentState())
-        assertNull(endpoint.captureRevisionSync())
-        val continuation = dev.spofify.mobile.feature.devices.CachedPlaybackPermission { true }
-        assertFalse(endpoint.retainCachedOutput(continuation))
-        assertNull(endpoint.continuingOutputWitness(continuation))
-        // Even a caller presenting a nominally valid ONLINE permit cannot adopt local work.
-        val forged = PlaybackAuthority(91, 2) { true }
-        assertFalse(endpoint.renewContinuingOutput(continuation, forged, Any()))
-        assertEquals("rejected", endpoint.activate(PlaybackSnapshot(), forged).status)
-        assertEquals("rejected", endpoint.activatePreparedResume(PlaybackSnapshot(), forged).status)
-        assertEquals("rejected", endpoint.execute(PlaybackDeviceCommand.transport("resume"), forged).status)
-        assertEquals(retained, PlaybackService.displayLocalSnapshot().queue)
+        assertEquals(PlaybackSnapshot(), PlaybackService.displayLocalSnapshot())
+        assertSame(media, mediaSession!!.player.currentMediaItem)
+        assertFalse(PlaybackService.localTransport(LocalPlaybackCommand.transport("resume")))
+        assertEquals(LibraryPlaybackObservation(), endpoint.observe())
+        // A nominal ONLINE permit cannot execute or adopt retained local work without
+        // matching authenticated targeted preparation by this endpoint incarnation.
+        val nominal = LibraryPlaybackAuthority { true }
+        val instruction = LibraryPlaybackInstruction("foreign-execute", "execute", 91, "foreign-event", 0.0, true)
+        assertEquals("rejected", endpoint.prepare(instruction.copy(type = "prepare")) { false })
+        assertEquals("rejected", endpoint.execute(instruction, nominal))
+        assertFalse("An unbound endpoint cannot claim source-stop proof for dormant local media", endpoint.release())
+        assertEquals(PlaybackSnapshot(), PlaybackService.displayLocalSnapshot())
         assertFalse(controller!!.playWhenReady)
         graph.setOfflineMode(true)
         pump(200)
+        assertTrue(PlaybackService.isLocalOnlyQueue())
+        assertEquals(retained, PlaybackService.displayLocalSnapshot().queue)
         assertFalse("Mode entry does not resume the retained queue", controller!!.playWhenReady)
+        assertEquals(opened, opens.get())
+        assertEquals(started, SongCachePlaybackMedia.starts.get())
         assertNoTraffic()
     }
 

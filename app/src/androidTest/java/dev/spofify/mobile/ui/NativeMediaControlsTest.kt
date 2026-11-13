@@ -46,7 +46,8 @@ import java.util.concurrent.TimeUnit
  *
  * Keys go through Android input/AudioManager; seeks go through a real Media3 MediaController;
  * notification commands send the actual posted PendingIntent. These are SYNTHETIC delivery
- * checks, not acoustic, physical-headset/AVRCP, OEM power-management or visual approval.
+ * checks against a single-output synthetic v2 socket subset, NOT real-server authority,
+ * transfer/planned-next acceptance, acoustic, physical-headset/AVRCP, OEM or visual approval.
  */
 @RunWith(AndroidJUnit4::class)
 @LargeTest
@@ -228,7 +229,8 @@ class NativeMediaControlsTest {
                 assertIdentity(finalPaused, awaitPaused(), "Stop remains non-destructive Pause")
                 assertPausedFor(finalPaused, 800)
 
-                assertEquals("Transport/lifecycle must not refetch a collection", 1, fixture.playbackPreparations.get())
+                assertEquals("Transport/lifecycle must not replace the synthetic queue", 1, fixture.queueReplacements.get())
+                assertTrue("Synthetic socket failures: ${fixture.socketFailures}", fixture.socketFailures.isEmpty())
                 assertEquals("No query-free catalog browse", 0, fixture.emptyGlobalBrowseCalls.get())
                 assertEquals("Authenticated cookie/CSRF must reach the fixture", 0, fixture.authenticationFailures.get())
                 assertTrue("Unexpected fixture routes: ${fixture.unexpectedRoutes}", fixture.unexpectedRoutes.isEmpty())
@@ -254,11 +256,11 @@ class NativeMediaControlsTest {
                 cleanup { instrumentation.runOnMainSync { controller?.release(); controller = null } }
                 cleanup { compose.activityRule.scenario.close() }
                 // Disposal only, not a media-dispatch assertion: a paused started service can
-                // otherwise outlive the Activity and poll after its synthetic server closes.
+                // otherwise outlive the Activity and retain its synthetic socket.
                 cleanup { onMain { (context.applicationContext as SpofifyApplication).graph.clear() } }
                 cleanup {
-                    note("audioRequests=${fixture.audioRequests.get()}\nplaybackPreparations=${fixture.playbackPreparations.get()}\n" +
-                        "historyWrites=${fixture.historyWrites.get()}\nauthenticationFailures=${fixture.authenticationFailures.get()}\n" +
+                    note("audioRequests=${fixture.audioRequests.get()}\nqueueReplacements=${fixture.queueReplacements.get()}\n" +
+                        "qualifiedHistoryEvents=${fixture.qualifiedHistoryEvents.get()}\nauthenticationFailures=${fixture.authenticationFailures.get()}\n" +
                         "unexpectedRoutes=${fixture.unexpectedRoutes.size}")
                 }
                 cleanupFailure?.let { error ->
@@ -457,9 +459,9 @@ class NativeMediaControlsTest {
             val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             assertTrue("AVD must expose at least two adjustable local music steps", max - min >= 2)
             val before = awaitPlaying()
-            val preparations = fixture.playbackPreparations.get()
-            val registrationCount = fixture.playerCalls.count { it == "register" }
-            val musicalRequests = fixture.playerCalls.count { it == "command" || it == "transfer" }
+            val replacements = fixture.queueReplacements.get()
+            val admissionCount = fixture.playerCalls.count { it == "hello" }
+            val musicalRequests = fixture.playerCalls.count { it == "command" }
             // Leave a real step in both directions even if the original setting was a boundary.
             val middle = (min + (max - min) / 2).coerceIn(min + 1, max - 1)
             setMusicIndexWithKeys(middle)
@@ -483,10 +485,10 @@ class NativeMediaControlsTest {
             val after = sample()
             assertIdentity(before, after, "volume keys")
             if (before.volume != null) assertEquals("OS volume must not change player gain", before.volume, after.volume)
-            assertEquals("Volume keys must not prepare a collection", preparations, fixture.playbackPreparations.get())
-            assertEquals("Volume keys must not register another output", registrationCount, fixture.playerCalls.count { it == "register" })
-            assertEquals("Volume keys must not send coordinator transport/transfer requests", musicalRequests,
-                fixture.playerCalls.count { it == "command" || it == "transfer" })
+            assertEquals("Volume keys must not replace the queue", replacements, fixture.queueReplacements.get())
+            assertEquals("Volume keys must not admit another socket", admissionCount, fixture.playerCalls.count { it == "hello" })
+            assertEquals("Volume keys must not send musical socket commands", musicalRequests,
+                fixture.playerCalls.count { it == "command" })
             note("volumeEvidence=foreground Android input changed STREAM_MUSIC up/down/mute while controller progress continued; acoustic output not measured")
         } catch (error: Throwable) {
             failure = error
@@ -612,6 +614,7 @@ class NativeMediaControlsTest {
         val metrics = context.resources.displayMetrics
         File(evidence, "media-controls-info.txt").writeText(
             "suite=NativeMediaControlsTest\ndata=synthetic on-device loopback only\n" +
+                "semantics=synthetic-single-output-ui-not-real-server-authority-or-planned-next-acceptance\n" +
                 "device=${Build.MODEL}\nhardware=${Build.HARDWARE}\nro.kernel.qemu=1\napi=${Build.VERSION.SDK_INT}\n" +
                 "viewport=${metrics.widthPixels}x${metrics.heightPixels}\ndensity=${metrics.density}\n" +
                 "fontScale=${context.resources.configuration.fontScale}\n" +

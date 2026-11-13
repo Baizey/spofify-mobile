@@ -1,642 +1,220 @@
 package dev.spofify.mobile.playback
 
-import android.app.ForegroundServiceStartNotAllowedException
 import android.os.Looper
-import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.test.core.app.ApplicationProvider
-import androidx.lifecycle.ViewModelStore
-import dev.spofify.mobile.AppGraph
-import dev.spofify.mobile.LibraryViewModel
-import dev.spofify.mobile.LoginStore
-import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
 import dev.spofify.mobile.core.*
-import java.net.InetAddress
-import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.TestScope
-import kotlinx.coroutines.test.resetMain
-import kotlinx.coroutines.test.runCurrent
-import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.*
 import kotlinx.serialization.json.*
-import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
-import okhttp3.mockwebserver.RecordedRequest
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
-import org.robolectric.android.controller.ServiceController
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
+import java.util.concurrent.atomic.AtomicBoolean
 
-/** Production AppGraph -> PlaybackDevicesApi -> coordinator -> enabled real service endpoint.
- * Only transport is synthetic loopback; no capability overrides, fake endpoint, live account,
- * audio source or native-device claim. Foreground denial is intentional and must be published.
- */
+/** Real graph/client/coordinator/controller lifetimes using the current controlled socket.
+ * Authoritative snapshots/results are supplied explicitly; this fixture is NOT a server reducer,
+ * collection resolver, executor, media or native-device acceptance test. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = SpofifyApplication::class)
 @LooperMode(LooperMode.Mode.PAUSED)
 @OptIn(ExperimentalCoroutinesApi::class)
-@androidx.annotation.OptIn(UnstableApi::class)
 class AppGraphPlaybackParticipationTest {
-    private class Sessions : SessionStore {
-        private var value: StoredSession? = null
-        override fun read() = value
-        override fun write(value: StoredSession?) { this.value = value }
-    }
-    private class Logins : LoginStore {
-        override fun read(): RememberedLogin? = null
-        override fun write(value: RememberedLogin?) = Unit
-    }
-
-    private val seed = PlaybackSnapshot(
-        queue = listOf(PlaybackTrack("same-song", "Prepared song", emptyList(), "Album", "album", 120.0,
-            entryId = "manual-occurrence", key = 71, order = 3)),
-        position = 0, context = PlaybackContext("playlist", "manual", "Original context", 9),
-        elapsed = 31.25, duration = 120.0, playing = true,
-        occurrence = PlaybackOccurrence(71, "same-song", "original-history-event", 17.875, false),
-    ).validated()
-
-    private inner class Fixture(private val negotiated: Boolean = false) : Dispatcher() {
-        val registrations = AtomicInteger()
-        val probes = AtomicInteger()
-        val capableRegisters = AtomicInteger()
-        val collectionReads = AtomicInteger()
-        var additions: List<String> = emptyList()
-        private var publishedMetadata = false
-        private var metadata: QueueIntentState? = if (negotiated) QueueIntentState("fixture-source", 1, "tracked",
-            seed.queue.map { QueueIntentOrigin(it.key, "low") }, emptyList()) else null
-        private val outcomes = linkedMapOf<String, String>()
-        private val details = linkedMapOf<String, QueueIntentResult>()
-        val registrationsSeen = CopyOnWriteArrayList<JsonObject>()
-        val unexpected = CopyOnWriteArrayList<String>()
-        val polls = CopyOnWriteArrayList<JsonObject>()
-        val pending = AtomicReference<PlaybackDirective?>()
-        @Volatile private var deviceId = ""
-        @Volatile private var snapshot: PlaybackSnapshot? = seed
-        @Volatile private var sequence = 0L
-        private fun view(directives: List<PlaybackDirective> = emptyList()) = PlaybackDevicesView(
-            deviceId, if (deviceId.isEmpty()) emptyList() else listOf(PlaybackDevice(deviceId, "Synthetic phone", true)),
-            deviceId, 1, if (deviceId.isEmpty()) 0 else 8000, state = snapshot, stateSeq = sequence,
-            stateAgeMs = 0, transfer = null, directives = directives,
-            commands = outcomes.map { PlaybackOutcome(it.key, it.value) },
-            queueIntents = if (!negotiated) null else QueueIntentsView(1,
-                if (deviceId.isEmpty()) emptyList() else listOf(QueueIntentReceiver(deviceId, 1)),
-                if (!publishedMetadata || deviceId.isEmpty()) null else metadata?.let {
-                    QueueIntentBinding(deviceId, it.receiverId, it.revision,
-                        snapshot?.queue?.getOrNull(snapshot?.position ?: -1)?.key, snapshot?.occurrence?.eventId)
-                }, metadata, emptyList(), details.map { QueueIntentCommandResult(it.key, it.value) }),
-        )
-        @Synchronized override fun dispatch(request: RecordedRequest): MockResponse {
-            if (request.method == "POST" && request.path == "/api/auth/login") return response(
-                """{"accountId":"fixture-participant","username":"listener","role":"user","csrfToken":"fixture-csrf"}""",
-            ).setHeader("Set-Cookie", "spofify_session=fixture-session; Path=/; HttpOnly; Max-Age=3600")
-            if (negotiated && request.method == "GET" && request.path == "/api/library/albums/album_B/playback") {
-                assertTrue(request.getHeader("Cookie")?.contains("spofify_session=fixture-session") == true)
-                collectionReads.incrementAndGet()
-                return response(buildJsonObject {
-                    put("context", buildJsonObject { put("kind", "album"); put("id", "album_B"); put("name", "Album B") })
-                    put("items", JsonArray(additions.map { id -> buildJsonObject {
-                        put("kind", "track"); put("id", id); put("name", id); put("artists", JsonArray(emptyList()))
-                        put("durationMs", 120000); put("hasAudio", true)
-                    } }))
-                    put("total", additions.size); put("limit", 1000); put("truncated", false); put("revision", 7)
-                }.toString())
-            }
-            if (request.path != "/api/me/player") {
-                unexpected += "${request.method} ${request.path}"
-                return MockResponse().setResponseCode(500)
-            }
-            if (request.getHeader("Cookie")?.contains("spofify_session=fixture-session") != true ||
-                request.method == "POST" && request.getHeader("X-CSRF-Token") != "fixture-csrf") {
-                unexpected += "Unauthenticated player request"
-                return MockResponse().setResponseCode(401)
-            }
-            if (request.method == "GET") {
-                if (request.getHeader("X-Spofify-Playback-Extensions") == "queue-intents-v1") probes.incrementAndGet()
-                return response(view().toJson().toString())
-            }
-            if (negotiated) assertEquals("queue-intents-v1", request.getHeader("X-Spofify-Playback-Extensions"))
-            val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
-            return when (body.getValue("action").jsonPrimitive.content) {
-                "register" -> {
-                    registrationsSeen += body
-                    if (negotiated) {
-                        assertTrue("Read-only probe must precede extended registration", probes.get() > 0)
-                        assertEquals(JsonPrimitive(1), body["queueIntentsVersion"])
-                        capableRegisters.incrementAndGet()
-                    }
-                    deviceId = "phone-${registrations.incrementAndGet()}"
-                    snapshot = seed; sequence = 0
-                    response(view().toJson().toString())
-                }
-                "poll" -> {
-                    polls += body
-                    assertEquals(deviceId, body.getValue("deviceId").jsonPrimitive.content)
-                    body["state"]?.let {
-                        snapshot = PlaybackSnapshot.fromJson(it.jsonObject)
-                        if (negotiated) {
-                            metadata = QueueIntentState.fromJson(body.getValue("queueIntentState").jsonObject, snapshot!!)
-                            publishedMetadata = true
-                        }
-                    }
-                    body["stateSeq"]?.let { sequence = it.jsonPrimitive.long }
-                    if (negotiated) body.getValue("acks").jsonArray.forEach { raw ->
-                        val ack = raw.jsonObject
-                        ack["queueIntentResult"]?.let { detail ->
-                            val result = QueueIntentResult.fromJson(detail.jsonObject)
-                            result.validated(requireNotNull(snapshot), requireNotNull(metadata), ack.getValue("status").jsonPrimitive.content)
-                            outcomes["priority-command"] = ack.getValue("status").jsonPrimitive.content
-                            details["priority-command"] = result
-                        }
-                    }
-                    val delivered = pending.getAndSet(null)
-                    if (negotiated && delivered?.command?.get("type")?.jsonPrimitive?.content == "queueIntent") {
-                        outcomes[delivered.commandId] = "pending"
-                    }
-                    response(view(listOfNotNull(delivered)).toJson().toString())
-                }
-                "leave" -> response(view().copy(deviceId = "", devices = emptyList(), activeDeviceId = "", leaseMs = 0).toJson().toString())
-                else -> {
-                    unexpected += "Unexpected player action"
-                    MockResponse().setResponseCode(500)
-                }
-            }
-        }
-        private fun response(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
-        fun states() = polls.mapNotNull { it["state"]?.jsonObject?.let(PlaybackSnapshot::fromJson) }
-        fun acked(id: String) = ackStatus(id) != null
-        fun ackStatus(id: String) = polls.asSequence().flatMap { it.getValue("acks").jsonArray.asSequence() }
-            .map { it.jsonObject }.firstOrNull { it.getValue("deliveryId").jsonPrimitive.content == id }
-            ?.getValue("status")?.jsonPrimitive?.content
-    }
-
-    /** Narrow Go-shaped room: registration is already unselected, never pristine idle ownership.
-     * The activation ACK reply is held so POST acceptance/active-ID cannot stand in for terminal
-     * confirmation. No direct coordinator/service admission method is invoked by this fixture. */
-    private inner class GuardedAdmissionFixture : Dispatcher() {
-        val registrations = AtomicInteger()
-        val claims = CopyOnWriteArrayList<JsonObject>()
-        val polls = CopyOnWriteArrayList<JsonObject>()
-        val unexpected = CopyOnWriteArrayList<String>()
-        val prepareDeliveries = AtomicInteger()
-        val activationDeliveries = AtomicInteger()
-        val terminalAck = AtomicReference<JsonObject?>()
-        val terminalReply = CountDownLatch(1)
-        val terminalResponses = AtomicInteger()
-        val freshEmptyPolls = AtomicInteger()
-        private var epoch = 7L
-        private var active = ""
-        private var sequence = 0L
-        private var snapshot: PlaybackSnapshot = seed.paused()
-        private var transfer: PlaybackTransfer? = null
-        private var commandId = ""
-        private var outcome = "pending"
-        private fun view(directives: List<PlaybackDirective> = emptyList()) = PlaybackDevicesView(
-            "guard-phone", listOf(PlaybackDevice("guard-phone", "Phone", true)), active, epoch,
-            if (active.isEmpty()) 0 else 8000, state = snapshot, stateSeq = sequence, stateAgeMs = 0,
-            transfer = transfer, directives = directives,
-            commands = if (commandId.isEmpty()) emptyList() else listOf(PlaybackOutcome(commandId, outcome)),
-        )
-        private fun response(value: PlaybackDevicesView = view()) = MockResponse()
-            .setHeader("Content-Type", "application/json").setBody(value.toJson().toString())
-        @Synchronized override fun dispatch(request: RecordedRequest): MockResponse {
-            if (request.method == "POST" && request.path == "/api/auth/login") return MockResponse()
-                .setHeader("Content-Type", "application/json")
-                .setHeader("Set-Cookie", "spofify_session=fixture-session; Path=/; HttpOnly; Max-Age=3600")
-                .setBody("""{"accountId":"fixture-participant","username":"listener","role":"user","csrfToken":"fixture-csrf"}""")
-            if (request.path != "/api/me/player") {
-                unexpected += "${request.method} ${request.path}"
-                return MockResponse().setResponseCode(500)
-            }
-            assertEquals("spofify_session=fixture-session", request.getHeader("Cookie"))
-            if (request.method == "GET") return response()
-            assertEquals("POST", request.method)
-            assertEquals("fixture-csrf", request.getHeader("X-CSRF-Token"))
-            assertNotNull(request.getHeader("Origin"))
-            val body = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
-            return when (body.getValue("action").jsonPrimitive.content) {
-                "register" -> { registrations.incrementAndGet(); response() }
-                "transfer" -> {
-                    assertTrue("Admission must refresh the cached empty observation", freshEmptyPolls.get() > 0)
-                    assertEquals(setOf("action", "deviceId", "epoch", "commandId", "targetDeviceId", "selectionSeq", "requireUnselected"), body.keys)
-                    assertEquals(JsonPrimitive(true), body["requireUnselected"])
-                    assertEquals("guard-phone", body.getValue("deviceId").jsonPrimitive.content)
-                    assertEquals("guard-phone", body.getValue("targetDeviceId").jsonPrimitive.content)
-                    assertEquals(epoch, body.getValue("epoch").jsonPrimitive.long)
-                    assertTrue(body.getValue("selectionSeq").jsonPrimitive.long > 0)
-                    assertEquals("", active); assertNull(transfer)
-                    claims += body
-                    assertEquals("One guarded write, never takeover/replay", 1, claims.size)
-                    commandId = body.getValue("commandId").jsonPrimitive.content
-                    transfer = PlaybackTransfer(commandId, "", "guard-phone", "preparing")
-                    response() // Go transfer replies do NOT deliver prepare.
-                }
-                "poll" -> {
-                    polls += body
-                    assertEquals("guard-phone", body.getValue("deviceId").jsonPrimitive.content)
-                    assertEquals(epoch, body.getValue("epoch").jsonPrimitive.long)
-                    body["state"]?.let {
-                        val published = PlaybackSnapshot.fromJson(it.jsonObject)
-                        if (terminalResponses.get() == 0) assertEquals("No retained/requested queue before terminal confirmation", PlaybackSnapshot(), published)
-                        assertEquals("guard-phone", active)
-                        val next = body.getValue("stateSeq").jsonPrimitive.long
-                        assertTrue(next > sequence); sequence = next; snapshot = published
-                    }
-                    val acks = body.getValue("acks").jsonArray.map { it.jsonObject }
-                    when {
-                        acks.any { it.getValue("deliveryId").jsonPrimitive.content == "guard-prepare" } -> {
-                            assertEquals("preparing", transfer?.phase)
-                            assertEquals("ok", acks.single().getValue("status").jsonPrimitive.content)
-                            assertEquals(7L, acks.single().getValue("epoch").jsonPrimitive.long)
-                            assertFalse(body.containsKey("state"))
-                            epoch++; active = "guard-phone"; sequence = 0
-                            transfer = transfer!!.copy(phase = "activating")
-                            activationDeliveries.incrementAndGet()
-                            response(view(listOf(PlaybackDirective("guard-activate", epoch, "activate", commandId, state = seed.paused()))))
-                        }
-                        acks.any { it.getValue("deliveryId").jsonPrimitive.content == "guard-activate" } -> {
-                            assertEquals("activating", transfer?.phase)
-                            assertEquals("ok", acks.single().getValue("status").jsonPrimitive.content)
-                            assertEquals(8L, acks.single().getValue("epoch").jsonPrimitive.long)
-                            assertEquals(PlaybackSnapshot(), snapshot)
-                            assertTrue(body.containsKey("stateSeq"))
-                            terminalAck.set(body)
-                            check(terminalReply.await(3, TimeUnit.SECONDS)) { "Terminal reply was not released" }
-                            transfer = null; outcome = "ok"; terminalResponses.incrementAndGet()
-                            response()
-                        }
-                        transfer?.phase == "preparing" && prepareDeliveries.get() == 0 -> {
-                            prepareDeliveries.incrementAndGet()
-                            response(view(listOf(PlaybackDirective("guard-prepare", epoch, "prepare", commandId, state = seed.paused()))))
-                        }
-                        else -> {
-                            if (commandId.isEmpty() && active.isEmpty()) freshEmptyPolls.incrementAndGet()
-                            response()
-                        }
-                    }
-                }
-                "leave" -> response()
-                else -> { unexpected += "Unexpected player action"; MockResponse().setResponseCode(500) }
-            }
-        }
-        fun states() = polls.mapNotNull { it["state"]?.jsonObject?.let(PlaybackSnapshot::fromJson) }
-    }
-
-    @Test fun viewModelPreparedDuplicatePlayClaimsThroughProductionApiAndWaitsForTerminalEmptyActivationAck() = runTest {
+    private fun fixture(block: suspend TestScope.(OnlineQueueConnectionFixture) -> Unit) = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
-        val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        app.graph.clear()
-        val graph = AppGraph(app, Sessions(), Logins())
-        SpofifyApplication::class.java.getDeclaredField("graph").apply { isAccessible = true; set(app, graph) }
-        val fixture = GuardedAdmissionFixture()
-        val web = MockWebServer().apply { dispatcher = fixture; start(InetAddress.getByName("127.0.0.1"), 0) }
-        var service: ServiceController<PlaybackService>? = null
-        var connection: PlaybackConnection? = null
-        val models = ViewModelStore()
-        try {
-            val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
-            client.login("listener", "synthetic-password")
-            val owner = requireNotNull(graph.playbackCoordinator)
-            service = Robolectric.buildService(PlaybackService::class.java).create()
-            await("Production service registers in an already-unselected room") { owner.state.value.connected }
-            assertEquals("", owner.state.value.activeDeviceId)
-            assertEquals(0, fixture.claims.size)
-            val actualService = service.get()
-            shadowOf(actualService).setThrowInStartForeground(ForegroundServiceStartNotAllowedException("Synthetic restriction"))
-            val session = PlaybackService::class.java.getDeclaredField("session").let {
-                it.isAccessible = true; it.get(actualService) as androidx.media3.session.MediaSession
-            }
-            val future = androidx.media3.session.MediaController.Builder(actualService, session.token).buildAsync()
-            shadowOf(Looper.getMainLooper()).idleFor(100, TimeUnit.MILLISECONDS)
-            val controller = future.get(1, TimeUnit.SECONDS)
-            val connected = PlaybackConnection(actualService).also {
-                // Binding injection only, as in PlaybackServiceBridgeTest.connectedPlayback.
-                // All musical delivery/admission/installation uses real production methods.
-                PlaybackConnection::class.java.getDeclaredField("controller").apply { isAccessible = true; set(it, controller) }
-            }
-            connection = connected
-            val model = LibraryViewModel(app, graph, connected).also { models.put("explicit-play", it) }
-            await("ViewModel restores the existing exact authenticated session") { model.state.value.session != null && !model.state.value.busy }
-            val queue = PlaybackQueue(
-                listOf(
-                    LibraryItem("track", "requested-duplicate", "First occurrence", hasAudio = true, entryId = "entry-1"),
-                    LibraryItem("track", "requested-duplicate", "Clicked occurrence", hasAudio = true, entryId = "entry-2"),
-                    LibraryItem("track", "requested-tail", "Complete-context tail", hasAudio = true, entryId = "entry-3"),
-                ), total = 3, context = LibraryPlaybackContext("playlist", "requested-manual", "Requested full context"), revision = 9,
-            )
-            val expected = PlaybackSnapshotCodec.preparedQueue(queue, null, "entry-2", false, null)
-            model.playPrepared(client, client.currentSession()!!.accountId, queue, null, "entry-2")
-            await("VM → connection → service must issue exactly one guarded production HTTP claim") { fixture.claims.size == 1 }
-            owner.retry()
-            await("Only polling delivers preparation") { fixture.prepareDeliveries.get() == 1 }
-            owner.retry()
-            await("Prepare ACK advances one epoch and delivers activation") { fixture.activationDeliveries.get() == 1 }
-            owner.retry()
-            await("Real endpoint stages empty paused state and sends exact activation ACK") { fixture.terminalAck.get() != null }
-            assertEquals(0, fixture.terminalResponses.get())
-            val staged = PlaybackService.exportLocalSnapshot()
-            assertEquals(PlaybackSnapshot(), staged)
-            assertNull("Empty activation staging must not create listening history", staged.occurrence)
-            assertTrue(fixture.states().all { it == PlaybackSnapshot() })
-            val raw = PlaybackService::class.java.getDeclaredField("player").let { it.isAccessible = true; it.get(actualService) as ExoPlayer }
-            assertEquals("Neither retained nor requested music is installed before terminal acceptance", 0, raw.mediaItemCount)
-            assertFalse(raw.playWhenReady)
-            fixture.terminalReply.countDown()
-            await("Requested complete context installs only after terminal ok, with honest FGS denial") {
-                fixture.states().any { it.error == "blocked" && it.queue.size == 3 } && owner.state.value.view?.state?.error == "blocked"
-            }
-            val blocked = fixture.states().last { it.error == "blocked" }
-            assertEquals(listOf("requested-duplicate", "requested-duplicate", "requested-tail"), blocked.queue.map { it.id })
-            assertEquals(listOf("entry-1", "entry-2", "entry-3"), blocked.queue.map { it.entryId })
-            assertEquals(1, blocked.position)
-            assertEquals("entry-2", blocked.queue[blocked.position].entryId)
-            assertEquals(expected.context, blocked.context)
-            assertEquals("Clicked occurrence", blocked.queue[blocked.position].name)
-            assertEquals(1, raw.currentMediaItemIndex)
-            assertEquals("requested-duplicate", raw.currentMediaItem!!.mediaId)
-            assertEquals("wire-${blocked.queue[blocked.position].key}", PlaybackMedia.occurrence(raw.currentMediaItem!!))
-            // FGS denial precedes prepare/play. The selected queue occurrence exists, but
-            // sampleHistory deliberately does not create a listening record while silent.
-            // Do not require a later Media3 transition callback to manufacture a history nonce.
-            assertNull("Denied startup must not inherit or fabricate listening history", blocked.occurrence)
-            assertEquals(0.0, blocked.elapsed, 0.0)
-            assertFalse(blocked.playing); assertFalse(raw.playWhenReady)
-            assertEquals(1, fixture.registrations.get())
-            assertEquals(1, fixture.claims.size)
-            assertEquals(1, fixture.prepareDeliveries.get())
-            assertEquals(1, fixture.activationDeliveries.get())
-            assertEquals(1, fixture.terminalResponses.get())
-            assertTrue("No audio/history/catalog refetch permitted: ${fixture.unexpected}", fixture.unexpected.isEmpty())
-        } finally {
-            fixture.terminalReply.countDown()
-            models.clear(); connection?.release()
-            graph.clear(); service?.destroy(); runCurrent(); web.shutdown(); Dispatchers.resetMain()
-        }
+        try { OnlineQueueConnectionFixture(this).use { block(it) } }
+        finally { Dispatchers.resetMain() }
     }
-
-    private fun TestScope.await(description: String, diagnostics: () -> String = { "" }, condition: () -> Boolean) {
-        val deadline = System.nanoTime() + 5_000_000_000L
-        while (!condition() && System.nanoTime() < deadline) {
-            runCurrent()
-            shadowOf(Looper.getMainLooper()).idleFor(10, java.util.concurrent.TimeUnit.MILLISECONDS)
-            Thread.sleep(5)
+    private fun server(fixture: OnlineQueueConnectionFixture): MockWebServer =
+        OnlineQueueConnectionFixture::class.java.getDeclaredField("web").let {
+            it.isAccessible = true; it.get(fixture) as MockWebServer
         }
+    private fun loginResponse(account: String) = MockResponse().setHeader("Content-Type", "application/json")
+        .setHeader("Set-Cookie", "spofify_session=synthetic-successor; Path=/; HttpOnly; Max-Age=3600")
+        .setBody("""{"accountId":"$account","username":"listener","role":"user","csrfToken":"synthetic-csrf"}""")
+    private fun observe(connection: PlaybackConnection) {
+        // Presentation-only attachment: no MediaController/service creation or output permission.
+        PlaybackConnection::class.java.getDeclaredField("observing").apply { isAccessible = true; setBoolean(connection, true) }
+        PlaybackConnection::class.java.getDeclaredMethod("publish").apply { isAccessible = true }.invoke(connection)
+    }
+    @Test fun repeatedRestoreAndPresentationReattachmentRetainOneCoordinatorWithoutMusicOrQueueImport() = fixture { f ->
+        val session = requireNotNull(f.client.currentSession())
+        val owner = f.owner
+        val snapshot = f.snapshot
+        repeat(3) {
+            assertSame(session, f.graph.restore())
+            assertSame(owner, f.graph.playbackCoordinator)
+        }
+        f.connection.release()
+        assertTrue(owner.state.value.connected)
+        assertEquals(snapshot, owner.state.value.snapshot)
+        val replacement = PlaybackConnection(ApplicationProvider.getApplicationContext<SpofifyApplication>())
+        try {
+            observe(replacement)
+            assertSame(owner, f.graph.playbackCoordinator)
+            assertEquals(snapshot.state.queue.map { it.key }, replacement.state.value.remoteSnapshot!!.queue.map { it.key })
+            assertFalse(replacement.state.value.isPlaying)
+            assertTrue(f.commands.isEmpty())
+            assertTrue("Display attachment must never install server music into the local queue", PlaybackService.displayLocalSnapshot().queue.isEmpty())
+            f.assertNoHttpPlayback()
+        } finally { replacement.release() }
+    }
+    @Test fun graphClearRetiresPendingConnectionAndNeverReplaysUncertainCommands() = fixture { f ->
+        val results = mutableListOf<PlaybackActionResult>()
+        f.connection.queueIntent(LibraryPlaybackSelection.Track(LibraryPlaybackTrackRef("one")), f.client,
+            PlaybackListAction.PLAY_NOW, f.connection.state.value.interactionKey, f.owner.captureBinding(), onResult = results::add)
+        assertEquals(1, f.commands.size)
+        assertTrue(results.isEmpty())
+        f.graph.fenceForLogout(f.client)
+        f.graph.clear(f.client)
         runCurrent()
-        assertTrue(description + diagnostics(), condition())
+        assertFalse(f.owner.state.value.connected)
+        assertNull(f.owner.captureBinding())
+        assertEquals(PlaybackActionStatus.UNAVAILABLE, results.single().status)
+        assertNull(f.graph.client)
+        advanceTimeBy(20_001); runCurrent()
+        assertEquals(1, results.size)
+        assertEquals(1, f.commands.size)
+        assertTrue(PlaybackService.displayLocalSnapshot().queue.isEmpty())
+        f.assertNoHttpPlayback()
     }
-
-    private fun longDerived(length: Int): PlaybackSnapshot {
-        val context = PlaybackContext("derived", "rules", "Original rules", 7, "original-fence")
-        val tracks = (0 until 1000).map { index -> PlaybackTrack("duplicate", "Song", emptyList(), "Album", "album", 120.0,
-            targetId = context.id, occurrenceId = "x".repeat(length) + "-$index", playbackContext = context,
-            key = index + 1L, order = (999 - index).toLong()) }
-        return seed.copy(queue = tracks, position = 17, context = context, shuffle = true,
-            occurrence = PlaybackOccurrence(18, "duplicate", "original-history-event", 17.875, true)).paused().validated()
+    @Test fun replacementAccountRejectsHeldClientAndLateOldUnauthorizedCannotRetireSuccessor() = fixture { f ->
+        val oldSession = requireNotNull(f.client.currentSession())
+        val oldUnauthorized = requireNotNull(f.client.onUnauthorized)
+        val binding = requireNotNull(f.owner.captureBinding())
+        val key = f.connection.state.value.interactionKey
+        val successor = f.graph.configure(f.client.server)
+        server(f).enqueue(loginResponse("other-account"))
+        successor.login("listener", "synthetic-password")
+        runCurrent()
+        val successorSession = requireNotNull(successor.currentSession())
+        assertEquals("other-account", successorSession.accountId)
+        assertNotEquals(oldSession.accountId, successorSession.accountId)
+        assertNull(f.client.currentSession())
+        oldUnauthorized()
+        shadowOf(Looper.getMainLooper()).idle(); runCurrent()
+        assertSame(successor, f.graph.client)
+        assertSame(successorSession, successor.currentSession())
+        assertFalse(f.graph.sessionExpired.value)
+        val results = mutableListOf<PlaybackActionResult>()
+        f.connection.queueIntent(LibraryPlaybackSelection.Track(LibraryPlaybackTrackRef("old-account-song")), f.client,
+            PlaybackListAction.QUEUE_HIGH, key, binding, onResult = results::add)
+        assertEquals(PlaybackActionStatus.STALE, results.single().status)
+        assertTrue(f.commands.isEmpty())
+        assertEquals("Only the two declared synthetic logins", 2, server(f).requestCount)
     }
-
-    @Test fun productionProtocolRejectsOversizedPrepareAndActivationBeforeChangingFullLongDerivedQueue() = runTest {
-        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
-        val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        app.graph.clear()
-        val graph = AppGraph(app, Sessions(), Logins())
-        SpofifyApplication::class.java.getDeclaredField("graph").apply { isAccessible = true; set(app, graph) }
-        val fixture = Fixture()
-        val web = MockWebServer().apply { dispatcher = fixture; start(InetAddress.getByName("127.0.0.1"), 0) }
-        var service: ServiceController<PlaybackService>? = null
-        try {
-            graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}")).login("listener", "synthetic-password")
-            val owner = requireNotNull(graph.playbackCoordinator)
-            service = Robolectric.buildService(PlaybackService::class.java).create()
-            await("Actual service registers") { owner.state.value.connected }
-            val endpoint = Media3PlaybackEndpoint()
-            val supported = longDerived(1400).publicationValidated()
-            val oversized = longDerived(4080)
-            assertEquals(1000, supported.queue.size)
-            assertTrue(oversized.toJson().toString().toByteArray().size > 2 * 1024 * 1024)
-            owner.localAction { permit -> endpoint.activate(supported, permit) }
-            await("Full long derived state must publish exactly through the production API") { fixture.states().lastOrNull() == supported }
-            assertEquals(supported, endpoint.exportSnapshot())
-
-            fixture.pending.set(PlaybackDirective("oversized-prepare", 1, "prepare", state = oversized))
-            owner.retry(); await("Oversized preparation is delivered") { fixture.pending.get() == null }
-            owner.retry(); await("Oversized preparation must ACK rejected, not mutate") { fixture.acked("oversized-prepare") }
-            assertEquals("rejected", fixture.ackStatus("oversized-prepare"))
-            assertEquals(supported, endpoint.exportSnapshot())
-
-            fixture.pending.set(PlaybackDirective("oversized-activate", 1, "activate", state = oversized))
-            owner.retry(); await("Oversized activation is delivered") { fixture.pending.get() == null }
-            owner.retry(); await("Oversized activation must ACK rejected with prior exact state") { fixture.acked("oversized-activate") }
-            assertEquals("rejected", fixture.ackStatus("oversized-activate"))
-            assertEquals(supported, endpoint.exportSnapshot())
-            assertEquals(supported, fixture.states().last())
-            assertTrue(fixture.polls.all { it.toString().toByteArray().size <= 2 * 1024 * 1024 })
-            assertTrue("No audio/history/refetch: ${fixture.unexpected}", fixture.unexpected.isEmpty())
-        } finally {
-            graph.clear(); service?.destroy(); runCurrent(); web.shutdown(); Dispatchers.resetMain()
+    @Test fun equalValuedReauthenticationCannotRefreshAHeldSignedSelectionOrBinding() = fixture { f ->
+        val session = requireNotNull(f.client.currentSession())
+        val binding = requireNotNull(f.owner.captureBinding())
+        val key = f.connection.state.value.interactionKey
+        val context = LibraryPlaybackContext("derived", "rules", "Rules", 7, "original-fence")
+        val selection = LibraryPlaybackSelection.Track(LibraryPlaybackTrackRef("duplicate", targetId = "rules",
+            occurrenceId = "ordered/path/second", selectionToken = "opaque.original.signature"), context)
+        server(f).enqueue(loginResponse(session.accountId))
+        f.client.login("listener", "synthetic-password")
+        assertEquals(session, f.client.currentSession())
+        assertNotSame(session, f.client.currentSession())
+        val results = mutableListOf<PlaybackActionResult>()
+        f.connection.queueIntent(selection, f.client, PlaybackListAction.PLAY_NOW, key, binding,
+            isCurrent = { f.client.currentSession() === session }, onResult = results::add)
+        assertEquals(PlaybackActionStatus.STALE, results.single().status)
+        assertTrue(f.commands.isEmpty())
+        assertEquals(2, server(f).requestCount)
+    }
+    @Test fun exactManualAndDerivedRowsSendOnlyIdentifiersAndWaitForAuthoritativeAcceptance() = fixture { f ->
+        val manual = queueIntentSelection(LibraryItem("track", "duplicate", "Untrusted display title",
+            hasAudio = true, entryId = "manual-second"), LibraryPlaybackContext("playlist", "manual", "Mix"))
+        val manualResults = mutableListOf<PlaybackActionResult>()
+        f.connection.queueIntent(manual, f.client, PlaybackListAction.PLAY_NOW, f.connection.state.value.interactionKey,
+            f.owner.captureBinding(), onResult = manualResults::add)
+        assertTrue(manualResults.isEmpty())
+        val first = (f.commands.single().command as LibraryPlaybackCommand.QueueIntent).selection as LibraryPlaybackSelection.Track
+        assertEquals("manual-second", first.track.entryId)
+        assertNull(first.track.occurrenceId)
+        f.result(placement = "replace", execution = "confirmed", count = 3)
+        assertNotEquals(PlaybackActionStatus.PLAYING, manualResults.single().status)
+        val derivedContext = LibraryPlaybackContext("derived", "rules", "Rules", 9, "fresh-fence")
+        val token = "opaque.signature_-/+="
+        val derived = queueIntentSelection(LibraryItem("track", "duplicate", "Display only", hasAudio = true,
+            entryId = "not-a-manual-entry"), derivedContext, "ordered/path/second", token)
+        val results = mutableListOf<PlaybackActionResult>()
+        f.connection.queueIntent(derived, f.client, PlaybackListAction.QUEUE_HIGH, f.connection.state.value.interactionKey,
+            f.owner.captureBinding(), onResult = results::add)
+        val sent = f.commands.last()
+        val encoded = Json.parseToJsonElement(LibraryPlaybackCodec.encode(sent, commandId = "2")).jsonObject
+        val command = encoded.getValue("command").jsonObject
+        assertEquals(setOf("type", "intent", "selection"), command.keys)
+        val selection = command.getValue("selection").jsonObject
+        val ref = selection.getValue("track").jsonObject
+        assertEquals(setOf("id", "targetId", "occurrenceId", "selectionToken"), ref.keys)
+        assertEquals(token, ref.getValue("selectionToken").jsonPrimitive.content)
+        assertEquals("ordered/path/second", ref.getValue("occurrenceId").jsonPrimitive.content)
+        assertFalse(sent.toString().contains(token))
+        assertEquals(derivedContext, (derived as LibraryPlaybackSelection.Track).context)
+        assertTrue(results.isEmpty())
+        f.result(placement = "high", execution = "unchanged")
+        assertEquals(PlaybackActionStatus.ADDED, results.single().status)
+        assertEquals(1, results.single().acceptedCount)
+        assertEquals(2, f.commands.size)
+        f.assertNoHttpPlayback()
+    }
+    @Test fun canceledSourceBeforePostedDispatchNeverResolvesUploadsOrStarts() = fixture { f ->
+        val live = AtomicBoolean(true)
+        val results = mutableListOf<PlaybackActionResult>()
+        val key = f.connection.state.value.interactionKey
+        val binding = f.owner.captureBinding()
+        val thread = Thread {
+            f.connection.queueIntent(LibraryPlaybackSelection.Collection(LibraryPlaybackContext("album", "album", "Album")),
+                f.client, PlaybackListAction.PLAY_NOW, key, binding, isCurrent = live::get, onResult = results::add)
         }
+        thread.start(); thread.join(1_000)
+        assertFalse("Owned dispatch thread must terminate", thread.isAlive)
+        assertTrue(results.isEmpty())
+        live.set(false)
+        shadowOf(Looper.getMainLooper()).idle(); runCurrent()
+        assertEquals(PlaybackActionStatus.STALE, results.single().status)
+        assertTrue(f.commands.isEmpty())
+        assertTrue(PlaybackService.displayLocalSnapshot().queue.isEmpty())
+        f.assertNoHttpPlayback()
     }
-
-    @Test fun negotiatedProductionReceiverConsumesFrozenPausedVectorAndPublishesAtomicDetailedAck() = runTest {
-        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
-        val corpusPath = listOf(java.io.File("core/src/test/resources/queue-intents-v1/queue-intents-v1.json"),
-            java.io.File("../core/src/test/resources/queue-intents-v1/queue-intents-v1.json")).first { it.isFile }
-        val bytes = corpusPath.readBytes()
-        assertEquals("621f5e5eea8632ea732c7369ae03bc442db53ec82e3d0edd7a9052a24547f44b",
-            java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) })
-        val vector = Json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject.getValue("semantics").jsonArray
-            .map { it.jsonObject }.single { it.getValue("name").jsonPrimitive.content == "corrected-P1-paused-A-keeps-current" }
-        fun labels(name: String) = vector.getValue(name).jsonArray.map { it.jsonPrimitive.content }
-        val initial = PlaybackSnapshot(queue = labels("queue").mapIndexed { index, id ->
-            PlaybackTrack(id, id, emptyList(), "", "", 120.0, key = index + 101L, order = index.toLong())
-        }, position = vector.getValue("position").jsonPrimitive.int, elapsed = 42.0, duration = 120.0,
-            occurrence = PlaybackOccurrence(101, "A", "frozen-vector-history", 12.25, false)).validated()
-        val imported = QueueIntentState("source-receiver", 31, "tracked", initial.queue.map {
-            QueueIntentOrigin(it.key, if (it.id in labels("high")) "high" else "low")
-        }, initial.queue.filter { it.id in labels("high") }.map { it.key }).validated(initial)
-        val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        app.graph.clear()
-        val graph = AppGraph(app, Sessions(), Logins())
-        SpofifyApplication::class.java.getDeclaredField("graph").apply { isAccessible = true; set(app, graph) }
-        val fixture = Fixture(negotiated = true).apply { additions = labels("additions") }
-        val web = MockWebServer().apply { dispatcher = fixture; start(InetAddress.getByName("127.0.0.1"), 0) }
-        var service: ServiceController<PlaybackService>? = null
-        try {
-            graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}")).login("listener", "synthetic-password")
-            val owner = requireNotNull(graph.playbackCoordinator)
-            service = Robolectric.buildService(PlaybackService::class.java).create()
-            await("Complete native receiver must negotiate before capable registration") { owner.state.value.connected }
-            assertEquals(1, fixture.capableRegisters.get())
-            assertTrue(Media3PlaybackEndpoint().supportsQueueIntents)
-            val endpoint = Media3PlaybackEndpoint()
-            owner.localAction { permit -> endpoint.activate(initial, imported, permit) }
-            await("Imported exact state and native incarnation must be published") {
-                owner.state.value.canQueueIntent && fixture.states().lastOrNull()?.queue?.map { it.id } == labels("queue")
-            }
-            val before = endpoint.exportSnapshot()
-            val binding = requireNotNull(owner.state.value.queueIntentBinding)
-            assertNotEquals("Incoming handoff must not adopt the source incarnation", imported.receiverId, binding.receiverId)
-            fixture.pending.set(PlaybackDirective("priority-delivery", owner.state.value.view!!.epoch, "command", "priority-command",
-                PlaybackDeviceCommand.queueIntent(QueueIntentIntent.fromWire(vector.getValue("intent").jsonPrimitive.content), binding,
-                    QueueIntentSelection.Collection(PlaybackContext("album", "album_B", "Album B"))).json))
-            owner.retry()
-            await("One native resolver must prepare the bounded album") { fixture.collectionReads.get() == 1 }
-            await("Receiver installs the accepted queue before terminal publication") { endpoint.exportSnapshot().queue.size == 6 }
-            owner.retry()
-            await("Queue acceptance must publish its detailed terminal ACK") { fixture.ackStatus("priority-delivery") == "ok" }
-            val after = endpoint.exportSnapshot()
-            assertEquals(labels("expectedQueue"), after.queue.map { it.id })
-            assertEquals(vector.getValue("expectedCurrent").jsonPrimitive.content, after.queue[after.position].id)
-            assertEquals(before.occurrence, after.occurrence)
-            assertEquals(42.0, after.elapsed, 0.0)
-            assertFalse(after.playing); assertEquals(before.error, after.error)
-            val metadata = requireNotNull(endpoint.exportQueueIntentState()).validated(after)
-            assertEquals(labels("expectedHigh"), metadata.highKeys.map { key -> after.queue.single { it.key == key }.id })
-            assertEquals(listOf("low", "low"), metadata.origins.takeLast(2).map { it.intent })
-            val ackPoll = fixture.polls.single { body -> body.getValue("acks").jsonArray.any {
-                it.jsonObject.getValue("deliveryId").jsonPrimitive.content == "priority-delivery"
-            } }
-            val detail = QueueIntentResult.fromJson(ackPoll.getValue("acks").jsonArray.single().jsonObject.getValue("queueIntentResult").jsonObject)
-            assertEquals("queued", detail.outcome); assertEquals(2, detail.acceptedCount)
-            assertEquals("low", detail.placement); assertEquals("unchanged", detail.playback); assertNull(detail.playbackKey)
-            detail.validated(PlaybackSnapshot.fromJson(ackPoll.getValue("state").jsonObject),
-                QueueIntentState.fromJson(ackPoll.getValue("queueIntentState").jsonObject), "ok")
-            val raw = PlaybackService::class.java.getDeclaredField("player").let { it.isAccessible = true; it.get(service.get()) as ExoPlayer }
-            assertFalse(raw.playWhenReady)
-            assertEquals(Player.STATE_IDLE, raw.playbackState)
-            assertEquals(1, fixture.collectionReads.get())
-            // A locally originated raw queue transaction must retain its pure output lease
-            // after its OWN publication changes the captured semantic Binding. Never store
-            // an authority predicate tied forever to the obsolete predecessor binding.
-            await("The controller consumes the preceding terminal publication before a new explicit action") {
-                owner.state.value.queueIntentBinding?.revision == metadata.revision
-            }
-            val localDetail = AtomicReference<List<QueueIntentResult?>>(emptyList())
-            owner.queueIntent(QueueIntentIntent.HIGH, owner.state.value.queueIntentBinding,
-                QueueIntentSelection.Track(buildJsonObject {
-                    put("id", "local-X"); put("name", "Local X"); put("artists", JsonArray(emptyList()))
-                    put("albumName", ""); put("albumId", ""); put("duration", 120)
-                }, null), isCurrent = { true }, onResult = { localDetail.set(listOf(it)) })
-            await("Locally originated queue action waits for its exact publication", diagnostics = {
-                " connected=${owner.state.value.connected} capable=${owner.state.value.canQueueIntent}" +
-                    " projectedRevision=${owner.state.value.queueIntentBinding?.revision}" +
-                    " nativeRevision=${endpoint.exportQueueIntentState()?.revision}" +
-                    " nativeCount=${endpoint.exportSnapshot().queue.size} polls=${fixture.polls.size}" +
-                    " lastSeq=${fixture.polls.lastOrNull()?.get("stateSeq")}" +
-                    " unexpectedRoutes=${fixture.unexpected.takeLast(3)}"
-            }) { localDetail.get().isNotEmpty() }
-            val localReceipt = requireNotNull(localDetail.get().single())
-            assertEquals("queued", localReceipt.outcome)
-            assertEquals(1, localReceipt.acceptedCount)
-            val retainedAuthority = PlaybackService::class.java.getDeclaredField("authority").let {
-                it.isAccessible = true; it.get(service.get()) as dev.spofify.mobile.feature.devices.PlaybackAuthority
-            }
-            assertTrue("Own successor publication must not revoke the native output's lease", retainedAuthority.isValid())
-            assertFalse(endpoint.exportSnapshot().playing)
-            assertTrue("Only authenticated synthetic player and one album resolver route", fixture.unexpected.isEmpty())
-        } finally {
-            graph.clear(); service?.destroy(); runCurrent(); web.shutdown(); Dispatchers.resetMain()
-        }
-    }
-
-    @Test fun enabledProductionGraphRegistersOnlyWithServiceExecutesCommandsAndRecreatesSilent() = runTest {
-        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
-        val app = ApplicationProvider.getApplicationContext<SpofifyApplication>()
-        app.graph.clear()
-        val graph = AppGraph(app, Sessions(), Logins())
-        SpofifyApplication::class.java.getDeclaredField("graph").apply { isAccessible = true; set(app, graph) }
-        val fixture = Fixture()
-        val web = MockWebServer().apply { dispatcher = fixture; start(InetAddress.getByName("127.0.0.1"), 0) }
-        var service: ServiceController<PlaybackService>? = null
-        try {
-            assertTrue(Media3PlaybackEndpoint().supportsExactHandoff)
-            val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
-            client.login("listener", "synthetic-password")
-            val owner = requireNotNull(graph.playbackCoordinator)
-            runCurrent()
-            assertEquals("Login/UI presence alone must not advertise a physical receiver", 0, fixture.registrations.get())
-            service = Robolectric.buildService(PlaybackService::class.java).create()
-            await("Production service must register via its AppGraph callback") { owner.state.value.connected }
-            assertEquals(1, fixture.registrations.get())
-            val raw = PlaybackService::class.java.getDeclaredField("player").let {
-                it.isAccessible = true; it.get(service.get()) as ExoPlayer
-            }
-            assertEquals(0, raw.mediaItemCount)
-            assertFalse(raw.playWhenReady)
-            assertNull("Registration metadata must not grant a restored traversal", owner.currentAuthority())
-
-            // Enqueue initializes the server's playing metadata PAUSED, preserves its occurrence,
-            // and adds a duplicate without opening audio or earning imported-position history.
-            val track = seed.toJson().getValue("queue").jsonArray.single().jsonObject
-            owner.remoteCommand(PlaybackDeviceCommand.musical("enqueue", track = track, first = true))
-            // Server receipt precedes the client's response/command completion. Do not issue
-            // the next deliberate Play while the coordinator still awaits this publication.
-            await("Real enqueue result must be published and accepted by the coordinator") {
-                fixture.states().any { it.queue.size == 2 } && owner.state.value.view?.state?.queue?.size == 2
-            }
-            val queued = fixture.states().last()
-            assertFalse(queued.playing)
-            assertEquals(seed.occurrence, queued.occurrence)
-            assertEquals(seed.elapsed, queued.elapsed, 0.0)
-            assertEquals(seed.queue.single().key, queued.queue.first().key)
-            assertNotEquals(queued.queue[0].key, queued.queue[1].key)
-            assertEquals(Player.STATE_IDLE, raw.playbackState)
-
-            // Positive Play of the authoritative current entry resumes/no-ops; no playlist GET,
-            // replacement traversal or imported history credit. Android denial is honest state.
-            shadowOf(service.get()).setThrowInStartForeground(ForegroundServiceStartNotAllowedException("Synthetic restriction"))
-            owner.remoteCommand(PlaybackDeviceCommand.musical("play", track = track, context = seed.context,
-                entryId = seed.queue.single().entryId))
-            await("Real blocked outcome must be published") { fixture.states().lastOrNull()?.error == "blocked" }
-            val blocked = fixture.states().last()
-            assertEquals(queued.queue, blocked.queue)
-            assertEquals(seed.occurrence, blocked.occurrence)
-            assertFalse(raw.playWhenReady)
-
-            fixture.pending.set(PlaybackDirective("server-pause", 1, "command", command = PlaybackDeviceCommand.transport("pause").json))
-            owner.retry()
-            await("Incoming Pause must reach the real service") { fixture.pending.get() == null }
-            owner.retry()
-            await("Execution ACK must return over the authenticated protocol") { fixture.acked("server-pause") }
-            assertFalse(raw.playWhenReady)
-
-            fixture.pending.set(PlaybackDirective("server-close", 1, "command", command = PlaybackDeviceCommand.transport("close").json))
-            owner.retry()
-            await("Close must publish ACK and dispose through AppGraph callback") {
-                fixture.acked("server-close") && !owner.state.value.connected
-            }
-            val close = fixture.polls.single { body -> body.getValue("acks").jsonArray.any {
-                it.jsonObject.getValue("deliveryId").jsonPrimitive.content == "server-close"
-            } }
-            assertEquals(PlaybackSnapshot(), PlaybackSnapshot.fromJson(close.getValue("state").jsonObject))
-            assertTrue(shadowOf(service.get()).isStoppedBySelf)
-            service.destroy(); service = null
-
-            service = Robolectric.buildService(PlaybackService::class.java).create()
-            await("New service must register a fresh session-scoped device") { fixture.registrations.get() == 2 && owner.state.value.connected }
-            assertEquals("phone-2", owner.state.value.deviceId)
-            assertEquals(PlaybackSnapshot(), PlaybackService.exportLocalSnapshot())
-            assertNull(owner.currentAuthority())
-            assertTrue("No audio/history/catalog/refetch routes permitted: ${fixture.unexpected}", fixture.unexpected.isEmpty())
-        } finally {
-            graph.clear()
-            service?.destroy()
-            runCurrent()
-            web.shutdown()
-            Dispatchers.resetMain()
-        }
+    @Test fun completeLongDerivedSnapshotRetainsEveryOccurrenceAndNeverBecomesLocalQueueAuthority() = fixture { f ->
+        val context = LibraryPlaybackContext("derived", "rules", "Rules", 7, "fresh-fence")
+        val tracks = (1L..1001L).map { key -> LibraryPlaybackTrack("duplicate", "Song $key", emptyList(), "Album", "album", 120.0,
+            key, 1002 - key, "low", targetId = "rules", occurrenceId = "ordered/path/🎵-$key", playbackContext = context) }
+        val before = f.snapshot
+        val state = before.state.copy(queue = tracks, position = 17, context = context, shuffle = true,
+            occurrence = LibraryPlaybackOccurrence(18, "duplicate", "event", 17.875, true))
+        f.publish(before.copy(stateVersion = 2, state = state, playback = before.playback.copy(stateVersion = 2)))
+        val display = f.connection.state.value
+        assertEquals(1001, display.queue.size)
+        assertEquals(17, display.queueIndex)
+        assertEquals("wire-18", display.currentEntryId)
+        assertEquals("ordered/path/🎵-18", display.item?.entryId)
+        assertEquals(tracks.map { it.key }, display.remoteSnapshot!!.queue.map { it.key })
+        assertEquals(tracks.map { it.occurrenceId }, display.remoteSnapshot!!.queue.map { it.occurrenceId })
+        assertEquals(tracks.map { it.order }, display.remoteSnapshot!!.queue.map { it.order })
+        assertEquals("ordered/path/🎵-1001", display.remoteSnapshot!!.queue.last().occurrenceId)
+        assertTrue(display.remoteSnapshot!!.queue.all { it.entryId.isEmpty() })
+        assertTrue(display.queue.all { it.libraryPath == null })
+        assertTrue(PlaybackService.displayLocalSnapshot().queue.isEmpty())
+        assertTrue(f.commands.isEmpty())
+        val results = mutableListOf<PlaybackActionResult>()
+        f.connection.queueIntent(LibraryPlaybackSelection.Collection(LibraryPlaybackContext("album", "oversized", "Album")),
+            f.client, PlaybackListAction.QUEUE_LOW, display.interactionKey, f.owner.captureBinding(), onResult = results::add)
+        assertTrue(results.isEmpty())
+        assertEquals(display.remoteSnapshot, f.connection.state.value.remoteSnapshot)
+        f.result(outcome = "rejected", code = "capacity", count = 0, placement = "none")
+        assertEquals(PlaybackActionStatus.FULL, results.single().status)
+        assertEquals(0, results.single().acceptedCount)
+        assertEquals(display.remoteSnapshot, f.connection.state.value.remoteSnapshot)
+        assertEquals(1, f.commands.size)
+        f.assertNoHttpPlayback()
     }
 }

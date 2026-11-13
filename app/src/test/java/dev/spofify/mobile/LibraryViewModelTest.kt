@@ -40,22 +40,14 @@ class LibraryViewModelTest {
         val listActions = mutableListOf<PlaybackListAction>()
         val actionResults = ArrayDeque<(PlaybackActionResult) -> Unit>()
         val actionCurrents = ArrayDeque<() -> Boolean>()
-        override fun queueIntent(selection: QueueIntentSelection, client: SpofifyClient, action: PlaybackListAction,
-            expectedKey: PlaybackInteractionKey?, expectedBinding: QueueIntentBinding?, isCurrent: () -> Boolean,
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient, action: PlaybackListAction,
+            expectedKey: PlaybackInteractionKey?, expectedBinding: dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding?, shuffle: Boolean?, isCurrent: () -> Boolean,
             onResult: (PlaybackActionResult) -> Unit) {
             listActions += action; actionResults.addLast(onResult); actionCurrents.addLast(isCurrent)
         }
-        override fun performPreparedAction(queue: dev.spofify.mobile.core.PlaybackQueue, client: SpofifyClient,
-            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, startTrackId: String?,
-            startEntryId: String?, context: LibraryItem?, isCurrent: () -> Boolean,
-            onResult: (PlaybackActionResult) -> Unit) {
-            listActions += action
-            actionResults.addLast(onResult)
-        }
         override fun connect() = Unit
         override fun release() = Unit
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean, startEntryId: String?) { plays++ }
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) { enqueues++ }
+
         override fun setContext(context: LibraryItem?) { contexts += context }
         override fun toggle() = Unit
         override fun next() = Unit
@@ -73,131 +65,6 @@ class LibraryViewModelTest {
         runCurrent()
         assertTrue("Timed out waiting for ViewModel state", condition())
     }
-
-    // Pause/revocation use the shared epoch, not LibraryViewModel's private queue generation.
-    // Keep the HTTP response pending so the test exercises the upstream fence, before play/enqueue.
-    private fun cancelledQueueCompletion(
-        enqueue: Boolean = false,
-        invalidateBeforeLaunch: Boolean = false,
-        response: () -> MockResponse = { json("""{"items":[{"kind":"track","id":"song","name":"Song","hasAudio":true}],"total":1001,"truncated":true}""") },
-        retry: Boolean = false,
-        retireThroughSettings: Boolean = false,
-    ) = runTest {
-        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
-        val queueStarted = CountDownLatch(1)
-        val releaseQueue = CountDownLatch(1)
-        val web = MockWebServer()
-        web.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
-                "/api/auth/login" -> json("""{"accountId":"id","username":"listener","role":"user","csrfToken":"csrf"}""")
-                    .setHeader("Set-Cookie", "spofify_session=secret; Path=/; HttpOnly; Max-Age=3600")
-                "/api/library/albums/album/playback" -> {
-                    queueStarted.countDown(); releaseQueue.await(5, TimeUnit.SECONDS)
-                    response()
-                }
-                else -> json("""{"items":[],"total":0}""")
-            }
-        }
-        web.start()
-        val app = ApplicationProvider.getApplicationContext<Application>()
-        val graph = AppGraph(app, MemoryStore())
-        val store = ViewModelStore()
-        try {
-            val client = graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}"))
-            client.login("listener", "password")
-            val playback = FakePlayback()
-            val model = LibraryViewModel(app, graph, playback)
-            store.put("subject", model)
-            until { model.state.value.session != null && !model.state.value.loading }
-            val browseSource = model.captureBrowseSource(client)
-            assertTrue(browseSource())
-            val album = LibraryItem("album", "album", "Album", coverage = Coverage(inLibrary = 1))
-            fun request() {
-                if (enqueue) model.enqueueFrom(client, album, playNext = true) else model.play(album)
-            }
-            request()
-            val intent = model.state.value.playbackIntentGeneration
-            if (invalidateBeforeLaunch) PlaybackRequests.invalidate()
-            runCurrent()
-            if (!enqueue) assertTrue(queueStarted.await(5, TimeUnit.SECONDS))
-            else assertEquals("Raw selected receiver owns preparation", 1, playback.listActions.size)
-            assertTrue(model.state.value.preparing)
-            if (retireThroughSettings) {
-                val playing = playback.state.value
-                // Retire the route even when no composition samples the intermediate tabs.
-                model.switchTab(Tab.SETTINGS)
-                model.open(Page.Profile)
-                model.back()
-                assertEquals(Page.Settings, model.state.value.page)
-                model.open(Page.Credits)
-                model.back()
-                assertEquals(Page.Settings, model.state.value.page)
-                model.switchTab(Tab.HOME)
-                assertEquals(Page.Home, model.state.value.page)
-                assertEquals(playing, playback.state.value)
-            } else if (!invalidateBeforeLaunch) PlaybackRequests.invalidate()
-            assertEquals("Unsampled navigation ABA retires source authority; transport revocation is separate",
-                !retireThroughSettings, browseSource())
-            assertTrue("A fresh source capture may be acquired only by a fresh composition/event", model.captureBrowseSource(client)())
-            if (enqueue) {
-                assertFalse("Held receiver work must observe route/epoch cancellation", playback.actionCurrents.removeFirst().invoke())
-                playback.actionResults.removeFirst().invoke(PlaybackActionResult(PlaybackActionStatus.STALE))
-                playback.listActions.clear()
-            }
-            releaseQueue.countDown()
-            // The completing fetch or terminal callback clears preparation, not an optimistic enqueue.
-            until { !model.state.value.preparing }
-            assertEquals(intent, model.state.value.playbackIntentGeneration)
-            assertEquals(0, playback.plays)
-            assertEquals(0, playback.enqueues)
-            assertTrue(playback.listActions.isEmpty())
-            assertTrue(playback.actionResults.isEmpty())
-            assertTrue(playback.contexts.isEmpty())
-            assertNull(model.state.value.notice)
-            if (retry) {
-                request()
-                if (enqueue) until { playback.listActions.size == 1 }
-                else until { !model.state.value.preparing }
-                assertEquals(if (enqueue) 0 else 1, playback.plays)
-                assertEquals(0, playback.enqueues)
-                assertEquals(if (enqueue) 0 else 1, playback.contexts.size)
-                if (enqueue) {
-                    assertEquals(listOf(PlaybackListAction.PLAY_NEXT), playback.listActions)
-                    assertTrue("The action stays preparing until authoritative acceptance", model.state.value.preparing)
-                    assertNull("Preparation is not service acceptance, even for a truncated queue", model.state.value.notice)
-                    val result = PlaybackActionResult(PlaybackActionStatus.LIMITED, acceptedCount = 1)
-                    playback.actionResults.removeFirst().invoke(result)
-                    until { !model.state.value.preparing }
-                    assertEquals("Track queued", model.state.value.feedback?.message)
-                    assertNull(model.state.value.notice)
-                } else {
-                    assertTrue(playback.listActions.isEmpty())
-                    assertEquals("This queue is limited to 1,000 available songs.", model.state.value.notice)
-                }
-            }
-        } finally {
-            releaseQueue.countDown(); store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain()
-        }
-    }
-
-    @Test fun pauseEpochCancelsPendingPlayButAFreshTapCanStillPlay() = cancelledQueueCompletion(retry = true)
-
-    @Test fun remoteHandoffEpochCancelsPendingPlayNextAndItsNotice() = cancelledQueueCompletion(enqueue = true, retry = true)
-
-    @Test fun invalidationBeforeTheFetchCoroutineStartsDoesNotBecomeAFreshPlay() =
-        cancelledQueueCompletion(invalidateBeforeLaunch = true)
-
-    @Test fun cancelledQueueErrorDoesNotPublishAStaleNotice() =
-        cancelledQueueCompletion(response = { MockResponse().setResponseCode(503) })
-
-    @Test fun cancelledEmptyQueueDoesNotPublishAStaleNotice() =
-        cancelledQueueCompletion(response = { json("""{"items":[],"total":0}""") })
-
-    @Test fun settingsAccountAndCreditsRoundTripRetiresHeldPlayPreparationWithoutAutoplay() =
-        cancelledQueueCompletion(retireThroughSettings = true)
-
-    @Test fun settingsAccountAndCreditsRoundTripRetiresHeldRowAddWithoutTransportOrStaleNotice() =
-        cancelledQueueCompletion(enqueue = true, retireThroughSettings = true)
 
     @Test fun expiryRetiresPrivateProfileRoutesAndIgnoresLateNavigationBeforeNewSignIn() =
         profileSessionRetirement(expire = true)
@@ -325,54 +192,4 @@ class LibraryViewModelTest {
         }
     }
 
-    @Test fun closingThePlayerCancelsAPreparingQueueAndPreventsLateAutoplay() = cancelledPreparingQueue(logout = false)
-
-    @Test fun logoutCancelsAPreparingQueueAndPreventsLateAutoplay() = cancelledPreparingQueue(logout = true)
-
-    private fun cancelledPreparingQueue(logout: Boolean) = runTest {
-        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
-        val queueStarted = CountDownLatch(1)
-        val releaseQueue = CountDownLatch(1)
-        val web = MockWebServer()
-        web.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
-                "/api/auth/login" -> json("""{"accountId":"id","username":"listener","role":"user","csrfToken":"csrf"}""")
-                    .setHeader("Set-Cookie", "spofify_session=secret; Path=/; HttpOnly; Max-Age=3600")
-                "/api/library/albums/album/playback" -> {
-                    queueStarted.countDown(); releaseQueue.await(5, TimeUnit.SECONDS)
-                    json("""{"items":[{"kind":"track","id":"song","name":"Song","hasAudio":true}],"total":1}""")
-                }
-                else -> json("""{"items":[],"total":0}""")
-            }
-        }
-        web.start()
-        val app = ApplicationProvider.getApplicationContext<Application>()
-        val graph = AppGraph(app, MemoryStore())
-        val store = ViewModelStore()
-        try {
-            graph.configure(ServerAddress.parse("http://127.0.0.1:${web.port}")).login("listener", "password")
-            val playback = FakePlayback()
-            val model = LibraryViewModel(app, graph, playback)
-            store.put("subject", model)
-            until { model.state.value.session != null && !model.state.value.loading }
-            model.play(LibraryItem("album", "album", "Album", coverage = Coverage(inLibrary = 1)))
-            runCurrent()
-            assertTrue(queueStarted.await(5, TimeUnit.SECONDS))
-            if (logout) model.logout() else model.stopPlayback()
-            runCurrent()
-            releaseQueue.countDown()
-            until { !model.state.value.preparing && !model.state.value.busy }
-            assertEquals(0, playback.plays)
-            assertEquals(0, playback.enqueues)
-            assertTrue(playback.listActions.isEmpty())
-            assertTrue(playback.contexts.isEmpty())
-            assertNull(model.state.value.notice)
-            if (logout) {
-                assertNull(model.state.value.session)
-                assertNull(graph.client)
-            }
-        } finally {
-            releaseQueue.countDown(); store.clear(); graph.clear(); web.shutdown(); Dispatchers.resetMain()
-        }
-    }
 }

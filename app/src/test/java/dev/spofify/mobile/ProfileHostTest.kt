@@ -1,5 +1,11 @@
 package dev.spofify.mobile
 
+import dev.spofify.mobile.core.LibraryPlaybackSelection
+import dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding
+import dev.spofify.mobile.playback.PlaybackActionResult
+import dev.spofify.mobile.playback.PlaybackActionStatus
+import dev.spofify.mobile.playback.PlaybackInteractionKey
+import dev.spofify.mobile.playback.PlaybackListAction
 import android.app.Application
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.requiredSize
@@ -75,8 +81,11 @@ class ProfileHostTest {
         val commands = mutableListOf<String>()
         override fun connect() = Unit
         override fun release() = Unit
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean, startEntryId: String?) { commands += "play" }
-        override fun enqueue(items: List<LibraryItem>, client: SpofifyClient, playNext: Boolean) { commands += "enqueue" }
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: LibraryPlaybackActionBinding?,
+            shuffle: Boolean?, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            commands += if (action == PlaybackListAction.PLAY_NOW) "play" else "enqueue"; onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+        }
         override fun setContext(context: LibraryItem?) { commands += "context" }
         override fun toggle() { commands += "toggle" }
         override fun next() { commands += "next" }

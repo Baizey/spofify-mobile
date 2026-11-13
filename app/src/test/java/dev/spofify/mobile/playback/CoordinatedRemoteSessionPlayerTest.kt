@@ -11,7 +11,8 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.Tracks
-import dev.spofify.mobile.core.PlaybackDeviceCommand
+import dev.spofify.mobile.core.LocalPlaybackCommand
+import dev.spofify.mobile.core.LibraryPlaybackCommand
 import dev.spofify.mobile.core.PlaybackSnapshot
 import dev.spofify.mobile.core.PlaybackTrack
 import java.lang.reflect.Proxy
@@ -113,7 +114,7 @@ class CoordinatedRemoteSessionPlayerTest {
             play()
             stop()
         }
-        assertEquals(listOf(PlaybackDeviceCommand.transport("resume"), PlaybackDeviceCommand.transport("pause")), f.sent)
+        assertEquals(listOf(LocalPlaybackCommand.transport("resume"), LocalPlaybackCommand.transport("pause")), f.sent)
         assertFalse(f.output.reads.contains("getMediaItemCount"))
     }
 
@@ -143,7 +144,7 @@ class CoordinatedRemoteSessionPlayerTest {
                     if (next) expected.addAll(listOf("next", "next"))
                     expected.add("previous")
                     if (previous) expected.add("previous")
-                    assertEquals(expected.map(PlaybackDeviceCommand::transport), f.sent)
+                    assertEquals(expected.map(LocalPlaybackCommand::transport), f.sent)
                 }
             }
         }
@@ -208,7 +209,7 @@ class CoordinatedRemoteSessionPlayerTest {
         f.player.seekTo(90_000)
         f.player.seekTo(-1)
         f.player.seekTo(Long.MAX_VALUE)
-        assertEquals(listOf(0.0, 7.25, 10.0, 10.0).map(PlaybackDeviceCommand::seek), f.sent)
+        assertEquals(listOf(0.0, 7.25, 10.0, 10.0).map(LocalPlaybackCommand::seek), f.sent)
         assertFalse(f.output.reads.contains("getCurrentPosition"))
     }
 
@@ -218,9 +219,11 @@ class CoordinatedRemoteSessionPlayerTest {
         f.player.setShuffleModeEnabled(true)
         f.player.setShuffleModeEnabled(false)
         f.player.setRepeatMode(Player.REPEAT_MODE_ALL)
-        f.player.setRepeatMode(Player.REPEAT_MODE_OFF) // Two cycles cannot be represented atomically.
+        f.player.setRepeatMode(Player.REPEAT_MODE_OFF) // Absolute off is one command, not two toggle cycles.
         f.player.setRepeatMode(Player.REPEAT_MODE_ONE)
-        assertEquals(listOf("shuffle", "repeat").map(PlaybackDeviceCommand::transport), f.sent)
+        assertEquals(listOf(LibraryPlaybackCommand.SetShuffle(false), LibraryPlaybackCommand.SetRepeat("off"),
+            LibraryPlaybackCommand.SetRepeat("one")), f.modes)
+        assertTrue(f.sent.isEmpty())
     }
 
     @Test fun bufferingErrorsPausedAndEmptyAreTruthfulAndDoNotInventLocalBufferedProgress() {
@@ -434,19 +437,20 @@ class CoordinatedRemoteSessionPlayerTest {
         f.output.listeners.forEach { it.onPlaybackStateChanged(Player.STATE_READY) }
         assertEquals(Player.STATE_READY, observer.states.last())
         f.player.seekToDefaultPosition(0)
-        assertEquals(listOf(PlaybackDeviceCommand.queue("jump", 999)), f.sent)
+        assertEquals(listOf(LocalPlaybackCommand.queue("jump", 999)), f.sent)
     }
 
     private class Fixture {
         val output = Output()
-        val sent = mutableListOf<PlaybackDeviceCommand>()
+        val sent = mutableListOf<LocalPlaybackCommand>()
+        val modes = mutableListOf<LibraryPlaybackCommand>()
         var remote: PlaybackSnapshot? = state()
         val local = PlaybackSnapshot(queue = listOf(track(999, 0)), position = 0, elapsed = 900.0, duration = 1000.0)
         // The fourth/trailing lambda remains physical-index mapping, preserving existing callers.
         val player = CoordinatedSessionPlayer(output.player, sent::add, { local }) { index ->
             check(remote == null) { "Remote request consulted local physical indices" }
             if (index == 0) 999L else null
-        }.apply { setRemoteSnapshotProvider { remote } }
+        }.apply { setRemoteSnapshotProvider { remote }; setModeDispatcher(modes::add) }
     }
 
     private class Observer(private val expected: Player) : Player.Listener {

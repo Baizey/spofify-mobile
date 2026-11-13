@@ -5,19 +5,16 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.Log
-import android.os.SystemClock
 import dev.spofify.mobile.core.*
 import kotlinx.serialization.json.*
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
-import okhttp3.mockwebserver.SocketPolicy
 import okio.Buffer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.io.IOException
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -27,7 +24,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sin
 
-/** Entirely on-device synthetic listener backend. Never contacts or proxies any real server. */
+/** On-device SYNTHETIC UI backend, not real-server protocol/audio acceptance. Never proxies. */
 class UiFixtureServer : AutoCloseable {
     init { VirtualAvdOnly.requireVerified() }
 
@@ -39,24 +36,19 @@ class UiFixtureServer : AutoCloseable {
     val searchCalls = CopyOnWriteArrayList<SearchCall>()
     val emptyGlobalBrowseCalls = AtomicInteger()
     val audioRequests = AtomicInteger()
-    val playbackPreparations = AtomicInteger()
-    val historyWrites = AtomicInteger()
+    /** Synthetic server-side selection/observation metrics; never obsolete REST calls. */
+    val queueReplacements get() = playerSocket.queueReplacements
+    val qualifiedHistoryEvents get() = playerSocket.qualifiedHistoryEvents
+    val socketFailures get() = playerSocket.failures
+    val selectedOutputName get() = playerSocket.outputName()
     val playlistWrites = AtomicInteger()
     val authenticationFailures = AtomicInteger()
-    /** Action names only: never request bodies, credentials, or musical metadata. */
-    val playerCalls = CopyOnWriteArrayList<String>()
-    private val playerRoom = SyntheticPlayerRoom()
-
-    /** Freeze only the fixture coordinator, not Android audio or the client's lease watchdog. */
-    @Synchronized fun freezePlayerClock() { playerRoom.freezeClock() }
-    /** Opt-in startup quarantine; only a pristine synthetic room may enter it. */
-    @Synchronized fun beginPlayerStartupDrain() { playerRoom.beginStartupDrain() }
-    /** Apply one ACK poll, then lose its reply. The client must not replay the write. */
-    @Synchronized fun loseNextPlayerAckResponse() { playerRoom.loseNextAckResponse() }
-    @Synchronized fun advancePlayerClockBy(milliseconds: Long) {
-        require(milliseconds >= 0)
-        playerRoom.advanceClock(milliseconds)
+    /** Frame classifications only; never hello, credentials, IDs or raw messages. */
+    val playerCalls get() = playerSocket.calls
+    private val playerSocket = SyntheticLibrarySocket(::resolveSelection) { id ->
+        synchronized(this) { history.remove(id); history.add(0, id) }
     }
+
     /** Per-hold acknowledgements contain counts only, never input or request payloads. */
     class HeldSearchResponses internal constructor() {
         internal val release = CountDownLatch(1)
@@ -99,6 +91,10 @@ class UiFixtureServer : AutoCloseable {
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val url = request.requestUrl
+                // Never hold the catalog monitor while entering the socket monitor: report
+                // history/resolution callbacks take the opposite direction.
+                if (url?.encodedPath in listOf("/api/me/player/connect", "/api/me/player/socket"))
+                    return routeSocket(request)
                 if (url?.encodedPath == "/api/library" && !url.queryParameter("q").isNullOrBlank() &&
                     url.queryParameter("artistId") == null && url.queryParameter("albumId") == null) {
                     // Deterministic loading evidence, without sleeping the instrumentation thread.
@@ -171,7 +167,7 @@ class UiFixtureServer : AutoCloseable {
             }.filter { sharedQuery || artistId != null || albumId != null || it.getString("name").contains(query, ignoreCase = true) }
             return json(page(all, limit, offset))
         }
-        val catalog = Regex("/api/library/(artists|albums|tracks)/([^/]+)(?:/(artwork|audio|playback))?").matchEntire(path)
+        val catalog = Regex("/api/library/(artists|albums|tracks)/([^/]+)(?:/(artwork|audio))?").matchEntire(path)
         if (catalog != null && method in listOf("GET", "HEAD")) {
             val kind = catalog.groupValues[1]
             val id = catalog.groupValues[2]
@@ -186,13 +182,6 @@ class UiFixtureServer : AutoCloseable {
                     json(JSONObject().put("error", "Synthetic artwork absent"), 404)
                 else binary(pngs[albumIndex(id)], "image/png", request)
                 "audio" -> if (kind == "tracks") { audioRequests.incrementAndGet(); binary(wav, "audio/wav", request) } else unexpected(request)
-                "playback" -> {
-                    if (kind !in listOf("artists", "albums")) return unexpected(request)
-                    playbackPreparations.incrementAndGet()
-                    val items = if (kind == "artists") tracks().filter { hasArtist(it, id) }
-                        else tracks().filter { it.getString("albumId") == id }
-                    json(playback(items, kind.removeSuffix("s"), id, item.getString("name")))
-                }
                 "" -> {
                     catalogDetails.add(DetailCall(kind.removeSuffix("s"), id))
                     json(JSONObject().put("item", item).put("revision", 7))
@@ -217,15 +206,6 @@ class UiFixtureServer : AutoCloseable {
             val offset = url.queryParameter("offset")?.toIntOrNull() ?: 0
             return json(page(ids.map { JSONObject().put("track", track(it)) }, limit, offset))
         }
-        if (method == "GET" && path == "/api/me/likes/playback") {
-            playbackPreparations.incrementAndGet()
-            return json(playback(liked.map(::track), "likes", "likes", "Liked songs"))
-        }
-        if (method == "POST" && path == "/api/me/history") {
-            val id = JSONObject(request.body.readUtf8()).getString("trackId")
-            history.remove(id); history.add(0, id); historyWrites.incrementAndGet()
-            return MockResponse().setResponseCode(204)
-        }
         if (method == "GET" && path == "/api/me/playlists") {
             val kind = url.queryParameter("kind")
             val items = when (kind) { "manual" -> listOf(manual()); "derived" -> listOf(derived()); else -> listOf(manual(), derived()) }
@@ -245,12 +225,6 @@ class UiFixtureServer : AutoCloseable {
             val entries = manualTrackIds.mapIndexed { index, id -> JSONObject().put("id", "entry-${index + 1}").put("position", index).put("track", track(id)) }
             return json(page(entries, url.queryParameter("limit")?.toIntOrNull() ?: 40, url.queryParameter("offset")?.toIntOrNull() ?: 0))
         }
-        if (method == "GET" && path == "/api/me/playlists/$MANUAL_ID/playback") {
-            playbackPreparations.incrementAndGet()
-            val items = manualTrackIds.mapIndexed { index, id -> track(id).put("entryId", "entry-${index + 1}") }
-            return json(playback(items, "playlist", MANUAL_ID, manualName).put("revision", manualRevision)
-                .put("context", JSONObject().put("kind", "playlist").put("id", MANUAL_ID).put("name", manualName).put("revision", manualRevision)))
-        }
         if (method == "GET" && path == "/api/me/playlists/$DERIVED_ID") return json(derived())
         if (method == "GET" && path == "/api/me/playlists/$DERIVED_ID/evaluation") {
             val limit = url.queryParameter("limit")?.toIntOrNull() ?: 40
@@ -268,8 +242,34 @@ class UiFixtureServer : AutoCloseable {
                 .put("nextCursor", if (offset + limit < 4) "synthetic-cursor-${offset + limit}" else JSONObject.NULL)
                 .put("revision", 1).put("fence", "synthetic-fence").put("complete", true))
         }
-        if (path == "/api/me/player" && method in listOf("GET", "POST"))
-            return playerRoom.route(request).setHeader("Cache-Control", "no-store")
+        return unexpected(request)
+    }
+
+    private fun routeSocket(request: RecordedRequest): MockResponse {
+        val url = request.requestUrl ?: return unexpected(request)
+        val path = url.encodedPath
+        val method = request.method.orEmpty()
+        if (request.getHeader("Cookie")?.split(';')?.map(String::trim)
+                ?.contains("spofify_session=synthetic-ui-cookie") != true ||
+            (method != "GET" && request.getHeader("X-CSRF-Token") != CSRF)) {
+            authenticationFailures.incrementAndGet()
+            return json(JSONObject().put("error", "Synthetic authentication required"), 401)
+        }
+        if (path in listOf("/api/me/player/connect", "/api/me/player/socket")) {
+            if (url.encodedQuery != null || request.getHeader("Origin") != origin) return unexpected(request)
+            if (method == "POST" && path.endsWith("/connect") &&
+                request.getHeader("Content-Type")?.substringBefore(';') == "application/json" &&
+                request.body.readUtf8() == "{}") {
+                return json(JSONObject().put("ticket", playerSocket.ticket()))
+                    .setHeader("Cache-Control", "no-store")
+            }
+            if (method == "GET" && path.endsWith("/socket") &&
+                request.headers.values("Sec-WebSocket-Protocol") == listOf(LibraryPlaybackProtocol.SUBPROTOCOL)) {
+                return MockResponse().withWebSocketUpgrade(playerSocket.listener())
+                    .setHeader("Sec-WebSocket-Protocol", LibraryPlaybackProtocol.SUBPROTOCOL)
+            }
+            return unexpected(request)
+        }
         return unexpected(request)
     }
 
@@ -320,407 +320,80 @@ class UiFixtureServer : AutoCloseable {
         .put("capabilities", JSONObject().put("editMetadata", true).put("editEntries", false).put("editDefinition", true)
             .put("play", true).put("copyToManual", true).put("delete", true).put("addTracks", false))
     /**
-     * Small account-local implementation of internal/web/playback.go, not a new device API.
-     * A pristine room starts after the Go coordinator's startup drain: first registration owns
-     * an idle lease. Additional devices must register/poll and ACK exactly like the phone.
-     * No fake speaker, hidden audio engine, automatic ACK, or off-device connection is installed.
+     * Fixed synthetic catalog resolver, not the real server's authorization/token implementation.
+     * Exact manual/derived row identities must match what this fixture actually served.
      */
-    private inner class SyntheticPlayerRoom {
-        private inner class Device(val id: String, var name: String, var seen: Long, val capable: Boolean, var selectionSeq: Long = 0) {
-            var metadata: QueueIntentState? = null
-            var snapshot: PlaybackSnapshot? = null
-        }
-        private inner class Delivery(val deviceId: String, val value: PlaybackDirective, val deadline: Long,
-            val metadata: QueueIntentState?, val base: PlaybackSnapshot?, val baseMetadata: QueueIntentState?, var delivered: Boolean = false)
-        private inner class Outcome(val deviceId: String, val request: JsonObject, var status: String, val expires: Long) {
-            var detail: QueueIntentResult? = null
-            var deliveryId = ""
-            var ackEpoch = 0L
-            var ackOwner = ""
-        }
-        private val devices = linkedMapOf<String, Device>()
-        private val deliveries = mutableListOf<Delivery>()
-        private val outcomes = linkedMapOf<String, Outcome>()
-        private var nextDevice = 0
-        private var nextDelivery = 0
-        private var registered = false
-        private var active = ""
-        private var epoch = 1L
-        private var leaseUntil = 0L
-        private var quarantineUntil = 0L
-        private var state: PlaybackSnapshot? = null
-        private var queueState: QueueIntentState? = null
-        // route() executes under the enclosing fixture monitor; response projection is
-        // request-local even when legacy and negotiated clients share this synthetic room.
-        private var opted = false
-        private var stateSeq = 0L
-        private var stateAccepted = 0L
-        private var transfer: PlaybackTransfer? = null
-        private var frozenNow: Long? = null
-        private var loseAckResponse = false
-        private fun now() = frozenNow ?: SystemClock.elapsedRealtime()
-        fun freezeClock() { frozenNow = now() }
-        fun advanceClock(ms: Long) { frozenNow = Math.addExact(now(), ms) }
-        fun beginStartupDrain() { check(!registered); quarantineUntil = now() + 8000 }
-        fun loseNextAckResponse() { check(!loseAckResponse); loseAckResponse = true }
-
-        fun route(request: RecordedRequest): MockResponse {
-            val headers = request.headers.values("X-Spofify-Playback-Extensions")
-            opted = headers.size == 1 && headers.single() == "queue-intents-v1"
-            if (request.requestUrl?.query != null) return invalid()
-            if (request.method == "GET") {
-                prune()
-                playerCalls.add("view")
-                return response()
-            }
-            if (request.getHeader("Content-Type")?.substringBefore(';')?.trim() != "application/json")
-                return json(JSONObject().put("error", "Content-Type must be application/json"), 415)
-            if (request.body.size > 2 * 1024 * 1024) return json(JSONObject().put("error", "JSON body is too large"), 413)
-            val q = try {
-                // The original bytes hit the SAME bounded recursive decoder as core's
-                // frozen raw corpus. Never parse through JSONObject/normalize negatives first.
-                PlaybackRequestContract.fromRawJson(request.body.readUtf8()).also(::validate)
-            } catch (_: RuntimeException) { return invalid() } catch (_: IOException) { return invalid() }
-            playerCalls.add(q.string("action"))
-            // Conditional denials and exact retained retries are observational, even when
-            // housekeeping would otherwise expire an owner, delivery, or outcome.
-            if (q["requireUnselected"] == JsonPrimitive(true)) guardedTransfer(q)?.let { return it }
-            prune()
-            if (q["requireUnselected"] == JsonPrimitive(true)) guardedTransfer(q)?.let { return it }
-            val action = q.string("action")
-            if (action == "register") {
-                if (devices.size >= 16) return response(status = 429, error = "device limit reached")
-                val id = "synthetic-player-${++nextDevice}"
-                devices[id] = Device(id, q.string("name"), now(), q["queueIntentsVersion"] == JsonPrimitive(1))
-                if (!registered && epoch == 1L && now() >= quarantineUntil) { active = id; leaseUntil = now() + 8000 }
-                registered = true
-                return response(id, deliver = true)
-            }
-            val id = q.string("deviceId")
-            val device = devices[id] ?: return response(id, 404, "device not found")
-            if (action == "rename") { device.name = q.string("name"); return response(id) }
-            if (action == "leave") { remove(id, explicit = true); return response(id) }
-            var staleSelection = false
-            if (action == "transfer") {
-                val selection = q["selectionSeq"]?.jsonPrimitive?.long
-                if (selection != null && selection > device.selectionSeq) device.selectionSeq = selection
-                else if (selection != null || device.selectionSeq != 0L) staleSelection = true
-            }
-            if (action in listOf("command", "transfer")) {
-                outcomes[q.string("commandId")]?.let {
-                    return if (it.deviceId == id && it.request == q) response(id)
-                    else response(id, 409, "commandId already used")
+    private fun resolveSelection(selection: JsonObject, intent: String): SyntheticLibrarySocket.Selection = synchronized(this) {
+        fun reject(code: String = "unavailable"): Nothing = throw SyntheticLibrarySocket.Rejected(code)
+        val kind = selection.getValue("kind").jsonPrimitive.content
+        val requested = selection["context"]?.jsonObject
+        val ref = selection["track"]?.jsonObject
+        var canonical: LibraryPlaybackContext? = null
+        val items: List<JSONObject> = if (requested == null) {
+            if (kind != "track") reject("invalid")
+            listOf(track(ref!!.getValue("id").jsonPrimitive.content))
+        } else {
+            val contextKind = requested.getValue("kind").jsonPrimitive.content
+            val id = requested.getValue("id").jsonPrimitive.content
+            when (contextKind) {
+                "album" -> {
+                    val album = albums().singleOrNull { it.getString("id") == id } ?: reject()
+                    canonical = LibraryPlaybackContext("album", id, album.getString("name"), 7)
+                    tracks().filter { it.getString("albumId") == id }
                 }
-            }
-            if (staleSelection) return response(id, 409, "stale selection sequence")
-            val requestedEpoch = q.number("epoch")
-            if (requestedEpoch != epoch && !(action == "transfer" && q.containsKey("selectionSeq") && requestedEpoch < epoch))
-                return response(id, 409, "stale epoch")
-            val error = when (action) {
-                "poll" -> poll(device, q)
-                "command" -> command(device, q)
-                "transfer" -> select(device, q)
-                else -> error("Validated action missing implementation")
-            }
-            val status = when (error) { "" -> 200; "command limit reached" -> 429; else -> 409 }
-            val result = response(id, status, error, deliver = action == "poll" && error.isEmpty())
-            if (loseAckResponse && action == "poll" && error.isEmpty() && q["acks"]?.jsonArray?.isNotEmpty() == true) {
-                loseAckResponse = false
-                result.setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST)
-            }
-            return result
-        }
-
-        /** Null means admitted to the ordinary transfer state machine, not active ownership. */
-        private fun guardedTransfer(q: JsonObject): MockResponse? {
-            val id = q.string("deviceId")
-            val device = devices[id]?.takeIf { now() - it.seen < 30000 }
-                ?: return response(id, 404, "device not found")
-            outcomes[q.string("commandId")]?.let { old ->
-                return when {
-                    old.deviceId != id || old.request != q -> response(id, 409, "commandId already used")
-                    old.status != "pending" && now() >= old.expires -> response(id, 409, "command outcome expired")
-                    else -> response(id)
+                "artist" -> {
+                    if (CREDIT_ARTISTS.none { it.first == id }) reject()
+                    canonical = LibraryPlaybackContext("artist", id, artist(id).getString("name"), 7)
+                    tracks().filter { hasArtist(it, id) }
                 }
-            }
-            if (q.number("epoch") != epoch) return response(id, 409, "stale epoch")
-            if (q.string("targetDeviceId") != id) return response(id, 409, "guarded transfer must target its issuer")
-            if (active.isNotEmpty() || transfer != null || deliveries.isNotEmpty() || now() < leaseUntil || now() < quarantineUntil)
-                return response(id, 409, "output already selected or recovering")
-            val selection = q["selectionSeq"]?.jsonPrimitive?.long
-            if (selection != null && selection <= device.selectionSeq || selection == null && device.selectionSeq != 0L)
-                return response(id, 409, "stale selection sequence")
-            if (outcomes.size >= 128 && outcomes.values.none { it.status != "pending" })
-                return response(id, 429, "command limit reached")
-            return null
-        }
-
-        private fun invalid(): MockResponse {
-            unexpectedRoutes.add("invalid synthetic player request")
-            return json(JSONObject().put("error", "invalid playback request"), 400)
-        }
-        private fun JsonObject.string(key: String): String = getValue(key).jsonPrimitive.let {
-            require(it.isString); it.content
-        }
-        private fun JsonObject.number(key: String): Long = getValue(key).jsonPrimitive.let {
-            require(!it.isString); it.long.also { n -> require(n in 1..9007199254740991L) }
-        }
-        private fun validate(q: JsonObject) {
-            val required = when (q.string("action")) {
-                "register" -> setOf("action", "name")
-                "rename" -> setOf("action", "deviceId", "name")
-                "leave" -> setOf("action", "deviceId")
-                "poll" -> setOf("action", "deviceId", "epoch")
-                "command" -> setOf("action", "deviceId", "epoch", "commandId", "command")
-                "transfer" -> setOf("action", "deviceId", "epoch", "commandId", "targetDeviceId")
-                else -> throw IllegalArgumentException("Unknown action")
-            }
-            val optional = when (q.string("action")) {
-                "register" -> setOf("queueIntentsVersion")
-                "poll" -> setOf("state", "stateSeq", "acks", "queueIntentState")
-                "transfer" -> setOf("selectionSeq", "requireUnselected")
-                else -> emptySet()
-            }
-            require(q.keys.containsAll(required) && q.keys.all { it in required || it in optional })
-            if (q.containsKey("requireUnselected")) require(q.getValue("requireUnselected") == JsonPrimitive(true))
-            if (q.containsKey("queueIntentsVersion")) require(opted && q.getValue("queueIntentsVersion") == JsonPrimitive(1))
-            if (q.containsKey("queueIntentState")) require(opted && q.getValue("queueIntentState") is JsonObject)
-            if (q["command"]?.jsonObject?.get("type") == JsonPrimitive("queueIntent")) require(opted)
-            listOf("deviceId", "commandId", "targetDeviceId").forEach { if (q.containsKey(it)) require(validPlaybackProtocolId(q.string(it))) }
-            if (q.containsKey("name")) require(validPlaybackDeviceName(q.string("name")))
-            listOf("epoch", "stateSeq", "selectionSeq").forEach { if (q.containsKey(it)) q.number(it) }
-            val snapshot = q["state"]?.takeUnless { it == JsonNull }
-            require((snapshot != null) == q.containsKey("stateSeq"))
-            snapshot?.let { PlaybackSnapshot.fromJson(it.jsonObject) }
-            // Use the shipped mobile positive command DTO; do not silently accept arbitrary APIs.
-            q["command"]?.let { PlaybackDeviceCommand.fromJson(it.jsonObject) }
-            val acks = q["acks"]?.jsonArray.orEmpty()
-            require(acks.size <= 16 && acks.map { it.jsonObject.string("deliveryId") }.distinct().size == acks.size)
-            acks.forEach {
-                val a = it.jsonObject
-                require(a.keys.containsAll(setOf("deliveryId", "epoch", "status")) && a.keys.all { key -> key in setOf("deliveryId", "epoch", "status", "queueIntentResult") } && validPlaybackProtocolId(a.string("deliveryId")))
-                a.number("epoch"); require(a.string("status") in setOf("ok", "blocked", "media", "rejected"))
-                if (a.containsKey("queueIntentResult")) require(opted && a.getValue("queueIntentResult") is JsonObject)
-            }
-        }
-        private fun response(id: String = "", status: Int = 200, error: String = "", deliver: Boolean = false): MockResponse {
-            val directives = if (deliver) deliveries.filter { it.deviceId == id && !it.delivered }.map { it.delivered = true; it.value } else emptyList()
-            val extension = if (!opted) null else QueueIntentsView(1,
-                devices.values.filter { it.capable }.map { QueueIntentReceiver(it.id, 1) }, binding(), queueState,
-                directives.filter { it.type in setOf("prepare", "activate") && devices[id]?.capable == true }.map { d ->
-                    QueueIntentDirective(d.deliveryId, deliveries.single { it.value.deliveryId == d.deliveryId }.metadata)
-                }, outcomes.mapNotNull { (commandId, outcome) -> outcome.detail?.let { QueueIntentCommandResult(commandId, it) } })
-            val view = PlaybackDevicesView(id, devices.values.map { PlaybackDevice(it.id, it.name, now() - it.seen <= 5000) },
-                active, epoch, if (active.isEmpty()) 0 else (leaseUntil - now()).coerceAtLeast(0),
-                (quarantineUntil - now()).coerceIn(0, 8000), state, stateSeq,
-                if (state == null) 0 else (now() - stateAccepted).coerceAtLeast(0), transfer, directives,
-                outcomes.map { PlaybackOutcome(it.key, it.value.status) }, error, extension)
-            return json(JSONObject(view.toJson().toString()), status).setHeader("Cache-Control", "no-store")
-                .setHeader("Vary", "X-Spofify-Playback-Extensions")
-        }
-        private fun finish(commandId: String, status: String) { outcomes[commandId]?.let { if (it.status == "pending") it.status = status } }
-        private fun cancelTransfer(status: String) {
-            val id = transfer?.commandId ?: return
-            finish(id, status); deliveries.removeAll { it.value.commandId == id }; transfer = null
-        }
-        private fun fence(status: String) {
-            quarantineUntil = maxOf(quarantineUntil, leaseUntil)
-            val waiting = transfer?.takeIf { it.phase == "waiting" }
-            outcomes.forEach { (id, outcome) -> if (outcome.status == "pending" && id != waiting?.commandId) outcome.status = status }
-            deliveries.clear(); transfer = waiting; active = ""; leaseUntil = 0; epoch++; stateSeq = 0; state = state?.paused()
-        }
-        private fun recoverTransfer(status: String) {
-            transfer = transfer?.copy(sourceDeviceId = "", phase = "waiting")
-            fence(status)
-        }
-        private fun remove(id: String, explicit: Boolean = false) {
-            val wasActive = active == id
-            devices.remove(id)
-            transfer?.let { t ->
-                if (t.targetDeviceId == id || outcomes[t.commandId]?.deviceId == id) {
-                    if (t.phase in setOf("preparing", "waiting")) cancelTransfer("cancelled") else fence("cancelled")
+                "likes" -> {
+                    if (id != "liked-songs") reject("invalid")
+                    canonical = LibraryPlaybackContext("likes", id, "Liked songs")
+                    liked.map(::track)
                 }
-            }
-            if (active == id || transfer?.sourceDeviceId == id) recoverTransfer("cancelled")
-            if (outcomes.values.any { it.deviceId == id && it.status == "pending" }) fence("cancelled")
-            if (explicit && wasActive) quarantineUntil = 0
-        }
-        private fun prune() {
-            devices.values.filter { now() - it.seen >= 30000 }.map { it.id }.forEach { remove(it) }
-            transfer?.let { t ->
-                val target = devices[t.targetDeviceId]
-                val requester = devices[outcomes[t.commandId]?.deviceId]
-                if (target == null || requester == null || now() - target.seen > 5000 || now() - requester.seen > 5000) {
-                    if (t.phase in setOf("preparing", "waiting")) cancelTransfer("cancelled") else fence("cancelled")
+                "playlist" -> {
+                    if (id != MANUAL_ID) reject()
+                    canonical = LibraryPlaybackContext("playlist", id, manualName)
+                    manualTrackIds.mapIndexed { index, trackId -> track(trackId).put("entryId", "entry-${index + 1}") }
                 }
-            }
-            if (active.isNotEmpty()) {
-                if (transfer?.sourceDeviceId == active && (now() - devices.getValue(active).seen > 5000 || now() >= leaseUntil)) recoverTransfer("timeout")
-                else if (now() >= leaseUntil) fence("timeout")
-            }
-            if (deliveries.any { now() >= it.deadline && it.value.type != "prepare" }) fence("timeout")
-            if (deliveries.any { now() >= it.deadline && it.value.type == "prepare" }) cancelTransfer("timeout")
-            outcomes.entries.removeAll { it.value.status != "pending" && now() >= it.value.expires }
-        }
-        private fun binding(): QueueIntentBinding? {
-            val device = devices[active] ?: return null
-            val metadata = queueState ?: return null
-            val snapshot = state ?: return null
-            if (!device.capable || device.metadata?.receiverId != metadata.receiverId || device.metadata?.revision != metadata.revision ||
-                transfer != null || now() < quarantineUntil || now() >= leaseUntil || now() - device.seen > 5000) return null
-            return QueueIntentBinding(active, metadata.receiverId, metadata.revision, snapshot.queue.getOrNull(snapshot.position)?.key, snapshot.occurrence?.eventId)
-        }
-        private fun addDelivery(device: String, type: String, commandId: String, command: JsonObject? = null, snapshot: PlaybackSnapshot? = null) {
-            val metadata = if (type in setOf("prepare", "activate") && devices[device]?.capable == true) queueState else null
-            metadata?.validated(checkNotNull(snapshot))
-            deliveries += Delivery(device, PlaybackDirective("synthetic-delivery-${++nextDelivery}", epoch, type, commandId, command, snapshot), now() + 8000,
-                metadata, state, queueState)
-        }
-        private fun makeOutcome(device: Device, q: JsonObject): Boolean {
-            if (outcomes.size >= 128) {
-                val completed = outcomes.entries.firstOrNull { it.value.status != "pending" } ?: return false
-                outcomes.remove(completed.key)
-            }
-            outcomes[q.string("commandId")] = Outcome(device.id, q, "pending", now() + 300000)
-            return true
-        }
-        private fun command(device: Device, q: JsonObject): String {
-            if (transfer != null) return "transfer in progress"
-            if (active.isEmpty()) return "no active device"
-            val command = PlaybackDeviceCommand.fromJson(q.getValue("command").jsonObject)
-            if (command.type == "queueIntent") {
-                if (!opted || devices[active]?.capable != true) return "unsupported receiver"
-                if (command.expected != binding()) return "stale queue intent binding"
-                val key = (command.selection as? QueueIntentSelection.Occurrence)?.key
-                if (key != null && state!!.queue.drop(state!!.position + 1).none { it.key == key }) return "stale queue occurrence"
-            }
-            if (deliveries.isNotEmpty()) {
-                if (q.getValue("command").jsonObject.string("type") !in setOf("pause", "close")) return "command in progress"
-                deliveries.forEach { finish(it.value.commandId, "cancelled") }; deliveries.clear()
-            }
-            if (!makeOutcome(device, q)) return "command limit reached"
-            addDelivery(active, "command", q.string("commandId"), q.getValue("command").jsonObject)
-            return ""
-        }
-        private fun select(device: Device, q: JsonObject): String {
-            val target = devices[q.string("targetDeviceId")] ?: return "target unavailable"
-            if (target != device && now() - target.seen > 5000) return "target unavailable"
-            if (target.id == active && transfer == null && deliveries.isEmpty()) return "target is already active"
-            if (outcomes.size >= 128 && outcomes.values.none { it.status != "pending" }) return "command limit reached"
-            device.seen = now()
-            val uncertain = deliveries.isNotEmpty() && (transfer == null || transfer?.phase != "preparing")
-            cancelTransfer("cancelled")
-            if (uncertain || active.isNotEmpty() && now() - devices.getValue(active).seen > 5000) fence("cancelled")
-            check(makeOutcome(device, q))
-            transfer = PlaybackTransfer(q.string("commandId"), active, target.id, "waiting")
-            startTransfer()
-            return ""
-        }
-        private fun startTransfer() {
-            val t = transfer ?: return
-            if (t.phase != "waiting" || now() < quarantineUntil) return
-            val target = devices[t.targetDeviceId]
-            if (target == null || now() - target.seen > 5000) { cancelTransfer("cancelled"); return }
-            if (target.id == active) { cancelTransfer("ok"); return }
-            transfer = t.copy(phase = "preparing")
-            addDelivery(target.id, "prepare", t.commandId, snapshot = state)
-        }
-        private fun activate() {
-            val t = checkNotNull(transfer)
-            if (t.sourceDeviceId.isEmpty()) state = state?.paused()
-            epoch++; stateSeq = 0; active = t.targetDeviceId; leaseUntil = now() + 8000
-            transfer = t.copy(phase = "activating")
-            addDelivery(active, "activate", t.commandId, snapshot = state)
-        }
-        private fun poll(device: Device, q: JsonObject): String {
-            val snapshot = q["state"]?.let { PlaybackSnapshot.fromJson(it.jsonObject) }
-            val metadata = q["queueIntentState"]?.let { QueueIntentState.fromJson(it.jsonObject, checkNotNull(snapshot)) }
-            if (device.capable && !opted) return "capable receiver requires negotiated poll"
-            if (metadata != null && (!opted || !device.capable || snapshot == null || active != device.id)) return "invalid queue intent state publisher"
-            if (snapshot != null) {
-                if (active != device.id) return "only the active device may publish state"
-                if (q.number("stateSeq") <= stateSeq) return "stale state sequence"
-                if (device.capable && metadata == null) return "capable publication requires queue intent state"
-            }
-            if (metadata != null) {
-                if (devices.values.any { it.id != device.id && it.metadata?.receiverId == metadata.receiverId }) return "receiver incarnation already registered"
-                device.metadata?.let { previous ->
-                    if (metadata.receiverId != previous.receiverId) return "receiver incarnation requires registration"
-                    if (metadata.revision < previous.revision || metadata.revision == previous.revision &&
-                        !QueueIntentReceipt.sameSemantics(checkNotNull(device.snapshot), previous, checkNotNull(snapshot), metadata)) return "stale semantic revision"
-                }
-            }
-            // Validate EVERY publication and ACK before touching heartbeat, lease, state or
-            // retained outcomes. The fixture does not execute music or fabricate native ACKs.
-            val acknowledged = mutableListOf<Triple<Delivery, String, QueueIntentResult?>>()
-            for (element in q["acks"]?.jsonArray.orEmpty()) {
-                val ack = element.jsonObject
-                val detail = ack["queueIntentResult"]?.let { QueueIntentResult.fromJson(it.jsonObject) }
-                val found = deliveries.firstOrNull { it.value.deliveryId == ack.string("deliveryId") }
-                if (found == null) {
-                    if (detail != null && outcomes.values.none { it.deliveryId == ack.string("deliveryId") && it.ackEpoch == ack.number("epoch") &&
-                            it.ackOwner == device.id && it.status == ack.string("status") && it.detail == detail }) return "unknown queue intent acknowledgement"
-                    continue
-                }
-                if (found.deviceId != device.id || found.value.epoch != ack.number("epoch") || !found.delivered) return "invalid acknowledgement"
-                if (found.value.type in setOf("release", "activate", "command") && snapshot == null) return "acknowledgement requires state"
-                val status = ack.string("status")
-                if (found.value.type == "activate" && status == "ok" && snapshot?.error != "") return "activation outcome does not match state"
-                if (status in setOf("blocked", "media") && snapshot != null && (snapshot.playing || snapshot.error != status)) return "outcome does not match state"
-                val command = found.value.command?.let(PlaybackDeviceCommand::fromJson)
-                if (found.value.type == "command" && command?.type == "queueIntent") {
-                    if (!opted || !device.capable || detail == null || snapshot == null || metadata == null || active != device.id) return "queue intent acknowledgement requires state and detail"
-                    try {
-                        QueueIntentReceipt.validate(command, detail, status, snapshot, metadata, checkNotNull(found.base), checkNotNull(found.baseMetadata))
-                    } catch (_: RuntimeException) { return "invalid queue intent receipt" }
-                } else if (detail != null) return "unexpected queue intent result"
-                if (found.value.type == "activate" && status != "rejected" && device.capable) {
-                    if (snapshot == null || metadata == null) return "capable activation requires metadata"
-                    // First explicit app Play is allowed to stage blank/paused replacement
-                    // state, never retained old audio. Its raw handoff was already admitted
-                    // when constructing prepare/activate; this is NOT a normal queue reset.
-                    val guardedBlank = outcomes[found.value.commandId]?.request?.get("requireUnselected") == JsonPrimitive(true) && snapshot == PlaybackSnapshot()
-                    if (!guardedBlank) {
-                        if (found.metadata != null) {
-                            if (!QueueIntentReceipt.sameSemantics(checkNotNull(found.value.state), found.metadata, snapshot, metadata)) return "handoff metadata does not match prepared state"
-                        } else if (metadata.provenance != "legacy-reset" || metadata.highKeys.isNotEmpty() || metadata.origins.any { it.intent != "legacy" }) return "legacy handoff requires provenance reset"
+                "derived" -> {
+                    if (id != DERIVED_ID || requested["revision"]?.jsonPrimitive?.long != 1L ||
+                        requested["fence"]?.jsonPrimitive?.content != "synthetic-fence") reject("stale_revision")
+                    canonical = LibraryPlaybackContext("derived", id, DERIVED_NAME, 1, "synthetic-fence")
+                    tracks().take(4).mapIndexed { index, item ->
+                        item.put("targetId", id).put("occurrenceId", "derived-occurrence-$index")
                     }
                 }
-                acknowledged += Triple(found, status, detail)
+                else -> reject("invalid")
             }
-            device.seen = now()
-            if (active == device.id) leaseUntil = now() + 8000
-            if (snapshot != null) {
-                state = snapshot; queueState = metadata; stateSeq = q.number("stateSeq"); stateAccepted = now()
-                device.snapshot = snapshot; device.metadata = metadata
-            }
-            for ((delivery, status, detail) in acknowledged) {
-                deliveries.remove(delivery)
-                when (delivery.value.type) {
-                    "command" -> {
-                        finish(delivery.value.commandId, status)
-                        if (detail != null) outcomes[delivery.value.commandId]?.let {
-                            it.detail = detail; it.deliveryId = delivery.value.deliveryId; it.ackEpoch = delivery.value.epoch; it.ackOwner = device.id
-                        }
-                    }
-                    "prepare" -> if (status != "ok") cancelTransfer(status) else {
-                        val t = checkNotNull(transfer)
-                        if (t.sourceDeviceId.isEmpty()) activate() else {
-                            transfer = t.copy(phase = "releasing")
-                            addDelivery(t.sourceDeviceId, "release", t.commandId)
-                        }
-                    }
-                    "release" -> if (status != "ok") cancelTransfer(status) else activate()
-                    "activate" -> { finish(delivery.value.commandId, status); transfer = null; if (status == "rejected") fence("cancelled") }
-                }
-            }
-            startTransfer()
-            return ""
         }
+        val mapped = items.map { item ->
+            val artists = item.getJSONArray("artists")
+            LibraryPlaybackTrack(item.getString("id"), item.getString("name"),
+                (0 until artists.length()).map { index -> artists.getJSONObject(index).let {
+                    LibraryPlaybackArtist(it.getString("name"), it.optString("id").takeIf(String::isNotEmpty))
+                } }, item.getString("albumName"), item.getString("albumId"), item.getLong("durationMs") / 1000.0,
+                1, 1, intent, item.optString("entryId").takeIf(String::isNotEmpty),
+                item.optString("targetId").takeIf(String::isNotEmpty),
+                item.optString("occurrenceId").takeIf(String::isNotEmpty),
+                if (canonical?.kind == "derived") canonical else null)
+        }
+        val selected = if (ref == null) 0 else {
+            val matches = mapped.indices.filter { index ->
+                val item = mapped[index]
+                item.id == ref.getValue("id").jsonPrimitive.content &&
+                    (canonical?.kind != "playlist" || item.entryId == ref["entryId"]?.jsonPrimitive?.content) &&
+                    (canonical?.kind != "derived" || (ref["targetId"]?.jsonPrimitive?.content == canonical?.id &&
+                        item.occurrenceId == ref["occurrenceId"]?.jsonPrimitive?.content &&
+                        ref["selectionToken"]?.jsonPrimitive?.content == "synthetic-selection-$index"))
+            }
+            matches.singleOrNull() ?: reject()
+        }
+        if (mapped.isEmpty()) reject()
+        if (ref != null && intent != "now") SyntheticLibrarySocket.Selection(listOf(mapped[selected]), canonical, 0)
+        else SyntheticLibrarySocket.Selection(mapped, canonical, selected)
     }
-    private fun playback(items: List<JSONObject>, kind: String, id: String, name: String) = JSONObject()
-        .put("items", JSONArray(items)).put("total", items.size).put("limit", 1000).put("truncated", false)
-        .put("revision", 7).put("context", JSONObject().put("kind", kind).put("id", id).put("name", name))
+
     private fun page(items: List<JSONObject>, limit: Int, offset: Int) = JSONObject()
         .put("items", JSONArray(items.drop(offset).take(limit))).put("total", items.size).put("limit", limit).put("offset", offset).put("revision", 7)
     private fun conflict() = json(JSONObject().put("error", JSONObject().put("code", "REVISION_CONFLICT")
@@ -788,7 +461,10 @@ class UiFixtureServer : AutoCloseable {
         }.array()
     }
 
-    override fun close() { releaseSearchResponses(); server.shutdown() }
+    override fun close() {
+        releaseSearchResponses()
+        try { playerSocket.close() } finally { server.shutdown() }
+    }
 
     companion object {
         const val USERNAME = "fixture-listener"

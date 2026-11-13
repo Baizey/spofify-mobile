@@ -5,10 +5,10 @@ import dev.spofify.mobile.feature.devices.PlaybackDevicesState
 /** Read-only observed output, never the pending selection or a claim of local playback. */
 internal fun selectedOutputLabel(state: PlaybackDevicesState?): String {
     if (state == null) return "Outputs unavailable"
-    val active = state.activeDeviceId
+    val active = state.selectedDeviceId
     if (active.isBlank()) return when {
-        state.connecting || state.verifyingConnection -> "Loading outputs"
-        state.view == null && !state.connected -> "Outputs unavailable"
+        state.connecting -> "Loading outputs"
+        state.snapshot == null && !state.connected -> "Outputs unavailable"
         else -> "No output selected"
     }
     val device = state.devices.firstOrNull { it.deviceId == active }

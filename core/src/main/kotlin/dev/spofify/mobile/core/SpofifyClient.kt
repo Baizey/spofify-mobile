@@ -1,19 +1,10 @@
 package dev.spofify.mobile.core
 
 import java.io.IOException
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Proxy
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,10 +19,6 @@ import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Cookie
 import okhttp3.CookieJar
-import okhttp3.Connection
-import okhttp3.ConnectionPool
-import okhttp3.Dispatcher
-import okhttp3.Dns
 import okhttp3.EventListener
 import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -82,7 +69,7 @@ class SpofifyClient(
 
     /** Explicit, process-local zero-network admission. The app owns persistence and local-media
      * eligibility. Mode changes neither authenticate nor clear/replace a live Session, and do
-     * not send logout/leave. Both edges permanently fence earlier calls and response parsing. */
+     * not send logout or musical commands. Both edges permanently fence earlier calls and response parsing. */
     val isOffline: Boolean get() = admission.isOffline
     fun setOffline(offline: Boolean) {
         var retired: List<Call> = emptyList()
@@ -118,6 +105,15 @@ class SpofifyClient(
     // Capture at Call creation, before OkHttp's queue can span an account switch.
     // Weak keys also retire never-executed Calls; completed Calls remove themselves.
     private val requests = java.util.WeakHashMap<Call, RequestAuthentication>()
+    private class LibrarySocketAdmission(val auth: RequestAuthentication, val identity: ValidatedSessionIdentity) {
+        var retire: ((LibraryPlaybackEvent.Reason) -> Unit)? = null
+        var upgradeCall: Call? = null
+        var retired = false
+    }
+    private val librarySockets = mutableSetOf<LibrarySocketAdmission>()
+    /** Supported factory seam for deterministic dispatch/handle-publication tests. Production
+     * uses the exact admitted client, including its captured-cookie/no-followup policy. */
+    internal var libraryPlaybackWebSocketFactory: (OkHttpClient) -> okhttp3.WebSocket.Factory = { it }
     private var authentication = AuthenticationChange(0, AuthenticationChangeKind.DORMANT, null)
     @Volatile private var observedScope: ObservedAuthenticatedScope? = null
 
@@ -130,8 +126,6 @@ class SpofifyClient(
      * No cookie, token, password or Session is exposed by this callback. */
     @Volatile var onAuthenticationChanged: ((AuthenticationChange) -> Unit)? = null
 
-    // One no-auth, already connected direct address; never resolve or persist route metadata.
-    private var playbackLeaveAddress: InetAddress? = null
     private val mutablePersonalRevision = MutableStateFlow(PersonalRevision())
     val personalRevision: StateFlow<PersonalRevision> = mutablePersonalRevision.asStateFlow()
 
@@ -149,13 +143,6 @@ class SpofifyClient(
                 requests[call] = captured
             }
             object : EventListener() {
-                override fun connectionAcquired(call: Call, connection: Connection) {
-                    val route = connection.route()
-                    synchronized(lock) {
-                        if (admission.isCurrent(captured.admissionEpoch))
-                            recordPlaybackLeaveRoute(captured.generation, call.request().url, route.address.url, route.proxy.type(), route.socketAddress)
-                    }
-                }
                 override fun callEnd(call: Call) {
                     synchronized(lock) { requests.remove(call) }
                     admission.finished(call)
@@ -183,7 +170,22 @@ class SpofifyClient(
             if (!server.contains(request.url)) throw IOException("Off-origin requests are not allowed")
             val login = request.method == "POST" && request.url.encodedPath == "/api/auth/login"
             val auth = synchronized(lock) {
-                requests[chain.call()] ?: throw IOException("Missing request authentication")
+                // RealWebSocket replaces EventListener.Factory with NONE. Register its actual
+                // Call BEFORE Bridge/Connect/route waits, while retirement is excluded. The
+                // WebSocket handle need not have returned to start() yet: auth/offline/close
+                // can already cancel this exact Call without touching a successor.
+                val binding = request.tag(LibrarySocketAdmission::class.java)?.takeIf {
+                    request.method == "GET" && request.url == server.url("api", "me", "player", "socket")
+                }
+                if (binding != null) {
+                    if (binding !in librarySockets || !librarySocketCurrentLocked(binding) ||
+                        binding.upgradeCall?.let { it !== chain.call() } == true)
+                        throw IOException("Playback admission was superseded")
+                    admission.track(chain.call(), binding.auth.admissionEpoch)
+                    requests[chain.call()] = binding.auth
+                    binding.upgradeCall = chain.call()
+                    binding.auth
+                } else requests[chain.call()] ?: throw IOException("Missing request authentication")
             }
             requireLiveDispatch(auth)
             val builder = request.newBuilder().tag(RequestAuthentication::class.java, auth)
@@ -197,6 +199,10 @@ class SpofifyClient(
                 if (login) builder.header("X-Spofify-Login", "1").header("X-Spofify-Session-Mode", ROLLING_SESSION_MODE)
                 else auth.session?.let { builder.header("X-CSRF-Token", it.csrfToken) }
             }
+            // OkHttp deliberately skips network interceptors for WebSocket upgrades. Bind this
+            // request to its captured cookie here; CookieJar must never lend it successor auth.
+            if (request.tag(LibrarySocketAdmission::class.java) != null && request.method == "GET")
+                auth.cookie?.let { builder.header("Cookie", "${it.name}=${it.value}") }
             val response = chain.proceed(builder.build())
             try {
                 admission.requireCurrent(auth.admissionEpoch)
@@ -228,6 +234,32 @@ class SpofifyClient(
             chain.proceed(bound.build())
         }
         .build()
+
+    // WebSocket upgrades bypass network interceptors. Keep their explicitly captured Cookie,
+    // and use BridgeInterceptor's per-attempt cookie hook to refuse even HTTP 503/421 followups
+    // (retryOnConnectionFailure(false) alone does not disable all HTTP status retries).
+    // TLS, auth/exact-origin interceptors, dispatcher and pool remain the shared client's.
+    private fun libraryWebSocketClient(binding: LibrarySocketAdmission): OkHttpClient {
+        val attempted = java.util.concurrent.atomic.AtomicBoolean()
+        return httpClient.newBuilder().cookieJar(object : CookieJar {
+            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) = Unit
+            override fun loadForRequest(url: HttpUrl): List<Cookie> {
+                if (url != server.url("api", "me", "player", "socket") || !attempted.compareAndSet(false, true))
+                    throw IOException("Playback upgrade cannot be retried")
+                requireLiveDispatch(binding.auth)
+                synchronized(lock) {
+                    if (!librarySocketCurrentLocked(binding)) throw IOException("Playback admission was superseded")
+                }
+                return emptyList()
+            }
+        }).addInterceptor { chain ->
+            // RealWebSocket adds its compression offer before application interceptors.
+            // The v2 contract uses uncompressed text; do not permit an inflater to bypass
+            // the original-byte bound/UTF-8 guard. A negotiated extension fails closed.
+            val request = chain.request().newBuilder().removeHeader("Sec-WebSocket-Extensions").build()
+            guardLibraryPlaybackUpgrade(chain.proceed(request))
+        }.build()
+    }
 
     fun currentSession(): Session? = changingAuthentication {
         expireSessionLocked()
@@ -266,7 +298,112 @@ class SpofifyClient(
                 finally { if (authentication.revision != previous) change = authentication }
             }
         } finally {
+            retireLibrarySockets()
             change?.let { onAuthenticationChanged?.invoke(it) }
+        }
+    }
+
+    private fun librarySocketCurrentLocked(binding: LibrarySocketAdmission): Boolean =
+        !binding.retired && admission.isCurrent(binding.auth.admissionEpoch) && authentication.identity == binding.identity &&
+            session === binding.auth.session && cookie?.let { live ->
+                live.expiresAt > authenticationTimeMillis() && live.name == binding.auth.cookie?.name && live.value == binding.auth.cookie?.value
+            } == true
+
+    /** Detach only this admission's actual Call. Caller cancels it OUTSIDE the auth lock. */
+    private fun detachLibrarySocketLocked(binding: LibrarySocketAdmission): Call? {
+        binding.retired = true
+        librarySockets.remove(binding)
+        return binding.upgradeCall.also { call ->
+            binding.upgradeCall = null
+            if (call != null) {
+                requests.remove(call)
+                admission.finished(call)
+            }
+        }
+    }
+
+    private fun retireLibrarySockets() {
+        val retired = synchronized(lock) {
+            librarySockets.filter { !librarySocketCurrentLocked(it) }.map {
+                val reason = if (isOffline) LibraryPlaybackEvent.Reason.OFFLINE else LibraryPlaybackEvent.Reason.AUTHENTICATION
+                Triple(detachLibrarySocketLocked(it), it.retire, reason)
+            }
+        }
+        // Cancel even a still-unpublished WebSocket's in-flight upgrade before notifying its
+        // transport. Never call OkHttp/socket/coordinator callbacks under the authentication lock.
+        retired.forEach { (call, retire, reason) -> call?.cancel(); retire?.invoke(reason) }
+    }
+
+    /** One-use ticket, exact-origin shared authenticated transport. No reconnect or musical replay.
+     * The caller supplies its deterministic account-scoped logical device identity, not a lease. */
+    suspend fun openLibraryPlayback(
+        scope: CoroutineScope, name: String, deviceId: String, canPlay: Boolean,
+    ): LibraryPlaybackTransport {
+        LibraryPlaybackCodec.name(name)
+        LibraryPlaybackCodec.text(deviceId)
+        scope.coroutineContext.ensureActive()
+        val binding = changingAuthentication {
+            expireSessionLocked()
+            val identity = authentication.identity ?: throw IOException("Playback requires a validated session")
+            val epoch = admission.capture()
+            LibrarySocketAdmission(RequestAuthentication(generation, credentialRevision, epoch, cookie, session), identity)
+        }
+        fun bound(path: String, method: String, body: String? = null): Request =
+            request(server.url("api", "me", "player", path), method, body, binding.auth.admissionEpoch)
+                .newBuilder().tag(LibrarySocketAdmission::class.java, binding).build()
+        val ticket = response(bound("connect", "POST", "{}")) {
+            requireLiveDispatch(binding.auth)
+            val media = it.body.contentType()
+            if (media?.subtype != "json" || it.body.source().request(1025)) throw LibraryPlaybackProtocolException()
+            LibraryPlaybackCodec.ticket(it.body.string()).also { requireLiveDispatch(binding.auth) }
+        }
+        currentCoroutineContext().ensureActive()
+        scope.coroutineContext.ensureActive()
+        val transport = OkHttpLibraryPlaybackTransport(
+            identity = binding.identity, scope = scope, deviceId = deviceId,
+            current = { changingAuthentication { expireSessionLocked(); librarySocketCurrentLocked(binding) } },
+            guardedSend = { action -> synchronized(lock) { librarySocketCurrentLocked(binding) && action() } },
+            renewAuthentication = { renewLibraryPlaybackAuthentication(binding) },
+            unregister = {
+                val call = synchronized(lock) { detachLibrarySocketLocked(binding) }
+                call?.cancel()
+            },
+        )
+        binding.retire = transport::retire
+        try {
+            changingAuthentication {
+                if (!librarySocketCurrentLocked(binding)) throw IOException("Playback admission was superseded")
+                librarySockets.add(binding)
+            }
+            if (!transport.isCurrent) throw IOException("Playback admission was superseded")
+            val hello = LibraryPlaybackCodec.hello(ticket, name, deviceId, canPlay)
+            transport.start(hello) { listener ->
+                requireLiveDispatch(binding.auth)
+                libraryPlaybackWebSocketFactory(libraryWebSocketClient(binding)).newWebSocket(bound("socket", "GET").newBuilder()
+                    .header("Sec-WebSocket-Protocol", LibraryPlaybackProtocol.SUBPROTOCOL).build(), listener)
+            }
+            return transport
+        } catch (error: Exception) {
+            transport.close()
+            throw error
+        }
+    }
+
+    /** Rolling HTTP renewal is authentication-only. WS frames never refresh the HTTP session. */
+    private suspend fun renewLibraryPlaybackAuthentication(binding: LibrarySocketAdmission) {
+        requireLiveDispatch(binding.auth)
+        val renewal = request(server.url("api", "auth", "session"), admissionEpoch = binding.auth.admissionEpoch)
+            .newBuilder().tag(LibrarySocketAdmission::class.java, binding).build()
+        response(renewal) {
+            requireLiveDispatch(binding.auth)
+            if (it.body.source().request(65537)) throw LibraryPlaybackProtocolException()
+            val renewed = decode<Session>(it)
+            if (renewed.accountId != binding.identity.accountId || renewed != binding.auth.session) {
+                invalidate(binding.auth.generation, notifyUnauthorized = true,
+                    expectedCredentialRevision = binding.auth.dispatchedRevision, expectedAdmission = binding.auth.admissionEpoch)
+                throw LibraryPlaybackProtocolException()
+            }
+            requireLiveDispatch(binding.auth)
         }
     }
 
@@ -295,20 +432,6 @@ class SpofifyClient(
         }
     }
 
-    /** Metadata-only seam shared by the production connection listener and core route tests.
-     * Neither stale generations nor another origin may supply a cleanup destination. A proxied
-     * or unresolved same-origin connection retires any previous direct candidate. */
-    internal fun recordPlaybackLeaveRoute(
-        expectedGeneration: Long, requestUrl: HttpUrl, routeUrl: HttpUrl,
-        proxyType: Proxy.Type, socketAddress: InetSocketAddress,
-    ) = synchronized(lock) {
-        if (generation == expectedGeneration && server.contains(requestUrl) && server.contains(routeUrl)) {
-            playbackLeaveAddress = socketAddress.address?.takeIf {
-                proxyType == Proxy.Type.DIRECT && socketAddress.port == requestUrl.port && !socketAddress.isUnresolved
-            }
-        }
-    }
-
     /** Call only after a confirmed personal mutation, never after optimistic UI changes or reads. */
     fun notifyPersonalChange(collection: PersonalCollection) = synchronized(lock) {
         notifyPersonalChange(collection, personalMutationGeneration())
@@ -330,43 +453,6 @@ class SpofifyClient(
 
     fun clearSession() { resetSession() }
 
-    /** Only the fixed player leave may outlive clearSession/cancelAll, never an offline edge.
-     * No client, store, Session or mutable auth provider escapes; only the credential-free
-     * admission gate is shared. The clock seam is per capability, for core tests. */
-    internal fun preparePlaybackLeave(deviceId: String, nanoTime: () -> Long = System::nanoTime): suspend () -> Unit =
-        preparePlaybackLeave(deviceId, registrationGeneration = null, nanoTime = nanoTime)
-
-    internal fun preparePlaybackLeave(deviceId: String, registrationGeneration: String?, nanoTime: () -> Long = System::nanoTime): suspend () -> Unit {
-        require(registrationGeneration == null || validPlaybackProtocolId(registrationGeneration))
-        require(validPlaybackProtocolId(deviceId)) { "Invalid playback device identifier" }
-        val capturedAt = nanoTime()
-        val admissionEpoch = admission.revision
-        val request = synchronized(lock) {
-            val oldCookie = cookie
-            val oldSession = session
-            val oldAddress = playbackLeaveAddress
-            if (!admission.isCurrent(admissionEpoch) || authentication.identity == null || oldCookie == null || oldSession == null || oldAddress == null || oldCookie.expiresAt <= authenticationTimeMillis()) null
-            else {
-                val body = buildJsonObject {
-                    put("action", "leave"); put("deviceId", deviceId)
-                    registrationGeneration?.let { put("registrationGeneration", it) }
-                }.toString()
-                PlaybackLeaveAuthority(
-                    Request.Builder().url(server.url("api", "me", "player"))
-                        .header("Origin", server.origin)
-                        .header("Cookie", "${oldCookie.name}=${oldCookie.value}")
-                        .header("X-CSRF-Token", oldSession.csrfToken)
-                        .header("Accept", "application/json")
-                        .apply { if (registrationGeneration != null) header("X-Spofify-Playback-Registration", "installation-v1") }
-                        .post(OneShotBody(body.toRequestBody("application/json; charset=utf-8".toMediaType())))
-                        .build(),
-                    oldCookie.expiresAt, oldAddress,
-                )
-            }
-        }
-        return PreparedPlaybackLeave(request, capturedAt, nanoTime, admission, admissionEpoch)::invoke
-    }
-
     private fun resetSession(): Long = changingAuthentication { resetSessionLocked(AuthenticationChangeKind.RESET) }
 
     private fun resetSessionLocked(kind: AuthenticationChangeKind): Long {
@@ -375,7 +461,6 @@ class SpofifyClient(
         sessionMode = null
         persistedDeadline = 0
         nextPersistenceAttempt = 0
-        playbackLeaveAddress = null
         generation++
         credentialRevision++
         authenticationChangedLocked(kind)
@@ -439,7 +524,6 @@ class SpofifyClient(
             sessionMode = null
             persistedDeadline = 0
             nextPersistenceAttempt = 0
-            playbackLeaveAddress = null
             authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
             generation to store.read()
         } }
@@ -505,7 +589,6 @@ class SpofifyClient(
         sessionMode = null
         persistedDeadline = 0
         nextPersistenceAttempt = 0
-        playbackLeaveAddress = null
         generation++
         credentialRevision++
         authenticationChangedLocked(AuthenticationChangeKind.DORMANT)
@@ -545,18 +628,9 @@ class SpofifyClient(
         return get(url.build())
     }
 
-    suspend fun playback(item: LibraryItem): PlaybackQueue = when (item.kind) {
-        "artist", "album" -> get(server.url("api", "library", plural(item.kind), item.id, "playback"))
-        "track" -> if (!item.albumId.isNullOrEmpty()) get(server.url("api", "library", "albums", item.albumId, "playback"))
-            else if (item.playable) PlaybackQueue(listOf(item), total = 1) else PlaybackQueue(emptyList())
-        else -> throw IllegalArgumentException("Unsupported library kind")
-    }
-
     suspend fun likes(offset: Int = 0): LibraryPage = get<TrackPage>(pageUrl(server.url("api", "me", "likes"), offset)).flatten()
-    suspend fun likedPlayback(): PlaybackQueue = get(server.url("api", "me", "likes", "playback"))
     suspend fun playlists(offset: Int = 0): PlaylistPage = get(pageUrl(server.url("api", "me", "playlists"), offset).newBuilder().addQueryParameter("kind", "manual").build())
     suspend fun playlistEntries(id: String, offset: Int = 0): LibraryPage = get<TrackPage>(pageUrl(server.url("api", "me", "playlists", id, "entries"), offset)).flatten(keepEntries = true)
-    suspend fun playlistPlayback(id: String): PlaybackQueue = get(server.url("api", "me", "playlists", id, "playback"))
 
     suspend fun setLiked(trackId: String, liked: Boolean) {
         val writeGeneration = personalMutationGeneration()
@@ -573,12 +647,6 @@ class SpofifyClient(
     }
 
     suspend fun recent(): LibraryPage = get<TrackPage>(server.url("api", "me", "recent").newBuilder().addQueryParameter("limit", "40").build()).flatten()
-    suspend fun recordHistory(eventId: String, trackId: String) {
-        val writeGeneration = personalMutationGeneration()
-        mutate(server.url("api", "me", "history"), "POST", buildJsonObject { put("eventId", validId(eventId)); put("trackId", validId(trackId)) }.toString())
-        notifyPersonalChange(PersonalCollection.HISTORY, writeGeneration)
-    }
-
     fun audioUrl(item: LibraryItem): String {
         require(item.kind == "track") { "Only tracks have audio" }
         return server.url("api", "library", "tracks", item.id, "audio").toString()
@@ -622,6 +690,16 @@ class SpofifyClient(
     } }
     private fun requestAuthentication(request: Request): RequestAuthentication {
         if (!server.contains(request.url)) throw IOException("Off-origin requests are not allowed")
+        request.tag(LibrarySocketAdmission::class.java)?.let { binding ->
+            val valid = (request.method == "POST" && request.url == server.url("api", "me", "player", "connect")) ||
+                (request.method == "GET" && request.url in listOf(server.url("api", "me", "player", "socket"), server.url("api", "auth", "session")))
+            if (!valid) throw IOException("Invalid playback admission request")
+            requireLiveDispatch(binding.auth)
+            synchronized(lock) {
+                if (!librarySocketCurrentLocked(binding)) throw IOException("Playback admission was superseded")
+            }
+            return binding.auth
+        }
         request.tag(TerminalLogout::class.java)?.let { terminal ->
             if (request.method != "POST" || request.url != server.url("api", "auth", "logout"))
                 throw IOException("Invalid sign-out request")
@@ -730,101 +808,6 @@ class SpofifyClient(
     }
 }
 
-private const val PLAYBACK_LEAVE_LIFETIME_MS = 4000L
-private val PLAYBACK_LEAVE_LIFETIME_NS = TimeUnit.MILLISECONDS.toNanos(PLAYBACK_LEAVE_LIFETIME_MS)
-private class PlaybackLeaveAuthority(val request: Request, val cookieExpiresAt: Long, val address: InetAddress)
-
-/** No system/custom resolver, reverse lookup, fallback address or resolver worker. The origin
- * hostname remains in the request URL, Host header and default TLS/hostname verification. */
-internal class PlaybackLeaveDns(private val host: String, private val address: InetAddress) : Dns {
-    override fun lookup(hostname: String): List<InetAddress> {
-        if (hostname != host) throw leaveUnavailable()
-        return listOf(address)
-    }
-}
-
-/** Not an authenticated client clone: the only reachable operation is this captured POST.
- * Unused auth is dropped by the timer, and claiming the capability removes it from the closure.
- * Transport resources are created only on invocation and never share ordinary cancellation.
- * Explicit offline admission is the exception: it fences/cancels this transport as well. */
-private class PreparedPlaybackLeave(
-    authority: PlaybackLeaveAuthority?,
-    private val capturedAt: Long,
-    private val nanoTime: () -> Long,
-    private val admission: NetworkAdmission,
-    private val admissionEpoch: Long,
-) {
-    private val pending = AtomicReference(authority)
-    private val expiry = if (authority == null) null else CoroutineScope(Dispatchers.Default).launch(start = CoroutineStart.UNDISPATCHED) {
-        // Schedule against capture, not against eventual dispatcher execution. Rounding down
-        // may retire unused authority <1ms early, never extend its lifetime.
-        val remaining = try { remainingNanos() } catch (_: IOException) { 0L }
-        delay(TimeUnit.NANOSECONDS.toMillis(remaining))
-        pending.set(null)
-    }
-
-    private fun remainingNanos(): Long {
-        val elapsed = nanoTime() - capturedAt
-        if (elapsed < 0 || elapsed >= PLAYBACK_LEAVE_LIFETIME_NS) throw leaveUnavailable()
-        return PLAYBACK_LEAVE_LIFETIME_NS - elapsed
-    }
-
-    suspend fun invoke() {
-        val authority = pending.getAndSet(null) ?: throw leaveUnavailable()
-        expiry?.cancel()
-        currentCoroutineContext().ensureActive()
-        admission.requireCurrent(admissionEpoch)
-        remainingNanos()
-        if (authority.cookieExpiresAt <= System.currentTimeMillis()) throw leaveUnavailable()
-        val dispatcher = Dispatcher()
-        val pool = ConnectionPool()
-        var call: Call? = null
-        try {
-            // Fresh transport deliberately retains OkHttp's platform TLS/hostname defaults.
-            // No inherited interceptor, cookie jar, authenticator, cache or successor auth.
-            // Never enter blocking InetAddress DNS or proxy selection: cancellation cannot
-            // interrupt those calls. Use only the captured, previously connected direct route.
-            val transport = OkHttpClient.Builder()
-                .dispatcher(dispatcher).connectionPool(pool)
-                .eventListenerFactory { created ->
-                    admission.track(created, admissionEpoch)
-                    object : EventListener() {
-                        override fun callEnd(call: Call) { admission.finished(call) }
-                        override fun callFailed(call: Call, ioe: IOException) { admission.finished(call) }
-                    }
-                }
-                .addInterceptor { chain ->
-                    admission.requireCurrent(admissionEpoch)
-                    val response = chain.proceed(chain.request())
-                    try { admission.guard(response, admissionEpoch) }
-                    catch (error: Exception) { response.close(); throw error }
-                }
-                .proxy(Proxy.NO_PROXY)
-                .dns(PlaybackLeaveDns(authority.request.url.host, authority.address))
-                .followRedirects(false).followSslRedirects(false)
-                .retryOnConnectionFailure(false)
-                .addNetworkInterceptor { chain ->
-                    admission.requireCurrent(admissionEpoch)
-                    remainingNanos()
-                    if (authority.cookieExpiresAt <= System.currentTimeMillis()) throw leaveUnavailable()
-                    chain.proceed(chain.request())
-                }
-                .build()
-            currentCoroutineContext().ensureActive()
-            call = transport.newCall(authority.request)
-            call.timeout().deadlineNanoTime(System.nanoTime() + remainingNanos())
-            call.awaitResponse({ ApiException(it.code, "The server refused playback cleanup (HTTP ${it.code})") },
-                { Unit }, admission, admissionEpoch)
-        } finally {
-            call?.cancel()
-            pool.evictAll()
-            dispatcher.executorService.shutdown()
-        }
-    }
-}
-
-private fun leaveUnavailable() = IOException("Playback cleanup is unavailable or expired")
-
 /** Keep cancellation attached through response consumption, not merely header delivery. */
 private suspend fun <T> Call.awaitResponse(errorFactory: (Response) -> ApiException, block: (Response) -> T,
     admission: NetworkAdmission, admissionEpoch: Long): T {
@@ -873,7 +856,7 @@ internal fun parseSessionCookie(server: ServerAddress, serialized: String, nowMi
     if (absoluteExpiry && (parts.drop(1).none { it.trim().startsWith("Expires=", ignoreCase = true) } ||
         parts.drop(1).filter { it.trim().startsWith("Max-Age=", ignoreCase = true) }
             .any { it.substringAfter('=').trim().toLongOrNull()?.let { age -> age <= 0 } != false })) return null
-    // The server's absolute deadline must not drift on every quiet poll due to
+    // The server's absolute deadline must not drift on every authenticated renewal due to
     // Max-Age/receipt-time rounding, delay or process restart.
     val wire = if (absoluteExpiry) parts.filterNot { it.trim().startsWith("Max-Age=", ignoreCase = true) }.joinToString(";") else serialized
     val value = Cookie.parse(server.url(), wire) ?: return null

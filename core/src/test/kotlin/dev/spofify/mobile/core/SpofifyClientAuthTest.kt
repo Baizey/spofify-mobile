@@ -268,7 +268,7 @@ class SpofifyClientAuthTest {
     @Test fun disconnectedMutationIsNotRetried() = runBlocking {
         web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
         web.enqueue(MockResponse().setResponseCode(204))
-        try { client.recordHistory("event-id", "track-id"); fail("Expected network error") } catch (_: IOException) { }
+        try { client.setLiked("track-id", true); fail("Expected network error") } catch (_: IOException) { }
         assertEquals(1, web.requestCount)
         assertNotNull(web.takeRequest(1, TimeUnit.SECONDS))
         assertNull(web.takeRequest(100, TimeUnit.MILLISECONDS))

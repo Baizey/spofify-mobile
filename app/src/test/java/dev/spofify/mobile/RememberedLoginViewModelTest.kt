@@ -1,5 +1,6 @@
 package dev.spofify.mobile
 
+import dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding
 import android.app.Application
 import androidx.lifecycle.ViewModelStore
 import androidx.test.core.app.ApplicationProvider
@@ -43,7 +44,11 @@ class RememberedLoginViewModelTest {
         var connects = 0
         override fun connect() { connects++ }
         override fun release() = Unit
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean, startEntryId: String?) = Unit
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: LibraryPlaybackActionBinding?,
+            shuffle: Boolean?, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+        }
         override fun toggle() = Unit
         override fun next() = Unit
         override fun previous() = Unit

@@ -18,9 +18,8 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.Density
-import dev.spofify.mobile.core.PlaybackDevice
-import dev.spofify.mobile.core.PlaybackDevicesView
-import dev.spofify.mobile.core.PlaybackSnapshot
+import dev.spofify.mobile.core.LibraryPlaybackDevice
+import dev.spofify.mobile.playback.testLibrarySnapshot
 import dev.spofify.mobile.listeningColorScheme
 import dev.spofify.mobile.ui.theme.AppTypography
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -46,18 +45,16 @@ class PlaybackDevicesRefreshTest {
     private val effects = TestCoroutineScheduler()
     @get:Rule val compose = createComposeRule(effectContext =
         StandardTestDispatcher(effects, name = "PlaybackDevicesRefresh-effects"))
-    private val phone = PlaybackDevice("phone", "Phone", true)
-    private val room = PlaybackDevice("room", "Listening room", true)
+    private val phone = LibraryPlaybackDevice("phone", "Phone", true, true)
+    private val room = LibraryPlaybackDevice("room", "Listening room", true, true)
     private val progress = SemanticsMatcher.keyIsDefined(SemanticsProperties.ProgressBarRangeInfo)
     private val liveRegion = SemanticsMatcher.keyIsDefined(SemanticsProperties.LiveRegion)
     private val sheet = SemanticsMatcher.keyIsDefined(SemanticsProperties.PaneTitle)
     private val list = SemanticsMatcher.keyIsDefined(SemanticsProperties.VerticalScrollAxisRange)
     private val durations = listOf(16L, 250L, 500L, 1_000L)
-    private fun healthy(devices: List<PlaybackDevice> = listOf(phone, room)) = PlaybackDevicesState(
-        deviceId = "phone", connected = true, message = "",
-        view = PlaybackDevicesView(deviceId = "phone", devices = devices, activeDeviceId = "",
-            epoch = 1, leaseMs = 0, state = null, stateSeq = 0, stateAgeMs = 0,
-            transfer = null, directives = emptyList(), commands = emptyList()),
+    private fun healthy(devices: List<LibraryPlaybackDevice> = listOf(phone, room)) = PlaybackDevicesState(
+        deviceId = "phone", connectionId = "socket-phone", connected = true, message = "",
+        snapshot = testLibrarySnapshot(devices = devices),
     )
 
     private class Calls {
@@ -157,7 +154,7 @@ class PlaybackDevicesRefreshTest {
         compose.onNodeWithText("Retry connection").assertDoesNotExist()
     }
     private fun busy(base: PlaybackDevicesState, projection: Int) = base.copy(
-        connecting = projection != 1, verifyingConnection = projection != 0,
+        connecting = base.snapshot == null || projection != 1,
     )
     @Test fun healthyPopulatedRefreshKeepsGeometryAndSemanticsStable() {
         val calls = Calls()
@@ -176,7 +173,7 @@ class PlaybackDevicesRefreshTest {
             assertQuietSemantics()
             for (projection in 0..2) for (delay in durations) {
                 val checking = busy(base, projection)
-                assertSame(base.view, checking.view)
+                assertSame(base.snapshot, checking.snapshot)
                 publish(holder, checking, delay)
                 // Bounds FIRST: capture causality before the expected spinner assertion fails.
                 assertGeometry(settled, geometry("Phone"), "registered=$registered busy=$projection ${delay}ms")
@@ -244,7 +241,7 @@ class PlaybackDevicesRefreshTest {
         val healthy = healthy()
         val guidance = "Connection could not be verified. The previous action was not replayed."
         val failure = healthy.copy(recovery = PlaybackConnectionRecovery.VERIFICATION_NEEDED, message = guidance)
-        val holder = host(failure, calls, retryPublication = { it.value = it.value.copy(verifyingConnection = true) })
+        val holder = host(failure, calls, retryPublication = { it.value = it.value.copy(connecting = true) })
         title("Phone").assertExists() // connected=true plus cached cards is not recovery success.
         compose.onNodeWithText(guidance).assertExists()
         compose.onNode(SemanticsMatcher.expectValue(SemanticsProperties.LiveRegion, LiveRegionMode.Polite)).assertExists()
@@ -252,7 +249,8 @@ class PlaybackDevicesRefreshTest {
         drain(16)
         for (delay in durations) {
             drain(delay)
-            compose.onNode(progress).assertExists()
+            // Retained structural content stays stable during socket admission; only first load spins.
+            compose.onNode(progress).assertDoesNotExist()
             compose.onNodeWithText(guidance).assertExists()
             title("Phone").assertExists()
             compose.onNodeWithText("Retry connection").assertDoesNotExist()
@@ -283,8 +281,7 @@ class PlaybackDevicesRefreshTest {
         val base = healthy(listOf(phone, room.copy(available = false))).copy(
             message = "Device name saved. Native handoff remains unavailable on this phone.",
             messagePurpose = PlaybackDevicesMessagePurpose.INFORMATION,
-            view = healthy(listOf(phone, room.copy(available = false))).view!!.copy(
-                activeDeviceId = "phone", state = PlaybackSnapshot(playing = false)))
+            snapshot = testLibrarySnapshot(devices = listOf(phone, room.copy(available = false)), selected = "phone"))
         val holder = host(base, calls)
         compose.onNodeWithText(base.message).assertDoesNotExist()
         compose.onNodeWithText("This device · Active output · Paused").assertExists()
@@ -301,10 +298,10 @@ class PlaybackDevicesRefreshTest {
         val calls = Calls()
         val base = healthy(listOf(phone))
         val blocked = base.copy(needsTap = true, message = "Playback needs a tap. The previous action was not replayed.",
-            view = base.view!!.copy(activeDeviceId = "phone", state = PlaybackSnapshot(error = "blocked")))
+            snapshot = testLibrarySnapshot(devices = listOf(phone), selected = "phone", error = "blocked"))
         val holder = host(blocked, calls)
         for (delay in durations) {
-            publish(holder, blocked.copy(verifyingConnection = true), delay)
+            publish(holder, blocked.copy(connecting = true), delay)
             compose.onNodeWithText(blocked.message).assertExists()
             compose.onNodeWithText("This device · Needs a tap").assertExists()
             compose.onNodeWithText("Continue playback here").assertIsEnabled()
@@ -328,7 +325,7 @@ class PlaybackDevicesRefreshTest {
     }
 
     @Test fun overflowingListKeepsReleasedTerminalAnchorThroughManyRefreshCycles() {
-        val devices = (0 until 24).map { PlaybackDevice("device-$it", "Room $it", true) }
+        val devices = (0 until 24).map { LibraryPlaybackDevice("device-$it", "Room $it", true, true) }
         val base = healthy(devices)
         val calls = Calls()
         val holder = host(base, calls)
@@ -429,8 +426,8 @@ class PlaybackDevicesRefreshTest {
         drain(16)
         selection(2, 5)
         val id = editor().fetchSemanticsNode().id
-        val added = PlaybackDevice("new", "New output 🎧", true)
-        val changed = base.copy(view = base.view!!.copy(devices = listOf(added, phone.copy(name = "Accepted phone name"))))
+        val added = LibraryPlaybackDevice("new", "New output 🎧", true, true)
+        val changed = base.copy(snapshot = base.snapshot!!.copy(devices = listOf(added, phone.copy(name = "Accepted phone name"))))
         publish(holder, changed, 1_000)
         title("Listening room").assertDoesNotExist()
         title("New output 🎧").assertExists()
@@ -441,7 +438,7 @@ class PlaybackDevicesRefreshTest {
         drain(16)
         compose.runOnIdle { assertEquals(listOf("phone" to "Unsaved 音楽"), calls.rename) }
         // Removal must still dispose the real card; quiet refresh must not freeze the device list.
-        publish(holder, changed.copy(view = changed.view!!.copy(devices = listOf(added))), 1_000)
+        publish(holder, changed.copy(snapshot = changed.snapshot!!.copy(devices = listOf(added))), 1_000)
         title("Accepted phone name").assertDoesNotExist()
         title("New output 🎧").assertExists()
     }

@@ -147,8 +147,8 @@ class PlaylistContinuousHostTest {
         val shown = mutableStateOf(true)
         val key = PlaybackInteractionKey()
         val feedback = mutableStateOf(CatalogPlaybackFeedback(interactionKey = key,
-            queueIntentBinding = QueueIntentBinding("controller", "receiver", 1, 1, "history")))
-        val accepted = mutableListOf<Pair<QueueIntentSelection, PlaybackListAction>>()
+            queueIntentBinding = dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding("controller", "receiver", 1, 1, 1)))
+        val accepted = mutableListOf<Pair<LibraryPlaybackSelection, PlaybackListAction>>()
         val sourceEpoch = mutableStateOf(0)
         val initialId = mutableStateOf(if (fixture.source == Source.INDEX) null else "fixture")
         var dispatcher: OnBackPressedDispatcher? = null
@@ -156,7 +156,7 @@ class PlaylistContinuousHostTest {
             val currentDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
             SideEffect { dispatcher = currentDispatcher }
             MaterialTheme {
-                if (shown.value) PlaylistsRoute(fixture.client, {}, { _, _, _ -> fail("Browsing must never prepare") }, {},
+                if (shown.value) PlaylistsRoute(fixture.client, {}, {},
                     initialPlaylistId = initialId.value, playback = feedback.value, sourceEpoch = sourceEpoch.value,
                     onQueueIntent = { selection, action, captured, _, current ->
                         assertSame(key, captured); assertTrue(current()); accepted += selection to action
@@ -171,7 +171,7 @@ class PlaylistContinuousHostTest {
         assertEquals(0, fixture.preparations.get())
         assertEquals(0, fixture.regenerationRequests.get())
     }
-    private class MutableHost(val accepted: MutableList<Pair<QueueIntentSelection, PlaybackListAction>>,
+    private class MutableHost(val accepted: MutableList<Pair<LibraryPlaybackSelection, PlaybackListAction>>,
         val heartbeat: () -> Unit, val navigate: (String?) -> Unit, val back: () -> Unit,
         val advanceSourceEpoch: () -> Unit)
 
@@ -237,9 +237,9 @@ class PlaylistContinuousHostTest {
                 await { visible("Like song") }
                 compose.onNodeWithText("Play now").performScrollTo().performClick()
                 compose.waitForIdle()
-                val selection = host.accepted.single().first as QueueIntentSelection.Track
-                assertEquals("path-1001", selection.track.getValue("occurrenceId").jsonPrimitive.content)
-                assertEquals("signed-1001", selection.track.getValue("selectionToken").jsonPrimitive.content)
+                val selection = host.accepted.single().first as LibraryPlaybackSelection.Track
+                assertEquals("path-1001", selection.track.occurrenceId)
+                assertEquals("signed-1001", selection.track.selectionToken)
                 assertEquals("fence", selection.context!!.fence)
                 assertEquals((0..1000 step 40).toList(), fixture.requests())
             }
@@ -289,7 +289,7 @@ class PlaylistContinuousHostTest {
                 compose.onNodeWithContentDescription("More actions for Fixture playlist").performClick()
                 compose.onNodeWithText("Queue").performScrollTo().performClick()
                 compose.waitForIdle()
-                val selection = host.accepted.single().first as QueueIntentSelection.Collection
+                val selection = host.accepted.single().first as LibraryPlaybackSelection.Collection
                 assertEquals("fixture", selection.context.id)
                 assertEquals("fence", selection.context.fence)
                 assertEquals(listOf(0), fixture.requests())
@@ -320,10 +320,10 @@ class PlaylistContinuousHostTest {
                 row.performTouchInput { swipe(Offset(80f, 24f), Offset(180f, 24f)) }
                 compose.waitForIdle()
                 assertEquals("A new deliberate gesture on the refreshed occurrence still works", 1, host.accepted.size)
-                val selection = host.accepted.single().first as QueueIntentSelection.Track
+                val selection = host.accepted.single().first as LibraryPlaybackSelection.Track
                 assertEquals(PlaybackListAction.QUEUE_HIGH, host.accepted.single().second)
-                assertEquals("path-0", selection.track.getValue("occurrenceId").jsonPrimitive.content)
-                assertEquals("signed-0", selection.track.getValue("selectionToken").jsonPrimitive.content)
+                assertEquals("path-0", selection.track.occurrenceId)
+                assertEquals("signed-0", selection.track.selectionToken)
                 assertEquals("fence", selection.context!!.fence)
                 assertEquals(listOf(0, 0), fixture.requests())
             }
@@ -349,13 +349,13 @@ class PlaylistContinuousHostTest {
                 compose.onNodeWithText("Queue").assertIsEnabled().performScrollTo().performClick()
                 compose.waitForIdle()
                 assertEquals(before, compose.onNodeWithText("Song 38").getUnclippedBoundsInRoot())
-                val selection = host.accepted.single().first as QueueIntentSelection.Track
+                val selection = host.accepted.single().first as LibraryPlaybackSelection.Track
                 assertEquals(PlaybackListAction.QUEUE_HIGH, host.accepted.single().second)
-                assertEquals("same", selection.track.getValue("id").jsonPrimitive.content)
-                if (source == Source.MANUAL) assertEquals("entry-38", selection.track.getValue("entryId").jsonPrimitive.content)
+                assertEquals("same", selection.track.id)
+                if (source == Source.MANUAL) assertEquals("entry-38", selection.track.entryId)
                 else {
-                    assertEquals("path-38", selection.track.getValue("occurrenceId").jsonPrimitive.content)
-                    assertEquals("signed-38", selection.track.getValue("selectionToken").jsonPrimitive.content)
+                    assertEquals("path-38", selection.track.occurrenceId)
+                    assertEquals("signed-38", selection.track.selectionToken)
                     assertEquals("fence", selection.context!!.fence)
                 }
                 scroll(if (source == Source.MANUAL) "entry-42" else "path-42")

@@ -23,6 +23,7 @@ import androidx.test.filters.LargeTest
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.spofify.mobile.LibraryViewModel
 import dev.spofify.mobile.MainActivity
+import dev.spofify.mobile.SpofifyApplication
 import dev.spofify.mobile.Page
 import dev.spofify.mobile.Tab
 import dev.spofify.mobile.playback.PlaybackState
@@ -38,6 +39,8 @@ import kotlin.math.roundToInt
  * Run only after pm clear on a fresh isolated test AVD. One journey intentionally owns one fixture
  * origin for the whole Application lifetime. Uses the real Activity, Keystore, networking and Media3.
  * Screenshots are full-device UiAutomation bitmaps, not Compose/Robolectric/source renders.
+ * Playback uses a single-output SYNTHETIC v2 socket subset, not real-server authority,
+ * cross-output transfer, planned-next, acoustic or independently inspected visual acceptance.
  */
 @RunWith(AndroidJUnit4::class)
 @LargeTest
@@ -361,21 +364,22 @@ class NativeUiSmokeTest {
                 // Opening is presentation only and returning retains the playlist detail.
                 compose.onNodeWithText("No song selected").assertIsDisplayed()
                 compose.onNodeWithContentDescription("Play").assertIsNotEnabled()
+                val commandsBeforePicker = fixture.playerCalls.count { it == "command" }
                 compose.onNodeWithContentDescription("Playback devices").assertIsDisplayed()
                     .assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp).performClick()
-                waitFor(hasText("Studio speaker"))
-                // Commands may be hidden rather than disabled. Never require unsupported actions.
+                compose.waitUntil(15_000) { fixture.selectedOutputName != null }
+                val admittedOutput = checkNotNull(fixture.selectedOutputName)
+                waitFor(hasText(admittedOutput))
+                // v2 automatically selects the real local socket. The picker is not the old
+                // read-only HTTP placeholder; opening it still must issue no musical command.
                 compose.onAllNodes(hasText("Close") or hasText("Play from here")).assertCountEquals(0)
-                val deviceCommand = hasContentDescription("Select output on ", substring = true) or hasText("Rename") or
-                    hasText("Continue playback here") or hasText("Save")
-                compose.onAllNodes(deviceCommand and hasClickAction())
-                    .fetchSemanticsNodes().forEach { node ->
-                        assertTrue("Device picker must be read-only: ${node.config}",
-                            node.config.contains(SemanticsProperties.Disabled))
-                    }
-                screenshot("08c-playback-devices-read-only")
+                compose.onNodeWithContentDescription("Select output on $admittedOutput")
+                    .assertIsDisplayed().assertHeightIsAtLeast(48.dp)
+                screenshot("08c-playback-devices-local-socket")
                 pressBack()
                 waitFor(hasText("Night walk · edited"))
+                assertEquals("Opening/dismissing Devices must not send a musical command", commandsBeforePicker,
+                    fixture.playerCalls.count { it == "command" })
                 assertNoAutoplayOnBrowse(fixture)
                 compose.onNodeWithTag("nav-settings").performClick()
                 waitFor(hasTestTag("settings-screen"))
@@ -401,7 +405,7 @@ class NativeUiSmokeTest {
                 screenshot("09b-now-playing-controls")
                 val beforePicker = capturePlaying(fixture)
                 compose.onNode(sheetTransport("Playback devices")).performClick()
-                waitFor(hasText("Studio speaker"))
+                waitFor(hasText(checkNotNull(fixture.selectedOutputName)))
                 screenshot("09c-now-playing-device-picker")
                 pressBack()
                 waitUntilAbsent(hasText("Playback devices"))
@@ -486,10 +490,10 @@ class NativeUiSmokeTest {
                 search("Orbit")
                 scrollSearchToLastSongAutomatically(fixture)
                 assertPlayingTransition(beforeQuerySubmit, fixture, "query submission and automatic append")
-                val preparationsBeforeSearchEditing = fixture.playbackPreparations.get()
+                val replacementsBeforeSearchEditing = fixture.queueReplacements.get()
                 assertQueuePreservedFromMini(originalQueue, fixture)
                 assertSearchEditingContinuity(fixture, "10c", playing = true, expectedQueue = originalQueue)
-                assertEquals("Search focus/IME must not prepare another queue", preparationsBeforeSearchEditing, fixture.playbackPreparations.get())
+                assertEquals("Search focus/IME must not replace the queue", replacementsBeforeSearchEditing, fixture.queueReplacements.get())
 
                 val beforePlayingReselect = capturePlaying(fixture)
                 activateSearchAndAssertEmpty(fixture, "10cc-playing-paged-root-reselect-keyboard")
@@ -603,7 +607,7 @@ class NativeUiSmokeTest {
                 compose.onNode(expandPlayer).performClick()
                 waitFor(playerSheet)
                 assertPlayingTransition(beforeLargePlayerExpand, fixture, "large-font player expansion")
-                assertEquals("Font recreation must not prepare another queue", preparationsBeforeSearchEditing, fixture.playbackPreparations.get())
+                assertEquals("Font recreation must not replace the queue", replacementsBeforeSearchEditing, fixture.queueReplacements.get())
                 assertPlayerPresentation()
                 screenshot("13-large-font-now-playing")
                 openQueueForInspection()
@@ -620,8 +624,9 @@ class NativeUiSmokeTest {
                 assertEquals("No query-free catalog reads are allowed", 0, fixture.emptyGlobalBrowseCalls.get())
                 assertEquals("Real auth cookie and CSRF must reach the fixture", 0, fixture.authenticationFailures.get())
                 assertTrue("Unexpected fixture routes: ${fixture.unexpectedRoutes.joinToString()}", fixture.unexpectedRoutes.isEmpty())
-                File(evidence, "fixture-summary.txt").writeText("tracks=16\nalbums=3\nartists=1\ncreditArtistAliases=3\nmanualPlaylists=1\nderivedPlaylists=1\n" +
-                    "audioRequests=${fixture.audioRequests.get()}\nplaybackPreparations=${fixture.playbackPreparations.get()}\nhistoryWrites=${fixture.historyWrites.get()}\nplaylistWrites=${fixture.playlistWrites.get()}\n" +
+                assertTrue("Synthetic socket failures: ${fixture.socketFailures}", fixture.socketFailures.isEmpty())
+                File(evidence, "fixture-summary.txt").writeText("semantics=synthetic-single-output-ui-not-real-server-acceptance\ntracks=16\nalbums=3\nartists=1\ncreditArtistAliases=3\nmanualPlaylists=1\nderivedPlaylists=1\n" +
+                    "audioRequests=${fixture.audioRequests.get()}\nqueueReplacements=${fixture.queueReplacements.get()}\nqualifiedHistoryEvents=${fixture.qualifiedHistoryEvents.get()}\nplaylistWrites=${fixture.playlistWrites.get()}\n" +
                     "emptyGlobalBrowseCalls=${fixture.emptyGlobalBrowseCalls.get()}\nauthenticationFailures=${fixture.authenticationFailures.get()}\nunexpectedRoutes=${fixture.unexpectedRoutes.size}\n")
             } catch (error: Throwable) {
                 journeyFailure = error
@@ -638,6 +643,17 @@ class NativeUiSmokeTest {
                 if (sizeChanged) runCatching {
                     shell("wm size ${originalSizeOverride ?: "reset"}")
                     compose.waitUntil(20_000) { compose.activity.resources.displayMetrics.widthPixels == baselineWidth }
+                }.exceptionOrNull()?.let { error ->
+                    val first = cleanupFailure
+                    if (first == null) cleanupFailure = error else first.addSuppressed(error)
+                }
+                // Dispose the authenticated coordinator/service before closing its owned socket
+                // fixture. No successor Application or background audio outlives this journey.
+                runCatching {
+                    compose.activityRule.scenario.close()
+                    instrumentation.runOnMainSync {
+                        (instrumentation.targetContext.applicationContext as SpofifyApplication).graph.clear()
+                    }
                 }.exceptionOrNull()?.let { error ->
                     val first = cleanupFailure
                     if (first == null) cleanupFailure = error else first.addSuppressed(error)
@@ -711,7 +727,7 @@ class NativeUiSmokeTest {
         assertEquals(UiFixtureServer.TRACK_NAMES.first(), before.item?.name)
         assertEquals(originalQueue, upcomingOccurrences())
         assertTrue("Previous restart fixture must begin beyond restart threshold", before.positionMs >= 29_000)
-        val preparations = fixture.playbackPreparations.get()
+        val replacements = fixture.queueReplacements.get()
         val density = compose.activity.resources.displayMetrics.density
         fun pauseAfterSkip() {
             // Existing semantic Next/Previous intentionally start playback, even from pause.
@@ -732,7 +748,7 @@ class NativeUiSmokeTest {
         compose.onNode(playerSheet).assertDoesNotExist()
         assertEquals(firstOccurrence, readPlaybackState().currentEntryId)
         assertEquals(originalQueue, upcomingOccurrences())
-        assertEquals(preparations, fixture.playbackPreparations.get())
+        assertEquals(replacements, fixture.queueReplacements.get())
         screenshot("10ba-mini-child-pause")
 
         // At the first occurrence Previous restarts current; no guessed queueIndex - 1.
@@ -757,7 +773,7 @@ class NativeUiSmokeTest {
         compose.onNode(playerSheet).assertDoesNotExist()
         pauseAfterSkip()
         assertEquals("One left release advances exactly one prepared occurrence", originalQueue.drop(1), upcomingOccurrences())
-        assertEquals(preparations, fixture.playbackPreparations.get())
+        assertEquals(replacements, fixture.queueReplacements.get())
         // Test setup through the EXISTING UI-facing controls, never a raw player: a slow AVD
         // may exceed Previous's restart threshold before Pause settles. Seek only this paused
         // occurrence to zero, without preparing/replacing its queue, before testing traversal.
@@ -775,7 +791,7 @@ class NativeUiSmokeTest {
         compose.onNode(playerSheet).assertDoesNotExist()
         pauseAfterSkip()
         assertEquals("Previous restores the same exact upcoming occurrences", originalQueue, upcomingOccurrences())
-        assertEquals(preparations, fixture.playbackPreparations.get())
+        assertEquals(replacements, fixture.queueReplacements.get())
         screenshot("10bd-mini-right-previous")
 
         // A physical tap still expands while paused; all expanded transport stays reachable.
@@ -807,7 +823,7 @@ class NativeUiSmokeTest {
         assertPlayingTransition(restored, fixture, "mini transport fixture restoration")
         assertEquals(firstOccurrence, readPlaybackState().currentEntryId)
         assertEquals(originalQueue, upcomingOccurrences())
-        assertEquals(preparations, fixture.playbackPreparations.get())
+        assertEquals(replacements, fixture.queueReplacements.get())
     }
 
     private fun assertContextualListPlayback(fixture: UiFixtureServer) {
@@ -1532,7 +1548,7 @@ class NativeUiSmokeTest {
         assertTrue("Results must start at the safe top boundary without a reserved toolbar gap", kotlin.math.abs(contentTop - safeTop) <= 2f)
         val query = queryText()
         val requests = fixture.searchCalls.size
-        val preparations = fixture.playbackPreparations.get()
+        val replacements = fixture.queueReplacements.get()
         listOf(false, true).forEach { submit ->
             val action = if (submit) "submit" else "back"
             val beforeFocus = if (playing) capturePlaying(fixture) else null
@@ -1556,7 +1572,7 @@ class NativeUiSmokeTest {
             assertEquals("Ending editing must retain the query", query, queryText())
             assertRetainedSearchPosition(anchorTop, anchor)
             assertEquals("Unchanged-query $action must retain loaded search pages", requests, fixture.searchCalls.size)
-            assertEquals("Search editing must not prepare playback", preparations, fixture.playbackPreparations.get())
+            assertEquals("Search editing must not replace playback", replacements, fixture.queueReplacements.get())
             if (playing) {
                 assertPlayingTransition(checkNotNull(beforeEditingEnd), fixture, "Search IME $action")
                 assertQueuePreservedFromMini(checkNotNull(expectedQueue), fixture)
@@ -1585,7 +1601,7 @@ class NativeUiSmokeTest {
             assertEquals(query, queryText())
             assertRetainedSearchPosition(anchorTop, anchor)
             assertEquals(requests, fixture.searchCalls.size)
-            assertEquals(preparations, fixture.playbackPreparations.get())
+            assertEquals(replacements, fixture.queueReplacements.get())
             assertEquals(expectedQueue, upcomingOccurrences())
             assertPlayingTransition(beforeExpansion, fixture, "player collapse must not refocus Search")
             screenshot("$evidencePrefix-search-after-player-collapse")
@@ -1647,9 +1663,9 @@ class NativeUiSmokeTest {
         }
     }
     private fun assertNoAutoplayOnBrowse(fixture: UiFixtureServer) {
-        assertEquals("Browsing must not prepare a playback queue", 0, fixture.playbackPreparations.get())
+        assertEquals("Browsing must not replace a playback queue", 0, fixture.queueReplacements.get())
         assertEquals("Browsing and liking must not request audio", 0, fixture.audioRequests.get())
-        assertEquals("Browsing must not report audible history", 0, fixture.historyWrites.get())
+        assertEquals("Browsing must not qualify synthetic listening history", 0, fixture.qualifiedHistoryEvents.get())
     }
     private fun assertPlayerPresentation() {
         val viewport = compose.onNode(playerSheet).assertIsDisplayed().fetchSemanticsNode()
@@ -1725,15 +1741,24 @@ class NativeUiSmokeTest {
         }
         val before = capturePlaying(fixture)
         val addedCount = 30
-        compose.runOnIdle {
-            val model = ViewModelProvider(compose.activity)[LibraryViewModel::class.java]
-            val state = model.playback.state.value
-            val queuedTrack = state.upcoming.first().item.copy(entryId = null)
-            val finalTrack = checkNotNull(state.item).copy(entryId = null)
-            model.playback.enqueue(List(addedCount - 1) { queuedTrack } + finalTrack,
-                checkNotNull(model.graph.client))
+        val temporaryItems = compose.runOnIdle {
+            val state = ViewModelProvider(compose.activity)[LibraryViewModel::class.java].playback.state.value
+            val queuedTrack = state.upcoming.first().item
+            val finalTrack = checkNotNull(state.item)
+            List(addedCount - 1) { queuedTrack } + finalTrack
         }
-        compose.waitUntil(10_000) { upcomingOccurrences().size == original.size + addedCount }
+        temporaryItems.forEachIndexed { index, item ->
+            compose.runOnIdle {
+                val model = ViewModelProvider(compose.activity)[LibraryViewModel::class.java]
+                val state = model.playback.state.value
+                model.playback.queueIntent(
+                    dev.spofify.mobile.core.LibraryPlaybackSelection.Track(dev.spofify.mobile.core.LibraryPlaybackTrackRef(item.id)),
+                    checkNotNull(model.graph.client), dev.spofify.mobile.playback.PlaybackListAction.QUEUE_LOW,
+                    state.interactionKey, state.queueIntentBinding, onResult = {})
+            }
+            // Each command retains its own published revision; never refresh a held batch's binding.
+            compose.waitUntil(10_000) { upcomingOccurrences().size == original.size + index + 1 }
+        }
         val overflowing = upcomingOccurrences()
         val originalIds = original.map { it.id }.toSet()
         assertEquals("Enqueue preserves original upcoming identities and relative order", original,
@@ -1745,9 +1770,12 @@ class NativeUiSmokeTest {
             overflowing.count { it.title == overflowing.last().title })
         assertPlayingTransition(before, fixture, "temporary overflow enqueue without preparation")
         assertReleasedQueueBottomStable(overflowing, fixture, evidenceName)
-        compose.runOnIdle {
-            val controls = ViewModelProvider(compose.activity)[LibraryViewModel::class.java].playback
-            added.forEach { controls.removeUpcoming(it.id) }
+        added.forEach { entry ->
+            compose.runOnIdle {
+                val controls = ViewModelProvider(compose.activity)[LibraryViewModel::class.java].playback
+                controls.removeUpcoming(checkNotNull(controls.state.value.interactionKey), entry.id) { true }
+            }
+            compose.waitUntil(10_000) { upcomingOccurrences().none { it.id == entry.id } }
         }
         compose.waitUntil(10_000) { upcomingOccurrences() == original }
         assertQueueSnapshot(original)
@@ -1815,7 +1843,7 @@ class NativeUiSmokeTest {
             }
             progress += positionMs()
             assertEquals("Exact occurrence order survives progress frames", expected, upcomingOccurrences())
-            assertEquals("Bottom scrolling must not prepare playback", before.preparations, fixture.playbackPreparations.get())
+            assertEquals("Bottom scrolling must not replace playback", before.replacements, fixture.queueReplacements.get())
         }
         assertTrue("Observe repeated real playback progress updates, not a frozen frame", progress.size >= 3)
         assertPlayingTransition(before, fixture, "released queue bottom stability")
@@ -1880,7 +1908,7 @@ class NativeUiSmokeTest {
 
     private data class PlaybackWitness(
         val positionMs: Float, val durationMs: Float, val sampledAtMs: Long,
-        val track: String, val occurrenceId: String, val preparations: Int,
+        val track: String, val occurrenceId: String, val replacements: Int,
     )
     private fun activePlayingButton() = if (exists(playerSheet)) playingButton() and inPlayerSheet() else playingButton()
     private fun readPlaybackWitness(fixture: UiFixtureServer): PlaybackWitness {
@@ -1908,7 +1936,7 @@ class NativeUiSmokeTest {
         }
         assertEquals("Actual duration must agree with synthetic metadata/WAV", UiFixtureServer.AUDIO_DURATION_MS.toFloat(), duration, 1f)
         assertTrue("Fixture must not naturally finish during this journey", position + 90_000f < duration)
-        return PlaybackWitness(position, duration, sampledAt, track, occurrenceId, fixture.playbackPreparations.get())
+        return PlaybackWitness(position, duration, sampledAt, track, occurrenceId, fixture.queueReplacements.get())
     }
     private fun capturePlaying(fixture: UiFixtureServer): PlaybackWitness {
         waitFor(activePlayingButton())
@@ -1918,7 +1946,7 @@ class NativeUiSmokeTest {
         assertEquals("$label must retain the audible track", before.track, after.track)
         assertEquals("$label must retain the exact prepared occurrence", before.occurrenceId, after.occurrenceId)
         assertEquals("$label must retain duration", before.durationMs, after.durationMs, 1f)
-        assertEquals("$label must not prepare another queue", before.preparations, after.preparations)
+        assertEquals("$label must not replace the queue", before.replacements, after.replacements)
         val elapsed = (after.sampledAtMs - before.sampledAtMs).toFloat()
         val expected = before.positionMs + elapsed
         // Media3 publishes on a UI polling cadence. Two seconds covers that sampling lag, not
@@ -1943,7 +1971,7 @@ class NativeUiSmokeTest {
         assertEquals(before.track, after.track)
         assertEquals("Paused transition must retain the exact prepared occurrence", before.occurrenceId, after.occurrenceId)
         assertEquals(before.durationMs, after.durationMs, 1f)
-        assertEquals("Paused collapse must not prepare another queue", before.preparations, after.preparations)
+        assertEquals("Paused collapse must not replace the queue", before.replacements, after.replacements)
         assertEquals("Paused collapse must preserve position", before.positionMs, after.positionMs, 1_000f)
     }
     private fun assertQueuePreservedFromMini(expected: List<QueueOccurrence>, fixture: UiFixtureServer) {

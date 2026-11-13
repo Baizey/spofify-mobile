@@ -128,121 +128,6 @@ class DerivedPlaylistsApiTest {
         assertEquals(2, web.requestCount)
     }
 
-    @Test fun fencedPlaybackPreservesBothDuplicateOccurrencesAndExactStart() = runBlocking {
-        authenticate()
-        val initial = client.personalRevision.value
-        web.enqueue(jsonResponse(playbackBody("[${flatTrack("occ-1", "token-1")},${flatTrack("occ-2", "token-2")}]", 2, "occ-2")
-            .replace("\"limit\":2", "\"limit\":1000")))
-        val result = api.playback("rules", 5, "f1_fence", "signed-click")
-        val request = web.takeRequest()
-        assertEquals("POST", request.method)
-        assertEquals("/api/me/playlists/rules/playback", request.path)
-        val payload = objectOf(request.body.readUtf8())
-        assertEquals(setOf("expectedRevision", "fence", "selectionToken"), payload.keys)
-        assertEquals("signed-click", payload["selectionToken"]!!.jsonPrimitive.content)
-        assertEquals(listOf("same", "same"), result.items.map { it.id })
-        assertEquals(listOf("occ-1", "occ-2"), result.queue.items.map { it.entryId })
-        assertEquals(1, result.startIndex)
-        assertEquals("occ-2", result.startOccurrenceId)
-        assertEquals("token-2", result.selectionTokens["occ-2"])
-        assertEquals("derived", result.context.kind)
-        assertEquals(5L, result.context.revision)
-        assertEquals("f1_fence", result.context.fence)
-        assertEquals(LibraryPlaybackContext("derived", "rules", "Rules"), result.queue.context)
-        assertEquals(5L, result.queue.revision)
-        assertEquals(result.queue, result.toPlaybackQueue())
-        val prepared = requireNotNull(result.queue.preparedState)
-        val authority = requireNotNull(result.queue.selectionAuthority)
-        assertTrue(authority.isValidFor(client, prepared))
-        assertEquals("signed-click", authority.selectionTokenFor(client, prepared))
-        assertFalse(result.toString().contains("token-"))
-        assertFalse(result.toString().contains("signed-click"))
-        assertFalse(result.toString().contains("selectionTokens"))
-        val expectedContext = PlaybackContext("derived", "rules", "Rules", 5, "f1_fence")
-        assertEquals(expectedContext, prepared.context)
-        assertEquals(1, prepared.position)
-        assertEquals(listOf("same", "same"), prepared.queue.map { it.id })
-        assertEquals(listOf("occ-1", "occ-2"), prepared.queue.map { it.occurrenceId })
-        assertEquals(listOf("rules", "rules"), prepared.queue.map { it.targetId })
-        assertEquals(listOf(expectedContext, expectedContext), prepared.queue.map { it.playbackContext })
-        assertEquals(listOf(1L, 2L), prepared.queue.map { it.key })
-        assertEquals(listOf(0L, 1L), prepared.queue.map { it.order })
-        assertTrue(prepared.queue.all { it.entryId.isEmpty() })
-        assertFalse(prepared.playing)
-        assertFalse(prepared.waiting)
-        assertFalse(prepared.loading)
-        assertNull(prepared.occurrence)
-        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
-        assertFalse(prepared.toJson().toString().contains("selectionToken"))
-        assertFalse(prepared.toJson().toString().contains("token-"))
-        assertFalse(prepared.toJson().toString().contains("signed-click"))
-        assertEquals(initial, client.personalRevision.value)
-    }
-
-    @Test fun clickedOnlyLegacyFallbackRejectsInsteadOfPreparingPartialContext() = runBlocking {
-        val occurrence = "o1_" + "x".repeat(1024) // Body identity is not restricted to the 128-byte URL-ID bound.
-        web.enqueue(jsonResponse(playbackBody("[${flatTrack(occurrence, "signed-token")}]", 5_000_000_000L, occurrence, "CLICKED_OCCURRENCE_ONLY")))
-        assertEquals(200, apiFailure { api.playback("rules", 5, "f1_fence", "signed-selection") }.status)
-        assertEquals(1, web.requestCount)
-    }
-
-    @Test fun preparedQueueProjectsOnlyPositiveMusicalFieldsAndCompleteContext() = runBlocking {
-        val item = flatTrack("occ-1", "returned-selection").dropLast(1) +
-            ""","artists":[{"id":"artist-id","name":"Artist"}],"albumId":"album-id","albumName":"Album","durationMs":123456,"libraryPath":"/private/catalog/song.flac","unknownPrivateField":"hidden"}"""
-        web.enqueue(jsonResponse(playbackBody("[$item]", 1, "occ-1")))
-        val queue = api.playback("rules", 5, "f1_fence").toPlaybackQueue()
-        val prepared = requireNotNull(queue.preparedState)
-        val selected = prepared.queue.single()
-        assertEquals(listOf(PlaybackArtist("artist-id", "Artist")), selected.artists)
-        assertEquals("album-id", selected.albumId)
-        assertEquals("Album", selected.albumName)
-        assertEquals(123.456, selected.duration, 0.0)
-        assertEquals(123.456, prepared.duration, 0.0)
-        assertEquals(0.0, prepared.elapsed, 0.0)
-        assertEquals("", prepared.notice)
-        assertFalse(prepared.truncated)
-        assertEquals(1, queue.total)
-        assertEquals(1, queue.limit)
-        assertFalse(queue.items.single().libraryPath.isNullOrEmpty()) // Existing callback data stays unchanged.
-        val wire = prepared.toJson().toString()
-        listOf("libraryPath", "/private", "unknownPrivateField", "hidden", "selectionToken", "returned-selection", "hasAudio").forEach {
-            assertFalse("Unexpected private field in prepared wire data", wire.contains(it))
-        }
-        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
-        assertEquals(1, web.requestCount)
-    }
-
-    @Test fun complete1001DerivedDuplicatesRetainLastSelectionAndRejectPartialAndWrongLimit() = runBlocking {
-        val items = (0..1000).joinToString(",", "[", "]") { flatTrack("occ-$it", "token-$it") }
-        val body = playbackBody(items, 1001, "occ-1000")
-        web.enqueue(jsonResponse(body))
-        val loaded = api.playback("rules", 5, "f1_fence", "signed-click")
-        assertEquals(1001, loaded.queue.items.size)
-        assertEquals(1000, loaded.queue.preparedState!!.position)
-        assertEquals((0..1000).map { "occ-$it" }, loaded.queue.preparedState!!.queue.map { it.occurrenceId })
-        for (invalid in listOf(body.replace("\"limit\":1001", "\"limit\":1000"),
-            body.replace("\"total\":1001", "\"total\":5000"), body.replace("\"truncated\":false", "\"truncated\":true"))) {
-            web.enqueue(jsonResponse(invalid))
-            assertEquals(200, apiFailure { api.playback("rules", 5, "f1_fence") }.status)
-        }
-        assertEquals(4, web.requestCount)
-    }
-
-    @Test fun emptyPreparedQueueRetainsContextWithoutInventingASelection() = runBlocking {
-        web.enqueue(jsonResponse(playbackBody("[]", 0, "unused").replace("\"startOccurrenceId\":\"unused\"", "\"startOccurrenceId\":null")))
-        val result = api.playback("rules", 5, "f1_fence")
-        val queue = result.toPlaybackQueue()
-        val prepared = requireNotNull(queue.preparedState)
-        assertTrue(queue.items.isEmpty())
-        assertTrue(prepared.queue.isEmpty())
-        assertEquals(-1, prepared.position)
-        assertNull(result.startIndex)
-        assertEquals(PlaybackContext("derived", "rules", "Rules", 5, "f1_fence"), prepared.context)
-        assertNull(prepared.occurrence)
-        assertEquals(prepared, PlaybackSnapshot.fromJson(prepared.toJson()))
-        assertEquals(1, web.requestCount)
-    }
-
     @Test fun copySendsFenceAndMetadataAndCreatesManualSummaryWithoutConversion() = runBlocking {
         authenticate()
         val initial = client.personalRevision.value
@@ -283,13 +168,10 @@ class DerivedPlaylistsApiTest {
             assertFalse(error.message.contains("private"))
             assertEquals("/api/me/playlists/rules/evaluation", web.takeRequest().requestUrl!!.encodedPath)
         }
-        web.enqueue(jsonResponse("""{"error":{"code":"STALE_EVALUATION","message":"unsafe"}}""", 409))
-        assertEquals(409, apiFailure { api.playback("rules", 5, "f1_fence", "signed-selection") }.status)
-        assertEquals("POST", web.takeRequest().method)
         web.enqueue(jsonResponse("""{"error":{"code":"COPY_LIMIT_EXCEEDED","message":"unsafe"}}""", 422))
         assertEquals("COPY_LIMIT_EXCEEDED", apiFailure { api.copy("rules", "Copy", expectedRevision = 5, fence = "f1_fence") }.code)
         web.takeRequest()
-        assertEquals(6, web.requestCount)
+        assertEquals(5, web.requestCount)
         assertEquals(initial, client.personalRevision.value)
     }
 
@@ -312,9 +194,6 @@ class DerivedPlaylistsApiTest {
     private fun page(cursor: String? = null, preview: Boolean = false): String =
         """{"items":[{"occurrenceId":"occ-2","selectionToken":${if (preview) "null" else "\"signed-selection\""},"position":1000001,"track":${track()}}],"total":5000000000,"availableTotal":4000000000,"limit":2,"nextCursor":${cursor?.let { ApiJson.encodeToString(kotlinx.serialization.serializer<String>(), it) } ?: "null"},"revision":5,"fence":"f1_fence","complete":true}"""
     private fun track() = """{"kind":"track","id":"same","name":"Song","hasAudio":true}"""
-    private fun flatTrack(occurrence: String, token: String) = track().dropLast(1) + ""","occurrenceId":"$occurrence","selectionToken":"$token"}"""
-    private fun playbackBody(items: String, total: Long, start: String, notice: String? = null) =
-        """{"context":{"kind":"derived","id":"rules","name":"Rules","revision":5,"fence":"f1_fence"},"items":$items,"total":$total,"limit":${objectOf("{\"items\":$items}").getValue("items").jsonArray.size},"truncated":${total != objectOf("{\"items\":$items}").getValue("items").jsonArray.size.toLong() || notice != null},"revision":5,"fence":"f1_fence","startOccurrenceId":"$start","notice":${notice?.let { "\"$it\"" } ?: "null"}}"""
     private fun summary(derived: Boolean) =
         """{"id":"${if (derived) "rules" else "copy"}","name":"Rules","description":"","kind":"${if (derived) "derived" else "manual"}","countState":"${if (derived) "unevaluated" else "exact"}","trackCount":${if (derived) "null" else "2"},"availableCount":${if (derived) "null" else "2"},"revision":5,"capabilities":{"editMetadata":true,"editEntries":${!derived},"editDefinition":$derived,"play":true,"copyToManual":$derived,"delete":true,"addTracks":${!derived}}}"""
     private fun objectOf(text: String) = ApiJson.parseToJsonElement(text) as JsonObject

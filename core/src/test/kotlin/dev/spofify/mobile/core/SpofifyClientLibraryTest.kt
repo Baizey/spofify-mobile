@@ -89,52 +89,13 @@ class SpofifyClientLibraryTest {
         assertEquals("/api/me/recent?limit=40", web.takeRequest().path)
     }
 
-    @Test fun playbackEndpointsAndStandaloneTrackBehavior() = runBlocking {
-        val queue = """{"context":{"kind":"album","id":"a"},"items":[$track],"total":1,"limit":1000,"truncated":false,"revision":1}"""
-        web.enqueue(jsonResponse(queue))
-        val album = LibraryItem("album", "album/a%", "Album")
-        val prepared = client.playback(album)
-        assertEquals("t1", prepared.items.single().id)
-        assertFalse(prepared.truncated)
-        assertEquals(1, prepared.total)
-        assertEquals("/api/library/albums/album%2Fa%25/playback", web.takeRequest().path)
-        web.enqueue(jsonResponse(queue))
-        client.playback(LibraryItem("track", "t1", "Song", albumId = "parent/album"))
-        assertEquals("/api/library/albums/parent%2Falbum/playback", web.takeRequest().path)
-        web.enqueue(jsonResponse(queue))
-        client.playback(LibraryItem("artist", "artist/id", "Artist"))
-        assertEquals("/api/library/artists/artist%2Fid/playback", web.takeRequest().path)
-        val standalone = LibraryItem("track", "standalone", "Song", hasAudio = true)
-        assertEquals(listOf(standalone), client.playback(standalone).items)
-        assertTrue(client.playback(standalone.copy(hasAudio = false)).items.isEmpty())
-        assertEquals(3, web.requestCount)
-    }
-
-    @Test fun personalPlaybackUsesAlreadyFlattenedGoItems() = runBlocking {
-        val body = """{"items":[${track.dropLast(1)},"entryId":"e1"}],"total":1,"limit":1,"truncated":false}"""
-        web.enqueue(jsonResponse(body))
-        val queueItem = client.playlistPlayback("playlist/1").items.single()
-        assertEquals("t1", queueItem.id)
-        assertEquals("e1", queueItem.entryId)
-        assertEquals("/api/me/playlists/playlist%2F1/playback", web.takeRequest().path)
-        web.enqueue(jsonResponse(body))
-        assertEquals("t1", client.likedPlayback().items.single().id)
-        assertEquals("/api/me/likes/playback", web.takeRequest().path)
-    }
-
-    @Test fun likeStatusIsJsonPostNotTokenizedUrlAndHistoryUsesEventId() = runBlocking {
+    @Test fun likeStatusIsJsonPostNotTokenizedUrl() = runBlocking {
         web.enqueue(jsonResponse("""{"items":[{"trackId":"track/id%","liked":true}]}"""))
         assertTrue(client.likeStatus("track/id%"))
         val status = web.takeRequest()
         assertEquals("POST", status.method)
         assertEquals("/api/me/likes/status", status.path)
         assertEquals("""{"trackIds":["track/id%"]}""", status.body.readUtf8())
-        web.enqueue(jsonResponse("", 204))
-        client.recordHistory("event-unique", "track/id%")
-        val history = web.takeRequest()
-        assertEquals("POST", history.method)
-        assertEquals("/api/me/history", history.path)
-        assertEquals("""{"eventId":"event-unique","trackId":"track/id%"}""", history.body.readUtf8())
     }
 
     @Test fun mediaUrlsUseOnlySafeRoutesNeverFilesystemPaths() {

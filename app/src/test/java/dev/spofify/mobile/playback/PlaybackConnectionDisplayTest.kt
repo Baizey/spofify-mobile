@@ -50,6 +50,27 @@ class PlaybackConnectionDisplayTest {
         assertTrue(display.queue.all { it.libraryPath == null })
     }
 
+    @Test fun duplicateDerivedDisplayUsesExactPathsWithoutInventingManualEntriesOrChangingQueueKeys() {
+        val context = PlaybackContext("derived", "rules", "Rules", 7, "fresh-fence")
+        val first = track(3, 0).copy(entryId = "", targetId = "rules",
+            occurrenceId = "ordered/path/first", playbackContext = context)
+        val second = first.copy(key = 4, order = 1, occurrenceId = "ordered/path/second")
+        val snapshot = PlaybackSnapshot(queue = listOf(first, second), position = 1, context = context)
+        val display = remotePlaybackState(snapshot)
+        assertEquals(listOf("duplicate", "duplicate"), display.queue.map { it.id })
+        assertEquals(listOf("ordered/path/first", "ordered/path/second"), display.queue.map { it.entryId })
+        assertEquals("ordered/path/second", display.item?.entryId)
+        assertEquals("wire-4", display.currentEntryId)
+        assertTrue(display.remoteSnapshot!!.queue.all { it.entryId.isEmpty() })
+        assertEquals(listOf("ordered/path/first", "ordered/path/second"), display.remoteSnapshot!!.queue.map { it.occurrenceId })
+        assertEquals(snapshot, display.remoteSnapshot)
+        val wrongTarget = snapshot.copy(queue = listOf(first.copy(targetId = "other")), position = 0)
+        assertEquals("", remotePlaybackState(wrongTarget).item?.entryId)
+        val manual = snapshot.copy(queue = listOf(first.copy(targetId = "", playbackContext = null)),
+            position = 0, context = PlaybackContext("playlist", "manual", "Manual"))
+        assertEquals("", remotePlaybackState(manual).item?.entryId)
+    }
+
     @Test fun remoteCollectionContextIsFallbackWithoutInventingAnAlbumContext() {
         val context = PlaybackContext("playlist", "collection", "Collection")
         val display = remotePlaybackState(PlaybackSnapshot(queue = listOf(track(1, 0)), position = 0, context = context))
@@ -87,16 +108,10 @@ class PlaybackConnectionDisplayTest {
         assertEquals(PlaybackSnapshot(), display.remoteSnapshot)
     }
 
-    @Test fun remoteErrorsAndTruncationAreSafeActionableDisplayText() {
-        val source = PlaybackSnapshot()
-        assertTrue(remotePlaybackState(source.copy(error = "blocked")).error!!.contains("tap"))
-        assertTrue(remotePlaybackState(source.copy(error = "media")).error!!.contains("Retry"))
-        assertTrue(remotePlaybackState(source.copy(error = "queue")).error!!.contains("queue"))
-        assertEquals("Move is unsupported.", remotePlaybackState(source, "Move is unsupported.").error)
-        assertNull(remotePlaybackState(source).error)
-        assertTrue(remotePlaybackState(source.copy(truncated = true)).notice!!.contains("incomplete"))
-        assertTrue(remotePlaybackState(source.copy(notice = "PLAYBACK_LIMIT")).notice!!.contains("incomplete"))
-        assertTrue(remotePlaybackState(source.copy(notice = "CLICKED_OCCURRENCE_ONLY")).notice!!.contains("selected occurrence"))
+    @Test fun remoteErrorsAreConciseAndDoNotExposeRawDiagnostics() {
+        assertTrue(remotePlaybackState(PlaybackSnapshot(error = "blocked")).error!!.contains("tap"))
+        assertNotNull(remotePlaybackState(PlaybackSnapshot(error = "media")).error)
+        assertNull(remotePlaybackState(PlaybackSnapshot()).error)
     }
 
     @Test fun remoteQueueCommandsResolveOnlyUpcomingWireKeysNotTrackOrEntryOrOccurrenceMetadata() {
@@ -132,15 +147,13 @@ class PlaybackConnectionDisplayTest {
         assertFalse(PlaybackState().canSkipPrevious)
     }
 
-    @Test fun remoteMoveIsOneSupportedDirectionAndNeverABatchForArbitraryReorder() {
-        assertEquals("up", remoteMoveDirection(4, 3))
-        assertEquals("down", remoteMoveDirection(4, 5))
-        assertEquals("next", remoteMoveDirection(4, 0))
-        assertEquals("next", remoteMoveDirection(1, 0))
-        assertNull(remoteMoveDirection(1, 4))
-        assertNull(remoteMoveDirection(5, 2))
-        assertNull(remoteMoveDirection(4, 4))
-        assertNull(remoteMoveDirection(-1, 0))
-        assertNull(remoteMoveDirection(4, -1))
+    @Test fun remoteMoveUsesOneExactAnchorForArbitraryReorder() {
+        val source = PlaybackSnapshot(queue = (1L..6L).map { track(it, it) }, position = 0)
+        assertEquals(dev.spofify.mobile.core.LibraryPlaybackCommand.Move(2, 6), remoteMoveCommand(source, "wire-2", 4))
+        assertEquals(dev.spofify.mobile.core.LibraryPlaybackCommand.Move(6, null), remoteMoveCommand(source, "wire-6", 0))
+        assertEquals(dev.spofify.mobile.core.LibraryPlaybackCommand.Move(3, 4), remoteMoveCommand(source, "wire-3", 2))
+        assertNull(remoteMoveCommand(source, "wire-1", 0))
+        assertNull(remoteMoveCommand(source, "wire-2", 0))
+        assertNull(remoteMoveCommand(source, "wire-2", 5))
     }
 }

@@ -15,8 +15,6 @@ class PlaybackAdditiveTransition internal constructor(
     internal val before: PlaybackInteractionKey,
     internal val after: PlaybackInteractionKey,
     internal val committedThrough: Long,
-    val beforeBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
-    val afterBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
 )
 
 /** Process-local ordering only; never persisted or used as output/server authority. */
@@ -31,11 +29,20 @@ data class PlaybackActionResult(
     val status: PlaybackActionStatus,
     val acceptedCount: Int = 0,
     val additiveTransition: PlaybackAdditiveTransition? = null,
-    val queueIntentResult: dev.spofify.mobile.core.QueueIntentResult? = null,
     val requestedAction: PlaybackListAction? = null,
+    val serverResult: dev.spofify.mobile.core.LibraryPlaybackResult? = null,
 ) {
     val userMessage: String get() {
-        queueIntentResult?.let { return queueIntentMessage(it, requestedAction) }
+        serverResult?.let { result ->
+            return when {
+                result.outcome == "accepted" && result.execution == "blocked" -> "Playback needs a tap on the selected device."
+                result.outcome == "accepted" && result.execution == "media" -> "The selected device could not play this selection."
+                result.outcome == "accepted" -> if (requestedAction == PlaybackListAction.PLAY_NOW) "Selection accepted" else if (result.acceptedCount == 1) "Track queued" else "${result.acceptedCount} tracks queued"
+                result.code in setOf("stale_state_version", "stale_revision", "superseded") -> "Playback changed. Choose again."
+                result.code == "capacity" -> "This queue is too large."
+                else -> "Playback unavailable."
+            }
+        }
         return when (status) {
         PlaybackActionStatus.PLAYING -> "Playing track"
         PlaybackActionStatus.ADDED -> if (acceptedCount > 1) "$acceptedCount tracks queued" else "Track queued"

@@ -19,7 +19,8 @@ import androidx.media3.common.VideoSize
 import androidx.media3.common.text.Cue
 import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
-import dev.spofify.mobile.core.PlaybackDeviceCommand
+import dev.spofify.mobile.core.LocalPlaybackCommand
+import dev.spofify.mobile.core.LibraryPlaybackCommand
 import dev.spofify.mobile.core.PlaybackSnapshot
 import java.util.IdentityHashMap
 
@@ -31,7 +32,7 @@ import java.util.IdentityHashMap
  * resolve a physical output index to that exact occurrence's wire key (or null if unavailable).
  * Never implement it as `snapshot().queue[index]` when the output uses a shuffle order.
  *
- * The protocol has no atomic jump-and-seek or arbitrary repeat setter. Unrepresentable requests
+ * The protocol has no atomic jump-and-seek. Absolute mode setters use typed server commands; unrepresentable requests
  * are ignored, not approximated with multiple commands against potentially changing authority.
  * Queue/speed edits are unsupported even if a stale controller still advertises their commands.
  * A non-null remote snapshot selects an in-memory, metadata-only view, even for an empty queue.
@@ -40,7 +41,7 @@ import java.util.IdentityHashMap
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class CoordinatedSessionPlayer(
     private val output: Player,
-    private val dispatch: (PlaybackDeviceCommand) -> Unit,
+    private val dispatch: (LocalPlaybackCommand) -> Unit,
     private val snapshot: () -> PlaybackSnapshot,
     private val keyAtMediaItemIndex: (Int) -> Long?,
 ) : ForwardingPlayer(output) {
@@ -50,6 +51,10 @@ internal class CoordinatedSessionPlayer(
         ?: sessionCommands(output.availableCommands)
 
     private var remoteSnapshotProvider: () -> PlaybackSnapshot? = { null }
+    private var modeDispatcher: (LibraryPlaybackCommand) -> Unit = {}
+
+    /** Same-process service ingress, still guarded by the normal controller admission. */
+    fun setModeDispatcher(dispatch: (LibraryPlaybackCommand) -> Unit) { modeDispatcher = dispatch }
     private var cachedRemote: RemoteSessionView? = null
     private var cachedRemoteSource: PlaybackSnapshot? = null
 
@@ -437,7 +442,8 @@ internal class CoordinatedSessionPlayer(
     override fun setShuffleModeEnabled(shuffleModeEnabled: Boolean) {
         val view = remoteView()
         if (view != null && view.currentIndex == C.INDEX_UNSET) return
-        if (shuffleModeEnabled != (view?.snapshot ?: snapshot()).shuffle) transport("shuffle")
+        if (shuffleModeEnabled != (view?.snapshot ?: snapshot()).shuffle)
+            modeDispatcher(LibraryPlaybackCommand.SetShuffle(shuffleModeEnabled))
     }
 
     override fun setRepeatMode(repeatMode: Int) {
@@ -449,17 +455,12 @@ internal class CoordinatedSessionPlayer(
         }
         val view = remoteView()
         if (view != null && view.currentIndex == C.INDEX_UNSET) return
-        val next = when ((view?.snapshot ?: snapshot()).repeat) {
-            "off" -> "all"
-            "all" -> "one"
-            "one" -> "off"
-            else -> return
-        }
-        if (desired == next) transport("repeat")
+        if (desired != (view?.snapshot ?: snapshot()).repeat)
+            modeDispatcher(LibraryPlaybackCommand.SetRepeat(desired))
     }
 
-    private fun transport(type: String) = dispatch(PlaybackDeviceCommand.transport(type))
-    private fun jump(key: Long) = dispatch(PlaybackDeviceCommand.queue("jump", key))
+    private fun transport(type: String) = dispatch(LocalPlaybackCommand.transport(type))
+    private fun jump(key: Long) = dispatch(LocalPlaybackCommand.queue("jump", key))
 
     private fun resolvedKey(index: Int, state: PlaybackSnapshot): Long? {
         if (index < 0 || index >= output.mediaItemCount) return null
@@ -479,7 +480,7 @@ internal class CoordinatedSessionPlayer(
 
     private fun seekSeconds(seconds: Double) {
         if (seconds.isFinite() && seconds in 0.0..MAX_SEEK_SECONDS) {
-            dispatch(PlaybackDeviceCommand.seek(seconds))
+            dispatch(LocalPlaybackCommand.seek(seconds))
         }
     }
 

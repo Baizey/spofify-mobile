@@ -1,5 +1,7 @@
 package dev.spofify.mobile.feature.player
 
+import dev.spofify.mobile.core.LibraryPlaybackSelection
+import dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding
 import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -540,6 +542,7 @@ class NativeUpcomingQueueTest {
             if (isCurrent()) removed += expectedKey to occurrenceId
         }
         val moves = mutableListOf<Pair<String, Int>>()
+        val moveKeys = mutableListOf<PlaybackInteractionKey>()
         val selected = mutableListOf<String>()
         val contextual = mutableListOf<String>()
         val contextualPredicates = mutableListOf<() -> Boolean>()
@@ -571,8 +574,12 @@ class NativeUpcomingQueueTest {
         }
         override fun connect() { playbackCalls++ }
         override fun release() { playbackCalls++ }
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?, shuffle: Boolean,
-            startEntryId: String?) { playbackCalls++ }
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: LibraryPlaybackActionBinding?,
+            shuffle: Boolean?, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            playbackCalls++
+            onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+        }
         override fun toggle() { playbackCalls++ }
         override fun next() { playbackCalls++ }
         override fun previous() { playbackCalls++ }
@@ -581,7 +588,12 @@ class NativeUpcomingQueueTest {
         override fun toggleShuffle() { playbackCalls++ }
         override fun cycleRepeat() { playbackCalls++ }
         override fun stop() { playbackCalls++ }
-        override fun moveUpcoming(occurrenceId: String, toIndex: Int) { moves += occurrenceId to toIndex }
+        override fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int,
+            isCurrent: () -> Boolean) {
+            if (!isCurrent()) return
+            moveKeys += expectedKey
+            moves += occurrenceId to toIndex
+        }
         override fun selectOccurrence(occurrenceId: String) { selected += occurrenceId }
         override fun undoQueueRemoval() { undos++ }
     }

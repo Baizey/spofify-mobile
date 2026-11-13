@@ -108,12 +108,12 @@ class PlaylistFilterHostTest {
     }
 
     private data class Host(val shown: MutableState<Boolean>, val memory: PlaylistBrowseMemory,
-        val accepted: MutableList<Pair<QueueIntentSelection, PlaybackListAction>>, val back: () -> Unit,
+        val accepted: MutableList<Pair<LibraryPlaybackSelection, PlaybackListAction>>, val back: () -> Unit,
         val height: MutableState<Dp>)
     private fun host(fixture: Fixture, projectionScheduler: TestCoroutineScheduler? = null, run: (Host) -> Unit) {
         val shown = mutableStateOf(true)
         val height = mutableStateOf(850.dp)
-        val accepted = mutableListOf<Pair<QueueIntentSelection, PlaybackListAction>>()
+        val accepted = mutableListOf<Pair<LibraryPlaybackSelection, PlaybackListAction>>()
         val memory = PlaylistBrowseMemory(projectionScheduler?.let { StandardTestDispatcher(it) } ?: kotlinx.coroutines.Dispatchers.Default)
         var dispatcher: OnBackPressedDispatcher? = null
         val key = PlaybackInteractionKey()
@@ -123,7 +123,7 @@ class PlaylistFilterHostTest {
             MaterialTheme(colorScheme = listeningColorScheme(), typography = AppTypography) {
                 Surface(Modifier.fillMaxWidth().height(height.value).testTag("filter-host")) {
                     if (shown.value) PlaylistsRoute(fixture.client,
-                        { fail("Filtering/song bodies must not navigate") }, { _, _, _ -> fail("No preparation during typing") }, {},
+                        { fail("Filtering/song bodies must not navigate") }, {},
                         initialPlaylistId = "fixture", browseMemory = memory,
                         artwork = { _, modifier -> Box(modifier) },
                         playback = CatalogPlaybackFeedback(interactionKey = key),
@@ -208,18 +208,18 @@ class PlaylistFilterHostTest {
             query("needle")
             capture(if (derived) "derived-matches" else "manual-matches")
             compose.onAllNodesWithText("Needle duplicate")[1].performClick()
-            val selected = host.accepted.single().first as QueueIntentSelection.Track
+            val selected = host.accepted.single().first as LibraryPlaybackSelection.Track
             assertEquals("fixture", selected.context!!.id)
             assertEquals(5L, selected.context!!.revision)
             assertEquals(if (derived) "derived" else "playlist", selected.context!!.kind)
             if (derived) {
-                assertEquals("path-39", selected.track.getValue("occurrenceId").jsonPrimitive.content)
-                assertEquals("signed-39", selected.track.getValue("selectionToken").jsonPrimitive.content)
+                assertEquals("path-39", selected.track.occurrenceId)
+                assertEquals("signed-39", selected.track.selectionToken)
                 assertEquals("fence", selected.context!!.fence)
-            } else assertEquals("entry-39", selected.track.getValue("entryId").jsonPrimitive.content)
+            } else assertEquals("entry-39", selected.track.entryId)
             assertEquals(PlaybackListAction.PLAY_NOW, host.accepted.single().second)
             compose.onNodeWithText("Play", substring = false).performScrollTo().performClick()
-            val header = host.accepted.last().first as QueueIntentSelection.Collection
+            val header = host.accepted.last().first as LibraryPlaybackSelection.Collection
             assertEquals(selected.context, header.context)
             assertEquals(1, fixture.requests().count { it.contains("/entries") })
         } }

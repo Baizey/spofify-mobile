@@ -35,9 +35,7 @@ data class CatalogPlaybackFeedback(
     val interactionKey: dev.spofify.mobile.playback.PlaybackInteractionKey? = null,
     val playWhenReady: Boolean = false,
     val onContextual: ((LibraryItem, dev.spofify.mobile.playback.PlaybackInteractionKey, () -> Boolean) -> Unit)? = null,
-    val queueIntentBinding: dev.spofify.mobile.core.QueueIntentBinding? = null,
-    val unselectedQueueOrigin: dev.spofify.mobile.playback.PlaybackQueueOrigin? = null,
-    val onUnselectedHigh: ((LibraryItem, dev.spofify.mobile.playback.PlaybackQueueOrigin, () -> Boolean) -> Unit)? = null,
+    val queueIntentBinding: dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding? = null,
     // Host captures its rendered transport key/binding; the callback retains the row's source lifetime.
     val onPlayNow: ((LibraryItem, () -> Boolean) -> Unit)? = null,
 ) {
@@ -110,16 +108,14 @@ fun MusicRow(
     val canPlay = playbackEnabled && item.playable
     val latestCanPlay by rememberUpdatedState(canPlay)
     val latestActionsEnabled by rememberUpdatedState(actionsEnabled)
-    val capture = playback.interactionKey ?: playback.unselectedQueueOrigin
+    val capture = playback.interactionKey
     val latestCapture by rememberUpdatedState(capture)
-    val contextualEnabled = canPlay && (playback.interactionKey != null && playback.onContextual != null ||
-        item.kind == "track" && playback.unselectedQueueOrigin != null && playback.onUnselectedHigh != null)
+    val contextualEnabled = canPlay && playback.interactionKey != null && playback.onContextual != null
     fun contextual(captured: Any, current: () -> Boolean) {
         if (!current()) return
         val admittedSource = sourceCurrent(current)
         when (captured) {
             is dev.spofify.mobile.playback.PlaybackInteractionKey -> playback.onContextual?.invoke(item, captured, admittedSource)
-            is dev.spofify.mobile.playback.PlaybackQueueOrigin -> playback.onUnselectedHigh?.invoke(item, captured, admittedSource)
         }
     }
     // Separate output admission from source lifetime so an admitted action can follow its

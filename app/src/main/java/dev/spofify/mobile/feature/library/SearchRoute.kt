@@ -226,10 +226,6 @@ internal fun CatalogScreenContent(
             val isCurrent = { sourceCurrent() && gestureCurrent() }
             if (isCurrent()) dispatch(item, playerKey, isCurrent)
         } },
-        onUnselectedHigh = playback.onUnselectedHigh?.let { dispatch -> { item, origin, gestureCurrent ->
-            val isCurrent = { sourceCurrent() && gestureCurrent() }
-            if (isCurrent()) dispatch(item, origin, isCurrent)
-        } },
     )
     BoxWithConstraints(modifier.fillMaxSize()) {
     val releaseColumns = artistReleaseColumns(

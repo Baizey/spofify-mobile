@@ -10,10 +10,10 @@ import dev.spofify.mobile.AppGraph
 import dev.spofify.mobile.LoginStore
 import dev.spofify.mobile.RememberedLogin
 import dev.spofify.mobile.SpofifyApplication
-import dev.spofify.mobile.core.PlaybackDevice
-import dev.spofify.mobile.core.PlaybackDevicesView
-import dev.spofify.mobile.core.PlaybackSnapshot
-import dev.spofify.mobile.core.PlaybackTrack
+import dev.spofify.mobile.core.LibraryPlaybackDevice
+import dev.spofify.mobile.core.LibraryPlaybackSnapshot
+import dev.spofify.mobile.core.LibraryPlaybackTrack
+import dev.spofify.mobile.core.LibraryPlaybackOccurrence
 import dev.spofify.mobile.core.ServerAddress
 import dev.spofify.mobile.core.SessionStore
 import dev.spofify.mobile.core.StoredSession
@@ -107,21 +107,28 @@ class RemoteNotificationIntentTest {
     private val session get() = serviceField("session") as MediaSession
     private val notifications get() = shadowOf(service.getSystemService(NotificationManager::class.java)).allNotifications
 
-    private fun remote() = PlaybackSnapshot(
-        queue = listOf(PlaybackTrack("remote-track", "Remote song", emptyList(), "Album", "album", 120.0, key = 7, order = 0)),
-        position = 0, playing = true,
-    ).validated()
+    private fun remote(): LibraryPlaybackSnapshot {
+        val base = testLibrarySnapshot(devices = listOf(
+            LibraryPlaybackDevice("phone", "Phone", true, true),
+            LibraryPlaybackDevice("speaker", "Speaker", true, true)), selected = "speaker", playing = true)
+        return base.copy(state = base.state.copy(
+            queue = listOf(LibraryPlaybackTrack("remote-track", "Remote song", emptyList(), "Album", "album",
+                120.0, key = 7, order = 0, intent = "now")), position = 0, desiredPlaying = true,
+            occurrence = LibraryPlaybackOccurrence(7, "remote-track", "event", 0.0, false)),
+            playback = base.playback.copy(eventId = "event"))
+    }
 
-    private fun update(snapshot: PlaybackSnapshot) {
+    private fun LibraryPlaybackSnapshot.facts(playing: Boolean = playback.isPlaying,
+        waiting: Boolean = false, loading: Boolean = false, error: String = "") = copy(
+        playback = playback.copy(isPlaying = playing, isBuffering = waiting, isLoading = loading, error = error))
+
+    private fun update(snapshot: LibraryPlaybackSnapshot) {
         // Fixture-only display publication into the real, dormant coordinator. No authority,
         // service/player field or production seam is changed. Bypassing wire admission also
         // lets the defensive invalid-current cases reach the actual notification callback;
         // those cases deliberately do not exercise the validating session projection/tick.
-        display.value = PlaybackDevicesState(deviceId = "phone", connected = true, view = PlaybackDevicesView(
-            deviceId = "phone", devices = listOf(PlaybackDevice("phone", "Phone", true), PlaybackDevice("speaker", "Speaker", true)),
-            activeDeviceId = "speaker", epoch = 1, leaseMs = 8000, state = snapshot,
-            stateSeq = 1, stateAgeMs = 0, transfer = null, directives = emptyList(), commands = emptyList(),
-        ))
+        display.value = PlaybackDevicesState(deviceId = "phone", connectionId = "socket-phone",
+            connected = true, snapshot = snapshot)
         // Even Media3 requesting foreground must remain a metadata/action refresh remotely.
         assertNull(service.onUpdateNotificationAsync(session, startInForegroundRequired = true).get(1, TimeUnit.SECONDS))
         assertFalse((serviceField("foreground") as PlaybackForegroundNotification).foregroundConfirmed)
@@ -147,11 +154,11 @@ class RemoteNotificationIntentTest {
     }
 
     @Test fun erroredRemotePlayingReplacesPauseWithResumeAndClearsOngoing() {
-        for (error in listOf("blocked", "media", "queue")) {
+        for (error in listOf("blocked", "media")) {
             update(remote())
             assertNotification(activeIntent = true)
             for (buffering in listOf(false, true)) {
-                update(remote().copy(error = error, waiting = buffering, loading = buffering))
+                update(remote().facts(error = error, waiting = buffering, loading = buffering))
                 assertNotification(activeIntent = false)
             }
         }
@@ -159,15 +166,16 @@ class RemoteNotificationIntentTest {
 
     @Test fun validBufferingTowardRemotePlaybackRetainsPauseAndOngoing() {
         for ((waiting, loading) in listOf(true to false, false to true, true to true)) {
-            update(remote().copy(waiting = waiting, loading = loading))
+            update(remote().facts(waiting = waiting, loading = loading))
             assertNotification(activeIntent = true)
         }
     }
 
     @Test fun emptyOrInvalidRemoteCurrentRemovesStalePlayingNotification() {
         val snapshot = remote()
-        for (absent in listOf(PlaybackSnapshot(playing = true, loading = true),
-            snapshot.copy(position = -1), snapshot.copy(position = snapshot.queue.size))) {
+        for (absent in listOf(testLibrarySnapshot(playing = true),
+            snapshot.copy(state = snapshot.state.copy(position = -1)),
+            snapshot.copy(state = snapshot.state.copy(position = snapshot.state.queue.size)))) {
             update(snapshot)
             assertNotification(activeIntent = true)
             update(absent)
@@ -179,7 +187,7 @@ class RemoteNotificationIntentTest {
         update(remote())
         assertNotification(activeIntent = true)
         for (buffering in listOf(false, true)) {
-            update(remote().copy(playing = false, waiting = buffering, loading = buffering))
+            update(remote().facts(playing = false, waiting = buffering, loading = buffering))
             assertNotification(activeIntent = false)
         }
     }

@@ -83,10 +83,10 @@ class MaintainedPlaylistRouteTest {
         awaitText("Unlike song")
         compose.onNodeWithText("Queue").performScrollTo().assertIsEnabled().performClick()
         compose.runOnIdle {
-            val selected = f.actions.last().selection as QueueIntentSelection.Track
+            val selected = f.actions.last().selection as LibraryPlaybackSelection.Track
             assertEquals("fence-1", selected.context?.fence)
-            assertEquals("selection-1", selected.track["selectionToken"]?.jsonPrimitive?.content)
-            assertEquals("occ-1", selected.track["occurrenceId"]?.jsonPrimitive?.content)
+            assertEquals("selection-1", selected.track.selectionToken)
+            assertEquals("occ-1", selected.track.occurrenceId)
             assertEquals(PlaybackListAction.QUEUE_HIGH, f.actions.last().action)
         }
         assertEquals(1, f.likes.get())
@@ -278,7 +278,7 @@ class MaintainedPlaylistRouteTest {
     private fun awaitText(text: String) {
         compose.waitUntil(5_000) { compose.waitForIdle(); compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty() }
     }
-    private data class Action(val selection: QueueIntentSelection, val action: PlaybackListAction, val current: () -> Boolean)
+    private data class Action(val selection: LibraryPlaybackSelection, val action: PlaybackListAction, val current: () -> Boolean)
 
     private inner class Fixture(val web: MockWebServer) {
         val entries = AtomicInteger()
@@ -353,7 +353,7 @@ class MaintainedPlaylistRouteTest {
             try {
                 runBlocking { f.client.login("listener", "synthetic") }
                 compose.setContent { MaterialTheme {
-                    if (f.shown.value) PlaylistsRoute(f.client, onOpenTrack = {}, onPlayQueue = { _, _, _ -> fail("Passive queue replacement") },
+                    if (f.shown.value) PlaylistsRoute(f.client, onOpenTrack = {},
                         onShowTrackActions = {}, initialPlaylistId = "rules",
                         onQueueIntent = { selection, action, _, _, current -> f.actions += Action(selection, action, current) })
                 } }

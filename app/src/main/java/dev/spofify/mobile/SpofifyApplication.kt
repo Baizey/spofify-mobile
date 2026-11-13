@@ -22,14 +22,11 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import dev.spofify.mobile.playback.PlaybackService
 import dev.spofify.mobile.playback.Media3PlaybackEndpoint
-import dev.spofify.mobile.core.PlaybackDevicesApi
 import dev.spofify.mobile.feature.devices.PlaybackCoordinator
-import dev.spofify.mobile.feature.devices.PlaybackRegistrationPacing
 import dev.spofify.mobile.feature.devices.PlaybackDeviceIdentityStore
 import dev.spofify.mobile.playback.PlaybackRequests
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -116,9 +113,6 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     var playbackCoordinator: PlaybackCoordinator? = null
         private set
     private var coordinationScope: CoroutineScope? = null
-    private var retiringDisposal: Job? = null
-    // Process-local rate limit only; never persistent device/session authority.
-    private val registrationPacing = PlaybackRegistrationPacing()
 
     // SessionStoreOwner checks the lease BEFORE reaching this delegate. A stale client
     // cannot tombstone its successor. Only genuine core install/touch writes are non-null;
@@ -622,7 +616,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
             PlaybackService.enterOfflineMode()
         } else {
             PlaybackService.retireLocalEligibility()
-            source?.let { startCoordination(it, retiringDisposal) }
+            source?.let { startCoordination(it) }
         }
         retired?.let { drainRetiredLocalOutput(it); finishLocalRetirement(it) }
         if (!value) savedDownloads.setNetworkAllowed(true) // Never restarts cancelled work or output.
@@ -633,15 +627,14 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
     internal fun audioCache(source: SpofifyClient, expected: Session): SongCache.SessionCache? =
         if (client === source && source.hasValidSession(expected)) audioCache else null
 
-    private fun endCoordination(): Job? {
+    private fun endCoordination() {
         PlaybackService.onServiceActiveChanged = null
         val owner = playbackCoordinator
         val scope = coordinationScope
         playbackCoordinator = null
         coordinationScope = null
-        try { retiringDisposal = owner?.close() ?: retiringDisposal }
+        try { owner?.close() }
         finally { scope?.cancel() }
-        return retiringDisposal
     }
     val lastServer: String get() = preferences.getString("server", "") ?: ""
     // Compatibility for the legacy signed-in account UI. Forgetting is not a future save opt-out.
@@ -744,8 +737,7 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
             attempt { songCache.fence() }
             attempt { if (lastServer.isNotEmpty() && lastServer != server.origin) songCache.retire() }
         }
-        var predecessorDisposal: Job? = retiringDisposal
-        attempt { predecessorDisposal = endCoordination() }
+        attempt { endCoordination() }
         attempt { PlaybackService.stopActivePlayback() }
         attempt { context.stopService(Intent(context, PlaybackService::class.java)) }
         val images = imageLoader
@@ -767,27 +759,27 @@ class AppGraph(private val context: Context, store: SessionStore = EncryptedSess
             cacheSource = next
             authenticationRevision = -1L
         }
-        if (!offlineMode.value) startCoordination(next, predecessorDisposal)
+        if (!offlineMode.value) startCoordination(next)
         refreshSavedLocalLibrary()
         preferences.edit().putString("server", server.origin).apply()
         return next
     }
 
-    private fun startCoordination(next: SpofifyClient, predecessorDisposal: Job?) {
+    private fun startCoordination(next: SpofifyClient) {
         if (playbackCoordinator != null || offlineMode.value) return
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        val coordinator = PlaybackCoordinator(PlaybackDevicesApi(next), Media3PlaybackEndpoint(), scope,
+        val coordinator = PlaybackCoordinator(next, Media3PlaybackEndpoint(context), scope,
             identity = { next.currentSession()?.let { PlaybackDeviceIdentityStore(context, next.server, it.accountId) } },
-            mediaEventUptimeMs = { android.os.SystemClock.uptimeMillis() },
-            predecessorDisposal = predecessorDisposal, registrationPacing = registrationPacing)
+            mediaEventUptimeMs = { android.os.SystemClock.uptimeMillis() })
         coordinationScope = scope
         playbackCoordinator = coordinator
         PlaybackService.onServiceActiveChanged = { active ->
             if (client === next && playbackCoordinator === coordinator && !offlineMode.value &&
                 !PlaybackService.isLocalOnlyQueue()) coordinator.setServiceActive(active)
         }
-        // One application-owned coordinator survives screen/activity reattachment. Only local
-        // installation/name metadata persists; registration and output authority never do.
+        // One account coordinator survives screen/activity reattachment. The identity/name
+        // preference persists, but socket/session/queue/output authority never does.
+        if (next.validatedSessionIdentity() != null) coordinator.retry()
         imageLoader = ImageLoader.Builder(context)
             .components { add(OkHttpNetworkFetcherFactory(callFactory = { next.httpClient })) }
             .diskCache(null).memoryCache(null).build()

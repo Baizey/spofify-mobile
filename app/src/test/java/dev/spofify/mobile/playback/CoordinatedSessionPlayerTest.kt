@@ -7,7 +7,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import dev.spofify.mobile.core.PlaybackDeviceCommand
+import dev.spofify.mobile.core.LocalPlaybackCommand
+import dev.spofify.mobile.core.LibraryPlaybackCommand
 import dev.spofify.mobile.core.PlaybackSnapshot
 import dev.spofify.mobile.core.PlaybackTrack
 import java.lang.reflect.Proxy
@@ -70,7 +71,7 @@ class CoordinatedSessionPlayerTest {
         val fixture = Fixture()
         fixture.player.seekTo(12_345)
         fixture.player.seekTo(0)
-        assertEquals(listOf(PlaybackDeviceCommand.seek(12.345), PlaybackDeviceCommand.seek(0.0)), fixture.commands)
+        assertEquals(listOf(LocalPlaybackCommand.seek(12.345), LocalPlaybackCommand.seek(0.0)), fixture.commands)
         fixture.output.assertNoMutations()
     }
 
@@ -94,7 +95,7 @@ class CoordinatedSessionPlayerTest {
             seekTo(0, 2_500) // Atomic jump-and-seek is NOT representable.
             seekTo(1, 0) // Current scrub is not a semantic restart.
         }
-        assertEquals(listOf(PlaybackDeviceCommand.seek(2.5), jump(22), PlaybackDeviceCommand.seek(0.0)), fixture.commands)
+        assertEquals(listOf(LocalPlaybackCommand.seek(2.5), jump(22), LocalPlaybackCommand.seek(0.0)), fixture.commands)
         fixture.output.assertNoMutations()
     }
 
@@ -128,7 +129,7 @@ class CoordinatedSessionPlayerTest {
         fixture.player.seekForward()
         fixture.state = fixture.state.copy(elapsed = 8.25)
         fixture.player.seekForward()
-        assertEquals(listOf(PlaybackDeviceCommand.seek(0.0), PlaybackDeviceCommand.seek(7.25), PlaybackDeviceCommand.seek(10.0)), fixture.commands)
+        assertEquals(listOf(LocalPlaybackCommand.seek(0.0), LocalPlaybackCommand.seek(7.25), LocalPlaybackCommand.seek(10.0)), fixture.commands)
         assertFalse(fixture.output.reads.contains("getCurrentPosition"))
         fixture.output.assertNoMutations()
     }
@@ -139,7 +140,7 @@ class CoordinatedSessionPlayerTest {
         fixture.player.seekForward()
         fixture.state = fixture.state.copy(elapsed = 604799.0)
         fixture.player.seekForward()
-        assertEquals(listOf(PlaybackDeviceCommand.seek(17.25), PlaybackDeviceCommand.seek(604800.0)), fixture.commands)
+        assertEquals(listOf(LocalPlaybackCommand.seek(17.25), LocalPlaybackCommand.seek(604800.0)), fixture.commands)
         fixture.output.assertNoMutations()
     }
 
@@ -163,22 +164,24 @@ class CoordinatedSessionPlayerTest {
         fixture.state = fixture.state.copy(shuffle = true)
         fixture.player.setShuffleModeEnabled(true)
         fixture.player.setShuffleModeEnabled(false)
-        fixture.assertCommands("shuffle", "shuffle")
+        assertEquals(listOf(LibraryPlaybackCommand.SetShuffle(true), LibraryPlaybackCommand.SetShuffle(false)), fixture.modes)
+        assertTrue(fixture.commands.isEmpty())
         fixture.output.assertNoMutations()
     }
 
-    @Test fun repeatSendsExactlyOneCycleOnlyWhenDesiredIsNextRepresentableState() {
+    @Test fun repeatSendsExactlyOneAbsoluteSetterForEveryChangedValidModeNeverAToggleChain() {
         val fixture = Fixture()
-        val states = listOf("off" to Player.REPEAT_MODE_ALL, "all" to Player.REPEAT_MODE_ONE, "one" to Player.REPEAT_MODE_OFF)
-        for ((current, next) in states) {
+        for (current in listOf("off", "all", "one")) {
             fixture.state = fixture.state.copy(repeat = current)
-            for (desired in listOf(Player.REPEAT_MODE_OFF, Player.REPEAT_MODE_ONE, Player.REPEAT_MODE_ALL, -99)) {
-                val count = fixture.commands.size
+            for ((desired, wire) in listOf(Player.REPEAT_MODE_OFF to "off", Player.REPEAT_MODE_ONE to "one",
+                Player.REPEAT_MODE_ALL to "all", -99 to null)) {
+                val before = fixture.modes.toList()
                 fixture.player.setRepeatMode(desired)
-                assertEquals("$current -> $desired", count + if (desired == next) 1 else 0, fixture.commands.size)
+                assertEquals("$current -> $desired", before + if (wire != null && wire != current)
+                    listOf(LibraryPlaybackCommand.SetRepeat(wire)) else emptyList(), fixture.modes)
             }
         }
-        fixture.assertCommands("repeat", "repeat", "repeat")
+        assertTrue(fixture.commands.isEmpty())
         fixture.output.assertNoMutations()
     }
 
@@ -189,7 +192,7 @@ class CoordinatedSessionPlayerTest {
         fixture.physicalKeys = listOf(11L, 22L)
         fixture.player.seekToDefaultPosition()
         fixture.player.seekTo(1, 4_125)
-        assertEquals(listOf(jump(11), jump(22), PlaybackDeviceCommand.seek(4.125)), fixture.commands)
+        assertEquals(listOf(jump(11), jump(22), LocalPlaybackCommand.seek(4.125)), fixture.commands)
         fixture.output.assertNoMutations()
     }
 
@@ -326,14 +329,16 @@ class CoordinatedSessionPlayerTest {
 
     private class Fixture {
         val output = Output()
-        val commands = mutableListOf<PlaybackDeviceCommand>()
+        val commands = mutableListOf<LocalPlaybackCommand>()
+        val modes = mutableListOf<LibraryPlaybackCommand>()
         var physicalKeys: List<Long?> = listOf(22, 11)
         // Duplicate track IDs intentionally distinguish occurrence identity from track identity.
         var state = PlaybackSnapshot(queue = listOf(track(11, 1), track(22, 0)), position = 0)
         val player = CoordinatedSessionPlayer(output.player, commands::add, { state }, { physicalKeys.getOrNull(it) })
+            .apply { setModeDispatcher(modes::add) }
 
         fun assertCommands(vararg types: String) {
-            assertEquals(types.map(PlaybackDeviceCommand::transport), commands)
+            assertEquals(types.map(LocalPlaybackCommand::transport), commands)
         }
     }
 
@@ -375,7 +380,7 @@ class CoordinatedSessionPlayerTest {
     }
 
     private companion object {
-        fun jump(key: Long) = PlaybackDeviceCommand.queue("jump", key)
+        fun jump(key: Long) = LocalPlaybackCommand.queue("jump", key)
         fun track(key: Long, order: Long) = PlaybackTrack("same-track", "Track", emptyList(), "Album", "album", 30.0, key = key, order = order)
     }
 }

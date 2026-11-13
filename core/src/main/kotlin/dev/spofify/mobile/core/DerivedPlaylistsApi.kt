@@ -151,55 +151,6 @@ data class DerivedEvaluationPage(
     }
 }
 
-/** The full count is Long and stays outside the shared, Int-count callback queue. */
-data class DerivedPlayback(
-    val context: PersonalPlaybackContext,
-    val items: List<LibraryItem>,
-    val selectionTokens: Map<String, String>,
-    val total: Long,
-    val limit: Int,
-    val truncated: Boolean,
-    val revision: Long,
-    val fence: String,
-    val startOccurrenceId: String?,
-    val notice: String?,
-    internal val preparedSelectionAuthority: PreparedPlaybackAuthority? = null,
-) {
-    val startIndex: Int? get() = startOccurrenceId?.let { id -> items.indexOfFirst { it.entryId == id }.takeIf { it >= 0 } }
-    /** Shared queue counts saturate at Int.MAX_VALUE; the exact Long count remains in this envelope. */
-    fun toPlaybackQueue(): PlaybackQueue = toPlaybackQueue(selectionAuthority = preparedSelectionAuthority)
-
-    internal fun toPlaybackQueue(selectionAuthority: PreparedPlaybackAuthority?): PlaybackQueue {
-        require(context.kind == "derived" && context.revision == revision && context.fence == fence)
-        require(total == items.size.toLong() && limit.toLong() >= total && !truncated && notice == null) { "Incomplete playback collection" }
-        val preparedContext = PlaybackContext(context.kind, context.id, context.name, revision, fence)
-        val tracks = items.mapIndexed { index, item ->
-            require(item.kind == "track" && item.playable && item.durationMs >= 0)
-            PlaybackTrack(
-                id = item.id, name = item.name, artists = item.artists.map { PlaybackArtist(it.id, it.name) },
-                albumName = item.albumName.orEmpty(), albumId = item.albumId.orEmpty(), duration = item.durationMs / 1000.0,
-                // Derived occurrence identity is not a manual-playlist entry ID (and has a larger wire bound).
-                targetId = context.id, occurrenceId = requireNotNull(item.entryId), playbackContext = preparedContext,
-                key = index + 1L, order = index.toLong(),
-            )
-        }
-        val position = if (tracks.isEmpty()) -1 else requireNotNull(startIndex)
-        val prepared = PlaybackSnapshot(
-            queue = tracks, position = position, context = preparedContext,
-            duration = tracks.getOrNull(position)?.duration ?: 0.0,
-            truncated = truncated, notice = notice.orEmpty(),
-        ).publicationValidated()
-        return PlaybackQueue(
-            items, total = total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), limit = limit, truncated = truncated,
-            context = LibraryPlaybackContext(context.kind, context.id, context.name), revision = revision,
-            preparedState = prepared, selectionAuthority = selectionAuthority,
-        )
-    }
-    val queue: PlaybackQueue get() = toPlaybackQueue()
-
-    override fun toString(): String = "DerivedPlayback(total=$total, limit=$limit, truncated=$truncated, [redacted])"
-}
-
 /** Opaque signed cursors/selections are passed unchanged, never decoded or reconstructed here. */
 class DerivedPlaylistsApi(client: SpofifyClient) {
     private val transport = ApiTransport(client)
@@ -260,37 +211,6 @@ class DerivedPlaylistsApi(client: SpofifyClient) {
         }, emptyMap())), preview = true)
     }
 
-    suspend fun playback(id: String, expectedRevision: Long, fence: String, selectionToken: String? = null): DerivedPlayback {
-        requirePersonalRevision(expectedRevision)
-        requireOpaqueToken(fence, 4096)
-        selectionToken?.let { requireOpaqueToken(it, 8192) }
-        val preparedSource = PreparedPlaybackSource.capture(transport.client)
-        val wire: DerivedPlaybackWire = personalDecode(personalRequired(transport.send("POST", derivedPath(id, "playback"), buildJsonObject {
-            put("expectedRevision", expectedRevision); put("fence", fence)
-            selectionToken?.let { put("selectionToken", it) }
-        }, emptyMap())))
-        val items = wire.items.map { raw ->
-            val authority: DerivedPlaybackOccurrence = personalDecode(raw)
-            DerivedPreparedTrack(authority.occurrenceId, authority.selectionToken, personalDecode<LibraryItem>(raw))
-        }
-        if (wire.context.kind != "derived" || wire.context.id != id || wire.revision != expectedRevision || wire.fence != fence ||
-            wire.context.revision != wire.revision || wire.context.fence != wire.fence || wire.total != items.size.toLong() ||
-            wire.limit.toLong() < wire.total || wire.truncated || wire.notice != null ||
-            items.map { it.occurrenceId }.toSet().size != items.size ||
-            (items.isEmpty() != (wire.startOccurrenceId == null)) ||
-            (wire.startOccurrenceId != null && items.none { it.occurrenceId == wire.startOccurrenceId })) throw incompatiblePersonalResponse()
-        val tokens = items.associate { item ->
-            try { requireOpaqueToken(item.occurrenceId, 4096); requireOpaqueToken(item.selectionToken, 8192) }
-            catch (_: IllegalArgumentException) { throw incompatiblePersonalResponse() }
-            item.occurrenceId to item.selectionToken
-        }
-        return DerivedPlayback(wire.context, items.map { it.track.copy(entryId = it.occurrenceId) }, tokens,
-            wire.total, wire.limit, wire.truncated, wire.revision, wire.fence, wire.startOccurrenceId, wire.notice,
-            preparedSelectionAuthority = preparedSource.bind(selectionToken,
-                PlaybackContext(wire.context.kind, wire.context.id, wire.context.name, wire.revision, wire.fence),
-                items.firstOrNull { it.occurrenceId == wire.startOccurrenceId }?.track?.id, wire.startOccurrenceId))
-    }
-
     suspend fun copy(id: String, name: String, description: String? = null, expectedRevision: Long, fence: String): PersonalPlaylistSummary {
         validatePlaylistMetadata(name, description ?: "")
         requirePersonalRevision(expectedRevision); requireOpaqueToken(fence, 4096)
@@ -331,21 +251,3 @@ private fun derivedPath(id: String, action: String) = personalPlaylistsPath + li
 private fun requireOpaqueToken(value: String, maximum: Int) {
     require(value.length in 1..maximum && value.all { it.code in 0x21..0x7e }) { "Invalid evaluation token" }
 }
-
-@Serializable
-private data class DerivedPlaybackWire(
-    val context: PersonalPlaybackContext,
-    val items: List<JsonObject>,
-    val total: Long,
-    val limit: Int,
-    val truncated: Boolean,
-    val revision: Long,
-    val fence: String,
-    val startOccurrenceId: String?,
-    val notice: String?,
-)
-
-// Flat Go musical DTOs carry occurrence authority beside (not inside) track metadata.
-@Serializable
-private data class DerivedPlaybackOccurrence(val occurrenceId: String, val selectionToken: String)
-private data class DerivedPreparedTrack(val occurrenceId: String, val selectionToken: String, val track: LibraryItem)

@@ -106,7 +106,7 @@ class PlaylistSharedRowHostTest {
                                     }
                                     "search" -> SearchRoute(client, initialQuery = "fixture", onOpenItem = {},
                                         onPlayItem = { _, _ -> fail("Browsing must not Play") }, onShowActions = {}, onEnqueueItem = {}, artwork = artwork)
-                                    else -> PlaylistsRoute(client, {}, { _, _, _ -> fail("Browsing must not prepare") }, {},
+                                    else -> PlaylistsRoute(client, {}, {},
                                         initialPlaylistId = host.value, artwork = artwork)
                                 }
                             }

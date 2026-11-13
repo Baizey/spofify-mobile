@@ -200,27 +200,6 @@ class PersonalCollectionsApiTest {
         assertEquals("1000001", web.takeRequest().requestUrl!!.queryParameter("offset"))
     }
 
-    @Test fun manualPlaybackKeepsFlatDuplicateEntryIdentityAndContext() = runBlocking {
-        web.enqueue(jsonResponse("""{"context":{"kind":"playlist","id":"p","name":"Mix"},"items":[${flatTrack("e1")},${flatTrack("e2")}],"total":2,"limit":1000,"truncated":false}"""))
-        val result = api.playback("p")
-        assertEquals("/api/me/playlists/p/playback", web.takeRequest().path)
-        assertEquals("playlist", result.context.kind)
-        assertEquals(listOf("e1", "e2"), result.queue.items.map { it.entryId })
-        assertEquals(listOf("same", "same"), result.items.map { it.id })
-        assertEquals(2, result.queue.total)
-        assertEquals(LibraryPlaybackContext("playlist", "p", "Mix"), result.queue.context)
-        assertEquals(0L, result.queue.revision) // Legacy manual playback has no revision authority.
-    }
-
-    @Test fun manualQueueConversionRetainsEnvelopeOrContextRevisionWhenProvided() = runBlocking {
-        web.enqueue(jsonResponse("""{"context":{"kind":"playlist","id":"p","name":"Mix"},"items":[],"total":0,"limit":1000,"truncated":false,"revision":7}"""))
-        val result = api.playback("p")
-        assertEquals(7L, result.queue.revision)
-        assertEquals(LibraryPlaybackContext("playlist", "p", "Mix"), result.queue.context)
-        val contextRevision = result.copy(revision = 0, context = result.context.copy(revision = 8))
-        assertEquals(8L, contextRevision.queue.revision)
-    }
-
     @Test fun malformedSuccessfulMutationResponseIsNotRetriedOrAcceptedAsSaved() = runBlocking {
         authenticate()
         val initial = client.personalRevision.value

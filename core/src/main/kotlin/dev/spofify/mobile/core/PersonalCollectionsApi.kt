@@ -93,35 +93,6 @@ class ManualPlaylistSnapshot internal constructor(val playlist: PersonalPlaylist
     val entryIds: List<String> get() = entries.map { it.id }
 }
 
-@Serializable
-data class PersonalPlaybackContext(
-    val kind: String,
-    val id: String,
-    val name: String,
-    val revision: Long? = null,
-    val fence: String? = null,
-)
-
-@Serializable
-data class PersonalPlayback(
-    val context: PersonalPlaybackContext,
-    val items: List<LibraryItem>,
-    val total: Long,
-    val limit: Int,
-    val truncated: Boolean,
-    val revision: Long = 0,
-) {
-    init {
-        require(total == items.size.toLong() && limit.toLong() >= total && !truncated) { "Incomplete playback collection" }
-    }
-    fun toPlaybackQueue() = PlaybackQueue(
-        items, total = total.coerceIn(0, Int.MAX_VALUE.toLong()).toInt(), limit = limit, truncated = truncated,
-        context = LibraryPlaybackContext(context.kind, context.id, context.name),
-        revision = revision.takeIf { it > 0 } ?: context.revision ?: 0,
-    )
-    val queue: PlaybackQueue get() = toPlaybackQueue()
-}
-
 /** Account-local listener APIs. Every write is a single transport attempt, including uncertain failures. */
 class PersonalCollectionsApi(client: SpofifyClient) {
     private val transport = ApiTransport(client)
@@ -226,7 +197,6 @@ class PersonalCollectionsApi(client: SpofifyClient) {
         return confirmedPlaylistMutation(transport.client, transport.send("PUT", personalPlaylistPath(snapshot.playlist.id) + "order", body, emptyMap()), writeGeneration)
     }
 
-    suspend fun playback(id: String): PersonalPlayback = personalDecode(transport.get(personalPlaylistPath(id) + "playback", emptyMap()))
 
     suspend fun list(kind: PlaylistKind? = null, limit: Int = 40, offset: Int = 0) = playlists(kind, limit, offset)
     suspend fun detail(id: String) = playlist(id)

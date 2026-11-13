@@ -40,7 +40,6 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -82,6 +81,16 @@ private fun upcomingIntentActions(entry: QueueEntry, state: PlaybackState, contr
         label to { if (key != null && entry.item.playable && rowIsCurrent() && hostIsCurrent())
             controls.queueIntentOccurrence(key, entry.occurrenceId, action, hostIsCurrent) {} }
     }
+}
+
+/** Edits retain the rendered position/key and both row and queue-host lifetimes. */
+private class UpcomingQueueEdits(entry: QueueEntry, state: PlaybackState, index: Int,
+    controls: PlaybackControls, rowIsCurrent: () -> Boolean, hostIsCurrent: () -> Boolean) {
+    private val key = state.interactionKey
+    private val current = { rowIsCurrent() && hostIsCurrent() }
+    val moveUp: () -> Unit = { if (key != null && current()) controls.moveUpcoming(key, entry.occurrenceId, index - 1, current) }
+    val moveDown: () -> Unit = { if (key != null && current()) controls.moveUpcoming(key, entry.occurrenceId, index + 1, current) }
+    val remove: () -> Unit = { if (key != null && current()) controls.removeUpcoming(key, entry.occurrenceId, current) }
 }
 
 /** Same grouped menu as catalog/playlist songs; queue edits retain their exact occurrence closures. */
@@ -299,13 +308,14 @@ private fun CompactUpcomingRow(
                 controls.removeUpcoming(key, entry.occurrenceId, actionIsCurrent)
         }) { swipeModifier, isCurrent ->
     val intents = upcomingIntentActions(entry, state, controls, isCurrent, actionIsCurrent)
+    val edits = UpcomingQueueEdits(entry, state, index, controls, isCurrent, actionIsCurrent)
     Row(swipeModifier.fillMaxWidth().heightIn(min = 72.dp).background(MaterialTheme.colorScheme.surface).semantics {
         customActions = buildList {
             if (entry.item.playable && state.interactionKey != null)
                 intents.forEach { (label, action) -> add(CustomAccessibilityAction(label) { action(); true }) }
-            if (index > 0) add(CustomAccessibilityAction("Move up") { controls.moveUpcoming(entry.occurrenceId, index - 1); true })
-            if (index < count - 1) add(CustomAccessibilityAction("Move down") { controls.moveUpcoming(entry.occurrenceId, index + 1); true })
-            add(CustomAccessibilityAction("Remove from queue") { controls.removeUpcoming(entry.occurrenceId); true })
+            if (index > 0) add(CustomAccessibilityAction("Move up") { edits.moveUp(); true })
+            if (index < count - 1) add(CustomAccessibilityAction("Move down") { edits.moveDown(); true })
+            add(CustomAccessibilityAction("Remove from queue") { edits.remove(); true })
         }
     }, verticalAlignment = Alignment.CenterVertically) {
         UpcomingSongBody(entry, state, intents.single { it.first == "Play now" }.second,
@@ -321,9 +331,8 @@ private fun CompactUpcomingRow(
                 }
                 if (menuOpen) UpcomingOccurrenceActions(entry, state, intents, index > 0, index < count - 1,
                     onDismiss = { menuOpen = false }, onOpenItem = onOpenItem,
-                    onMoveUp = { controls.moveUpcoming(entry.occurrenceId, index - 1) },
-                    onMoveDown = { controls.moveUpcoming(entry.occurrenceId, index + 1) },
-                    onRemove = { controls.removeUpcoming(entry.occurrenceId) }, localNavigation = localNavigation)
+                    onMoveUp = edits.moveUp, onMoveDown = edits.moveDown,
+                    onRemove = edits.remove, localNavigation = localNavigation)
             }
         }
     }
@@ -346,13 +355,7 @@ private fun UpcomingRow(
     var rowHeight by remember { mutableIntStateOf(80) }
     var dragY by remember(entry.occurrenceId) { mutableFloatStateOf(0f) }
     var dragging by remember(entry.occurrenceId) { mutableStateOf(false) }
-    val latestIndex by rememberUpdatedState(index)
-    val latestCount by rememberUpdatedState(count)
-    val latestControls by rememberUpdatedState(controls)
     val haptics = LocalHapticFeedback.current
-    val moveUp = { controls.moveUpcoming(entry.occurrenceId, (index - 1).coerceAtLeast(0)) }
-    val moveDown = { controls.moveUpcoming(entry.occurrenceId, (index + 1).coerceAtMost(count - 1)) }
-    val remove = { controls.removeUpcoming(entry.occurrenceId) }
     ContextualSwipeRow(entry, state.interactionKey, state.interactionKey != null, "Play next",
         onCommit = { key, rowIsCurrent ->
             if (entry.item.playable && rowIsCurrent() && actionIsCurrent())
@@ -362,15 +365,16 @@ private fun UpcomingRow(
                 controls.removeUpcoming(key, entry.occurrenceId, actionIsCurrent)
         }, excludeLeadingHandle = true, leadingTargetWidth = 88.dp) { swipeModifier, isCurrent ->
     val intents = upcomingIntentActions(entry, state, controls, isCurrent, actionIsCurrent)
+    val edits = UpcomingQueueEdits(entry, state, index, controls, isCurrent, actionIsCurrent)
     Row(
         swipeModifier.fillMaxWidth().heightIn(min = 80.dp).background(MaterialTheme.colorScheme.surface).onSizeChanged { rowHeight = it.height }
             .semantics {
                 customActions = buildList {
                     if (entry.item.playable && state.interactionKey != null)
                         intents.forEach { (label, action) -> add(CustomAccessibilityAction(label) { action(); true }) }
-                    if (index > 0) add(CustomAccessibilityAction("Move up") { moveUp(); true })
-                    if (index < count - 1) add(CustomAccessibilityAction("Move down") { moveDown(); true })
-                    add(CustomAccessibilityAction("Remove from queue") { remove(); true })
+                    if (index > 0) add(CustomAccessibilityAction("Move up") { edits.moveUp(); true })
+                    if (index < count - 1) add(CustomAccessibilityAction("Move down") { edits.moveDown(); true })
+                    add(CustomAccessibilityAction("Remove from queue") { edits.remove(); true })
                 }
             },
         verticalAlignment = Alignment.CenterVertically,
@@ -381,7 +385,7 @@ private fun UpcomingRow(
                 stateDescription = if (dragging) "Move to position ${queueMoveTarget(index, dragY, rowHeight, count) + 1}"
                     else "Position ${index + 1} of $count. Use queue actions to move up or down."
             }
-            .pointerInput(entry, state.interactionKey, state.canMoveUpcomingAbsolutely) {
+            .pointerInput(entry, state.interactionKey, state.canMoveUpcomingAbsolutely, index, count, controls) {
                 val expectedKey = state.interactionKey
                 if (expectedKey == null || !state.canMoveUpcomingAbsolutely) return@pointerInput
                 detectVerticalDragGestures(
@@ -392,8 +396,9 @@ private fun UpcomingRow(
                     },
                     onDragCancel = { dragY = 0f; dragging = false },
                     onDragEnd = {
-                        val target = queueMoveTarget(latestIndex, dragY, rowHeight, latestCount)
-                        if (target != latestIndex) latestControls.moveUpcoming(expectedKey, entry.occurrenceId, target)
+                        val target = queueMoveTarget(index, dragY, rowHeight, count)
+                        val current = { isCurrent() && actionIsCurrent() }
+                        if (target != index && current()) controls.moveUpcoming(expectedKey, entry.occurrenceId, target, current)
                         dragY = 0f
                         dragging = false
                     },
@@ -415,7 +420,7 @@ private fun UpcomingRow(
             }
             if (menuOpen) UpcomingOccurrenceActions(entry, state, intents, index > 0, index < count - 1,
                 onDismiss = { menuOpen = false }, onOpenItem = onOpenItem,
-                onMoveUp = moveUp, onMoveDown = moveDown, onRemove = remove, artwork = artwork,
+                onMoveUp = edits.moveUp, onMoveDown = edits.moveDown, onRemove = edits.remove, artwork = artwork,
                 localNavigation = localNavigation)
         }
     }

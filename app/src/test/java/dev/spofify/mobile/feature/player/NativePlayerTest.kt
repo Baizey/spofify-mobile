@@ -6,6 +6,9 @@ import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.SemanticsMatcher
+import dev.spofify.mobile.core.LibraryPlaybackSelection
+import dev.spofify.mobile.feature.devices.LibraryPlaybackActionBinding
+import dev.spofify.mobile.playback.PlaybackListAction
 import android.graphics.Bitmap
 import java.io.File
 import dev.spofify.mobile.listeningColorScheme
@@ -1303,8 +1306,12 @@ class NativePlayerTest {
 
         override fun connect() { connects++ }
         override fun release() = Unit
-        override fun play(items: List<LibraryItem>, client: SpofifyClient, startTrackId: String?,
-            shuffle: Boolean, startEntryId: String?) { prepares++ }
+        override fun queueIntent(selection: LibraryPlaybackSelection, client: SpofifyClient,
+            action: PlaybackListAction, expectedKey: PlaybackInteractionKey?, expectedBinding: LibraryPlaybackActionBinding?,
+            shuffle: Boolean?, isCurrent: () -> Boolean, onResult: (PlaybackActionResult) -> Unit) {
+            prepares++
+            onResult(PlaybackActionResult(PlaybackActionStatus.UNSUPPORTED))
+        }
         override fun toggle() { toggles++ }
         override fun next() { nexts++ }
         override fun previous() { previouses++ }
@@ -1325,8 +1332,9 @@ class NativePlayerTest {
         override fun toggleShuffle() { shuffles++ }
         override fun cycleRepeat() { repeats++ }
         override fun stop() { stops++ }
-        override fun moveUpcoming(occurrenceId: String, toIndex: Int) { moves += occurrenceId to toIndex }
-        override fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int) {
+        override fun moveUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, toIndex: Int,
+            isCurrent: () -> Boolean) {
+            if (!isCurrent()) return
             guardedMoves += Triple(expectedKey, occurrenceId, toIndex)
             moves += occurrenceId to toIndex
         }
@@ -1343,7 +1351,6 @@ class NativePlayerTest {
             playNexts += expectedKey to occurrenceId
             onResult(PlaybackActionResult(PlaybackActionStatus.NO_OP))
         }
-        override fun removeUpcoming(occurrenceId: String) { removed += occurrenceId }
         override fun removeUpcoming(expectedKey: PlaybackInteractionKey, occurrenceId: String, isCurrent: () -> Boolean) {
             if (isCurrent()) removed += occurrenceId
         }

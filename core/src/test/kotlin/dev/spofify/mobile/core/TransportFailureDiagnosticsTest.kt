@@ -10,6 +10,9 @@ import org.junit.Test
 
 class TransportFailureDiagnosticsTest {
     private val secret = "password=synthetic-secret https://private.invalid/path Cookie: private-token raw-body"
+    private class MessageTrap : IOException() {
+        override val message: String get() = throw AssertionError("Original message must never be inspected")
+    }
 
     @Test fun callFailurePreservesOnlyBoundedClassChainAndFixedPublicMessage() {
         val original = SocketTimeoutException(secret).apply {
@@ -34,9 +37,8 @@ class TransportFailureDiagnosticsTest {
     }
 
     @Test fun messageGettersAreNeverConsultedAndResponseConsumerPhaseIsDistinct() {
-        val original = object : IOException() {
-            override val message: String get() = throw AssertionError("Original message must never be inspected")
-        }
+        val original = MessageTrap()
+        assertTrue("Fixture class name must fit the diagnostic's unchanged byte budget", original.javaClass.name.length <= 128)
         val safe = networkError(original, TransportFailurePhase.RESPONSE_CONSUMER)
         val diagnostic = safe.cause as TransportFailureDiagnostic
         assertEquals(TransportFailurePhase.RESPONSE_CONSUMER, diagnostic.phase)

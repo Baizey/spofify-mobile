@@ -8,9 +8,13 @@ as support. Browser/default login remains unchanged on the server.
 
 The negotiated session uses the **same access token, CSRF, logical auth
 incarnation and actual `Session` object** while its deadline advances. There is
-no extra renewal credential, remember-me toggle, password replay or keepalive.
+no extra renewal credential, remember-me toggle or password replay.
 Normal successful authenticated API/media activity, including background playback,
 HEAD/ranges and conditional responses, maintains the server's rolling window.
+WebSocket frames and pings do not renew HTTP sessions; a live online playback
+connection therefore periodically uses ordinary authenticated
+`GET /api/auth/session` (every 60 seconds). This auth-only renewal never selects,
+prepares, resumes or replays music; see [online playback](online-playback.md).
 The server coalesces durable touches hourly: the effective inactivity window is
 29 days 23 hours through 30 days. Truly server-expired sessions require login.
 
@@ -23,7 +27,7 @@ policy. Authenticated redirects remain disabled; TLS verification is unchanged.
 Ordinary unnegotiated Set-Cookie responses cannot install or replace auth.
 
 The absolute `Expires` deadline is authoritative. `Max-Age` receipt-time rounding
-must not create an apparent extension and storage write on every quiet poll.
+must not create an apparent extension and storage write on every quiet response.
 Late smaller deadlines are ignored. Only real newer deadlines are persisted;
 a failed save retains both live validated auth and the previous encrypted record,
 with at most one retry per minute triggered by subsequent normal responses.
@@ -77,12 +81,12 @@ expired/revoked row; the client does not renew it.
 Ordinary deadline extensions do not emit a new auth incarnation, replace the
 Session reference, restart coordination, select output, replay music, or alter
 queue/current/elapsed/playing/history. Local-deadline uncertainty and authoritative
-revocation separately fence live output. Receiver/activation leases remain
+revocation separately fence live output. Finite WebSocket executor leases remain
 independent and are never restored from persistent sign-in.
 
 Live authority reads consult the current cookie deadline on every check; they do
 not retain an old expiry value or a one-shot timer which disappears on extension.
-The separate captured playback-leave capability keeps its existing four-second,
-capture-relative cleanup bound and captured cookie expiry. It must not borrow a
-later deadline or successor credential. None of these source/JVM contracts imply
-installed Android, physical audio/background acceptance or server deployment.
+Socket close cancels local execution but is not release acknowledgement; the
+server owns any outstanding finite lease drain. There is no REST playback-leave
+capability. None of these source/JVM contracts imply installed Android, physical
+audio/background acceptance or server deployment.

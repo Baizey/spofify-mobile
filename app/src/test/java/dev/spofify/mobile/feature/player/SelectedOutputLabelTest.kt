@@ -1,18 +1,17 @@
 package dev.spofify.mobile.feature.player
 
-import dev.spofify.mobile.core.PlaybackDevice
-import dev.spofify.mobile.core.PlaybackDevicesView
+import dev.spofify.mobile.core.LibraryPlaybackDevice
 import dev.spofify.mobile.feature.devices.PlaybackDevicesState
+import dev.spofify.mobile.feature.devices.PlaybackDeviceSelection
+import dev.spofify.mobile.playback.testLibrarySnapshot
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class SelectedOutputLabelTest {
-    private fun state(active: String = "phone", available: Boolean = true) = PlaybackDevicesState(
-        deviceId = "phone", connected = true,
-        view = PlaybackDevicesView(devices = listOf(PlaybackDevice("phone", "Pocket", available),
-            PlaybackDevice("room", "Living room", true)), activeDeviceId = active,
-            epoch = 1, leaseMs = 1000, state = null, stateSeq = 0, stateAgeMs = 0,
-            transfer = null, directives = emptyList(), commands = emptyList()))
+    private fun state(selected: String = "phone", available: Boolean = true) = PlaybackDevicesState(
+        deviceId = "phone", connectionId = "socket-phone", connected = true,
+        snapshot = testLibrarySnapshot(listOf(LibraryPlaybackDevice("phone", "Pocket", available, true),
+            LibraryPlaybackDevice("room", "Living room", true, true)), selected))
 
     @Test fun truthfulLocalRemoteUnavailableAndUnselectedLabels() {
         assertEquals("This phone · Pocket", selectedOutputLabel(state()))
@@ -24,9 +23,8 @@ class SelectedOutputLabelTest {
         assertEquals("Outputs unavailable", selectedOutputLabel(PlaybackDevicesState()))
         assertEquals("Loading outputs", selectedOutputLabel(PlaybackDevicesState(connecting = true)))
     }
-
     @Test fun pendingChoiceNeverPretendsToBeActualOutput() {
         assertEquals("This phone · Pocket", selectedOutputLabel(state().copy(
-            selectedDeviceId = "room", selectionUnconfirmed = true)))
+            pendingSelection = PlaybackDeviceSelection("room", 1))))
     }
 }
