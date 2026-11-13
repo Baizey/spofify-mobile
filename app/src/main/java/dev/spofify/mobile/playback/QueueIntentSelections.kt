@@ -13,7 +13,8 @@ internal fun queueIntentSelection(item: LibraryItem, context: LibraryPlaybackCon
     require(item.playable)
     val ref = when (context?.kind) {
         "derived" -> {
-            require(context.revision != null && context.revision > 0 && !context.fence.isNullOrEmpty())
+            val revision = context.revision ?: 0
+            require(revision > 0 && !context.fence.isNullOrEmpty())
             require(!occurrenceId.isNullOrEmpty() && !selectionToken.isNullOrEmpty())
             LibraryPlaybackTrackRef(item.id, targetId = context.id, occurrenceId = occurrenceId, selectionToken = selectionToken)
         }
