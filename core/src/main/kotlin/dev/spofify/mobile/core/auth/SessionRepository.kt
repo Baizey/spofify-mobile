@@ -23,10 +23,11 @@ sealed interface AuthState {
 }
 
 /**
- * App-lifetime owner. All authority and disk publications share one monitor;
- * network never holds it. Every async completion must still own its generation.
- * Cookies are explicit request/response values, never automatic CookieJar writes.
- * No auth transition deletes offline files, receipts, keys or remembered login.
+ * App-lifetime owner. The authority monitor never encloses storage or network I/O.
+ * A current fully validated response atomically promotes authority and accepts its
+ * durable intent. Those intents run in acceptance order, independently of retired
+ * network jobs: an in-flight save precedes signout's clear and every successor save.
+ * Cookies are explicit values, never automatic CookieJar publications.
  */
 class SessionRepository(
     private val sessions: SessionStore,
@@ -39,196 +40,252 @@ class SessionRepository(
     private val mutableState = MutableStateFlow<AuthState>(AuthState.Starting)
     val state: StateFlow<AuthState> = mutableState.asStateFlow()
     private var generation = 0L
-    private var durableGeneration = 0L
     private var initialized = false
     private var operation: Job? = null
+    private var persistenceTail: Job? = null
+    private var sessionSaveFailed = false
+    private var profileSaveFailed = false
+    private var localInvalidationFailed = false
     private var api: AuthApi? = null
     private var saved: StoredSession? = null
     private var identity: AccountIdentity? = null
 
-    /** For future authenticated work: callers capture identity; cancellation is not publication authority. */
     fun isCurrent(expected: AccountIdentity): Boolean = synchronized(lock) {
         (state.value as? AuthState.Authenticated)?.identity == expected
     }
 
-    fun start(): Unit = synchronized(lock) {
-        if (initialized) return@synchronized
-        initialized = true
-        val token = advance(AuthState.Starting)
-        operation = scope.launch(io) {
-            val record = try {
-                synchronized(lock) { if (token == generation) sessions.read() else null }
-            } catch (_: Exception) {
-                publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
-                return@launch
-            }
-            if (record == null) {
-                publish(token, AuthState.SignedOut())
-            } else {
-                restore(token, record, null)
-            }
-        }
-    }
-
-    /** Reads contain secrets and never enter StateFlow. A corrupt record is preserved, not repaired. */
-    suspend fun rememberedLogin(): RememberedLogin? = withContext(io) { synchronized(lock) { logins.read() } }
-
-    fun signIn(server: String, username: String, password: String): Unit = synchronized(lock) {
-        val origin = try { ServerOrigin.parse(server) } catch (_: IllegalArgumentException) {
-            advance(AuthState.SignedOut(AuthNotice.INVALID_ORIGIN))
-            return@synchronized
-        }
-        val token = advance(AuthState.SigningIn)
-        saved = null
-        identity = null
-        val client = apis.create(origin).also { api = it }
-        operation = scope.launch(io) {
-            try {
-                val login = client.login(username, password)
-                val cookie = requireNotNull(login.cookie)
-                val validated = client.session(cookie)
-                require(validated.session.accountId == login.session.accountId)
-                val record = StoredSession(origin.value, validated.cookie ?: cookie, validated.session, validated.mode ?: login.mode)
-                synchronized(lock) {
-                    if (token != generation) return@synchronized
-                    coroutineContext.ensureActive()
-                    var notice: AuthNotice? = null
-                    // Commit only after both responses were validated. Failure preserves prior durable values.
-                    try { sessions.write(record); durableGeneration = token } catch (_: Exception) { notice = AuthNotice.SAVE_FAILED }
-                    try { logins.write(RememberedLogin(origin.value, validated.session.username, password)) }
-                    catch (_: Exception) { notice = AuthNotice.SAVE_FAILED }
-                    promote(record, token, notice)
+    fun start() {
+        val job = synchronized(lock) {
+            if (initialized) return
+            initialized = true
+            val token = advance(AuthState.Starting)
+            operationLocked {
+                val record = try { readSession() } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
+                    return@operationLocked
                 }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                val notice = if (error is AuthFailure && error.kind == AuthFailure.Kind.UNAUTHORIZED)
-                    AuthNotice.INVALID_CREDENTIALS else AuthNotice.CONNECTION_FAILED
-                publish(token, AuthState.SignedOut(notice))
+                if (record == null) publish(token, AuthState.SignedOut()) else restore(token, record, null)
             }
         }
+        job.start()
     }
 
-    /** Explicit recovery, not login/password replay. No timer or hidden network retry. */
-    fun retry(): Unit = synchronized(lock) {
-        if (state.value !is AuthState.Unavailable) return@synchronized
-        val record = saved
-        val previous = identity
-        val token = advance(AuthState.Validating)
-        operation = scope.launch(io) {
-            val candidate = if (record != null) record else try {
-                synchronized(lock) { if (token == generation) sessions.read() else null }
-            } catch (_: Exception) {
-                publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
-                return@launch
+    /** Secrets stay out of StateFlow; reads wait for already accepted saves, never on Main. */
+    suspend fun rememberedLogin(): RememberedLogin? = withContext(io) {
+        val pending = synchronized(lock) { persistenceTail }
+        pending?.join()
+        ensureActive()
+        logins.read()
+    }
+
+    fun signIn(server: String, username: String, password: String) {
+        val job = synchronized(lock) {
+            val origin = try { ServerOrigin.parse(server) } catch (_: IllegalArgumentException) {
+                advance(AuthState.SignedOut(AuthNotice.INVALID_ORIGIN))
+                return
             }
-            if (candidate == null) publish(token, AuthState.SignedOut()) else restore(token, candidate, previous)
+            val token = advance(AuthState.SigningIn)
+            saved = null
+            identity = null
+            val client = apis.create(origin).also { api = it }
+            operationLocked {
+                try {
+                    val login = client.login(username, password)
+                    val cookie = requireNotNull(login.cookie)
+                    val validated = client.session(cookie)
+                    require(validated.session.accountId == login.session.accountId)
+                    val record = StoredSession(origin.value, validated.cookie ?: cookie, validated.session, validated.mode ?: login.mode)
+                    ensureActive()
+                    val write = synchronized(lock) {
+                        if (token != generation) return@operationLocked
+                        // Linearization point: a fully successful CURRENT login, not a pending attempt.
+                        promote(record, token)
+                        persistLocked(record, RememberedLogin(origin.value, validated.session.username, password))
+                    }
+                    write.start()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    val notice = if (error is AuthFailure && error.kind == AuthFailure.Kind.UNAUTHORIZED)
+                        AuthNotice.INVALID_CREDENTIALS else AuthNotice.CONNECTION_FAILED
+                    publish(token, AuthState.SignedOut(notice))
+                }
+            }
         }
+        job.start()
     }
 
-    fun useManualLogin(): Unit = synchronized(lock) {
+    /** Explicit recovery, never login/password replay. */
+    fun retry() {
+        val job = synchronized(lock) {
+            if (state.value !is AuthState.Unavailable) return
+            val record = saved
+            val previous = identity
+            val token = advance(AuthState.Validating)
+            operationLocked {
+                val candidate = record ?: try { readSession() } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
+                    return@operationLocked
+                }
+                if (candidate == null) publish(token, AuthState.SignedOut()) else restore(token, candidate, previous)
+            }
+        }
+        job.start()
+    }
+
+    fun useManualLogin() = synchronized(lock) {
         advance(AuthState.SignedOut())
         saved = null
         identity = null
     }
 
-    /** Revalidate on foreground entry, once; failures fence access but retain recovery material. */
-    fun refresh(): Unit = synchronized(lock) {
-        if (state.value !is AuthState.Authenticated) return@synchronized
-        val record = saved ?: return@synchronized
-        val previous = identity
-        val token = advance(AuthState.Validating)
-        operation = scope.launch(io) { restore(token, record, previous) }
+    /** Main-safe even while Keystore/SharedPreferences is blocked in the durable lane. */
+    fun refresh() {
+        val job = synchronized(lock) {
+            if (state.value !is AuthState.Authenticated) return
+            val record = saved ?: return
+            val previous = identity
+            val token = advance(AuthState.Validating)
+            operationLocked { restore(token, record, previous) }
+        }
+        job.start()
     }
 
-    /** Immediate local fence; bounded remote logout uses ONLY the retired cookie and CSRF. */
-    fun signOut(): Unit = synchronized(lock) {
-        val retired = saved
-        val token = advance(AuthState.SignedOut())
-        saved = null
-        identity = null
-        scope.launch(io) {
-            val localFailure = synchronized(lock) {
-                // A delayed clear must never erase a successfully persisted successor.
-                if (durableGeneration > token) false else try {
-                    sessions.write(null)
-                    durableGeneration = token
-                    false
-                } catch (_: Exception) { true }
+    fun signOut() {
+        val job = synchronized(lock) {
+            val retired = saved
+            val token = advance(AuthState.SignedOut())
+            saved = null
+            identity = null
+            val clear = persistLocked(null)
+            // Separate from the cancellable auth operation and from the durable lane.
+            scope.launch(io, start = CoroutineStart.LAZY) {
+                clear.start()
+                val localFailure = !clear.await()
+                val remoteFailure = if (retired == null) false else {
+                    val logout = apis.create(ServerOrigin.parse(retired.server))
+                    try { logout.logout(retired.cookie, retired.session.csrfToken); false }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { true }
+                    finally { logout.cancel() }
+                }
+                if (!localFailure && remoteFailure) publish(token, AuthState.SignedOut(AuthNotice.REMOTE_LOGOUT_FAILED))
             }
-            if (localFailure) publish(token, AuthState.SignedOut(AuthNotice.LOCAL_LOGOUT_FAILED))
-            val remoteFailure = if (retired == null) false else {
-                val logout = apis.create(ServerOrigin.parse(retired.server))
-                try { logout.logout(retired.cookie, retired.session.csrfToken); false }
-                catch (cancelled: CancellationException) { throw cancelled }
-                catch (_: Exception) { true }
-                finally { logout.cancel() }
-            }
-            if (!localFailure && remoteFailure) publish(token, AuthState.SignedOut(AuthNotice.REMOTE_LOGOUT_FAILED))
         }
+        job.start()
     }
 
     private suspend fun restore(token: Long, record: StoredSession, previous: AccountIdentity?) {
-        val context = currentCoroutineContext()
         try {
             val origin = ServerOrigin.parse(record.server)
             val client = apis.create(origin)
+            client.validateCookie(record.cookie)
+            record.session.validated()
             synchronized(lock) {
                 if (token != generation) { client.cancel(); return }
-                client.validateCookie(record.cookie)
-                record.session.validated()
                 saved = record
                 api = client
             }
             val response = client.session(record.cookie)
             require(response.session.accountId == record.session.accountId)
             val updated = StoredSession(origin.value, response.cookie ?: record.cookie, response.session, response.mode ?: record.sessionMode)
-            synchronized(lock) {
+            currentCoroutineContext().ensureActive()
+            val write = synchronized(lock) {
                 if (token != generation) return
-                context.ensureActive()
-                var notice: AuthNotice? = null
-                try { sessions.write(updated); durableGeneration = token }
-                catch (_: Exception) { notice = AuthNotice.SAVE_FAILED }
-                promote(updated, previous?.incarnation ?: token, notice)
+                promote(updated, previous?.incarnation ?: token)
+                persistLocked(updated)
             }
+            write.start()
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            synchronized(lock) {
+            val clear = synchronized(lock) {
                 if (token != generation) return
                 if (error is AuthFailure && error.kind == AuthFailure.Kind.UNAUTHORIZED) {
                     saved = null
                     identity = null
-                    var notice = AuthNotice.SESSION_EXPIRED
-                    try { sessions.write(null); durableGeneration = token }
-                    catch (_: Exception) { notice = AuthNotice.LOCAL_LOGOUT_FAILED }
-                    mutableState.value = AuthState.SignedOut(notice)
+                    mutableState.value = signedOutState(AuthNotice.SESSION_EXPIRED)
+                    persistLocked(null)
                 } else {
-                    // Corrupt storage, TLS, DNS, 5xx, parser errors and mismatched identity
-                    // are NOT authoritative revocation. Preserve every durable byte.
+                    // Unavailability is not revocation: preserve all recovery material.
                     mutableState.value = AuthState.Unavailable(AuthNotice.CONNECTION_FAILED)
+                    null
                 }
             }
+            clear?.start()
         }
     }
 
-    /** Must hold lock. Retires the in-flight auth operation before replacing authority. */
+    private suspend fun readSession(): StoredSession? {
+        val pending = synchronized(lock) { persistenceTail }
+        pending?.join()
+        currentCoroutineContext().ensureActive()
+        return sessions.read()
+    }
+
+    /** Caller holds only the short authority monitor; LAZY jobs start AFTER it is released. */
+    private fun operationLocked(block: suspend CoroutineScope.() -> Unit): Job =
+        scope.launch(io, start = CoroutineStart.LAZY, block = block).also { operation = it }
+
+    /**
+     * Acceptance-ordered durable lane, not an authority lock. Once accepted, a save
+     * must finish before the next clear/save even if its network job is retired.
+     * Remote logout never holds up this lane. No reads/writes delete unrelated data.
+     */
+    private fun persistLocked(record: StoredSession?, profile: RememberedLogin? = null): Deferred<Boolean> {
+        val previous = persistenceTail
+        val write = scope.async(io, start = CoroutineStart.LAZY) {
+            previous?.join()
+            val sessionOk = try { sessions.write(record); true } catch (_: Exception) { false }
+            val profileOk = if (profile == null) true else try { logins.write(profile); true } catch (_: Exception) { false }
+            synchronized(lock) {
+                sessionSaveFailed = !sessionOk
+                if (record == null) localInvalidationFailed = !sessionOk
+                else if (sessionOk) localInvalidationFailed = false
+                if (profile != null) profileSaveFailed = !profileOk
+                val current = mutableState.value
+                if (current is AuthState.Authenticated) {
+                    // Storage health can outlive a validation generation; do not hide a
+                    // failed remembered-profile save merely because foreground revalidated.
+                    mutableState.value = current.copy(notice = saveNotice())
+                } else if (current is AuthState.SignedOut) {
+                    // A newer FAILED login does not make a failed clear restart-safe.
+                    mutableState.value = if (localInvalidationFailed) signedOutState(current.notice)
+                    else if (current.notice == AuthNotice.LOCAL_LOGOUT_FAILED) AuthState.SignedOut() else current
+                }
+            }
+            sessionOk && profileOk
+        }
+        persistenceTail = write
+        return write
+    }
+
     private fun advance(state: AuthState): Long {
         generation++
         operation?.cancel()
         api?.cancel()
         api = null
-        mutableState.value = state
+        mutableState.value = if (state is AuthState.SignedOut) signedOutState(state.notice) else state
         return generation
     }
 
-    private fun promote(record: StoredSession, incarnation: Long, notice: AuthNotice?) {
+    private fun saveNotice(): AuthNotice? = if (sessionSaveFailed || profileSaveFailed) AuthNotice.SAVE_FAILED else null
+
+    private fun promote(record: StoredSession, incarnation: Long) {
         saved = record
         identity = AccountIdentity(record.server, record.session.accountId, record.session.username, incarnation)
-        mutableState.value = AuthState.Authenticated(requireNotNull(identity), notice)
+        mutableState.value = AuthState.Authenticated(requireNotNull(identity), saveNotice())
     }
 
+    private fun signedOutState(notice: AuthNotice?) = AuthState.SignedOut(
+        if (localInvalidationFailed) AuthNotice.LOCAL_LOGOUT_FAILED else notice,
+    )
+
     private fun publish(token: Long, state: AuthState) = synchronized(lock) {
-        if (token == generation) mutableState.value = state
+        if (token == generation) mutableState.value = if (state is AuthState.SignedOut) signedOutState(state.notice) else state
     }
 }

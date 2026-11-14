@@ -54,7 +54,7 @@ class OkHttpAuthApi(
     override suspend fun logout(cookie: String, csrfToken: String) {
         val request = request("/api/auth/logout").header("Cookie", cookieHeader(cookie))
             .header("X-CSRF-Token", csrfToken).post(OneShotBody("".toRequestBody(JSON))).build()
-        execute(request).use { response ->
+        execute(request) { response ->
             if (response.code != 204) throw failure(response.code)
             // Logout never publishes Set-Cookie or rolling renewal.
         }
@@ -71,10 +71,19 @@ class OkHttpAuthApi(
             .header("Accept", "application/json").header("Cache-Control", "no-store")
     }
 
-    private suspend fun exchange(request: Request, requireCookie: Boolean = false): AuthReply {
-        execute(request).use { response ->
+    private suspend fun exchange(request: Request, requireCookie: Boolean = false): AuthReply =
+        execute(request) { response ->
             if (response.code != 200) throw failure(response.code)
             try {
+                // Parse the server's absolute cookie attributes at headers, before body I/O.
+                val modes = response.headers.values("X-Spofify-Session-Mode")
+                require(modes.isEmpty() || modes == listOf("rolling-v1"))
+                val cookies = response.headers.values("Set-Cookie").filter { raw ->
+                    raw.substringBefore(';').substringBefore('=').trim() == cookieName
+                }
+                require(cookies.size <= 1)
+                val cookie = cookies.singleOrNull()?.let { parseCookie(it, requireAbsoluteExpiry = true).toString() }
+                require(!requireCookie || cookie != null)
                 val body = response.body ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
                 val source = body.source()
                 source.request(MAX_BODY + 1)
@@ -82,28 +91,34 @@ class OkHttpAuthApi(
                 val bytes = source.readByteArray()
                 require(body.contentType()?.subtype == "json")
                 val summary = json.decodeFromString<SessionSummary>(bytes.decodeToString(throwOnInvalidSequence = true)).validated()
-                val modes = response.headers.values("X-Spofify-Session-Mode")
-                require(modes.isEmpty() || modes == listOf("rolling-v1"))
-                val cookies = response.headers.values("Set-Cookie").mapNotNull { raw ->
-                    val parsed = Cookie.parse(origin.url, raw)
-                    if (parsed?.name == cookieName) raw else null
-                }
-                require(cookies.size <= 1)
-                // Persist the absolute expiry, never a relative Max-Age that rebases on restore.
-                val cookie = cookies.singleOrNull()?.let { parseCookie(it).toString() }
-                require(!requireCookie || cookie != null)
                 require(summary.sessionMode == null || modes == listOf(summary.sessionMode))
-                return AuthReply(summary, cookie, modes.singleOrNull())
+                AuthReply(summary, cookie, modes.singleOrNull())
             } catch (error: SerializationException) {
                 throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
             } catch (error: IllegalArgumentException) {
                 throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
             }
         }
-    }
 
-    private fun parseCookie(raw: String): Cookie {
-        val cookie = Cookie.parse(origin.url, raw) ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+    private fun parseCookie(raw: String, requireAbsoluteExpiry: Boolean = false): Cookie {
+        // Cookie.parse gives Max-Age precedence and rebases it on the device clock.
+        // Strip ONLY that attribute; OkHttp still owns cookie/date/attribute parsing.
+        // Expires is the backend's durable deadline, even if the device clock is skewed.
+        val parts = raw.split(';')
+        val attributes = parts.drop(1)
+        fun String.named(name: String) = substringBefore('=').trim().equals(name, ignoreCase = true)
+        val expires = attributes.filter { it.named("Expires") }
+        val maxAge = attributes.filter { it.named("Max-Age") }
+        if (expires.size > 1 || maxAge.size > 1 ||
+            (maxAge.isNotEmpty() && (expires.isEmpty() ||
+                maxAge.single().substringAfter('=', "").trim().toLongOrNull()?.let { it > 0 } != true))) {
+            throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+        }
+        val absolute = parts.filterIndexed { index, part -> index == 0 || !part.named("Max-Age") }.joinToString(";")
+        val cookie = Cookie.parse(origin.url, absolute) ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+        if ((requireAbsoluteExpiry || expires.isNotEmpty()) && (expires.size != 1 || !cookie.persistent)) {
+            throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+        }
         if (cookie.name != cookieName || cookie.value.isEmpty() || !cookie.hostOnly ||
             cookie.domain != origin.url.host || cookie.path != "/" || !cookie.httpOnly ||
             cookie.secure != origin.url.isHttps || cookie.expiresAt <= 0L) {
@@ -114,22 +129,44 @@ class OkHttpAuthApi(
 
     private fun cookieHeader(raw: String): String = parseCookie(raw).let { "${it.name}=${it.value}" }
 
-    private suspend fun execute(request: Request): Response {
+    /** Keep the continuation and Call owned until body consumption AND close finish. */
+    private suspend fun <T> execute(request: Request, consume: (Response) -> T): T {
         check(origin.contains(request.url))
         val call = client.newCall(request)
         calls.add(call)
         return suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation { call.cancel(); calls.remove(call) }
-            call.enqueue(object : Callback {
+            continuation.invokeOnCancellation { call.cancel() }
+            val callback = object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     calls.remove(call)
                     if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
                 }
                 override fun onResponse(call: Call, response: Response) {
-                    calls.remove(call)
-                    continuation.resume(response) { _, discarded, _ -> discarded.close() }
+                    try {
+                        if (!continuation.isActive) {
+                            // Cancel before close: do not drain a retired slow response body.
+                            call.cancel()
+                            response.close()
+                            return
+                        }
+                        val result = response.use(consume)
+                        // Only a fully consumed, already closed value crosses the suspension.
+                        continuation.resumeWith(Result.success(result))
+                    } catch (error: Exception) {
+                        if (continuation.isActive) continuation.resumeWithException(
+                            if (error is IOException && error !is AuthFailure)
+                                AuthFailure(AuthFailure.Kind.UNAVAILABLE) else error,
+                        )
+                    } finally {
+                        calls.remove(call)
+                    }
                 }
-            })
+            }
+            try { call.enqueue(callback) } catch (error: Exception) {
+                call.cancel()
+                calls.remove(call)
+                if (continuation.isActive) continuation.resumeWithException(error)
+            }
         }
     }
 

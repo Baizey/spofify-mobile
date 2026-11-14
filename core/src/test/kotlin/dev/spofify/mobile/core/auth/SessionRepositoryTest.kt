@@ -4,6 +4,15 @@ import dev.spofify.mobile.core.origin.ServerOrigin
 import java.io.IOException
 import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.*
 import kotlinx.coroutines.test.*
 import org.junit.Assert.*
@@ -194,6 +203,21 @@ class SessionRepositoryTest {
         assertSame(old, logins.record)
     }
 
+    @Test fun rememberedSaveFailureRemainsVisibleAcrossForegroundRevalidation() = runTest {
+        val logins = Logins().apply { fails = true }
+        val repo = repository(Sessions(), logins, Api(), Api(), Api())
+        repo.signIn(origin.value, "fixture-user", UUID.randomUUID().toString())
+        advanceUntilIdle()
+        assertEquals(AuthNotice.SAVE_FAILED, (repo.state.value as AuthState.Authenticated).notice)
+        repo.refresh()
+        advanceUntilIdle()
+        assertEquals(AuthNotice.SAVE_FAILED, (repo.state.value as AuthState.Authenticated).notice)
+        logins.fails = false
+        repo.signIn(origin.value, "fixture-user", UUID.randomUUID().toString())
+        advanceUntilIdle()
+        assertNull((repo.state.value as AuthState.Authenticated).notice)
+    }
+
     @Test fun staleRestoreCookieCannotReplaceSuccessor() = runTest {
         val sessions = Sessions(stored())
         val old = Api().apply {
@@ -284,6 +308,107 @@ class SessionRepositoryTest {
         advanceUntilIdle()
         assertSame(accepted, sessions.record)
         assertTrue(repo.state.value is AuthState.Authenticated)
+    }
+
+    @Test fun blockedPersistenceNeverBlocksForegroundFenceOrSuccessorAndWritesStayOrdered() = runBlocking {
+        val ioExecutor = Executors.newFixedThreadPool(2)
+        val dispatcher = ioExecutor.asCoroutineDispatcher()
+        val main = Executors.newSingleThreadExecutor()
+        val appJob = SupervisorJob()
+        val appScope = CoroutineScope(appJob + dispatcher)
+        val enteredStore = CountDownLatch(1)
+        val releaseStore = CountDownLatch(1)
+        val refreshCreated = CountDownLatch(1)
+        val refreshGate = CompletableDeferred<Unit>()
+        val firstWrite = AtomicBoolean(true)
+        val stored = AtomicReference<StoredSession?>()
+        val profile = AtomicReference<RememberedLogin?>()
+        val writes = CopyOnWriteArrayList<StoredSession?>()
+        val sessions = object : SessionStore {
+            override fun read() = stored.get()
+            override fun write(value: StoredSession?) {
+                if (firstWrite.compareAndSet(true, false)) {
+                    enteredStore.countDown()
+                    check(releaseStore.await(10, TimeUnit.SECONDS)) { "Store was not released" }
+                }
+                stored.set(value)
+                writes.add(value)
+            }
+        }
+        val logins = object : LoginStore {
+            override fun read() = profile.get()
+            override fun write(value: RememberedLogin) { profile.set(value) }
+        }
+        val first = Api()
+        val refresh = Api().apply { sessionGate = refreshGate }
+        val successor = Api()
+        val clients = ConcurrentLinkedQueue(listOf(first, refresh, successor, Api()))
+        val created = AtomicInteger()
+        val repo = SessionRepository(sessions, logins, AuthApiFactory {
+            val client = clients.remove()
+            if (created.incrementAndGet() == 2) refreshCreated.countDown()
+            client
+        }, appScope, dispatcher)
+        try {
+            repo.signIn(origin.value, "fixture-user", UUID.randomUUID().toString())
+            assertTrue(enteredStore.await(2, TimeUnit.SECONDS))
+            val beforeForeground = (repo.state.value as? AuthState.Authenticated)?.identity
+            // Real ON_START follows this synchronous frontend path. A blocked store
+            // must not delay even the state check, nor make retirement wait for I/O.
+            main.submit { repo.refresh() }.get(500, TimeUnit.MILLISECONDS)
+            val previous = requireNotNull(beforeForeground)
+            assertTrue(refreshCreated.await(2, TimeUnit.SECONDS))
+            val nextSecret = UUID.randomUUID().toString()
+            main.submit {
+                repo.signOut()
+                assertFalse(repo.isCurrent(previous))
+                assertTrue(repo.state.value is AuthState.SignedOut)
+                repo.signIn(origin.value, "fixture-user", nextSecret)
+            }.get(500, TimeUnit.MILLISECONDS)
+            val next = withTimeout(2_000) {
+                repo.state.first { it is AuthState.Authenticated && it.identity != previous }
+            } as AuthState.Authenticated
+            assertTrue(repo.isCurrent(next.identity))
+            assertTrue("Blocked predecessor unexpectedly finished", writes.isEmpty())
+            releaseStore.countDown()
+            // Read waits for the accepted successor intent, not merely its network result.
+            assertEquals(nextSecret, withTimeout(2_000) { repo.rememberedLogin() }!!.password)
+            refreshGate.complete(Unit)
+            withTimeout(2_000) { appJob.children.toList().joinAll() }
+            assertEquals(3, writes.size)
+            assertEquals(first.loginReply.cookie, writes[0]!!.cookie)
+            assertNull(writes[1])
+            assertEquals(successor.loginReply.cookie, writes[2]!!.cookie)
+            assertEquals(successor.loginReply.cookie, stored.get()!!.cookie)
+            assertTrue(repo.isCurrent(next.identity))
+        } finally {
+            releaseStore.countDown()
+            refreshGate.complete(Unit)
+            main.shutdownNow()
+            appJob.cancel()
+            try { withTimeout(2_000) { appJob.join() } } finally {
+                dispatcher.close()
+                val mainStopped = main.awaitTermination(2, TimeUnit.SECONDS)
+                val ioStopped = ioExecutor.awaitTermination(2, TimeUnit.SECONDS)
+                assertTrue(mainStopped)
+                assertTrue(ioStopped)
+            }
+        }
+    }
+
+    @Test fun failedClearIsNotHiddenByAYoungerFailedLogin() = runTest {
+        val sessions = Sessions()
+        val failedLogin = Api().apply { loginError = AuthFailure(AuthFailure.Kind.UNAUTHORIZED) }
+        val repo = repository(sessions, Logins(), Api(), failedLogin, Api())
+        repo.signIn(origin.value, "fixture-user", UUID.randomUUID().toString())
+        advanceUntilIdle()
+        val previous = sessions.record
+        sessions.writeFails = true
+        repo.signOut()
+        repo.signIn(origin.value, "fixture-user", UUID.randomUUID().toString())
+        advanceUntilIdle()
+        assertSame(previous, sessions.record)
+        assertEquals(AuthState.SignedOut(AuthNotice.LOCAL_LOGOUT_FAILED), repo.state.value)
     }
 
     @Test fun localSignoutFailureIsTruthfulAndDoesNotDeleteOtherRecords() = runTest {

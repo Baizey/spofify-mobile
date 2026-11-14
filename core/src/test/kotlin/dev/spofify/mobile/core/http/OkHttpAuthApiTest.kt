@@ -2,12 +2,18 @@ package dev.spofify.mobile.core.http
 
 import dev.spofify.mobile.core.auth.AuthFailure
 import dev.spofify.mobile.core.origin.ServerOrigin
+import java.io.IOException
+import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.Call
+import okhttp3.Cookie
+import okhttp3.EventListener
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.*
@@ -16,7 +22,7 @@ import org.junit.Test
 class OkHttpAuthApiTest {
     private val summary = """{"accountId":"fixture-id","username":"fixture-user","role":"user","csrfToken":"fixture-csrf"}"""
     private fun response() = MockResponse().setHeader("Content-Type", "application/json").setBody(summary)
-    private fun cookie() = "spofify_session=${UUID.randomUUID()}; Path=/; HttpOnly; Max-Age=3600"
+    private fun cookie() = "spofify_session=${UUID.randomUUID()}; Path=/; HttpOnly; Max-Age=3600; Expires=Tue, 01 Jan 2030 00:00:00 GMT"
 
     @Test fun exactLoginJsonHeadersAndCookieNegotiation() = runBlocking {
         MockWebServer().use { server ->
@@ -90,10 +96,10 @@ class OkHttpAuthApiTest {
     @Test fun invalidOrMissingCookieAndInvalidJsonCannotAuthenticate() = runBlocking {
         val invalid = listOf(
             response(),
-            response().setHeader("Set-Cookie", "spofify_session=x; Path=/other; HttpOnly"),
-            response().setHeader("Set-Cookie", "spofify_session=x; Path=/; HttpOnly; Domain=localhost"),
-            response().setHeader("Set-Cookie", "spofify_session=x; Path=/; HttpOnly; Secure"),
-            response().setHeader("Set-Cookie", "spofify_session=x; Path=/"),
+            response().setHeader("Set-Cookie", "spofify_session=x; Path=/other; HttpOnly; Expires=Tue, 01 Jan 2030 00:00:00 GMT"),
+            response().setHeader("Set-Cookie", "spofify_session=x; Path=/; HttpOnly; Domain=localhost; Expires=Tue, 01 Jan 2030 00:00:00 GMT"),
+            response().setHeader("Set-Cookie", "spofify_session=x; Path=/; HttpOnly; Secure; Expires=Tue, 01 Jan 2030 00:00:00 GMT"),
+            response().setHeader("Set-Cookie", "spofify_session=x; Path=/; Expires=Tue, 01 Jan 2030 00:00:00 GMT"),
             response().setHeader("Set-Cookie", cookie()).addHeader("Set-Cookie", cookie()),
             response().setHeader("Set-Cookie", cookie()).setBody("""{"accountId":"fixture-id"}"""),
             response().setHeader("Set-Cookie", cookie()).setBody(summary.replace("\"role\":\"user\"", "\"role\":\"other\"")),
@@ -105,6 +111,77 @@ class OkHttpAuthApiTest {
                 server.enqueue(response)
                 val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
                 try { api.login("fixture-user", UUID.randomUUID().toString()); fail("Expected invalid response") }
+                catch (failure: AuthFailure) { assertEquals(AuthFailure.Kind.INVALID_RESPONSE, failure.kind) }
+            }
+        }
+    }
+
+    @Test fun cancellationAfterHeadersOwnsBodyUntilClosed() = runBlocking {
+        for (cancelJob in listOf(false, true)) {
+            MockWebServer().use { server ->
+                server.start()
+                val reading = CountDownLatch(1)
+                val terminal = CountDownLatch(1)
+                val client = OkHttpAuthApi.defaultClient().newBuilder().eventListener(object : EventListener() {
+                    override fun responseBodyStart(call: Call) { reading.countDown() }
+                    override fun callFailed(call: Call, ioe: IOException) { terminal.countDown() }
+                    override fun callEnd(call: Call) { terminal.countDown() }
+                }).build()
+                val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()), client)
+                // Headers arrive immediately; the body cannot complete within the cancellation deadline.
+                server.enqueue(response().setBodyDelay(3, TimeUnit.SECONDS))
+                val request = async(Dispatchers.IO) { runCatching { api.session(cookie()) } }
+                try {
+                    assertTrue("Body read was not entered", reading.await(2, TimeUnit.SECONDS))
+                    if (cancelJob) request.cancel() else api.cancel()
+                    assertTrue("Retired Call did not terminate promptly", terminal.await(1, TimeUnit.SECONDS))
+                    withTimeout(1_000) { request.join() }
+                    if (!cancelJob) assertTrue(request.await().exceptionOrNull() is AuthFailure)
+                } finally {
+                    api.cancel()
+                    request.cancelAndJoin()
+                }
+            }
+        }
+    }
+
+    @Test fun serverAbsoluteExpirySurvivesConflictingMaxAgeBodyDelayAndClockSkew() = runBlocking {
+        // The past date deliberately models a device clock ahead of the server:
+        // local time is never a revocation decision and must not rebase Expires.
+        for ((date, epoch) in listOf(
+            "Tue, 01 Jan 2030 00:00:00 GMT" to Instant.parse("2030-01-01T00:00:00Z").toEpochMilli(),
+            "Mon, 01 Jan 2001 00:00:00 GMT" to Instant.parse("2001-01-01T00:00:00Z").toEpochMilli(),
+        )) {
+            MockWebServer().use { server ->
+                server.start()
+                server.enqueue(response().setHeader("Set-Cookie",
+                    "spofify_session=fixture-cookie; Path=/; HttpOnly; Expires=$date; Max-Age=1")
+                    .setBodyDelay(100, TimeUnit.MILLISECONDS))
+                server.enqueue(response()) // Quiet validation: no renewal.
+                val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
+                val first = api.login("fixture-user", UUID.randomUUID().toString())
+                assertEquals(epoch, Cookie.parse(server.url("/"), first.cookie!!)!!.expiresAt)
+                assertFalse(first.cookie!!.contains("max-age", ignoreCase = true))
+                val quiet = api.session(first.cookie!!)
+                assertNull(quiet.cookie)
+                assertEquals(epoch, Cookie.parse(server.url("/"), first.cookie!!)!!.expiresAt)
+            }
+        }
+    }
+
+    @Test fun malformedAbsoluteExpiryNeverBecomesLocallyInventedRenewal() = runBlocking {
+        for (attributes in listOf(
+            "Max-Age=3600",
+            "Expires=not-a-date; Max-Age=3600",
+            "Expires=Tue, 01 Jan 2030 00:00:00 GMT; Expires=Mon, 01 Jan 2001 00:00:00 GMT",
+            "Expires=Tue, 01 Jan 2030 00:00:00 GMT; Max-Age=not-a-number",
+            "Expires=Tue, 01 Jan 2030 00:00:00 GMT; Max-Age=1; Max-Age=2",
+        )) {
+            MockWebServer().use { server ->
+                server.start()
+                server.enqueue(response().setHeader("Set-Cookie", "spofify_session=x; Path=/; HttpOnly; $attributes"))
+                val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
+                try { api.session(cookie()); fail("Expected invalid cookie") }
                 catch (failure: AuthFailure) { assertEquals(AuthFailure.Kind.INVALID_RESPONSE, failure.kind) }
             }
         }
