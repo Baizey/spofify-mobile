@@ -9,6 +9,7 @@ import dev.spofify.mobile.core.auth.SessionRepository
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
 class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {

@@ -16,6 +16,12 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
 
+/** Shares the connection pool without exposing OkHttp types across the app composition boundary. */
+class OkHttpAuthApiFactory : AuthApiFactory {
+    private val client = OkHttpAuthApi.defaultClient()
+    override fun create(origin: ServerOrigin): AuthApi = OkHttpAuthApi(origin, client)
+}
+
 /** No global cookie jar, redirects, retry, HTTP logging or private-response disk cache. */
 class OkHttpAuthApi(
     override val origin: ServerOrigin,
