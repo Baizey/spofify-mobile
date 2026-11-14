@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">spofify</string>
+    <string name="sign_in">Sign in</string>
+    <string name="sign_out">Sign out</string>
+    <string name="server_url">Server URL</string>
+    <string name="username">Username</string>
+    <string name="password">Password</string>
+    <string name="show_password">Show</string>
+    <string name="hide_password">Hide</string>
+    <string name="show_password_accessibility">Show password</string>
+    <string name="hide_password_accessibility">Hide password</string>
+    <string name="account">Account</string>
+    <string name="connecting">Connecting…</string>
+    <string name="signing_in">Signing in…</string>
+    <string name="retry">Retry</string>
+    <string name="credits">Credits</string>
+    <string name="font_name">JetBrains Mono</string>
+    <string name="close">Close</string>
+    <string name="invalid_origin">Enter a valid server URL.</string>
+    <string name="invalid_credentials">Incorrect username or password.</string>
+    <string name="connection_failed">Couldn’t connect.</string>
+    <string name="storage_unavailable">Couldn’t read saved sign-in.</string>
+    <string name="save_failed">Signed in. Couldn’t save sign-in.</string>
+    <string name="session_expired">Session ended. Sign in again.</string>
+    <string name="remote_logout_failed">Signed out here. Couldn’t sign out on server.</string>
+    <string name="local_logout_failed">Saved sign-in couldn’t be cleared. It may return on restart.</string>
+</resources>

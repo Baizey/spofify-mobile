@@ -1,0 +1,151 @@
+package dev.spofify.mobile.core.http
+
+import dev.spofify.mobile.core.auth.*
+import dev.spofify.mobile.core.origin.ServerOrigin
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
+
+/** No global cookie jar, redirects, retry, HTTP logging or private-response disk cache. */
+class OkHttpAuthApi(
+    override val origin: ServerOrigin,
+    private val client: OkHttpClient = defaultClient(),
+) : AuthApi {
+    private val json = Json { ignoreUnknownKeys = true }
+    private val calls = ConcurrentHashMap.newKeySet<Call>()
+    private val cookieName = if (origin.url.isHttps) "__Host-spofify_session" else "spofify_session"
+
+    init {
+        require(!client.followRedirects && !client.followSslRedirects && !client.retryOnConnectionFailure)
+        require(client.cache == null && client.cookieJar === CookieJar.NO_COOKIES)
+        require(client.interceptors.isEmpty() && client.networkInterceptors.isEmpty())
+        require(client.authenticator === Authenticator.NONE && client.proxyAuthenticator === Authenticator.NONE)
+    }
+
+    @Serializable
+    private class LoginBody(val username: String, val password: String)
+
+    override suspend fun login(username: String, password: String): AuthReply {
+        val body = json.encodeToString(LoginBody(username, password)).toRequestBody(JSON)
+        val request = request("/api/auth/login").header("X-Spofify-Login", "1")
+            .header("X-Spofify-Session-Mode", "rolling-v1").post(OneShotBody(body)).build()
+        return exchange(request, requireCookie = true)
+    }
+
+    override suspend fun session(cookie: String): AuthReply =
+        exchange(request("/api/auth/session").header("Cookie", cookieHeader(cookie)).get().build())
+
+    override suspend fun logout(cookie: String, csrfToken: String) {
+        val request = request("/api/auth/logout").header("Cookie", cookieHeader(cookie))
+            .header("X-CSRF-Token", csrfToken).post(OneShotBody("".toRequestBody(JSON))).build()
+        execute(request).use { response ->
+            if (response.code != 204) throw failure(response.code)
+            // Logout never publishes Set-Cookie or rolling renewal.
+        }
+    }
+
+    override fun validateCookie(cookie: String) { parseCookie(cookie) }
+
+    override fun cancel() { calls.forEach(Call::cancel) }
+
+    private fun request(path: String): Request.Builder {
+        val url = origin.url.newBuilder().encodedPath(path).build()
+        check(origin.contains(url))
+        return Request.Builder().url(url).header("Origin", origin.value)
+            .header("Accept", "application/json").header("Cache-Control", "no-store")
+    }
+
+    private suspend fun exchange(request: Request, requireCookie: Boolean = false): AuthReply {
+        execute(request).use { response ->
+            if (response.code != 200) throw failure(response.code)
+            try {
+                val body = response.body ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+                val source = body.source()
+                source.request(MAX_BODY + 1)
+                if (source.buffer.size > MAX_BODY) throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+                val bytes = source.readByteArray()
+                require(body.contentType()?.subtype == "json")
+                val summary = json.decodeFromString<SessionSummary>(bytes.decodeToString(throwOnInvalidSequence = true)).validated()
+                val modes = response.headers.values("X-Spofify-Session-Mode")
+                require(modes.isEmpty() || modes == listOf("rolling-v1"))
+                val cookies = response.headers.values("Set-Cookie").mapNotNull { raw ->
+                    val parsed = Cookie.parse(origin.url, raw)
+                    if (parsed?.name == cookieName) raw else null
+                }
+                require(cookies.size <= 1)
+                // Persist the absolute expiry, never a relative Max-Age that rebases on restore.
+                val cookie = cookies.singleOrNull()?.let { parseCookie(it).toString() }
+                require(!requireCookie || cookie != null)
+                require(summary.sessionMode == null || modes == listOf(summary.sessionMode))
+                return AuthReply(summary, cookie, modes.singleOrNull())
+            } catch (error: SerializationException) {
+                throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+            } catch (error: IllegalArgumentException) {
+                throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+            }
+        }
+    }
+
+    private fun parseCookie(raw: String): Cookie {
+        val cookie = Cookie.parse(origin.url, raw) ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+        if (cookie.name != cookieName || cookie.value.isEmpty() || !cookie.hostOnly ||
+            cookie.domain != origin.url.host || cookie.path != "/" || !cookie.httpOnly ||
+            cookie.secure != origin.url.isHttps || cookie.expiresAt <= 0L) {
+            throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+        }
+        return cookie
+    }
+
+    private fun cookieHeader(raw: String): String = parseCookie(raw).let { "${it.name}=${it.value}" }
+
+    private suspend fun execute(request: Request): Response {
+        check(origin.contains(request.url))
+        val call = client.newCall(request)
+        calls.add(call)
+        return suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation { call.cancel(); calls.remove(call) }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    calls.remove(call)
+                    if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
+                }
+                override fun onResponse(call: Call, response: Response) {
+                    calls.remove(call)
+                    continuation.resume(response) { _, discarded, _ -> discarded.close() }
+                }
+            })
+        }
+    }
+
+    private fun failure(code: Int) = AuthFailure(
+        if (code == 401) AuthFailure.Kind.UNAUTHORIZED else AuthFailure.Kind.UNAVAILABLE,
+    )
+
+    /** OkHttp otherwise may follow up some 408/503/421 responses despite retry=false. */
+    private class OneShotBody(private val delegate: RequestBody) : RequestBody() {
+        override fun contentType() = delegate.contentType()
+        override fun contentLength() = delegate.contentLength()
+        override fun isOneShot() = true
+        override fun writeTo(sink: BufferedSink) = delegate.writeTo(sink)
+    }
+
+    companion object {
+        private const val MAX_BODY = 64L * 1024
+        private val JSON = "application/json; charset=utf-8".toMediaType()
+        fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+            .followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false)
+            .cookieJar(CookieJar.NO_COOKIES).cache(null)
+            .connectTimeout(15, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(25, TimeUnit.SECONDS).build()
+    }
+}
