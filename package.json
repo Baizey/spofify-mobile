@@ -1,7 +1,0 @@
-{
-  "name": "spofify-web",
-  "private": true,
-  "type": "module",
-  "scripts": {"test": "node --test test/*.test.js tests/*.test.mjs", "fixture": "node tools/fixture.js"},
-  "engines": {"node": ">=22"}
-}
