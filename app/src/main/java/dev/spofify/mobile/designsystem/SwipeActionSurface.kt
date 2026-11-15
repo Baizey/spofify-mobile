@@ -10,6 +10,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -51,7 +52,7 @@ fun SwipeActionSurface(
             offset = 0f
         }
     }
-    Box(modifier.onSizeChanged { width = it.width }.pointerInput(binding, width, onRight != null, onLeft != null) {
+    Box(modifier.clipToBounds().onSizeChanged { width = it.width }.pointerInput(binding, width, onRight != null, onLeft != null) {
         try {
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
