@@ -5,6 +5,15 @@ sign-in, validated session restoration and Account / Sign out. There are no plac
 music destinations. The Android-free `:core` owns origin, HTTP and session contracts;
 `:app` owns platform encryption, lifecycle and presentation.
 
+## UI specification
+
+The agreed, iterated visual and interaction specification is
+[the interactive wireframe](docs/reference/index.html). Open it directly in a browser;
+it is self-contained and works offline. Its final rendered screens and touch behavior
+are the specification, not suggestions. The file contains cumulative renderer overrides,
+so earlier function definitions alone do not describe the final UI. Its synthetic music,
+accounts and playback are fixtures, not production API contracts.
+
 ## Development
 
 Open this directory in Android Studio. Use JDK 25, Android platform 37.0 and
