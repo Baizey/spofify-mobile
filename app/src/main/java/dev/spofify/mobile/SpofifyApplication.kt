@@ -4,6 +4,7 @@ import android.app.Application
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.http.OkHttpAuthApiFactory
 import dev.spofify.mobile.storage.EncryptedAuthStores
+import dev.spofify.mobile.playback.PlaybackOwner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -13,11 +14,16 @@ class SpofifyApplication : Application() {
     lateinit var sessions: SessionRepository
         private set
 
+    lateinit var playback: PlaybackOwner
+        private set
+
     override fun onCreate() {
         super.onCreate()
         val stores = EncryptedAuthStores(this)
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         sessions = SessionRepository(stores.sessions, stores.logins, OkHttpAuthApiFactory(), scope)
+        playback = PlaybackOwner(this, sessions, CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate))
+        playback.start()
         sessions.start()
     }
 }

@@ -24,15 +24,32 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.*
+import dev.spofify.mobile.core.playback.*
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun SearchScreen(model: SearchViewModel, loader: ImageLoader, focusIntent: Int, onOpen: (MusicItem) -> Unit) {
+internal fun SearchScreen(
+    model: SearchViewModel, loader: ImageLoader, focusIntent: Int, onOpen: (MusicItem) -> Unit,
+    playback: PlaybackController? = null,
+) {
     val state by model.state.collectAsStateWithLifecycle()
     val scroll = rememberLazyListState()
     val requester = remember { FocusRequester() }
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     var editing by remember { mutableStateOf(false) }
+    val player = playback?.state?.collectAsStateWithLifecycle()?.value
+    val ready = player?.connection == PlaybackConnectionState.READY
+    val imeVisible = WindowInsets.isImeVisible
+    var imeWasVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(imeVisible) {
+        if (imeWasVisible && !imeVisible) focus.clearFocus()
+        imeWasVisible = imeVisible
+    }
+    fun queue(item: MusicItem, next: Boolean) {
+        if (item.kind == MusicKind.TRACK) playback?.queueTrack(PlaybackTrackReference(item.id), next = next)
+        else playback?.queueCollection(PlaybackContext(item.kind.name.lowercase(java.util.Locale.ROOT), item.id, item.name), next)
+    }
     DisposableEffect(model) {
         model.resume()
         onDispose { model.pause() }
@@ -53,7 +70,12 @@ internal fun SearchScreen(model: SearchViewModel, loader: ImageLoader, focusInte
         if (!editing) Box(Modifier.padding(horizontal = 20.dp)) { PageTitle("Search") }
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll, reverseLayout = true,
             contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp)) {
-            items(state.items, key = MusicItem::key) { item -> MusicRow(item, loader) { onOpen(item) } }
+            items(state.items, key = MusicItem::key) { item ->
+                val playable = ready && if (item.kind == MusicKind.TRACK) item.hasAudio else item.availableTracks > 0
+                MusicRow(item, loader,
+                    onQueue = if (playable) ({ queue(item, false) }) else null,
+                    onPlayNext = if (playable) ({ queue(item, true) }) else null) { onOpen(item) }
+            }
             if (state.query.isNotBlank()) {
                 item("search-status") {
                     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {

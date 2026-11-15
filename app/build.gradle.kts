@@ -35,6 +35,10 @@ dependencies {
     implementation(libs.serialization.json)
     implementation(libs.coil.compose)
     implementation(libs.navigation.compose)
+    implementation(libs.media3.common)
+    implementation(libs.media3.datasource)
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.session)
     testImplementation(libs.junit)
     testImplementation(libs.coroutines.test)
 }

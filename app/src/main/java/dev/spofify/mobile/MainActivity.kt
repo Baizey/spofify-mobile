@@ -9,6 +9,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -21,6 +23,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.spofify.mobile.core.auth.AuthState
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.feature.library.MusicRoot
+import dev.spofify.mobile.playback.PlaybackOwner
 import dev.spofify.mobile.designsystem.SpofifyTheme
 import dev.spofify.mobile.feature.auth.*
 
@@ -31,24 +34,41 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
-        val repository = (application as SpofifyApplication).sessions
+        val app = application as SpofifyApplication
+        val repository = app.sessions
         setContent {
             SpofifyTheme {
                 val model: AuthViewModel = viewModel(factory = AuthViewModel.Factory(repository))
-                AuthRoot(model, repository)
+                AuthRoot(model, repository, app.playback)
             }
         }
     }
 }
 
 @Composable
-private fun AuthRoot(model: AuthViewModel, sessions: SessionRepository) {
+private fun AuthRoot(model: AuthViewModel, sessions: SessionRepository, playback: PlaybackOwner) {
     val state by model.state.collectAsStateWithLifecycle()
     val inputNotice by model.inputNotice.collectAsStateWithLifecycle()
     val owner = LocalLifecycleOwner.current
-    DisposableEffect(owner, model) {
+    val pages = rememberSaveableStateHolder()
+    var previousPageKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val pageKey = (state as? AuthState.Authenticated)?.identity?.let {
+        "${it.origin.length}:${it.origin}${it.accountId.length}:${it.accountId}:${it.incarnation}"
+    }
+    LaunchedEffect(pageKey, state) {
+        if (pageKey != null && pageKey != previousPageKey) {
+            previousPageKey?.let(pages::removeState)
+            previousPageKey = pageKey
+        } else if (state is AuthState.SignedOut || state == AuthState.SigningIn) {
+            previousPageKey?.let(pages::removeState)
+            previousPageKey = null
+        }
+    }
+    DisposableEffect(owner, model, playback) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_START) model.foreground()
+            if (event == Lifecycle.Event.ON_START) {
+                if (playback.current != null) playback.foreground() else model.foreground()
+            }
         }
         owner.lifecycle.addObserver(observer)
         onDispose { owner.lifecycle.removeObserver(observer) }
@@ -58,11 +78,13 @@ private fun AuthRoot(model: AuthViewModel, sessions: SessionRepository) {
         Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
             when (val current = state) {
                 is AuthState.Authenticated -> {
-                    var credits by remember { mutableStateOf(false) }
-                    MusicRoot(current.identity, sessions) {
-                        AccountScreen(current, model::signOut) { credits = true }
+                    pages.SaveableStateProvider(requireNotNull(pageKey)) {
+                        var credits by rememberSaveable { mutableStateOf(false) }
+                        MusicRoot(current.identity, sessions, playback) {
+                            AccountScreen(current, model::signOut) { credits = true }
+                        }
+                        if (credits) FontCredits { credits = false }
                     }
-                    if (credits) FontCredits { credits = false }
                 }
                 is AuthState.SignedOut -> LoginScreen(model.inputs, false, current.notice ?: inputNotice,
                     model::server, model::username, model::password, model::reveal, model::signIn)
