@@ -40,6 +40,9 @@ fun SwipeActionSurface(
     val currentBinding by rememberUpdatedState(binding)
     val right by rememberUpdatedState(onRight)
     val left by rememberUpdatedState(onLeft)
+    val currentSlideOutOnCommit by rememberUpdatedState(slideOutOnCommit)
+    val currentSlideOutOnLeft by rememberUpdatedState(slideOutOnLeft)
+    val ownership = remember { SwipeGestureOwnership() }
     var width by remember { mutableIntStateOf(0) }
     var offset by remember { mutableFloatStateOf(0f) }
     var settling by remember { mutableStateOf<Job?>(null) }
@@ -48,21 +51,37 @@ fun SwipeActionSurface(
     val scale = density.density
     DisposableEffect(binding, onRight != null, onLeft != null) {
         onDispose {
+            ownership.invalidate()
             settling?.cancel()
+            settling = null
             offset = 0f
         }
     }
-    Box(modifier.clipToBounds().onSizeChanged { width = it.width }.pointerInput(binding, width, onRight != null, onLeft != null) {
+    Box(modifier.clipToBounds().onSizeChanged { width = it.width }
+        .pointerInput(binding, width, onRight != null, onLeft != null, scale, exclusion) {
+        var captured: CapturedSwipe? = null
         try {
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
-                if (width == 0 || down.position.x > width - exclusion || (right == null && left == null)) return@awaitEachGesture
+                // A new touch cancels the prior settle even when it lands on the excluded action slot.
+                ownership.invalidate()
                 settling?.cancel()
+                settling = null
                 offset = 0f
-                val capturedBinding = binding
+                captured = null
+                val capturedRight = right
+                val capturedLeft = left
+                val capturedWidth = width.toFloat()
+                if (capturedWidth == 0f || down.position.x > capturedWidth - exclusion ||
+                    (capturedRight == null && capturedLeft == null)) return@awaitEachGesture
+                val gesture = ownership.begin(currentBinding, capturedRight, capturedLeft)
+                captured = gesture
+                val capturedSlideOut = currentSlideOutOnCommit
+                val capturedSlideOutLeft = currentSlideOutOnLeft
                 val start = down.position
                 var dragging = false
                 var cancelled = false
+                var released = false
                 var peak = 0f
                 var sign = 0f
                 var dx = 0f
@@ -70,7 +89,7 @@ fun SwipeActionSurface(
                 while (true) {
                     val event = awaitPointerEvent()
                     val pointer = event.changes.firstOrNull { it.id == down.id }
-                    if (pointer == null || event.changes.count { it.pressed } > 1 || currentBinding != capturedBinding) {
+                    if (pointer == null || event.changes.count { it.pressed } > 1 || !ownership.owns(gesture, currentBinding)) {
                         cancelled = true
                         break
                     }
@@ -80,6 +99,8 @@ fun SwipeActionSurface(
                         cancelled = true
                         break
                     }
+                    // Pointer-up cannot turn a still-pending touch into a newly locked drag.
+                    if (!pointer.pressed && !dragging) break
                     if (!dragging) {
                         if (abs(dy) > lockDistance && abs(dy) > abs(dx)) {
                             cancelled = true
@@ -97,29 +118,47 @@ fun SwipeActionSurface(
                             break
                         }
                         peak = max(peak, abs(dx))
-                        val supported = if (dx > 0) right != null else left != null
-                        offset = if (supported) dx.coerceIn(-width.toFloat(), width.toFloat())
+                        val supported = gesture.action(if (dx > 0) 1 else -1) != null
+                        offset = if (supported) dx.coerceIn(-capturedWidth, capturedWidth)
                             else (dx * .15f).coerceIn(-12.dp.toPx(), 12.dp.toPx())
                         pointer.consume()
                     }
-                    if (!pointer.pressed) break
-                }
-                if (dragging) {
-                    val direction = if (cancelled) null else releasedSwipeDirection(width / scale, dx / scale, dy / scale, peak / scale, sign)
-                    val action = when (direction) { 1 -> right; -1 -> left; else -> null }
-                    val target = if (action != null && (slideOutOnCommit || dx < 0 && slideOutOnLeft)) {
-                        if (dx > 0) width.toFloat() else -width.toFloat()
-                    } else 0f
-                    settling = scope.launch {
-                        animate(offset, target, animationSpec = tween(if (action != null) 180 else 160)) { value, _ -> offset = value }
-                        if (action != null && currentBinding == capturedBinding && (if (dx > 0) right else left) != null) action()
-                        offset = 0f
+                    if (!pointer.pressed) {
+                        released = pointer.previousPressed
+                        break
                     }
                 }
+                if (dragging) {
+                    val direction = if (cancelled || !released) null else
+                        releasedSwipeDirection(capturedWidth / scale, dx / scale, dy / scale, peak / scale, sign)
+                    val action = gesture.action(direction)
+                    val target = if (action != null && (capturedSlideOut || dx < 0 && capturedSlideOutLeft)) {
+                        if (dx > 0) capturedWidth else -capturedWidth
+                    } else 0f
+                    settling = scope.launch {
+                        try {
+                            animate(offset, target, animationSpec = tween(if (action != null) 180 else 160)) { value, _ ->
+                                if (ownership.owns(gesture, currentBinding)) offset = value
+                            }
+                            // A mini-player callback can install a pending identity before its face returns to rest.
+                            ownership.finish(gesture, currentBinding, released && !cancelled, direction)
+                        } finally {
+                            ownership.cancel(gesture)
+                            // A cancelled old job must not reset a newer gesture's translated face.
+                            if (ownership.canResetFace(gesture)) offset = 0f
+                        }
+                    }
+                } else if (ownership.cancel(gesture)) offset = 0f
             }
         } finally {
-            settling?.cancel()
-            offset = 0f
+            // Includes pointerInput cancellation while a finger is still down, before any settle exists.
+            captured?.let { gesture ->
+                if (ownership.cancel(gesture)) {
+                    settling?.cancel()
+                    settling = null
+                    offset = 0f
+                }
+            }
         }
     }) {
         if (background != null) background(offset, width.toFloat())
