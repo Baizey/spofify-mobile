@@ -3,6 +3,7 @@ package dev.spofify.mobile.playback
 import android.content.Context
 import android.net.Uri
 import android.os.Looper
+import android.util.Log
 import androidx.media3.common.*
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
@@ -13,7 +14,6 @@ import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.playback.*
 import java.io.Closeable
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -38,7 +38,7 @@ internal class Media3AudioExecutor(
     override val observations = mutableObservations.asSharedFlow()
     private var binding: AudioBinding? = null
     private var generation = 0L
-    private var ready: CompletableDeferred<AudioResult>? = null
+    private var preparation: NativePreparation? = null
     private var endedBinding: AudioBinding? = null
     private var blocked = false
     private var released = false
@@ -49,11 +49,15 @@ internal class Media3AudioExecutor(
             if (released) return
             val current = binding ?: return
             if (player.currentMediaItem?.mediaId != current.trackId) return
-            if (events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED) && player.playbackState == Player.STATE_ENDED)
-                endedBinding = current
-            when {
-                player.playerError != null -> ready?.complete(AudioResult.MEDIA)
-                player.playbackState == Player.STATE_READY -> ready?.complete(AudioResult.OK)
+            val pending = preparation?.takeIf { it.matches(generation, current, player.currentMediaItem?.mediaId) }
+            val state = player.playbackState
+            val hasError = player.playerError != null
+            if (events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED) && state == Player.STATE_ENDED && !hasError &&
+                (pending == null || pending.reportsNativeEnd(state, hasError, player.duration))) endedBinding = current
+            pending?.outcome(state, hasError, player.duration)?.let { outcome ->
+                if (state == Player.STATE_ENDED) Log.i("SpofifyPlayer",
+                    "Native terminal preparation: playRequested=${pending.playRequested}, result=$outcome")
+                pending.result.complete(outcome)
             }
             mutableObservations.tryEmit(AudioObservation(current, facts()))
         }
@@ -76,10 +80,11 @@ internal class Media3AudioExecutor(
     ): AudioResult {
         checkThread()
         if (!isAuthorized()) { pause(); return AudioResult.REJECTED }
-        val result = load(binding, track, elapsed)
+        val result = load(binding, track, elapsed, playRequested = desiredPlaying)
         if (result != AudioResult.OK) return result
         if (this.binding != binding || !isAuthorized()) { pause(); return AudioResult.REJECTED }
-        if (track != null && desiredPlaying) {
+        // A known terminal position cannot start sound or justify a new foreground-service deadline.
+        if (track != null && desiredPlaying && player.playbackState != Player.STATE_ENDED) {
             val nativeGeneration = generation
             playbackAuthority = {
                 !released && this.binding == binding && generation == nativeGeneration && isAuthorized()
@@ -100,7 +105,7 @@ internal class Media3AudioExecutor(
         return AudioResult.OK
     }
 
-    private suspend fun load(next: AudioBinding, track: PlaybackTrack?, elapsed: Double): AudioResult {
+    private suspend fun load(next: AudioBinding, track: PlaybackTrack?, elapsed: Double, playRequested: Boolean = false): AudioResult {
         checkThread()
         pause()
         binding = next
@@ -115,8 +120,8 @@ internal class Media3AudioExecutor(
             }
             require(elapsed.isFinite() && elapsed >= 0)
             val position = (elapsed * 1000).toLong()
-            val wait = CompletableDeferred<AudioResult>()
-            ready = wait
+            val wait = NativePreparation(token, next, track.id, position, playRequested)
+            preparation = wait
             if (player.currentMediaItem?.mediaId != track.id || player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED)
                 || player.playerError != null) {
                 val metadata = MediaMetadata.Builder().setTitle(track.name)
@@ -127,8 +132,9 @@ internal class Media3AudioExecutor(
                     .setMimeType("application/octet-stream").setMediaMetadata(metadata).build(), position)
                 player.prepare()
             } else player.seekTo(position)
-            if (player.playbackState == Player.STATE_READY) wait.complete(AudioResult.OK)
-            val outcome = wait.await()
+            if (!wait.matches(generation, binding, player.currentMediaItem?.mediaId)) return AudioResult.REJECTED
+            wait.outcome(player.playbackState, player.playerError != null, player.duration)?.let(wait.result::complete)
+            val outcome = wait.result.await()
             if (token != generation || binding != next) return AudioResult.REJECTED
             if (outcome != AudioResult.OK) pause()
             return outcome
@@ -139,7 +145,7 @@ internal class Media3AudioExecutor(
             if (binding == next) pause()
             return AudioResult.MEDIA
         } finally {
-            if (token == generation) ready = null
+            if (token == generation) preparation = null
         }
     }
 
@@ -147,9 +153,9 @@ internal class Media3AudioExecutor(
         checkThread()
         generation++
         playbackAuthority = null
-        val pending = ready
-        ready = null
-        pending?.cancel()
+        val pending = preparation
+        preparation = null
+        pending?.result?.cancel()
         player.pause()
     }
 
