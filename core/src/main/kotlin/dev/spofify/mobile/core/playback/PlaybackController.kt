@@ -253,6 +253,7 @@ class PlaybackController(
         val envelope = JsonObject(fields("type" to "command", "id" to id, "command" to command) +
             if (guarded) fields("expectedStateVersion" to view.snapshot!!.stateVersion) else emptyMap())
         if (!send(envelope)) return@synchronized null
+        mutableState.value = state.value.copy(commandFailure = null, error = null)
         publish()
         id
     }
@@ -331,6 +332,8 @@ class PlaybackController(
         require(result.placement in setOf("none", "low", "high", "next", "replace", "existing"))
         require(result.execution in setOf("unchanged", "pending", "confirmed", "blocked", "media", "uncertain", "superseded"))
         val request = pending[result.id] ?: return
+        val safeCode = result.code.takeIf { it in setOf("", "stale_state_version", "stale_revision", "conflict",
+            "expired", "invalid", "unavailable", "capacity", "superseded") } ?: "unknown"
         if (result.outcome == "accepted" && request.removeKey != null && lastUndoRequest == result.id && undo == null) {
             result.undo?.let { capability ->
                 val remaining = minOf(4_000 - (clock.monotonicMs() - request.sentAt), capability.expiresAtMs - clock.wallTimeMs())
@@ -338,9 +341,18 @@ class PlaybackController(
             }
         }
         if (result.final) pending.remove(result.id)
-        // Do not expose the secret undo token to UI state or logs.
-        mutableState.value = state.value.copy(latestResult = result.copy(undo = null), error = when {
-            result.outcome == "rejected" -> "Playback action rejected (${result.code})."
+        val failed = result.outcome == "rejected" || result.execution in setOf("uncertain", "blocked", "media")
+        val diagnostic = if (failed) PlaybackCommandFailure(
+            command = requireNotNull(request.command["type"]).jsonPrimitive.content,
+            outcome = result.outcome,
+            code = safeCode,
+            execution = result.execution,
+            transferPhase = state.value.snapshot?.transfer?.phase,
+        ) else state.value.commandFailure
+        // Keep a safe diagnostic across unrelated snapshots; never expose the secret Undo capability.
+        mutableState.value = state.value.copy(latestResult = result.copy(code = safeCode, undo = null),
+            commandFailure = diagnostic, error = when {
+            result.outcome == "rejected" -> "Playback action rejected ($safeCode)."
             result.execution == "uncertain" -> "Playback action unconfirmed. It will not be replayed."
             result.execution == "blocked" -> "Playback needs permission on the selected device."
             result.execution == "media" -> "The selected device could not play this track."

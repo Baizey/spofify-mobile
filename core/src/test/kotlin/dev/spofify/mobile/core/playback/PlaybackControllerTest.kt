@@ -20,6 +20,39 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PlaybackControllerTest {
+    @Test fun rejectionKeepsItsCodeAndHandoffContextAcrossSnapshotsWithoutReplaying() = runTest {
+        Harness(this).use { h ->
+            h.snapshot()
+            val snapshot = h.controller.state.value.snapshot!!
+            h.message(PlaybackServerMessage("state", "session", snapshot = snapshot.copy(
+                stateVersion = 2, playback = snapshot.playback.copy(stateVersion = 2),
+                transfer = PlaybackTransfer("device", "other", "connection", "other-connection", "releasing"))))
+            val id = requireNotNull(h.controller.queueTrack(PlaybackTrackReference("track")))
+            h.message(PlaybackServerMessage("result", "session", result =
+                PlaybackCommandResult(id, "rejected", "capacity", 2, 0, "none", "unchanged", true)))
+            val expected = PlaybackCommandFailure("queueIntent", "rejected", "capacity", "unchanged", "releasing")
+            assertEquals(expected, h.controller.state.value.commandFailure)
+            h.snapshot(version = 3)
+            assertEquals(expected, h.controller.state.value.commandFailure)
+            assertEquals(1, h.frames("command").size)
+            assertNotNull(h.controller.queueTrack(PlaybackTrackReference("another")))
+            assertNull(h.controller.state.value.commandFailure)
+        }
+    }
+
+    @Test fun unknownResultCodeCannotPublishRawServerTextInDiagnostics() = runTest {
+        Harness(this).use { h ->
+            h.snapshot()
+            val id = requireNotNull(h.controller.pause())
+            val raw = "private-response-text-not-a-code"
+            h.message(PlaybackServerMessage("result", "session", result =
+                PlaybackCommandResult(id, "rejected", raw, 1, 0, "none", "unchanged", true)))
+            assertEquals("unknown", h.controller.state.value.commandFailure?.code)
+            assertEquals("unknown", h.controller.state.value.latestResult?.code)
+            assertFalse(h.controller.state.value.error.orEmpty().contains(raw))
+        }
+    }
+
     @Test fun deviceNamePolicyAcceptsUnicodeAdmissionAndPreservesRenameTrimming() = runTest {
         val note = "\uD83C\uDFB5"
         val name = note.repeat(64)

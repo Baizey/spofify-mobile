@@ -2,6 +2,7 @@ package dev.spofify.mobile.feature.library
 
 import android.net.Uri
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -216,10 +217,12 @@ private fun MusicSettingsScreen(onAccount: () -> Unit) {
 private fun PlayerConnectionStatus(player: NativePlayer) {
     val state by player.controller.state.collectAsStateWithLifecycle()
     if (state.connection == PlaybackConnectionState.CONNECTING) LinearProgressIndicator(Modifier.fillMaxWidth())
-    else if (state.connection != PlaybackConnectionState.READY || state.error != null) {
+    else if (state.connection != PlaybackConnectionState.READY || state.error != null || state.commandFailure != null) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(if (state.connection == PlaybackConnectionState.READY) state.error.orEmpty() else "Reconnecting playback",
-                Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            SelectionContainer(Modifier.weight(1f)) {
+                Text(playbackNotice(state).orEmpty(), style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }

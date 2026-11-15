@@ -134,6 +134,15 @@ data class PlaybackUndoCapability(val token: String, val expiresAtMs: Long)
 /** The token is deliberately not exposed to presentation code. */
 data class PlaybackUndo(val removedKey: Long, val remainingMs: Long)
 
+/** Safe protocol facts only: no track/device identities, credentials, or raw server messages. */
+data class PlaybackCommandFailure(
+    val command: String,
+    val outcome: String,
+    val code: String,
+    val execution: String,
+    val transferPhase: String?,
+)
+
 enum class PlaybackConnectionState { DISCONNECTED, CONNECTING, READY, CLOSED }
 
 data class PlaybackView(
@@ -145,6 +154,7 @@ data class PlaybackView(
     val playback: PlaybackStatus? = null,
     val pendingCommands: Int = 0,
     val latestResult: PlaybackCommandResult? = null,
+    val commandFailure: PlaybackCommandFailure? = null,
     val undo: PlaybackUndo? = null,
     val error: String? = null,
 ) {

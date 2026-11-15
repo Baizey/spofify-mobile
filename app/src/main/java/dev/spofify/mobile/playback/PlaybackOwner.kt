@@ -22,6 +22,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
 
 /** The Application owns account/socket lifetime. The service owns only local output presentation. */
 @androidx.annotation.OptIn(UnstableApi::class)
@@ -184,6 +187,14 @@ internal class NativePlayer(
         renew = { sessions.renew(identity) }, onFailure = { failure ->
             Log.w("SpofifyPlayer", "Session maintenance check failed: ${(failure as? AuthFailure)?.kind ?: "unexpected"}")
         })
+
+    init {
+        scope.launch {
+            controller.state.map { it.commandFailure }.distinctUntilChanged().filterNotNull().collect { failure ->
+                Log.w("SpofifyPlayer", failure.diagnosticText())
+            }
+        }
+    }
 
     fun connect() {
         if (!scope.isActive || !sessions.isCurrent(identity)) return
