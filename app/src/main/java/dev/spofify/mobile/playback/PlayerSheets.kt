@@ -82,7 +82,7 @@ private fun DeviceNameSheet(controller: PlaybackController, device: PlaybackDevi
     var name by remember(device.deviceId) { mutableStateOf(device.name) }
     var pending by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
-    val valid = name.isNotBlank() && name.codePointCount(0, name.length) <= 64 && name.none(Char::isISOControl)
+    val valid = isValidDeviceName(name)
     val currentName = state.devices.firstOrNull { it.deviceId == device.deviceId }?.name
     LaunchedEffect(currentName, pending) {
         if (pending != null && currentName == name.trim()) onDismiss()

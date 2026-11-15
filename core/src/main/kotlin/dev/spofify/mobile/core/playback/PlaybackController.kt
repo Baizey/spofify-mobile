@@ -76,7 +76,8 @@ class PlaybackController(
     /** Transport must expose every frame from the first snapshot onward. */
     fun connect(name: String, deviceId: String): Job = synchronized(lock) {
         check(!closed) { "Playback controller is closed" }
-        require(name.isNotBlank() && validIdentifier(deviceId))
+        require(isValidDeviceName(name))
+        require(validIdentifier(deviceId))
         disconnectLocked(null)
         requestedDeviceId = deviceId
         mutableState.value = PlaybackView(connection = PlaybackConnectionState.CONNECTING, deviceId = deviceId)
@@ -185,7 +186,7 @@ class PlaybackController(
         return issue(fields("type" to "select", "deviceId" to deviceId))
     }
     fun renameDevice(name: String, deviceId: String? = null): String? {
-        require(name.isNotBlank() && name.codePointCount(0, name.length) <= 64 && name.none { it.isISOControl() })
+        require(isValidDeviceName(name))
         require(deviceId == null || validIdentifier(deviceId))
         return issue(JsonObject(fields("type" to "rename", "name" to name.trim()) +
             if (deviceId != null) fields("deviceId" to deviceId) else emptyMap()))

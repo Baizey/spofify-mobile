@@ -20,6 +20,44 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PlaybackControllerTest {
+    @Test fun deviceNamePolicyAcceptsUnicodeAdmissionAndPreservesRenameTrimming() = runTest {
+        val note = "\uD83C\uDFB5"
+        val name = note.repeat(64)
+        Harness(this, name).use { h ->
+            h.start()
+            assertEquals(listOf(name to "device"), h.transport.admissions)
+            val renamed = note.repeat(60)
+            assertNotNull(h.controller.renameDevice("  $renamed  "))
+            assertEquals(renamed, h.frames("command").single()["command"]!!.jsonObject["name"]!!.jsonPrimitive.content)
+            assertTrue(h.socket.isOpen)
+            assertTrue(h.audio.actual.isPlaying)
+            assertEquals(1, h.audio.executions.size)
+        }
+    }
+
+    @Test fun invalidDeviceNamesFailBeforeDisconnectOrCommandSubmission() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            h.stage("retained-plan")
+            val before = h.controller.state.value
+            val sent = h.socket.sent.size
+            val invalid = listOf("", "   ", "a".repeat(65), "Phone\n", "\uD800", "Phone\uDC00", "\uFEFF")
+            invalid.forEach { name ->
+                assertTrue(runCatching { h.controller.connect(name, "device") }.exceptionOrNull() is IllegalArgumentException)
+                assertTrue(runCatching { h.controller.renameDevice(name) }.exceptionOrNull() is IllegalArgumentException)
+                assertEquals(before, h.controller.state.value)
+                assertEquals(sent, h.socket.sent.size)
+                assertTrue(h.socket.isOpen)
+                assertTrue(h.audio.actual.isPlaying)
+                assertTrue(h.audio.executions.single().authorized())
+            }
+            assertEquals(1, h.transport.admissions.size)
+            h.observe(h.audio.actual.copy(ended = true, isPlaying = false, elapsed = 10.0))
+            assertEquals("retained-plan", h.frames("report").single { it["ended"]!!.jsonPrimitive.boolean }["planId"]!!.jsonPrimitive.content)
+            assertEquals(2, h.audio.executions.size)
+        }
+    }
+
     @Test fun queueUsesIndividualHighAndCollectionLowWithoutStartingAudio() = runTest {
         Harness(this).use { h ->
             h.snapshot()
@@ -400,7 +438,7 @@ class PlaybackControllerTest {
         }
     }
 
-    private class Harness(private val scope: TestScope) : AutoCloseable {
+    private class Harness(private val scope: TestScope, name: String = "Phone") : AutoCloseable {
         val socket = FakeConnection()
         val transport = FakeTransport(socket)
         val audio = FakeAudio()
@@ -411,7 +449,7 @@ class PlaybackControllerTest {
         })
         private var controlId = 0
         init {
-            controller.connect("Phone", "device")
+            controller.connect(name, "device")
             scope.runCurrent()
         }
         suspend fun start() {
@@ -456,7 +494,11 @@ class PlaybackControllerTest {
     }
 
     private class FakeTransport(var socket: FakeConnection) : PlaybackTransport {
-        override suspend fun connect(name: String, deviceId: String): PlaybackConnection = socket
+        val admissions = mutableListOf<Pair<String, String>>()
+        override suspend fun connect(name: String, deviceId: String): PlaybackConnection {
+            admissions.add(name to deviceId)
+            return socket
+        }
     }
 
     private class FakeConnection : PlaybackConnection {

@@ -103,12 +103,14 @@ class LibraryClientTest {
                 socket.send("""{"type":"snapshot"}""")
             }
         }).setHeader("Sec-WebSocket-Protocol", "spofify.library-playback.v2"))
-        val connection = sessions.playbackTransport(identity).connect("Phone", "fixture-device")
+        val deviceName = "😀".repeat(64)
+        val connection = sessions.playbackTransport(identity).connect(deviceName, "fixture-device")
         try {
             val frame = kotlinx.serialization.json.Json.parseToJsonElement(withTimeout(3000) { hello.await() })
                 .let { it as kotlinx.serialization.json.JsonObject }
             assertEquals(setOf("type", "ticket", "name", "deviceId", "canPlay"), frame.keys)
             assertEquals("hello", (frame.getValue("type") as kotlinx.serialization.json.JsonPrimitive).content)
+            assertEquals(deviceName, (frame.getValue("name") as kotlinx.serialization.json.JsonPrimitive).content)
             assertEquals("one-use-fixture-ticket", (frame.getValue("ticket") as kotlinx.serialization.json.JsonPrimitive).content)
             assertEquals("true", (frame.getValue("canPlay") as kotlinx.serialization.json.JsonPrimitive).content)
             assertEquals("""{"type":"snapshot"}""", withTimeout(3000) { connection.messages.first() })
@@ -124,6 +126,14 @@ class LibraryClientTest {
             assertEquals(identity.origin, upgrade.getHeader("Origin"))
             assertFalse(upgrade.path!!.contains("fixture-ticket"))
         } finally { connection.close() }
+    } }
+
+    @Test fun invalidDeviceNamesDoNotRequestAdmission() = runBlocking { fixture { server, sessions, identity ->
+        val transport = sessions.playbackTransport(identity)
+        for (name in listOf("", "  ", "a".repeat(65), "😀".repeat(65), "Phone\n", "\uD83D", "\uDE00")) {
+            assertTrue(runCatching { transport.connect(name, "fixture-device") }.exceptionOrNull() is IllegalArgumentException)
+        }
+        assertEquals(1, server.requestCount)
     } }
 
     @Test fun inPlaceRenewalDoesNotRetireAuthenticatedIdentity() = runBlocking { fixture { server, sessions, identity ->

@@ -5,6 +5,7 @@ import dev.spofify.mobile.core.http.FeatureResponse
 import dev.spofify.mobile.core.http.FeatureTransport
 import dev.spofify.mobile.core.http.AudioStream
 import dev.spofify.mobile.core.playback.PlaybackTransport
+import dev.spofify.mobile.core.playback.isValidDeviceName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -65,7 +66,7 @@ class SessionRepository(
     )
 
     fun playbackTransport(expected: AccountIdentity): PlaybackTransport = PlaybackTransport { name, deviceId ->
-        require(name.isNotBlank() && name.toByteArray().size <= 128 && name.none(Char::isISOControl))
+        require(isValidDeviceName(name))
         require(deviceId.isNotBlank() && deviceId.toByteArray().size <= 128 && deviceId.none(Char::isISOControl))
         featureExchange(expected) { client, record, headers, authority ->
             val transport = featureTransport(client)
