@@ -24,6 +24,7 @@ data class MusicItem(
     val hasAudio: Boolean,
     val availableTracks: Long,
     val totalTracks: Long,
+    val genres: List<String> = emptyList(),
 ) {
     val key: String get() = "${kind.name}:$id"
 }
@@ -115,7 +116,7 @@ class LibraryClient(private val sessions: SessionRepository, private val identit
         return MusicItem(kind, validId(wire.id), wire.name,
             wire.artists.map { Artist(validId(it.id), it.name) }, wire.albumId, wire.albumName,
             wire.releaseDate, wire.durationMs, wire.trackNumber, audio,
-            wire.coverage.inLibrary, wire.coverage.tracks)
+            wire.coverage.inLibrary, wire.coverage.tracks, wire.genres)
     }
 
     private fun validId(value: String): String = value.also {
@@ -129,6 +130,7 @@ class LibraryClient(private val sessions: SessionRepository, private val identit
         val artists: List<WireArtist> = emptyList(), val albumId: String = "", val albumName: String = "",
         val releaseDate: String = "", val durationMs: Long = 0, val trackNumber: Int = 0,
         val hasAudio: Boolean? = null, val libraryPath: String? = null, val coverage: WireCoverage,
+        val genres: List<String> = emptyList(),
     )
     @Serializable private class WirePage(val items: List<WireItem>, val total: Long, val offset: Int, val limit: Int, val revision: Long)
     @Serializable private class WireDetail(val item: WireItem, val revision: Long)

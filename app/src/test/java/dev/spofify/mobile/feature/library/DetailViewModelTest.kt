@@ -1,7 +1,6 @@
 package dev.spofify.mobile.feature.library
 
 import androidx.lifecycle.ViewModelStore
-import dev.spofify.mobile.core.library.Artist
 import dev.spofify.mobile.core.library.LibraryApi
 import dev.spofify.mobile.core.library.LibraryException
 import dev.spofify.mobile.core.library.MusicItem
@@ -53,46 +52,40 @@ class DetailViewModelTest {
     private fun model(api: Api, kind: MusicKind = MusicKind.ALBUM) =
         DetailViewModel(api, kind, "collection").also { store.put("detail", it) }
 
-    @Test fun entireAlbumLoadsWithoutPageCapAndFilteringFindsTheLastPageInSourceOrder() = runTest(dispatcher) {
+    @Test fun entireAlbumLoadsWithoutPageCapInSourceOrder() = runTest(dispatcher) {
         val api = Api().apply { readPage = { offset -> page(offset, 201) } }
         val model = model(api)
-        model.filter("Song 200")
         advanceUntilIdle()
         assertEquals(listOf(0, 40, 80, 120, 160, 200), api.offsets)
         assertEquals((0..200).map(Int::toString), model.state.value.rows.map { it.id })
-        assertEquals(listOf("200"), model.state.value.visibleRows.map { it.id })
+        assertEquals("200", model.state.value.rows.last().id)
         assertTrue(model.state.value.loaded)
-        assertFalse(model.state.value.noMatches)
         assertNull(model.state.value.nextOffset)
     }
 
-    @Test fun aLoadedPrefixCannotProduceAFalseNoMatchesMessage() = runTest(dispatcher) {
+    @Test fun incompleteAlbumCannotReplaceAConsistentSnapshot() = runTest(dispatcher) {
         val gate = CompletableDeferred<Unit>()
         val api = Api().apply { readPage = { offset ->
             if (offset > 0) gate.await()
             page(offset, 41)
         } }
         val model = model(api)
-        model.filter("Song 40")
         runCurrent()
         assertNotNull(model.state.value.item)
         assertTrue(model.state.value.loading)
         assertFalse(model.state.value.loaded)
-        assertFalse(model.state.value.noMatches)
         assertTrue(model.state.value.rows.isEmpty())
         gate.complete(Unit)
         advanceUntilIdle()
-        assertEquals("40", model.state.value.visibleRows.single().id)
-        model.filter("not present")
-        assertTrue(model.state.value.noMatches)
+        assertEquals(41, model.state.value.rows.size)
+        assertEquals("40", model.state.value.rows.last().id)
     }
 
-    @Test fun refreshFailurePreservesTheWholeOldSnapshotAndFilterThenRetryRestartsAtZero() = runTest(dispatcher) {
+    @Test fun refreshFailurePreservesTheWholeOldSnapshotThenRetryRestartsAtZero() = runTest(dispatcher) {
         val api = Api().apply { readPage = { offset -> page(offset, 41) } }
         val model = model(api)
         advanceUntilIdle()
         val old = model.state.value
-        model.filter("Song 40")
         api.readDetail = { item(MusicKind.ALBUM, "collection").copy(name = "New name") }
         api.readPage = { offset -> if (offset > 0) throw LibraryException(503) else page(offset, 42, revision = 2) }
         model.refresh()
@@ -101,7 +94,6 @@ class DetailViewModelTest {
         assertEquals(old.item, model.state.value.item)
         assertEquals(old.rows, model.state.value.rows)
         assertEquals(old.revision, model.state.value.revision)
-        assertEquals("Song 40", model.state.value.filter)
         api.readPage = { offset -> page(offset, 42, revision = 2) }
         model.retry()
         advanceUntilIdle()
@@ -211,14 +203,36 @@ class DetailViewModelTest {
         assertTrue(album.copy(kind = MusicKind.TRACK, hasAudio = true, availableTracks = 0).canPlay())
     }
 
-    @Test fun filteringMatchesCreditsCaseInsensitivelyWithoutReorderingOrRenumbering() {
-        val rows = listOf(
-            item(MusicKind.TRACK, "9").copy(artists = listOf(Artist("a", "Guest Artist")), trackNumber = 2),
-            item(MusicKind.TRACK, "3").copy(artists = listOf(Artist("a", "Guest Artist")), trackNumber = 1),
-        )
-        assertEquals(rows, filterAlbumRows(rows, " gUeSt "))
-        assertEquals(listOf(2, 1), filterAlbumRows(rows, "artist").map { it.trackNumber })
-        assertSame(rows, filterAlbumRows(rows, "   "))
+    @Test fun rankingToggleChangesOnlyTheSelectedModeAndDoesNotInventRanksFromAlbums() = runTest(dispatcher) {
+        val api = Api().apply {
+            readDetail = { item(MusicKind.ARTIST, "collection") }
+            readPage = { offset -> page(offset, 41, kind = MusicKind.ALBUM) }
+        }
+        val model = model(api, MusicKind.ARTIST)
+        advanceUntilIdle()
+        val rows = model.state.value.rows
+        assertEquals("Catalogue", model.state.value.rankMode.label)
+        model.toggleRankMode()
+        assertEquals("Your plays", model.state.value.rankMode.label)
+        assertSame(rows, model.state.value.rows)
+        assertEquals(listOf(0), api.offsets)
+        assertEquals(1, api.detailReads)
+        assertEquals("Rankings unavailable", DETAIL_RANKINGS_UNAVAILABLE)
+        model.more()
+        advanceUntilIdle()
+        assertEquals(DetailRankMode.PERSONAL, model.state.value.rankMode)
+        model.refresh()
+        advanceUntilIdle()
+        assertEquals(DetailRankMode.PERSONAL, model.state.value.rankMode)
+        model.toggleRankMode()
+        assertEquals(DetailRankMode.CATALOGUE, model.state.value.rankMode)
+    }
+
+    @Test fun genreMetadataIsOptionalAndNeverDerivedFromUnrelatedRows() {
+        val album = item(MusicKind.ALBUM, "record")
+        assertTrue(album.genres.isEmpty())
+        val known = album.copy(genres = listOf("Electronic", "Ambient"))
+        assertEquals(listOf("Electronic", "Ambient"), known.genres)
     }
 
     companion object {

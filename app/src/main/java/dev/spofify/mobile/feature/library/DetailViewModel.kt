@@ -13,6 +13,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+internal enum class DetailRankMode(val label: String) {
+    CATALOGUE("Catalogue"), PERSONAL("Your plays");
+
+    val next: DetailRankMode get() = if (this == CATALOGUE) PERSONAL else CATALOGUE
+}
+
 internal data class DetailState(
     val item: MusicItem? = null,
     val rows: List<MusicItem> = emptyList(),
@@ -21,20 +27,12 @@ internal data class DetailState(
     val nextOffset: Int? = null,
     val revision: Long? = null,
     val loaded: Boolean = false,
-    val filter: String = "",
-) {
-    // Album rows are published only as a complete, consistent snapshot, never a prefix.
-    val visibleRows: List<MusicItem> get() = filterAlbumRows(rows, filter)
-    val noMatches: Boolean get() = loaded && filter.isNotBlank() && visibleRows.isEmpty()
-}
+    val rankMode: DetailRankMode = DetailRankMode.CATALOGUE,
+)
 
-internal fun filterAlbumRows(rows: List<MusicItem>, filter: String): List<MusicItem> {
-    val query = filter.trim()
-    if (query.isEmpty()) return rows
-    return rows.filter { row ->
-        (row.name + " " + row.artists.joinToString(" ") { it.name }).contains(query, ignoreCase = true)
-    }
-}
+// There is no catalogue popularity or artist ranking endpoint in the server API.
+// Do not turn album pages or a prefix of personal history into pretend top tracks.
+internal const val DETAIL_RANKINGS_UNAVAILABLE = "Rankings unavailable"
 
 internal fun releaseYear(releaseDate: String): String =
     releaseDate.takeIf { it.length >= 4 && it.take(4).all(Char::isDigit) }?.take(4).orEmpty()
@@ -62,7 +60,7 @@ internal class DetailViewModel(
 
     init { load(0) }
 
-    fun filter(value: String) { mutable.value = mutable.value.copy(filter = value) }
+    fun toggleRankMode() { mutable.value = mutable.value.copy(rankMode = mutable.value.rankMode.next) }
     fun refresh() = load(0)
     fun retry() = load(retryOffset)
     fun more() { if (!mutable.value.failed) mutable.value.nextOffset?.let(::load) }
@@ -101,7 +99,7 @@ internal class DetailViewModel(
                     nextOffset = page?.takeIf { kind == MusicKind.ARTIST && it.hasMore }?.nextOffset(),
                     revision = page?.revision,
                     loaded = true,
-                    filter = mutable.value.filter,
+                    rankMode = mutable.value.rankMode,
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled

@@ -5,7 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -13,9 +13,6 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -23,23 +20,30 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.ImageLoader
-import dev.spofify.mobile.R
 import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
+import dev.spofify.mobile.core.playback.PlaybackContext
 import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.PlaybackController
 import dev.spofify.mobile.core.playback.PlaybackTrackReference
+import dev.spofify.mobile.designsystem.SheetAction
+import dev.spofify.mobile.designsystem.SheetGroup
+import dev.spofify.mobile.designsystem.SheetHeading
+import dev.spofify.mobile.designsystem.SpofifyGlyph
+import dev.spofify.mobile.designsystem.SpofifyIcon
+import dev.spofify.mobile.designsystem.SpofifySheet
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -50,15 +54,15 @@ internal fun DetailScreen(
     onOpen: (MusicItem) -> Unit,
     playback: PlaybackController? = null,
     onNavigate: ((MusicKind, String) -> Unit)? = null,
+    onMore: ((MusicItem, PlaybackContext?) -> Unit)? = null,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val playbackView = playback?.state?.collectAsStateWithLifecycle()?.value
     val ready = playbackView?.connection == PlaybackConnectionState.READY
-    var menu by remember(model) { mutableStateOf(false) }
+    var menuItem by remember(model) { mutableStateOf<MusicItem?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
     val item = state.item
     val context = item?.collectionContext(state.revision)
-    val playable = ready && item?.canPlay() == true
     val send: (() -> String?) -> Unit = { action ->
         actionError = if (action() == null) "Playback action wasn't sent. Check the playback connection." else null
     }
@@ -67,115 +71,125 @@ internal fun DetailScreen(
             playback == null -> onOpen(row)
             !row.hasAudio -> actionError = "Audio unavailable for this song."
             !ready -> actionError = "Connect playback to listen."
+            // The server selects/rotates the complete album, not a local page or subset.
             else -> send { playback.playTrack(PlaybackTrackReference(row.id), context) }
+        }
+    }
+    val playCollection = {
+        send {
+            if (context != null) playback?.playCollection(context)
+            else item?.let { playback?.playTrack(PlaybackTrackReference(it.id)) }
         }
     }
 
     BackHandler(onBack = onBack)
-    Column(Modifier.fillMaxSize()) {
-        if (item?.kind == MusicKind.ARTIST) {
-            val largeText = LocalDensity.current.fontScale >= 1.5f
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(if (largeText) 1 else 2),
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 28.dp),
-            ) {
-                item("heading", span = { GridItemSpan(maxLineSpan) }) {
+    if (item?.kind == MusicKind.ARTIST) {
+        val largeText = LocalDensity.current.fontScale > 1.4f
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(if (largeText) 1 else 2),
+            modifier = Modifier.fillMaxSize(),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 28.dp),
+        ) {
+            item("heading", span = { GridItemSpan(maxLineSpan) }) {
+                Column {
+                    DetailHeading(item, loader, onNavigate)
+                    DetailControls(item, ready && item.canPlay(), playCollection, { menuItem = item })
+                    DetailActionError(actionError)
+                    DetailTopTracks(state.rankMode, model::toggleRankMode)
+                    Text("Albums", style = MaterialTheme.typography.bodyLarge.copy(
+                        fontSize = 17.4.sp, lineHeight = 21.75.sp, fontWeight = FontWeight(620)),
+                        modifier = Modifier.padding(top = 24.dp, bottom = 4.dp).semantics { heading() })
+                }
+            }
+            items(state.rows, key = MusicItem::key) { album ->
+                Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button) { onOpen(album) }) {
+                    MusicArtwork(album, loader, Modifier.fillMaxWidth().aspectRatio(1f)
+                        .clip(RoundedCornerShape(7.dp)).background(MaterialTheme.colorScheme.surfaceVariant))
+                    Text(album.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyLarge.copy(
+                        fontSize = 14.1.sp, lineHeight = 19.04.sp, fontWeight = FontWeight.SemiBold),
+                        modifier = Modifier.padding(top = 7.dp))
+                    releaseYear(album.releaseDate).takeIf(String::isNotBlank)?.let { year ->
+                        Text(year, style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.7.sp, lineHeight = 16.38.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp))
+                    }
+                }
+            }
+            item("load-state", span = { GridItemSpan(maxLineSpan) }) { DetailLoadState(state, model) }
+        }
+    } else {
+        LazyColumn(Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 28.dp)) {
+            if (item != null) {
+                item("heading") {
                     Column {
                         DetailHeading(item, loader, onNavigate)
-                        DetailControls(item, playable, { send { playback?.playCollection(requireNotNull(context)) } }, { menu = true })
-                        DetailPlaybackStatus(item, ready, actionError ?: playbackView?.error)
-                        Text("Albums", style = MaterialTheme.typography.titleMedium,
-                            modifier = Modifier.padding(top = 24.dp).semantics { heading() })
+                        DetailControls(item, ready && item.canPlay(), playCollection, { menuItem = item })
+                        DetailActionError(actionError)
                     }
                 }
-                items(state.rows, key = MusicItem::key) { album ->
-                    Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button) { onOpen(album) }) {
-                        MusicArtwork(album, loader, Modifier.widthIn(max = 180.dp).fillMaxWidth().aspectRatio(1f)
-                            .clip(RoundedCornerShape(7.dp)).background(MaterialTheme.colorScheme.surfaceVariant))
-                        Text(album.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 7.dp))
-                        releaseYear(album.releaseDate).takeIf(String::isNotBlank)?.let { year ->
-                            Text(year, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-                item("footer", span = { GridItemSpan(maxLineSpan) }) { DetailFooter(state, model) }
-            }
-        } else {
-            LazyColumn(Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(top = 20.dp, bottom = 28.dp)) {
-                if (item != null) {
-                    item("heading") { Box(Modifier.padding(horizontal = 20.dp)) { DetailHeading(item, loader, onNavigate) } }
-                    item("controls") {
-                        Box(Modifier.padding(horizontal = 20.dp)) {
-                            DetailControls(item, playable, {
-                                send {
-                                    if (context != null) playback?.playCollection(context)
-                                    else playback?.playTrack(PlaybackTrackReference(item.id))
-                                }
-                            }, { menu = true })
-                        }
-                    }
-                    item("status") { Box(Modifier.padding(horizontal = 20.dp)) {
-                        DetailPlaybackStatus(item, ready, actionError ?: playbackView?.error)
-                    } }
-                    if (item.kind == MusicKind.ALBUM) {
-                        item("filter") { DetailFilter(state.filter, model::filter) }
-                    } else {
-                        item("track-metadata") {
-                            Column(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
-                                if (item.albumName.isNotBlank()) {
-                                    TextButton({ onNavigate?.invoke(MusicKind.ALBUM, item.albumId) },
-                                        enabled = onNavigate != null && item.albumId.isNotBlank(), contentPadding = PaddingValues(0.dp)) {
-                                        Text(item.albumName)
-                                    }
-                                }
-                                if (item.durationMs > 0) Text(duration(item.durationMs), style = MaterialTheme.typography.bodySmall)
+                if (item.kind == MusicKind.TRACK) {
+                    item("track-metadata") {
+                        if (item.albumName.isNotBlank() && onNavigate != null && item.albumId.isNotBlank()) {
+                            TextButton({ onNavigate(MusicKind.ALBUM, item.albumId) }, contentPadding = PaddingValues(0.dp)) {
+                                Text(item.albumName)
                             }
                         }
                     }
                 }
-                items(state.visibleRows, key = MusicItem::key) { row ->
-                    Box(Modifier.padding(horizontal = 20.dp)) {
-                        MusicRow(row, loader,
-                            onQueue = if (ready && row.hasAudio) ({ send { playback?.queueTrack(PlaybackTrackReference(row.id), context) } }) else null,
-                            onPlayNext = if (ready && row.hasAudio) ({ send { playback?.queueTrack(PlaybackTrackReference(row.id), context, next = true) } }) else null,
-                        ) { playRow(row) }
-                    }
-                }
-                if (state.noMatches) {
-                    item("no-matches") { Text("No matches", Modifier.padding(horizontal = 20.dp, vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                }
-                item("footer") { Box(Modifier.padding(horizontal = 20.dp)) { DetailFooter(state, model) } }
             }
+            itemsIndexed(state.rows, key = { _, row -> row.key }) { index, row ->
+                MusicRow(row, loader,
+                    onQueue = if (ready && row.hasAudio) ({ send { playback?.queueTrack(PlaybackTrackReference(row.id), context) } }) else null,
+                    trackNumber = index + 1,
+                    reservePopularity = true,
+                    onMore = { if (onMore != null) onMore(row, context) else menuItem = row },
+                ) { playRow(row) }
+            }
+            item("load-state") { DetailLoadState(state, model) }
         }
     }
 
-    if (menu && item != null) {
-        ModalBottomSheet(onDismissRequest = { menu = false }) {
-            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 28.dp)) {
-                Text(item.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.padding(bottom = 16.dp).semantics { heading() })
-                DetailMenuAction("Play", playable) {
-                    menu = false
-                    send { if (context != null) playback?.playCollection(context) else playback?.playTrack(PlaybackTrackReference(item.id)) }
+    val selected = menuItem
+    if (selected != null) {
+        val isTrack = selected.kind == MusicKind.TRACK
+        val playable = ready && selected.canPlay()
+        val selectedContext = selected.collectionContext(state.revision)
+        SpofifySheet(onDismiss = { menuItem = null }) {
+            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
+                if (isTrack) DetailSongMenuHeading(selected, loader)
+                else SheetHeading(selected.name.ifBlank { "Unknown title" })
+                if (isTrack) SheetGroup("Listen")
+                SheetAction("Play now", SpofifyGlyph.Play, playable) {
+                    menuItem = null
+                    send {
+                        if (selectedContext != null) playback?.playCollection(selectedContext)
+                        else playback?.playTrack(PlaybackTrackReference(selected.id), context)
+                    }
                 }
-                if (context != null) {
-                    DetailMenuAction("Shuffle", playable) { menu = false; send { playback?.playCollection(context, shuffle = true) } }
+                SheetAction("Queue", SpofifyGlyph.Queue, playable) {
+                    menuItem = null
+                    send {
+                        if (selectedContext != null) playback?.queueCollection(selectedContext)
+                        else playback?.queueTrack(PlaybackTrackReference(selected.id), context)
+                    }
                 }
-                DetailMenuAction("Queue", playable) {
-                    menu = false
-                    send { if (context != null) playback?.queueCollection(context) else playback?.queueTrack(PlaybackTrackReference(item.id)) }
+                if (isTrack && onNavigate != null && (selected.artists.isNotEmpty() || selected.albumId.isNotBlank())) {
+                    SheetGroup("Go to")
+                    selected.artists.filter { it.id.isNotBlank() }.forEach { artist ->
+                        SheetAction(artist.name, SpofifyGlyph.Artist) {
+                            menuItem = null
+                            onNavigate(MusicKind.ARTIST, artist.id)
+                        }
+                    }
+                    if (selected.albumId.isNotBlank() && selected.albumName.isNotBlank()) {
+                        SheetAction(selected.albumName, SpofifyGlyph.Album) {
+                            menuItem = null
+                            onNavigate(MusicKind.ALBUM, selected.albumId)
+                        }
+                    }
                 }
-                DetailMenuAction("Play next", playable) {
-                    menu = false
-                    send { if (context != null) playback?.queueCollection(context, next = true)
-                        else playback?.queueTrack(PlaybackTrackReference(item.id), next = true) }
-                }
-                DetailMenuAction("Refresh", !state.loading) { menu = false; model.refresh() }
             }
         }
     }
@@ -183,24 +197,27 @@ internal fun DetailScreen(
 
 @Composable
 private fun DetailHeading(item: MusicItem, loader: ImageLoader, onNavigate: ((MusicKind, String) -> Unit)?) {
-    val largeText = LocalDensity.current.fontScale >= 1.5f
+    val largeText = LocalDensity.current.fontScale > 1.4f
     val shape = if (item.kind == MusicKind.ARTIST) CircleShape else RoundedCornerShape(5.dp)
     Row(Modifier.fillMaxWidth().padding(bottom = 16.dp), horizontalArrangement = Arrangement.spacedBy(15.dp),
         verticalAlignment = if (largeText) Alignment.Top else Alignment.CenterVertically) {
         MusicArtwork(item, loader, Modifier.size(if (largeText) 52.dp else 76.dp).clip(shape)
             .background(MaterialTheme.colorScheme.surfaceVariant))
         Column(Modifier.weight(1f)) {
-            Text(item.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+            Text(item.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyLarge.copy(
+                fontSize = 22.5.sp, lineHeight = 26.1.sp, fontWeight = FontWeight(650)),
+                modifier = Modifier.semantics { heading() })
             if (item.kind != MusicKind.ARTIST) {
                 item.artists.forEach { artist ->
+                    val creditStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 12.6.sp, lineHeight = 17.01.sp)
                     if (onNavigate != null && artist.id.isNotBlank()) {
                         TextButton({ onNavigate(MusicKind.ARTIST, artist.id) },
                             Modifier.heightIn(min = 48.dp), contentPadding = PaddingValues(vertical = 8.dp)) {
-                            Text(artist.name.ifBlank { "Unknown artist" }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(artist.name.ifBlank { "Unknown artist" }, style = creditStyle,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     } else {
-                        Text(artist.name.ifBlank { "Unknown artist" }, style = MaterialTheme.typography.bodySmall,
+                        Text(artist.name.ifBlank { "Unknown artist" }, style = creditStyle,
                             color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 8.dp))
                     }
                 }
@@ -211,81 +228,95 @@ private fun DetailHeading(item: MusicItem, loader: ImageLoader, onNavigate: ((Mu
                 MusicKind.ALBUM -> if (year.isBlank()) "Album" else "Album · $year"
                 MusicKind.TRACK -> "Song"
             }
-            Text(metadata, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(metadata, style = MaterialTheme.typography.bodySmall.copy(lineHeight = 16.8.sp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp))
+            if (item.genres.isNotEmpty()) {
+                Text(item.genres.joinToString(" · "), style = MaterialTheme.typography.bodySmall.copy(
+                    fontSize = 11.4.sp, lineHeight = 15.39.sp), color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 5.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun DetailSongMenuHeading(item: MusicItem, loader: ImageLoader) {
+    Row(Modifier.fillMaxWidth().padding(bottom = 16.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(15.dp)) {
+        MusicArtwork(item, loader, Modifier.size(48.dp).clip(RoundedCornerShape(4.dp)))
+        Column(Modifier.weight(1f)) {
+            Text(item.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyLarge.copy(
+                fontSize = 22.5.sp, lineHeight = 26.1.sp, fontWeight = FontWeight(650)))
+            if (item.artists.isNotEmpty()) {
+                Text(item.artists.joinToString(", ") { it.name }, style = MaterialTheme.typography.bodySmall.copy(lineHeight = 16.8.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp))
+            }
         }
     }
 }
 
 @Composable
 private fun DetailControls(item: MusicItem, playable: Boolean, onPlay: () -> Unit, onMore: () -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            FilledIconButton(onPlay, Modifier.size(48.dp), enabled = playable) {
-                Icon(painterResource(R.drawable.ic_detail_play), "Play ${item.name}", Modifier.size(24.dp))
+            if (item.canPlay()) {
+                FilledIconButton(onPlay, Modifier.size(48.dp), enabled = playable, shape = CircleShape) {
+                    SpofifyIcon(SpofifyGlyph.Play, "Play ${item.name}")
+                }
             }
         }
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.weight(1f)) // Reserved for real offline readiness; no fabricated status.
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
             IconButton(onMore, Modifier.size(48.dp)) {
-                Icon(painterResource(R.drawable.ic_detail_more), "More actions for ${item.name}", Modifier.size(24.dp))
+                SpofifyIcon(SpofifyGlyph.More, "More actions for ${item.name}")
             }
         }
     }
 }
 
 @Composable
-private fun DetailPlaybackStatus(item: MusicItem, ready: Boolean, error: String?) {
-    val message = error ?: when {
-        !item.canPlay() -> "Audio unavailable in library"
-        !ready -> "Connect playback to listen"
-        else -> null
+private fun DetailTopTracks(mode: DetailRankMode, onToggle: () -> Unit) {
+    val fontScale = LocalDensity.current.fontScale
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Top tracks", style = MaterialTheme.typography.bodyLarge.copy(
+            fontSize = 16.5.sp, lineHeight = 20.63.sp, fontWeight = FontWeight(620)),
+            modifier = Modifier.weight(1f).padding(vertical = 12.dp).semantics { heading() })
+        TextButton(onToggle, Modifier.width((82.2f * fontScale).dp).heightIn(min = 48.dp).semantics {
+            contentDescription = "Top tracks: ${mode.label}. Switch to ${mode.next.label}"
+            selected = mode == DetailRankMode.PERSONAL
+        }, contentPadding = PaddingValues(vertical = 8.dp)) {
+            Text(mode.label, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge.copy(
+                fontSize = 12.45.sp, lineHeight = 16.81.sp, textDecoration = TextDecoration.Underline),
+                textAlign = TextAlign.End, color = MaterialTheme.colorScheme.secondary, maxLines = 1)
+        }
     }
-    if (message != null) Text(message, Modifier.padding(bottom = 12.dp), style = MaterialTheme.typography.bodySmall,
+    Text(DETAIL_RANKINGS_UNAVAILABLE, Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 20.25.sp))
+}
+
+@Composable
+private fun DetailActionError(error: String?) {
+    if (error != null) Text(error, Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
 @Composable
-private fun DetailFilter(value: String, onChange: (String) -> Unit) {
-    val focus = LocalFocusManager.current
-    Column(Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 10.dp)) {
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        BasicTextField(value, onChange,
-            Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 20.dp, vertical = 12.dp)
-                .semantics { contentDescription = "Filter songs" },
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-            keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
-            decorationBox = { input ->
-                if (value.isEmpty()) Text("Filter songs", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                input()
-            })
+private fun DetailLoadState(state: DetailState, model: DetailViewModel) {
+    // This item is composed at the end of the visible grid, so continuation is demand-driven.
+    LaunchedEffect(state.nextOffset, state.loading, state.failed) {
+        if (state.nextOffset != null && !state.loading && !state.failed) model.more()
     }
-}
-
-@Composable
-private fun DetailMenuAction(label: String, enabled: Boolean, onClick: () -> Unit) {
-    TextButton(onClick, Modifier.fillMaxWidth().heightIn(min = 54.dp), enabled = enabled,
-        contentPadding = PaddingValues(vertical = 12.dp)) {
-        Text(label, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
-    }
-}
-
-@Composable
-private fun DetailFooter(state: DetailState, model: DetailViewModel) {
     when {
-        state.loading -> Row(Modifier.padding(vertical = 16.dp), verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            CircularProgressIndicator(Modifier.size(24.dp))
-            Text(if (state.loaded) "Refreshing music…" else "Loading music…", style = MaterialTheme.typography.bodySmall)
-        }
-        state.failed -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(if (state.loaded) "Couldn't update music" else "Can't load music", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+        state.loading -> CircularProgressIndicator(Modifier.padding(vertical = 24.dp).size(24.dp)
+            .semantics { contentDescription = "Loading music" })
+        state.failed -> Column(Modifier.padding(vertical = 24.dp)) {
+            Text("Can’t load music", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             TextButton(model::retry, Modifier.heightIn(min = 48.dp)) { Text("Retry") }
         }
-        state.nextOffset != null -> TextButton(model::more, Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("More albums") }
         state.loaded && state.rows.isEmpty() && state.item?.kind != MusicKind.TRACK ->
-            Text(if (state.item?.kind == MusicKind.ARTIST) "No albums in library" else "No songs in library",
-                Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(if (state.item?.kind == MusicKind.ARTIST) "No albums yet" else "No songs yet",
+                Modifier.padding(vertical = 24.dp), style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
