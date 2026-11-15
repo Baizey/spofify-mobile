@@ -19,7 +19,7 @@ internal class SessionSocket(
     private data class Message(val text: String, val bytes: Long)
     private val retired = AtomicBoolean(false)
     private val queuedBytes = AtomicLong(0)
-    private val incoming = Channel<Message>(32, onUndeliveredElement = { queuedBytes.addAndGet(-it.bytes) })
+    private val incoming = Channel<Message>(MAX_INCOMING_FRAMES, onUndeliveredElement = { queuedBytes.addAndGet(-it.bytes) })
     @Volatile private var socket: WebSocket? = null
     @Volatile private var opened = false
 
@@ -66,5 +66,8 @@ internal class SessionSocket(
         onRetired(this)
     }
 
-    private companion object { const val MAX_INCOMING_BYTES = 5L * 1024 * 1024 }
+    private companion object {
+        const val MAX_INCOMING_FRAMES = 256
+        const val MAX_INCOMING_BYTES = 5L * 1024 * 1024
+    }
 }
