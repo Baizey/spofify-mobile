@@ -4,6 +4,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelStore
 import dev.spofify.mobile.core.personal.*
 import dev.spofify.mobile.core.playback.PlaybackContext
+import dev.spofify.mobile.core.playback.PlaybackQueueState
+import dev.spofify.mobile.core.playback.PlaybackSnapshot
+import dev.spofify.mobile.core.playback.PlaybackStatus
+import dev.spofify.mobile.core.playback.PlaybackView
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -43,7 +47,7 @@ class PersonalViewModelsTest {
         gate.complete(Unit)
         advanceUntilIdle()
         assertEquals(listOf(0, 100, 200), api.listOffsets)
-        assertEquals((201 downTo 0).map { "List $it" }, model.state.value.items.map { it.name })
+        assertEquals((0..201).map { "List $it" }, model.state.value.items.map { it.name })
         assertTrue(model.state.value.loaded)
     }
 
@@ -99,6 +103,8 @@ class PersonalViewModelsTest {
         val model = keep(PlaylistDetailViewModel(api, "playlist"))
         model.filter("Last")
         runCurrent()
+        assertEquals("Playlist", model.state.value.summary?.name)
+        assertNull(model.state.value.context)
         assertTrue(model.state.value.rows.isEmpty())
         assertFalse(model.state.value.noMatches)
         gate.complete(Unit)
@@ -324,8 +330,39 @@ class PersonalViewModelsTest {
         assertEquals("Count pending", playlistCount(pending))
         val sorted = naturalPlaylistOrder(listOf(summary("Mix 2", id = "two"), summary("mix 10", id = "ten"),
             summary("Mix 9999999999999999999999999999999", id = "huge")))
-        assertEquals(listOf("huge", "ten", "two"), sorted.map { it.id })
+        assertEquals(listOf("two", "ten", "huge"), sorted.map { it.id })
         assertFalse(track(audio = false).musicItem().hasAudio)
+    }
+
+    @Test fun collectionQueueUsesFreshReturnedDerivedFenceAndManualIdentityWithoutInventingRows() = runTest(dispatcher) {
+        val api = Api().apply {
+            current = summary(kind = PersonalPlaylistKind.DERIVED, revision = 7)
+            derived = { PersonalDerivedPage(emptyList(), 0, 0, 1, null, 7, "fresh-fence", true, PersonalEvaluationState.READY) }
+        }
+        assertEquals(PlaybackContext("derived", "playlist", "Playlist", 7, "fresh-fence"), freshPlaylistContext(api, "playlist"))
+        assertEquals(listOf(null), api.cursors)
+        assertTrue(api.manualOffsets.isEmpty())
+        api.derived = { PersonalDerivedPage(emptyList(), 0, 0, 1, null, 7, "", false, PersonalEvaluationState.PENDING) }
+        val failure = runCatching { freshPlaylistContext(api, "playlist") }.exceptionOrNull()
+        assertTrue(failure is PersonalLibraryException)
+        assertEquals(PersonalLibraryErrorCode.STALE_EVALUATION, (failure as PersonalLibraryException).code)
+        api.current = summary(revision = 9)
+        assertEquals(PlaybackContext("playlist", "playlist", "Playlist"), freshPlaylistContext(api, "playlist"))
+    }
+
+    @Test fun gestureBindingDistinguishesDuplicateOccurrencesAndFreshFencesWithoutResettingForQuietProgress() {
+        val row = PlaylistSong("first-entry", 0, track(), entryId = "first-entry")
+        val context = PlaybackContext("derived", "playlist", "Playlist", 7, "fresh-fence")
+        val status = PlaybackStatus(2, 1, 1, "", false, 0.0, 0.0, false, false, false, "")
+        val snapshot = PlaybackSnapshot("session", 1, 2, PlaybackQueueState(), status, emptyList(), "", "", null, 0)
+        val view = PlaybackView(sessionId = "session", snapshot = snapshot, playback = status)
+        val binding = personalGestureBinding(row, context, view)
+        assertNotEquals(binding, personalGestureBinding(row.copy(identity = "second-entry", entryId = "second-entry"), context, view))
+        assertNotEquals(binding, personalGestureBinding(row, context.copy(fence = "new-fence"), view))
+        assertNotEquals(binding, personalGestureBinding(row, context, view.copy(snapshot = snapshot.copy(outputVersion = 3))))
+        assertNotEquals(binding, personalGestureBinding(row, context, view.copy(snapshot = snapshot.copy(stateVersion = 2))))
+        assertNotEquals(binding, personalGestureBinding(row, context, view.copy(sessionId = "new-session")))
+        assertEquals(binding, personalGestureBinding(row, context, view.copy(playback = status.copy(playbackSequence = 2, elapsed = 1.0))))
     }
 
     private data class Write(val type: String, val id: String, val member: String?, val revision: Long)

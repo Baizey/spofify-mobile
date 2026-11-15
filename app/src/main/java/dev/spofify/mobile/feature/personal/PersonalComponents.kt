@@ -1,57 +1,116 @@
 package dev.spofify.mobile.feature.personal
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.PersonalLibraryClient
 import dev.spofify.mobile.core.personal.PersonalTrack
+import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
 import dev.spofify.mobile.feature.library.MusicRow
 
 @Composable
-internal fun PersonalSongRow(track: PersonalTrack, loader: ImageLoader, onPlay: () -> Unit, onMore: () -> Unit) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.weight(1f)) { MusicRow(track.musicItem(), loader, onOpen = onPlay) }
-        IconButton(onMore, Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp).semantics {
-            contentDescription = "More actions for ${track.name.ifBlank { "song" }}"
-        }) { Text("⋮", style = MaterialTheme.typography.titleLarge) }
-    }
+internal fun PersonalSongRow(
+    track: PersonalTrack,
+    loader: ImageLoader,
+    onPlay: () -> Unit,
+    onMore: () -> Unit,
+    onQueue: (() -> Unit)? = null,
+    gestureBinding: Any = track,
+) {
+    MusicRow(track.musicItem(), loader, onQueue = onQueue, onMore = onMore, gestureBinding = gestureBinding, onOpen = onPlay)
 }
 
-@Composable
-internal fun PersonalAction(label: String, enabled: Boolean = true, onClick: () -> Unit) {
-    TextButton(onClick, Modifier.fillMaxWidth().heightIn(min = 52.dp), enabled = enabled,
-        contentPadding = PaddingValues(vertical = 12.dp)) {
-        Text(label, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
-    }
-}
-
+/** No permanent refresh control or healthy-state helper prose. */
 @Composable
 internal fun PersonalStatus(loading: Boolean, error: String?, onRefresh: () -> Unit) {
-    if (loading) Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        CircularProgressIndicator(Modifier.size(22.dp))
-        Text("Updating library…", style = MaterialTheme.typography.bodySmall)
-    }
-    if (error != null) {
+    if (loading) LinearProgressIndicator(Modifier.fillMaxWidth().height(3.dp))
+    if (error != null) Column(Modifier.padding(vertical = 12.dp)) {
         Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        TextButton(onRefresh, Modifier.heightIn(min = 48.dp), enabled = !loading) { Text("Refresh") }
+        TextButton(onRefresh, enabled = !loading, contentPadding = PaddingValues(0.dp)) { Text("Retry") }
     }
 }
 
 @Composable
-internal fun PlaylistMetadataDialog(
+internal fun PersonalSongFilter(value: String, onChange: (String) -> Unit) {
+    var focused by remember { mutableStateOf(false) }
+    val focus = LocalFocusManager.current
+    val amount by animateFloatAsState(if (focused) 1f else 0f, tween(240), label = "filter illumination")
+    val glow = MaterialTheme.colorScheme.secondary.copy(alpha = .16f * amount)
+    val line = if (focused) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline
+    Column(Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 10.dp)
+        .background(Brush.verticalGradient(0f to glow, .8f to Color.Transparent, 1f to Color.Transparent))
+        .drawBehind {
+            val stroke = if (focused) 2.dp.toPx() else 1.dp.toPx()
+            drawLine(line, Offset(0f, stroke / 2), Offset(size.width, stroke / 2), stroke)
+        }) {
+        BasicTextField(value, onChange, Modifier.fillMaxWidth().heightIn(min = 48.dp)
+            .onFocusChanged { focused = it.isFocused }.padding(horizontal = 20.dp, vertical = 12.dp)
+            .semantics { contentDescription = "Filter songs" },
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface), singleLine = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
+            decorationBox = { field ->
+                if (value.isEmpty()) Text("Filter songs", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                field()
+            })
+    }
+}
+
+@Composable
+internal fun PersonalConfirmSheet(title: String, consequence: String, confirm: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    SpofifySheet(onDismiss) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
+            SheetHeading(title)
+            Text(consequence, Modifier.padding(bottom = 20.dp), style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            PersonalSheetButtons(confirm, true, onDismiss, onConfirm)
+        }
+    }
+}
+
+@Composable
+private fun PersonalSheetButtons(label: String, enabled: Boolean, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        TextButton(onDismiss, Modifier.weight(1f).heightIn(min = 52.dp), colors = ButtonDefaults.textButtonColors(
+            contentColor = MaterialTheme.colorScheme.onSurface)) { Text("Cancel") }
+        Button(onConfirm, Modifier.weight(1f).heightIn(min = 52.dp), enabled = enabled, shape = RoundedCornerShape(8.dp)) { Text(label) }
+    }
+}
+
+/** FINAL name sheet edits Name only; PATCH still carries the unchanged server description. */
+@Composable
+internal fun PlaylistNameSheet(
     title: String,
     initialName: String = "",
     initialDescription: String = "",
@@ -59,20 +118,35 @@ internal fun PlaylistMetadataDialog(
     onSave: (String, String) -> Unit,
 ) {
     var name by remember(initialName) { mutableStateOf(initialName) }
-    var description by remember(initialDescription) { mutableStateOf(initialDescription) }
-    val valid = name.isNotBlank() && name.codePointCount(0, name.length) <= 100 &&
-        description.codePointCount(0, description.length) <= 500
-    AlertDialog(onDismissRequest = onDismiss, title = { Text(title) }, text = {
-        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true)
-            OutlinedTextField(description, { description = it }, label = { Text("Description") }, minLines = 2, maxLines = 4)
+    var focused by remember { mutableStateOf(false) }
+    val requester = remember { FocusRequester() }
+    val valid = name.isNotBlank() && name.codePointCount(0, name.length) <= 100 && name.none(Char::isISOControl)
+    val line = if (focused) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline
+    val amount by animateFloatAsState(if (focused) 1f else 0f, tween(240), label = "name illumination")
+    val glow = MaterialTheme.colorScheme.secondary.copy(alpha = .16f * amount)
+    LaunchedEffect(Unit) { requester.requestFocus() }
+    SpofifySheet(onDismiss) {
+        Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(bottom = 22.dp)) {
+            Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading(title) }
+            Text("Name", Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 9.dp),
+                style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.6.sp, fontWeight = FontWeight.Medium))
+            BasicTextField(name, { name = it }, Modifier.fillMaxWidth().heightIn(min = 56.dp)
+                .focusRequester(requester).onFocusChanged { focused = it.isFocused }
+                .background(Brush.verticalGradient(0f to Color.Transparent, .2f to Color.Transparent, 1f to glow))
+                .drawBehind {
+                    val stroke = if (focused) 2.dp.toPx() else 1.dp.toPx()
+                    drawLine(line, Offset(0f, size.height - stroke / 2), Offset(size.width, size.height - stroke / 2), stroke)
+                }.padding(horizontal = 20.dp, vertical = 14.dp).semantics { contentDescription = "Playlist name" },
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface), singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { if (valid) onSave(name, initialDescription) }))
+            Box(Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp)) {
+                PersonalSheetButtons(if (initialName.isEmpty()) "Create" else "Save", valid, onDismiss) { onSave(name, initialDescription) }
+            }
         }
-    }, confirmButton = {
-        TextButton({ onSave(name, description) }, enabled = valid) { Text(if (initialName.isEmpty()) "Create" else "Save") }
-    }, dismissButton = { TextButton(onDismiss) { Text("Cancel") } })
+    }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun PersonalSongActions(
     api: PersonalLibraryClient,
@@ -82,7 +156,6 @@ internal fun PersonalSongActions(
     metadataMissing: Boolean = false,
     onPlay: () -> Unit,
     onQueue: () -> Unit,
-    onPlayNext: () -> Unit,
     onNavigate: (MusicKind, String) -> Unit,
     onRemove: (() -> Unit)? = null,
     onDismiss: () -> Unit,
@@ -93,55 +166,51 @@ internal fun PersonalSongActions(
             adding = false
             onDismiss()
         })
-    } else ModalBottomSheet(onDismissRequest = onDismiss) {
-        LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 28.dp)) {
+    } else SpofifySheet(onDismiss) {
+        LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") {
-                Row(Modifier.padding(bottom = 12.dp), verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    MusicArtwork(track.musicItem(), loader)
-                    Text(track.name.ifBlank { "Song metadata unavailable" }, style = MaterialTheme.typography.titleLarge,
-                        modifier = Modifier.weight(1f).semantics { heading() })
+                Row(Modifier.padding(bottom = 16.dp), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(15.dp)) {
+                    MusicArtwork(track.musicItem(), loader, Modifier.size(48.dp).clip(RoundedCornerShape(4.dp)))
+                    Column(Modifier.weight(1f)) {
+                        Text(track.name.ifBlank { "Unavailable track" }, style = MaterialTheme.typography.titleLarge.copy(
+                            fontSize = 22.5.sp, fontWeight = FontWeight(650), lineHeight = 26.1.sp), modifier = Modifier.semantics { heading() })
+                        val credits = track.artists.joinToString(", ") { it.name }
+                        if (credits.isNotBlank()) Text(credits, style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
+                SheetGroup("Listen")
             }
-            item("play") { PersonalAction("Play now", playable) {
+            item("play") { SheetAction("Play now", SpofifyGlyph.Play, playable) {
                 onDismiss()
                 onPlay()
             } }
-            item("next") { PersonalAction("Play next", playable) {
-                onDismiss()
-                onPlayNext()
-            } }
-            item("queue") { PersonalAction("Queue", playable) {
+            item("queue") { SheetAction("Queue", SpofifyGlyph.Queue, playable) {
                 onDismiss()
                 onQueue()
             } }
-            item("add") { PersonalAction("Add to playlist", track.hasAudio) { adding = true } }
-            item("detail") { PersonalAction("Song details", !metadataMissing) {
+            item("library") { SheetGroup("Library") }
+            item("add") { SheetAction("Add to playlist", SpofifyGlyph.Plus, track.hasAudio) { adding = true } }
+            onRemove?.let { remove -> item("remove") { SheetAction("Remove this entry", SpofifyGlyph.Trash) {
                 onDismiss()
-                onNavigate(MusicKind.TRACK, track.id)
-            } }
-            if (!metadataMissing) {
+                remove()
+            } } }
+            if (!metadataMissing && (track.artists.any { it.id.isNotBlank() } || track.albumId.isNotBlank())) {
+                item("go-to") { SheetGroup("Go to") }
                 items(track.artists.size, key = { "artist-$it" }) { index ->
                     val artist = track.artists[index]
-                    if (artist.id.isNotBlank()) PersonalAction("Artist · ${artist.name}") {
+                    if (artist.id.isNotBlank()) SheetAction(artist.name, SpofifyGlyph.Artist) {
                         onDismiss()
                         onNavigate(MusicKind.ARTIST, artist.id)
                     }
                 }
                 if (track.albumId.isNotBlank()) item("album") {
-                    PersonalAction(if (track.albumName.isBlank()) "Album" else "Album · ${track.albumName}") {
+                    SheetAction(track.albumName.ifBlank { "Album" }, SpofifyGlyph.Album) {
                         onDismiss()
                         onNavigate(MusicKind.ALBUM, track.albumId)
                     }
                 }
-            }
-            onRemove?.let { remove -> item("remove") { PersonalAction("Remove this entry") {
-                onDismiss()
-                remove()
-            } } }
-            if (!track.hasAudio) item("unavailable") {
-                Text("Audio is unavailable. Existing metadata can still be opened.", style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(vertical = 12.dp))
             }
         }
     }

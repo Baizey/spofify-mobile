@@ -52,6 +52,8 @@ internal class PlaylistDetailViewModel(private val api: PersonalLibraryApi, priv
         reading = viewModelScope.launch {
             try {
                 val summary = api.playlist(id)
+                if (token != generation) return@launch
+                if (!mutable.value.loaded) mutable.value = mutable.value.copy(summary = summary)
                 val loaded = when (summary.kind) {
                     PersonalPlaylistKind.MANUAL -> readManual(summary)
                     PersonalPlaylistKind.DERIVED -> readDerived()
@@ -155,7 +157,7 @@ internal class PlaylistDetailViewModel(private val api: PersonalLibraryApi, priv
         viewModelScope.launch {
             try {
                 action()
-                mutable.value = mutable.value.copy(writing = false, message = "Playlist updated.")
+                mutable.value = mutable.value.copy(writing = false, message = null)
                 refresh()
             } catch (cancelled: CancellationException) {
                 throw cancelled

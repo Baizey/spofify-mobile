@@ -70,7 +70,7 @@ internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private v
         viewModelScope.launch {
             try {
                 val created = api.createManualPlaylist(name, description)
-                mutable.value = mutable.value.copy(writing = false, created = created, message = "Playlist created.")
+                mutable.value = mutable.value.copy(writing = false, created = created, message = null)
                 refresh()
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -86,7 +86,7 @@ internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private v
         viewModelScope.launch {
             try {
                 val saved = api.addTrack(summary.id, trackId, summary.revision)
-                mutable.value = mutable.value.copy(writing = false, added = saved, message = "Added to playlist.")
+                mutable.value = mutable.value.copy(writing = false, added = saved, message = null)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {

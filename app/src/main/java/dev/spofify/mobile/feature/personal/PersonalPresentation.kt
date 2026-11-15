@@ -6,12 +6,26 @@ import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.*
 import dev.spofify.mobile.core.playback.PlaybackContext
 import dev.spofify.mobile.core.playback.PlaybackTrackReference
+import dev.spofify.mobile.core.playback.PlaybackView
 import java.text.Collator
 import java.util.Locale
 
 internal fun PersonalTrack.musicItem() = MusicItem(
     MusicKind.TRACK, id, name, artists.map { Artist(it.id, it.name) }, albumId, albumName,
     releaseDate, durationMs, trackNumber, hasAudio, coverage.inLibrary, coverage.tracks,
+)
+
+/** Quiet scalar progress does not change a row gesture; occurrence, context and authority changes do. */
+internal data class PersonalGestureBinding(
+    val source: Any,
+    val context: PlaybackContext?,
+    val sessionId: String?,
+    val stateVersion: Long?,
+    val outputVersion: Long?,
+)
+
+internal fun personalGestureBinding(source: Any, context: PlaybackContext?, view: PlaybackView?) = PersonalGestureBinding(
+    source, context, view?.sessionId, view?.snapshot?.stateVersion, view?.snapshot?.outputVersion,
 )
 
 internal data class PlaylistSong(
@@ -34,7 +48,7 @@ internal data class PlaylistSong(
     }
 }
 
-/** Same descending numeric, case-insensitive browse order as the accepted wireframe. */
+/** Ascending data feeds reverseLayout directly: visually descending, with A nearest the bottom. */
 internal fun naturalPlaylistOrder(items: List<PersonalPlaylistSummary>): List<PersonalPlaylistSummary> {
     val collator = Collator.getInstance(Locale.getDefault()).apply { strength = Collator.PRIMARY }
     fun compareNames(left: String, right: String): Int {
@@ -63,8 +77,19 @@ internal fun naturalPlaylistOrder(items: List<PersonalPlaylistSummary>): List<Pe
         return (left.length - a).compareTo(right.length - b)
     }
     return items.sortedWith { first, second ->
-        compareNames(second.name, first.name).takeIf { it != 0 } ?: first.id.compareTo(second.id)
+        compareNames(first.name, second.name).takeIf { it != 0 } ?: first.id.compareTo(second.id)
     }
+}
+
+/** Collection-only admission needs the freshly returned rules fence, never guessed row identities. */
+internal suspend fun freshPlaylistContext(api: PersonalLibraryApi, id: String): PlaybackContext {
+    val summary = api.playlist(id)
+    if (summary.kind == PersonalPlaylistKind.MANUAL) return PlaybackContext("playlist", summary.id, summary.name)
+    val page = api.derivedEntries(id, limit = 1)
+    if (!page.complete || page.revision == null || page.fence.isBlank()) {
+        throw PersonalLibraryException(409, PersonalLibraryErrorCode.STALE_EVALUATION)
+    }
+    return PlaybackContext("derived", summary.id, summary.name, page.revision, page.fence)
 }
 
 internal fun playlistCount(summary: PersonalPlaylistSummary): String = when {
@@ -84,6 +109,6 @@ internal fun personalError(failure: Exception, mutation: Boolean = false): Strin
         mutation && (error == null || error.status == 0 || error.status == 408 || error.status >= 500) ->
             "The change couldn't be confirmed. Refresh to check before trying again; it wasn't resubmitted."
         mutation -> "The change wasn't saved. Refresh and review before trying again."
-        else -> "Couldn't update your library. Your previous view is still shown."
+        else -> "Can't load music."
     }
 }
