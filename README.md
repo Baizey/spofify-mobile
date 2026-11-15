@@ -9,9 +9,15 @@ music destinations. The Android-free `:core` owns origin, HTTP and session contr
 
 Open this directory in Android Studio. Use JDK 25, Android platform 37.0 and
 build-tools 36.0.0. The version catalog pins AGP 9.3.1, Kotlin / Compose compiler
-2.4.21 and Gradle 9.6.0. AGP built-in Kotlin consumes the newer KGP loaded by the
-root JVM plugin; no second Android Kotlin plugin is applied. Sources target Java 17;
-runtime minimum is Android 8 (API 26), target API 36.
+2.4.21. The wrapper retains Gradle 9.9.0 from main. AGP built-in Kotlin consumes
+the newer KGP loaded by the root JVM plugin; no second Android Kotlin plugin is
+applied. Sources target Java 17; runtime minimum is Android 8 (API 26), target API 36.
+
+The login slice was source-reviewed with a Gradle 9.6.0 pin. Retaining main’s
+9.9.0 wrapper is an explicit integration choice, not a verified compatibility claim.
+It is beyond Kotlin 2.4.21’s previously checked fully tested Gradle range (through
+9.7.0). Compilation, tests and APK execution remain unverified; the agent build
+attempt was blocked by policy before wrapper bootstrap.
 
 On an environment with these dependencies legitimately provisioned:
 
