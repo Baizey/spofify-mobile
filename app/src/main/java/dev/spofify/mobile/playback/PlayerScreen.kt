@@ -1,137 +1,195 @@
 package dev.spofify.mobile.playback
 
-import android.R
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
+import dev.spofify.mobile.core.content.TrackContentApi
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.playback.*
+import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
-import dev.spofify.mobile.feature.library.duration
+import kotlin.math.abs
+import kotlin.math.max
 
 @Composable
-internal fun MiniPlayer(controller: PlaybackController, loader: ImageLoader, onExpand: () -> Unit, onDevices: () -> Unit) {
+internal fun FullPlayer(
+    controller: PlaybackController,
+    loader: ImageLoader,
+    contentApi: TrackContentApi,
+    onNavigate: ((MusicKind, String) -> Unit)? = null,
+    onDismiss: () -> Unit,
+) {
     val state by controller.state.collectAsStateWithLifecycle()
     val track = state.current ?: return
-    val ready = state.connection == PlaybackConnectionState.READY
-    Surface(color = MaterialTheme.colorScheme.surface) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 76.dp).padding(start = 12.dp, end = 4.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onExpand, Modifier.weight(1f), contentPadding = PaddingValues(0.dp)) {
-                MusicArtwork(MusicKind.TRACK, track.id, loader, Modifier.size(44.dp))
-                Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                    Text(track.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.bodyLarge)
-                    Text(track.artists.joinToString(", ") { it.name }, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-            IconButton(onDevices, modifier = Modifier.semantics { contentDescription = "Playback devices" }) {
-                val remote = state.snapshot?.selectedDeviceId?.let { it.isNotEmpty() && it != state.deviceId } == true
-                Text(if (remote) "↗" else "▣", color = if (remote) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurface)
-            }
-            MediaButton(if (state.desiredPlaying) "Pause" else "Play",
-                if (state.desiredPlaying) R.drawable.ic_media_pause else R.drawable.ic_media_play, ready) { controller.toggle() }
-        }
-    }
-}
-
-@Composable
-internal fun FullPlayer(controller: PlaybackController, loader: ImageLoader, onDismiss: () -> Unit) {
-    val state by controller.state.collectAsStateWithLifecycle()
-    val track = state.current ?: return
+    val contentModel: TrackContentViewModel = viewModel(key = "track-content-${System.identityHashCode(contentApi)}",
+        factory = viewModelFactory { initializer { TrackContentViewModel(contentApi) } })
+    val content by contentModel.state.collectAsStateWithLifecycle()
+    val binding = "${state.sessionId}:${state.snapshot?.outputVersion}:${state.snapshot?.selectedDeviceId}:${state.snapshot?.state?.occurrence?.eventId}:${track.key}"
+    LaunchedEffect(binding, track.id) { contentModel.select(track.id, binding) }
+    DisposableEffect(contentModel) { onDispose { contentModel.select(null, "") } }
+    val currentContent = content.takeIf { it.trackId == track.id && it.binding == binding } ?: TrackContentState()
+    val actual = state.playback?.takeIf { it.hasReportedPlayback }
+    val elapsedMs = ((actual?.elapsed ?: 0.0) * 1000).toLong()
+    val durationMs = ((actual?.duration ?: 0.0) * 1000).toLong()
+    val inline = currentContent.currentLine(elapsedMs, durationMs)?.text?.takeIf { it.isNotBlank() }
     val ready = state.connection == PlaybackConnectionState.READY
     var queue by remember { mutableStateOf(false) }
     var devices by remember { mutableStateOf(false) }
+    var more by remember { mutableStateOf(false) }
+    var lyrics by remember { mutableStateOf(false) }
+    LaunchedEffect(binding) { more = false; lyrics = false }
+    val scroll = rememberScrollState()
     Dialog(onDismiss, DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
-                .verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
-                IconButton(onDismiss) { Icon(painterResource(R.drawable.arrow_down_float), "Dismiss player") }
-                MusicArtwork(MusicKind.TRACK, track.id, loader,
-                    Modifier.widthIn(max = 330.dp).fillMaxWidth().aspectRatio(1f).align(Alignment.CenterHorizontally))
-                Spacer(Modifier.height(36.dp))
-                Text(track.name, style = MaterialTheme.typography.headlineSmall)
-                Text(track.artists.joinToString(", ") { it.name }, Modifier.padding(top = 6.dp, bottom = 20.dp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                PlaybackSeek(state) { controller.seek(it) }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically) {
-                    TextButton({ controller.toggleShuffle() }, enabled = ready,
-                        modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp).semantics {
-                            contentDescription = "Shuffle"
-                            stateDescription = if (state.snapshot?.state?.shuffle == true) "On" else "Off"
-                        }) { Text("⇄", color = if (state.snapshot?.state?.shuffle == true)
-                            MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface) }
-                    MediaButton("Previous song", R.drawable.ic_media_previous, ready) { controller.previous() }
-                    FilledIconButton({ controller.toggle() }, enabled = ready, modifier = Modifier.size(64.dp)) {
-                        Icon(painterResource(if (state.desiredPlaying) R.drawable.ic_media_pause else R.drawable.ic_media_play),
-                            if (state.desiredPlaying) "Pause" else "Play", Modifier.size(28.dp))
+            BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+                val density = LocalDensity.current
+                val coverWidth = (maxWidth - 40.dp).coerceAtMost(if (density.fontScale >= 1.5f) 164.dp else 330.dp)
+                var controlsPixels by remember { mutableIntStateOf(0) }
+                val controlsHeight = with(density) { controlsPixels.toDp() }
+                val breathing = (maxHeight - coverWidth - controlsHeight - 34.dp).coerceAtLeast(16.dp)
+                val dismissGesture = Modifier.playerDismissGesture(binding, scroll.maxValue == 0 && scroll.value == 0, onDismiss)
+                Column(Modifier.fillMaxWidth().verticalScroll(scroll).padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 18.dp)
+                    .semantics { customActions = listOf(CustomAccessibilityAction("Dismiss player") { onDismiss(); true }) }) {
+                    MusicArtwork(MusicKind.TRACK, track.id, loader,
+                        Modifier.size(coverWidth).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(7.dp)).then(dismissGesture))
+                    if (inline == null) Spacer(Modifier.fillMaxWidth().height(breathing).then(dismissGesture))
+                    else {
+                        Box(Modifier.fillMaxWidth().heightIn(min = breathing.coerceAtLeast(128.dp))
+                            .clickable { lyrics = true }.padding(start = 26.dp, end = 26.dp, top = 22.dp, bottom = 22.dp),
+                            contentAlignment = Alignment.Center) {
+                            Text(inline, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 33.sp, lineHeight = 40.26.sp,
+                                fontWeight = FontWeight.Bold), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                            SpofifyIcon(SpofifyGlyph.Lyrics, "Open lyrics", Modifier.align(Alignment.CenterStart).offset(x = (-26).dp).size(20.dp),
+                                MaterialTheme.colorScheme.secondary)
+                        }
+                        Spacer(Modifier.height(8.dp))
                     }
-                    MediaButton("Next song", R.drawable.ic_media_next, ready) { controller.next() }
-                    TextButton({ controller.cycleRepeat() }, enabled = ready,
-                        modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp).semantics {
-                            contentDescription = "Repeat"
-                            stateDescription = state.snapshot?.state?.repeat ?: "off"
-                        }) { Text(if (state.snapshot?.state?.repeat == "one") "↻1" else "↻",
-                            color = if (state.snapshot?.state?.repeat != "off") MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.onSurface) }
-                }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    TextButton({ devices = true }, enabled = ready) {
-                        Text(state.devices.firstOrNull { it.deviceId == state.snapshot?.selectedDeviceId }?.name ?: "Output")
+                    Column(Modifier.fillMaxWidth().onSizeChanged { controlsPixels = it.height }) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Column(Modifier.weight(1f)) {
+                                Text(track.name, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 22.5.sp,
+                                    lineHeight = 26.1.sp, fontWeight = FontWeight.Bold))
+                                val artist = track.artists.firstOrNull { !it.id.isNullOrBlank() }
+                                val credit = track.artists.joinToString(", ") { it.name }
+                                Box(Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                                    .then(if (artist != null && onNavigate != null) Modifier.clickable {
+                                        onNavigate(MusicKind.ARTIST, requireNotNull(artist.id))
+                                    } else Modifier).padding(top = 2.dp)) {
+                                    Text(credit, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp))
+                                }
+                            }
+                            IconButton({ more = true }, Modifier.size(48.dp)) {
+                                SpofifyIcon(SpofifyGlyph.More, "More for this song")
+                            }
+                        }
+                        PlaybackSeek(state, currentContent) { controller.seek(it) }
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            TransportSlot(Modifier.weight(1f), "Shuffle", SpofifyGlyph.Shuffle, ready,
+                                active = state.snapshot?.state?.shuffle == true) { controller.toggleShuffle() }
+                            TransportSlot(Modifier.weight(1f), "Previous song", SpofifyGlyph.Previous, ready) { controller.previous() }
+                            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                                FilledIconButton({ controller.toggle() }, Modifier.size(64.dp), enabled = ready, shape = CircleShape) {
+                                    SpofifyIcon(if (state.desiredPlaying) SpofifyGlyph.Pause else SpofifyGlyph.Play,
+                                        if (state.desiredPlaying) "Pause" else "Play")
+                                }
+                            }
+                            TransportSlot(Modifier.weight(1f), "Next song", SpofifyGlyph.Next, ready) { controller.next() }
+                            val repeat = state.snapshot?.state?.repeat ?: "off"
+                            TransportSlot(Modifier.weight(1f), "Repeat ${if (repeat == "all") "queue" else repeat}",
+                                if (repeat == "one") SpofifyGlyph.RepeatOne else SpofifyGlyph.Repeat, ready,
+                                active = repeat != "off") { controller.cycleRepeat() }
+                        }
+                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { PlayerOutputButton(state) { devices = true } }
+                            Spacer(Modifier.weight(3f))
+                            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                                IconButton({ queue = true }, Modifier.size(48.dp)) { SpofifyIcon(SpofifyGlyph.Queue, "See queue") }
+                            }
+                        }
+                        state.error?.let { Text(it, Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall) }
                     }
-                    TextButton({ queue = true }) { Text("Queue") }
                 }
-                if (state.playback?.isBuffering == true || state.playback?.isLoading == true || state.snapshot?.transfer != null)
-                    CircularProgressIndicator(Modifier.padding(16.dp).size(24.dp))
-                state.error?.let { Text(it, Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall) }
-                Spacer(Modifier.height(24.dp))
             }
         }
         if (queue) QueueSheet(controller, loader) { queue = false }
         if (devices) DevicesSheet(controller) { devices = false }
+        if (more) SpofifySheet({ more = false }) {
+            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
+                SheetHeading(track.name)
+                if (inline == null) SheetAction("Lyrics", SpofifyGlyph.Lyrics) { more = false; lyrics = true }
+                SheetAction("Open album", SpofifyGlyph.Album, onNavigate != null && track.albumId.isNotBlank()) {
+                    more = false
+                    onNavigate?.invoke(MusicKind.ALBUM, track.albumId)
+                }
+            }
+        }
+        if (lyrics) PlayerLyricsSheet(track, currentContent, elapsedMs, durationMs, contentModel::refresh) { lyrics = false }
     }
 }
 
 @Composable
-private fun PlaybackSeek(state: PlaybackView, onSeek: (Double) -> Unit) {
-    val facts = state.playback
-    val seconds = facts?.takeIf { it.hasReportedPlayback }?.elapsed ?: 0.0
-    val total = facts?.takeIf { it.hasReportedPlayback }?.duration ?: 0.0
-    var preview by remember(state.current?.key, state.snapshot?.state?.occurrence?.eventId) { mutableStateOf<Float?>(null) }
-    Column {
-        Slider(value = preview ?: seconds.toFloat().coerceIn(0f, total.toFloat().coerceAtLeast(1f)),
-            onValueChange = { preview = it },
-            valueRange = 0f..total.toFloat().coerceAtLeast(1f),
-            enabled = state.connection == PlaybackConnectionState.READY && total > 0,
-            modifier = Modifier.semantics { contentDescription = "Seek playback" },
-            onValueChangeFinished = { preview?.let { onSeek(it.toDouble()) }; preview = null })
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(duration(((preview?.toDouble() ?: seconds) * 1000).toLong()), style = MaterialTheme.typography.labelSmall)
-            Text(duration((total * 1000).toLong()), style = MaterialTheme.typography.labelSmall)
+private fun TransportSlot(modifier: Modifier, label: String, glyph: SpofifyGlyph, enabled: Boolean, active: Boolean = false, onClick: () -> Unit) {
+    Box(modifier, contentAlignment = Alignment.Center) {
+        IconButton(onClick, Modifier.size(48.dp).semantics { if (label == "Shuffle") stateDescription = if (active) "On" else "Off" }, enabled = enabled) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                SpofifyIcon(glyph, label, tint = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                if (active) Box(Modifier.align(Alignment.BottomCenter).size(4.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
+            }
         }
     }
 }
 
-@Composable
-private fun MediaButton(label: String, drawable: Int, enabled: Boolean, onClick: () -> Unit) {
-    IconButton(onClick, enabled = enabled, modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)) {
-        Icon(painterResource(drawable), label, Modifier.size(24.dp))
+private fun Modifier.playerDismissGesture(binding: String, eligible: Boolean, onDismiss: () -> Unit): Modifier =
+    pointerInput(binding, eligible) {
+        if (!eligible) return@pointerInput
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            var peak = 0f
+            while (true) {
+                val event = awaitPointerEvent()
+                val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                val dx = pointer.position.x - down.position.x
+                val dy = pointer.position.y - down.position.y
+                if (pointer.isConsumed || event.changes.count { it.pressed } > 1 || dy < -12.dp.toPx() ||
+                    (abs(dx) > 12.dp.toPx() && abs(dx) > abs(dy) / 1.5f) ||
+                    (peak > 24.dp.toPx() && dy < peak - 20.dp.toPx())) break
+                peak = max(peak, dy)
+                if (dy > 16.dp.toPx() && dy > abs(dx) * 1.5f) pointer.consume()
+                if (!pointer.pressed) {
+                    if (dy >= 72.dp.toPx() && peak - dy <= 20.dp.toPx() && abs(dx) < 40.dp.toPx() && dy > abs(dx) * 1.5f) onDismiss()
+                    break
+                }
+            }
+        }
     }
-}
