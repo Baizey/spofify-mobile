@@ -19,25 +19,30 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.spofify.mobile.core.auth.AuthState
+import dev.spofify.mobile.core.auth.SessionRepository
+import dev.spofify.mobile.feature.library.MusicRoot
 import dev.spofify.mobile.designsystem.SpofifyTheme
 import dev.spofify.mobile.feature.auth.*
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         val repository = (application as SpofifyApplication).sessions
         setContent {
             SpofifyTheme {
                 val model: AuthViewModel = viewModel(factory = AuthViewModel.Factory(repository))
-                AuthRoot(model)
+                AuthRoot(model, repository)
             }
         }
     }
 }
 
 @Composable
-private fun AuthRoot(model: AuthViewModel) {
+private fun AuthRoot(model: AuthViewModel, sessions: SessionRepository) {
     val state by model.state.collectAsStateWithLifecycle()
     val inputNotice by model.inputNotice.collectAsStateWithLifecycle()
     val owner = LocalLifecycleOwner.current
@@ -54,7 +59,9 @@ private fun AuthRoot(model: AuthViewModel) {
             when (val current = state) {
                 is AuthState.Authenticated -> {
                     var credits by remember { mutableStateOf(false) }
-                    AccountScreen(current, model::signOut) { credits = true }
+                    MusicRoot(current.identity, sessions) {
+                        AccountScreen(current, model::signOut) { credits = true }
+                    }
                     if (credits) FontCredits { credits = false }
                 }
                 is AuthState.SignedOut -> LoginScreen(model.inputs, false, current.notice ?: inputNotice,

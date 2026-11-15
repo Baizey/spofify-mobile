@@ -1,6 +1,8 @@
 package dev.spofify.mobile.core.auth
 
 import dev.spofify.mobile.core.origin.ServerOrigin
+import dev.spofify.mobile.core.http.FeatureResponse
+import dev.spofify.mobile.core.http.FeatureTransport
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -49,6 +51,63 @@ class SessionRepository(
     private var api: AuthApi? = null
     private var saved: StoredSession? = null
     private var identity: AccountIdentity? = null
+    private val featureJobs = mutableSetOf<Job>()
+
+    internal fun isAdministrator(expected: AccountIdentity): Boolean = synchronized(lock) {
+        require(isCurrent(expected))
+        saved?.session?.role == "admin"
+    }
+
+    /** One session owner supplies credentials and fences headers and completed feature reads. */
+    internal suspend fun get(
+        expected: AccountIdentity,
+        segments: List<String>,
+        query: List<Pair<String, String>> = emptyList(),
+        artwork: Boolean = false,
+    ): FeatureResponse = coroutineScope {
+        val job = currentCoroutineContext().job
+        val capture = synchronized(lock) {
+            if (!isCurrent(expected)) throw CancellationException("Session retired")
+            featureJobs.add(job)
+            Triple(generation, requireNotNull(saved), requireNotNull(api))
+        }
+        fun checkCurrent() {
+            if (generation != capture.first || api !== capture.third || !isCurrent(expected))
+                throw CancellationException("Session retired")
+        }
+        try {
+            val transport = capture.third as? FeatureTransport
+                ?: throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
+            val response = transport.get(segments, query, capture.second.cookie, artwork) { status, renewed ->
+                val write = synchronized(lock) {
+                    checkCurrent()
+                    val sameCredential = saved?.cookie?.substringBefore(';')?.trim() ==
+                        capture.second.cookie.substringBefore(';').trim()
+                    when {
+                        status == 401 && sameCredential -> {
+                            advance(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED))
+                            saved = null
+                            identity = null
+                            persistLocked(null)
+                        }
+                        status == 401 -> throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
+                        renewed != null && sameCredential && capture.second.sessionMode == "rolling-v1" -> {
+                            val record = StoredSession(capture.second.server, renewed,
+                                capture.second.session, capture.second.sessionMode)
+                            saved = record
+                            persistLocked(record)
+                        }
+                        else -> null
+                    }
+                }
+                write?.start()
+            }
+            ensureActive()
+            synchronized(lock) { checkCurrent(); response }
+        } finally {
+            synchronized(lock) { featureJobs.remove(job) }
+        }
+    }
 
     fun isCurrent(expected: AccountIdentity): Boolean = synchronized(lock) {
         (state.value as? AuthState.Authenticated)?.identity == expected
@@ -267,6 +326,8 @@ class SessionRepository(
     private fun advance(state: AuthState): Long {
         generation++
         operation?.cancel()
+        featureJobs.toList().forEach { it.cancel() }
+        featureJobs.clear()
         api?.cancel()
         api = null
         mutableState.value = if (state is AuthState.SignedOut) signedOutState(state.notice) else state

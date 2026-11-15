@@ -47,7 +47,7 @@ class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
     fun reveal() = inputs.reveal()
     fun signIn() {
         mutableInputNotice.value = null
-        sessions.signIn(inputs.server, inputs.username, inputs.password)
+        sessions.signIn(inputs.server, inputs.username, inputs.password.trim())
     }
     fun signOut() = sessions.signOut()
     fun retry() = sessions.retry()

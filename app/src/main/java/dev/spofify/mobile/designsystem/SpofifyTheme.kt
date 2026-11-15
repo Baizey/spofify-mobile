@@ -1,6 +1,5 @@
 package dev.spofify.mobile.designsystem
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
@@ -53,17 +52,9 @@ private val dark = darkColorScheme(
     secondary = Color(0xFF91BFFF), tertiary = Color(0xFFDFBD78),
     outline = Color(0xFF68778A), outlineVariant = Color(0xFF353E49),
 )
-private val light = lightColorScheme(
-    background = Color(0xFFF8FAFC), onBackground = Color(0xFF1B2636),
-    surface = Color(0xFFEDF1F5), onSurface = Color(0xFF1B2636),
-    surfaceVariant = Color(0xFFE1E8EF), onSurfaceVariant = Color(0xFF4C5E74),
-    primary = Color(0xFF08704E), onPrimary = Color.White,
-    secondary = Color(0xFF2759A4), tertiary = Color(0xFF77551B),
-    outline = Color(0xFF728097), outlineVariant = Color(0xFFC0CBD6),
-)
 
 @Composable
 fun SpofifyTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) dark else light,
+    MaterialTheme(colorScheme = dark,
         typography = typography, content = content)
 }

@@ -1,9 +1,9 @@
 <resources>
-    <style name="Theme.Spofify" parent="android:style/Theme.Material.NoActionBar">
+    <style name="Theme.Spofify.Base" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">monospace</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowLightNavigationBar">false</item>
         <item name="android:windowActionModeOverlay">true</item>
         <item name="android:windowBackground">#101216</item>
     </style>
+    <style name="Theme.Spofify" parent="Theme.Spofify.Base" />
 </resources>

@@ -23,10 +23,10 @@ class OkHttpAuthApiFactory : AuthApiFactory {
 }
 
 /** No global cookie jar, redirects, retry, HTTP logging or private-response disk cache. */
-class OkHttpAuthApi(
+internal class OkHttpAuthApi(
     override val origin: ServerOrigin,
     private val client: OkHttpClient = defaultClient(),
-) : AuthApi {
+) : AuthApi, FeatureTransport {
     private val json = Json { ignoreUnknownKeys = true }
     private val calls = ConcurrentHashMap.newKeySet<Call>()
     private val cookieName = if (origin.url.isHttps) "__Host-spofify_session" else "spofify_session"
@@ -36,6 +36,66 @@ class OkHttpAuthApi(
         require(client.cache == null && client.cookieJar === CookieJar.NO_COOKIES)
         require(client.interceptors.isEmpty() && client.networkInterceptors.isEmpty())
         require(client.authenticator === Authenticator.NONE && client.proxyAuthenticator === Authenticator.NONE)
+    }
+
+    // Ordinary GET connection recovery is safe; HTTP status responses are never replayed.
+    private class ReadStatus(val status: Int) : java.net.ProtocolException("Read status received")
+    private val readClient = client.newBuilder()
+        .retryOnConnectionFailure(true)
+        .addNetworkInterceptor { chain ->
+            val response = chain.proceed(chain.request())
+            if (response.code in setOf(408, 421, 503)) {
+                val status = response.code
+                response.close()
+                throw ReadStatus(status)
+            }
+            response
+        }.build()
+
+    override suspend fun get(
+        segments: List<String>,
+        query: List<Pair<String, String>>,
+        cookie: String,
+        artwork: Boolean,
+        onHeaders: (Int, String?) -> Unit,
+    ): FeatureResponse {
+        val url = origin.url.newBuilder().apply {
+            segments.forEach { segment ->
+                require(segment.isNotEmpty() && segment != "." && segment != ".." && segment.none(Char::isISOControl))
+                addPathSegment(segment)
+            }
+            query.forEach { (key, value) -> addQueryParameter(key, value) }
+        }.build()
+        check(origin.contains(url))
+        val request = Request.Builder().url(url).get()
+            .header("Origin", origin.value)
+            .header("Cookie", cookieHeader(cookie))
+            .header("Accept", if (artwork) "image/jpeg, image/png" else "application/json")
+            .header("Cache-Control", "no-store").build()
+        return try {
+            execute(request, readClient) { response ->
+                val renewed = if (response.isSuccessful) response.headers.values("Set-Cookie")
+                    .filter { it.substringBefore(';').substringBefore('=').trim() == cookieName }
+                    .also { require(it.size <= 1) }.singleOrNull()
+                    ?.let { parseCookie(it, requireAbsoluteExpiry = true).toString() } else null
+                onHeaders(response.code, renewed)
+                if (response.code != 200) FeatureResponse(response.code, byteArrayOf(), null)
+                else {
+                    val body = response.body ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+                    val mime = body.contentType()
+                    require(if (artwork) mime?.type == "image" && mime.subtype in setOf("jpeg", "png")
+                        else mime?.type == "application" && mime.subtype == "json")
+                    val bound = if (artwork) 8L * 1024 * 1024 else 2L * 1024 * 1024
+                    val source = body.source()
+                    source.request(bound + 1)
+                    require(source.buffer.size <= bound)
+                    FeatureResponse(200, source.readByteArray(), mime.toString())
+                }
+            }
+        } catch (status: ReadStatus) {
+            onHeaders(status.status, null)
+            FeatureResponse(status.status, byteArrayOf(), null)
+        }
     }
 
     @Serializable
@@ -130,16 +190,22 @@ class OkHttpAuthApi(
     private fun cookieHeader(raw: String): String = parseCookie(raw).let { "${it.name}=${it.value}" }
 
     /** Keep the continuation and Call owned until body consumption AND close finish. */
-    private suspend fun <T> execute(request: Request, consume: (Response) -> T): T {
+    private suspend fun <T> execute(
+        request: Request,
+        transport: OkHttpClient = client,
+        consume: (Response) -> T,
+    ): T {
         check(origin.contains(request.url))
-        val call = client.newCall(request)
+        val call = transport.newCall(request)
         calls.add(call)
         return suspendCancellableCoroutine { continuation ->
             continuation.invokeOnCancellation { call.cancel() }
             val callback = object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     calls.remove(call)
-                    if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
+                    if (continuation.isActive) continuation.resumeWithException(
+                        if (e is ReadStatus) e else AuthFailure(AuthFailure.Kind.UNAVAILABLE),
+                    )
                 }
                 override fun onResponse(call: Call, response: Response) {
                     try {

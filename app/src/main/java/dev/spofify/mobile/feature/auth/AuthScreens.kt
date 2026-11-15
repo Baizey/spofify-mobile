@@ -9,7 +9,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.painterResource
@@ -37,23 +36,12 @@ internal fun LoginScreen(
     val submit = { if (!busy && inputs.server.isNotEmpty() && inputs.username.isNotEmpty() && inputs.password.isNotEmpty()) {
         focus.clearFocus(); onSignIn()
     } }
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-        val scrollWholePage = maxHeight < 480.dp || LocalDensity.current.fontScale >= 1.5f
-        if (scrollWholePage) {
-            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                LoginHeading()
-                LoginFields(inputs, busy, onServer, onUsername, onPassword, onReveal, submit)
-                LoginActions(busy, notice, inputs, submit)
-            }
-        } else {
-            Column(Modifier.fillMaxSize()) {
-                LoginHeading()
-                Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                    LoginFields(inputs, busy, onServer, onUsername, onPassword, onReveal, submit)
-                }
-                LoginActions(busy, notice, inputs, submit)
-            }
+    Column(Modifier.fillMaxSize()) {
+        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+            LoginHeading()
+            LoginFields(inputs, busy, onServer, onUsername, onPassword, onReveal, submit)
         }
+        LoginActions(busy, notice, inputs, submit)
     }
 }
 

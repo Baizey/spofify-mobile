@@ -128,8 +128,9 @@ class OkHttpAuthApiTest {
                     override fun callEnd(call: Call) { terminal.countDown() }
                 }).build()
                 val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()), client)
-                // Headers arrive immediately; the body cannot complete within the cancellation deadline.
-                server.enqueue(response().setBodyDelay(3, TimeUnit.SECONDS))
+                // OkHttp reports responseBodyStart on the first byte, not on headers.
+                // Admit that byte immediately, then keep the body incomplete during cancellation.
+                server.enqueue(response().throttleBody(1, 3, TimeUnit.SECONDS))
                 val request = async(Dispatchers.IO) { runCatching { api.session(cookie()) } }
                 try {
                     assertTrue("Body read was not entered", reading.await(2, TimeUnit.SECONDS))

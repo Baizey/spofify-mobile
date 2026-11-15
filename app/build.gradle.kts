@@ -33,7 +33,10 @@ dependencies {
     implementation(libs.lifecycle.viewmodel)
     implementation(libs.coroutines.android)
     implementation(libs.serialization.json)
+    implementation(libs.coil.compose)
+    implementation(libs.navigation.compose)
     testImplementation(libs.junit)
+    testImplementation(libs.coroutines.test)
 }
 tasks.withType<Test>().configureEach {
     maxHeapSize = "256m"
