@@ -75,7 +75,13 @@ internal fun MusicRoot(
     val search = entry?.destination?.route == "search"
     val imeOcclusion = WindowInsets.ime.getBottom(LocalDensity.current)
     val navigate: (MusicKind, String) -> Unit = remember(navigation) {
-        { kind, id -> navigation.navigate("music/${kind.name}/${Uri.encode(id)}") { launchSingleTop = true } }
+        { kind, id ->
+            val current = navigation.currentBackStackEntry
+            val sameDetail = current?.destination?.route == "music/{kind}/{id}" &&
+                current.arguments?.getString("kind") == kind.name && current.arguments?.getString("id") == id
+            // Different entities share a destination pattern, not a model or Back-stack entry.
+            if (!sameDetail) navigation.navigate("music/${kind.name}/${Uri.encode(id)}")
+        }
     }
     val openActions: (MusicItem, PlaybackContext?) -> Unit = remember(focus, keyboard) {
         { item, collection ->
@@ -116,7 +122,7 @@ internal fun MusicRoot(
             )) { owner ->
                 val kind = MusicKind.valueOf(requireNotNull(owner.arguments?.getString("kind")))
                 val id = requireNotNull(owner.arguments?.getString("id"))
-                val model: DetailViewModel = viewModel(owner,
+                val model: DetailViewModel = viewModel(owner, key = "detail-${kind.name}-$id",
                     factory = viewModelFactory { initializer { DetailViewModel(api, kind, id) } })
                 DetailScreen(model, loader, {
                     val returnOccurrence = owner.savedStateHandle.get<String>("returnPlayerOccurrence")
