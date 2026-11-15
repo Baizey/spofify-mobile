@@ -94,6 +94,66 @@ class LibraryClientTest {
         assertEquals(2, server.requestCount)
     } }
 
+    @Test fun playbackAdmissionKeepsTicketOutOfUrlAndUsesExactSubprotocol() = runBlocking { fixture { server, sessions, identity ->
+        val hello = CompletableDeferred<String>()
+        server.enqueue(json("""{"ticket":"one-use-fixture-ticket"}"""))
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+            override fun onMessage(socket: okhttp3.WebSocket, text: String) {
+                hello.complete(text)
+                socket.send("""{"type":"snapshot"}""")
+            }
+        }).setHeader("Sec-WebSocket-Protocol", "spofify.library-playback.v2"))
+        val connection = sessions.playbackTransport(identity).connect("Phone", "fixture-device")
+        try {
+            val frame = kotlinx.serialization.json.Json.parseToJsonElement(withTimeout(3000) { hello.await() })
+                .let { it as kotlinx.serialization.json.JsonObject }
+            assertEquals(setOf("type", "ticket", "name", "deviceId", "canPlay"), frame.keys)
+            assertEquals("hello", (frame.getValue("type") as kotlinx.serialization.json.JsonPrimitive).content)
+            assertEquals("one-use-fixture-ticket", (frame.getValue("ticket") as kotlinx.serialization.json.JsonPrimitive).content)
+            assertEquals("true", (frame.getValue("canPlay") as kotlinx.serialization.json.JsonPrimitive).content)
+            assertEquals("""{"type":"snapshot"}""", withTimeout(3000) { connection.messages.first() })
+            val admission = server.takeRequest(2, TimeUnit.SECONDS)!!
+            assertEquals("POST", admission.method)
+            assertEquals("/api/me/player/connect", admission.path)
+            assertEquals("{}", admission.body.readUtf8())
+            assertEquals("fixture-csrf", admission.getHeader("X-CSRF-Token"))
+            val upgrade = server.takeRequest(2, TimeUnit.SECONDS)!!
+            assertEquals("/api/me/player/socket", upgrade.path)
+            assertNull(upgrade.requestUrl!!.query)
+            assertEquals("spofify.library-playback.v2", upgrade.getHeader("Sec-WebSocket-Protocol"))
+            assertEquals(identity.origin, upgrade.getHeader("Origin"))
+            assertFalse(upgrade.path!!.contains("fixture-ticket"))
+        } finally { connection.close() }
+    } }
+
+    @Test fun inPlaceRenewalDoesNotRetireAuthenticatedIdentity() = runBlocking { fixture { server, sessions, identity ->
+        server.enqueue(json("""{"accountId":"account","username":"fixture-user","role":"user","csrfToken":"fixture-csrf"}"""))
+        sessions.renew(identity)
+        assertTrue(sessions.isCurrent(identity))
+        assertEquals(identity, (sessions.state.value as AuthState.Authenticated).identity)
+        assertEquals("/api/auth/session", server.takeRequest(2, TimeUnit.SECONDS)!!.path)
+    } }
+
+    @Test fun audioRangesAreBytesAndStopReadingAfterAccountRetirement() = runBlocking { fixture { server, sessions, identity ->
+        server.enqueue(MockResponse().setResponseCode(206).setHeader("Content-Type", "audio/mpeg")
+            .setHeader("Content-Range", "bytes 2-5/10").setBody("2345"))
+        sessions.audio(identity, "opaque/%", 2, 4).use { stream ->
+            assertEquals(4L, stream.length)
+            assertEquals("2345", stream.input.readBytes().decodeToString())
+        }
+        val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+        assertEquals(listOf("api", "library", "tracks", "opaque/%", "audio"), request.requestUrl!!.pathSegments)
+        assertEquals("bytes=2-5", request.getHeader("Range"))
+        assertEquals("identity", request.getHeader("Accept-Encoding"))
+        server.enqueue(MockResponse().setResponseCode(200).setHeader("Content-Type", "audio/mpeg").setBody("audio"))
+        val stream = sessions.audio(identity, "track", 0, null)
+        try {
+            server.enqueue(MockResponse().setResponseCode(204))
+            sessions.signOut()
+            assertTrue(runCatching { stream.input.read() }.exceptionOrNull() is java.io.IOException)
+        } finally { stream.close() }
+    } }
+
     @Test fun currentUnauthorizedResponseRetiresSession() = runBlocking { fixture { server, sessions, identity ->
         server.enqueue(json("{}", 401))
         assertTrue(runCatching { LibraryClient(sessions, identity).search(MusicKind.TRACK, "love") }.isFailure)

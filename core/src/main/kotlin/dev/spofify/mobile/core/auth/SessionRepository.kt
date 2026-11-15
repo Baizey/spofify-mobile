@@ -3,6 +3,11 @@ package dev.spofify.mobile.core.auth
 import dev.spofify.mobile.core.origin.ServerOrigin
 import dev.spofify.mobile.core.http.FeatureResponse
 import dev.spofify.mobile.core.http.FeatureTransport
+import dev.spofify.mobile.core.http.AudioStream
+import dev.spofify.mobile.core.playback.PlaybackTransport
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -52,58 +57,148 @@ class SessionRepository(
     private var saved: StoredSession? = null
     private var identity: AccountIdentity? = null
     private val featureJobs = mutableSetOf<Job>()
+    private val featureJson = Json
+
+    @Serializable private class Admission(val ticket: String)
+    @Serializable private class Hello(
+        val type: String, val ticket: String, val name: String, val deviceId: String, val canPlay: Boolean,
+    )
+
+    fun playbackTransport(expected: AccountIdentity): PlaybackTransport = PlaybackTransport { name, deviceId ->
+        require(name.isNotBlank() && name.toByteArray().size <= 128 && name.none(Char::isISOControl))
+        require(deviceId.isNotBlank() && deviceId.toByteArray().size <= 128 && deviceId.none(Char::isISOControl))
+        featureExchange(expected) { client, record, headers, authority ->
+            val transport = featureTransport(client)
+            val response = transport.post(listOf("api", "me", "player", "connect"), "{}",
+                record.cookie, record.session.csrfToken, headers)
+            if (response.status != 200) throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
+            val admission = try {
+                featureJson.decodeFromString<Admission>(response.bytes.decodeToString(throwOnInvalidSequence = true))
+            } catch (_: Exception) { throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE) }
+            require(admission.ticket.isNotBlank() && admission.ticket.toByteArray().size <= 4096)
+            synchronized(lock) {
+                if (!authority.isCurrent || !sameCredential(saved, record))
+                    throw CancellationException("Session retired")
+            }
+            val hello = featureJson.encodeToString(Hello("hello", admission.ticket, name, deviceId, true))
+            transport.socket(record.cookie, hello, authority, headers)
+        }
+    }
+
+    suspend fun audio(
+        expected: AccountIdentity, trackId: String, position: Long, length: Long?,
+    ): AudioStream = featureExchange(expected) { client, record, headers, authority ->
+        featureTransport(client).audio(trackId, position, length, record.cookie, authority, headers)
+    }
 
     internal fun isAdministrator(expected: AccountIdentity): Boolean = synchronized(lock) {
         require(isCurrent(expected))
         saved?.session?.role == "admin"
     }
 
-    /** One session owner supplies credentials and fences headers and completed feature reads. */
     internal suspend fun get(
         expected: AccountIdentity,
         segments: List<String>,
         query: List<Pair<String, String>> = emptyList(),
         artwork: Boolean = false,
-    ): FeatureResponse = coroutineScope {
+    ): FeatureResponse = featureExchange(expected) { client, record, headers, _ ->
+        featureTransport(client).get(segments, query, record.cookie, artwork, headers)
+    }
+
+    internal suspend fun postJson(
+        expected: AccountIdentity, segments: List<String>, body: String,
+    ): FeatureResponse = featureExchange(expected) { client, record, headers, _ ->
+        featureTransport(client).post(segments, body, record.cookie, record.session.csrfToken, headers)
+    }
+
+    internal suspend fun mutate(
+        expected: AccountIdentity, segments: List<String>, method: String, body: String,
+    ): FeatureResponse = featureExchange(expected) { client, record, headers, _ ->
+        featureTransport(client).mutate(segments, method, body, record.cookie, record.session.csrfToken, headers)
+    }
+
+    /** In-place HTTP validation does not tear down a live, separately fenced player socket. */
+    suspend fun renew(expected: AccountIdentity) {
+        featureExchange(expected) { client, record, headers, authority ->
+            val reply = try { client.session(record.cookie) } catch (failure: AuthFailure) {
+                if (failure.kind == AuthFailure.Kind.UNAUTHORIZED) headers(401, null)
+                throw failure
+            }
+            if (reply.session.accountId != expected.accountId) {
+                synchronized(lock) {
+                    if (authority.isCurrent) advance(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED))
+                }
+                throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
+            }
+            val write = synchronized(lock) {
+                if (!authority.isCurrent) throw CancellationException("Session retired")
+                if (sameCredential(saved, record)) {
+                    val updated = StoredSession(record.server, reply.cookie ?: record.cookie,
+                        reply.session, reply.mode ?: record.sessionMode)
+                    saved = updated
+                    persistLocked(updated)
+                } else null
+            }
+            write?.start()
+            Unit
+        }
+    }
+
+    private fun featureTransport(client: AuthApi): FeatureTransport = client as? FeatureTransport
+        ?: throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
+
+    private fun sameCredential(first: StoredSession?, second: StoredSession): Boolean =
+        first?.cookie?.substringBefore(';')?.trim() == second.cookie.substringBefore(';').trim()
+
+    /** Credentials stay here; every header, returned value and long-lived resource has the same owner. */
+    private suspend fun <T : Any> featureExchange(
+        expected: AccountIdentity,
+        exchange: suspend (AuthApi, StoredSession, (Int, String?) -> Unit, FeatureAuthority) -> T,
+    ): T = coroutineScope {
         val job = currentCoroutineContext().job
         val capture = synchronized(lock) {
             if (!isCurrent(expected)) throw CancellationException("Session retired")
             featureJobs.add(job)
             Triple(generation, requireNotNull(saved), requireNotNull(api))
         }
-        fun checkCurrent() {
-            if (generation != capture.first || api !== capture.third || !isCurrent(expected))
-                throw CancellationException("Session retired")
+        val authority = FeatureAuthority(lock) {
+            generation == capture.first && api === capture.third && isCurrent(expected)
         }
-        try {
-            val transport = capture.third as? FeatureTransport
-                ?: throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
-            val response = transport.get(segments, query, capture.second.cookie, artwork) { status, renewed ->
-                val write = synchronized(lock) {
-                    checkCurrent()
-                    val sameCredential = saved?.cookie?.substringBefore(';')?.trim() ==
-                        capture.second.cookie.substringBefore(';').trim()
-                    when {
-                        status == 401 && sameCredential -> {
-                            advance(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED))
-                            saved = null
-                            identity = null
-                            persistLocked(null)
-                        }
-                        status == 401 -> throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
-                        renewed != null && sameCredential && capture.second.sessionMode == "rolling-v1" -> {
-                            val record = StoredSession(capture.second.server, renewed,
-                                capture.second.session, capture.second.sessionMode)
-                            saved = record
-                            persistLocked(record)
-                        }
-                        else -> null
+        fun checkCurrent() {
+            if (!authority.isCurrent) throw CancellationException("Session retired")
+        }
+        val headers: (Int, String?) -> Unit = { status, renewed ->
+            val write = synchronized(lock) {
+                checkCurrent()
+                val same = sameCredential(saved, capture.second)
+                when {
+                    status == 401 && same -> {
+                        advance(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED))
+                        saved = null
+                        identity = null
+                        persistLocked(null)
                     }
+                    status == 401 -> throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
+                    renewed != null && same && capture.second.sessionMode == "rolling-v1" -> {
+                        val record = StoredSession(capture.second.server, renewed,
+                            capture.second.session, capture.second.sessionMode)
+                        saved = record
+                        persistLocked(record)
+                    }
+                    else -> null
                 }
-                write?.start()
             }
+            write?.start()
+        }
+        var produced: T? = null
+        try {
+            val result = exchange(capture.third, capture.second, headers, authority)
+            produced = result
             ensureActive()
-            synchronized(lock) { checkCurrent(); response }
+            synchronized(lock) { checkCurrent(); result }
+        } catch (failure: Exception) {
+            (produced as? java.io.Closeable)?.let { runCatching { it.close() } }
+            throw failure
         } finally {
             synchronized(lock) { featureJobs.remove(job) }
         }

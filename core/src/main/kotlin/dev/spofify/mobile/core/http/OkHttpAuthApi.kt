@@ -2,6 +2,8 @@ package dev.spofify.mobile.core.http
 
 import dev.spofify.mobile.core.auth.*
 import dev.spofify.mobile.core.origin.ServerOrigin
+import dev.spofify.mobile.core.auth.FeatureAuthority
+import dev.spofify.mobile.core.playback.PlaybackConnection
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -52,6 +54,17 @@ internal class OkHttpAuthApi(
             response
         }.build()
 
+    private val media = OriginMediaTransport(origin, readClient, ::cookieHeader, ::renewedCookie)
+
+    override suspend fun socket(
+        cookie: String, hello: String, authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
+    ): PlaybackConnection = media.socket(cookie, hello, authority, onHeaders)
+
+    override suspend fun audio(
+        trackId: String, position: Long, length: Long?, cookie: String,
+        authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
+    ): AudioStream = media.audio(trackId, position, length, cookie, authority, onHeaders)
+
     override suspend fun get(
         segments: List<String>,
         query: List<Pair<String, String>>,
@@ -59,6 +72,31 @@ internal class OkHttpAuthApi(
         artwork: Boolean,
         onHeaders: (Int, String?) -> Unit,
     ): FeatureResponse {
+        val request = featureRequest(segments, query, cookie, artwork).get().build()
+        return try {
+            execute(request, readClient) { featureResponse(it, artwork, onHeaders) }
+        } catch (status: ReadStatus) {
+            onHeaders(status.status, null)
+            FeatureResponse(status.status, byteArrayOf(), null)
+        }
+    }
+
+    override suspend fun mutate(
+        segments: List<String>, method: String, body: String, cookie: String, csrfToken: String,
+        onHeaders: (Int, String?) -> Unit,
+    ): FeatureResponse {
+        require(segments.take(2) == listOf("api", "me"))
+        require(method in setOf("POST", "PATCH", "PUT", "DELETE"))
+        require(body.toByteArray().size <= 65536)
+        val request = featureRequest(segments, emptyList(), cookie, false)
+            .header("X-CSRF-Token", csrfToken)
+            .method(method, OneShotBody(body.toRequestBody(JSON))).build()
+        return execute(request) { featureResponse(it, false, onHeaders) }
+    }
+
+    private fun featureRequest(
+        segments: List<String>, query: List<Pair<String, String>>, cookie: String, artwork: Boolean,
+    ): Request.Builder {
         val url = origin.url.newBuilder().apply {
             segments.forEach { segment ->
                 require(segment.isNotEmpty() && segment != "." && segment != ".." && segment.none(Char::isISOControl))
@@ -67,35 +105,26 @@ internal class OkHttpAuthApi(
             query.forEach { (key, value) -> addQueryParameter(key, value) }
         }.build()
         check(origin.contains(url))
-        val request = Request.Builder().url(url).get()
-            .header("Origin", origin.value)
+        return Request.Builder().url(url).header("Origin", origin.value)
             .header("Cookie", cookieHeader(cookie))
             .header("Accept", if (artwork) "image/jpeg, image/png" else "application/json")
-            .header("Cache-Control", "no-store").build()
-        return try {
-            execute(request, readClient) { response ->
-                val renewed = if (response.isSuccessful) response.headers.values("Set-Cookie")
-                    .filter { it.substringBefore(';').substringBefore('=').trim() == cookieName }
-                    .also { require(it.size <= 1) }.singleOrNull()
-                    ?.let { parseCookie(it, requireAbsoluteExpiry = true).toString() } else null
-                onHeaders(response.code, renewed)
-                if (response.code != 200) FeatureResponse(response.code, byteArrayOf(), null)
-                else {
-                    val body = response.body ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
-                    val mime = body.contentType()
-                    require(if (artwork) mime?.type == "image" && mime.subtype in setOf("jpeg", "png")
-                        else mime?.type == "application" && mime.subtype == "json")
-                    val bound = if (artwork) 8L * 1024 * 1024 else 2L * 1024 * 1024
-                    val source = body.source()
-                    source.request(bound + 1)
-                    require(source.buffer.size <= bound)
-                    FeatureResponse(200, source.readByteArray(), mime.toString())
-                }
-            }
-        } catch (status: ReadStatus) {
-            onHeaders(status.status, null)
-            FeatureResponse(status.status, byteArrayOf(), null)
-        }
+            .header("Cache-Control", "no-store")
+    }
+
+    private fun featureResponse(
+        response: Response, artwork: Boolean, onHeaders: (Int, String?) -> Unit,
+    ): FeatureResponse {
+        onHeaders(response.code, renewedCookie(response))
+        if (!response.isSuccessful || response.code == 204) return FeatureResponse(response.code, byteArrayOf(), null)
+        val body = response.body
+        val mime = body.contentType()
+        require(if (artwork) mime?.type == "image" && mime.subtype in setOf("jpeg", "png")
+            else mime?.type == "application" && mime.subtype == "json")
+        val bound = if (artwork) 8L * 1024 * 1024 else 2L * 1024 * 1024
+        val source = body.source()
+        source.request(bound + 1)
+        require(source.buffer.size <= bound)
+        return FeatureResponse(response.code, source.readByteArray(), mime.toString())
     }
 
     @Serializable
@@ -122,7 +151,16 @@ internal class OkHttpAuthApi(
 
     override fun validateCookie(cookie: String) { parseCookie(cookie) }
 
-    override fun cancel() { calls.forEach(Call::cancel) }
+    override fun cancel() {
+        media.cancel()
+        calls.forEach(Call::cancel)
+    }
+
+    private fun renewedCookie(response: Response): String? =
+        if (response.isSuccessful) response.headers.values("Set-Cookie")
+            .filter { it.substringBefore(';').substringBefore('=').trim() == cookieName }
+            .also { require(it.size <= 1) }.singleOrNull()
+            ?.let { parseCookie(it, requireAbsoluteExpiry = true).toString() } else null
 
     private fun request(path: String): Request.Builder {
         val url = origin.url.newBuilder().encodedPath(path).build()
