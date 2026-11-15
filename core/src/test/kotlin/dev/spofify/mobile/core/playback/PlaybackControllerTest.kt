@@ -335,6 +335,138 @@ class PlaybackControllerTest {
         }
     }
 
+    @Test fun retiredPlanCapacityDisablesOnlySpeculationAndOrdinaryEndFallbackRecovers() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            val source = h.audio.executions.single()
+            val initialAcks = h.frames("ack").size
+            repeat(160) { index ->
+                val planId = "retired-$index"
+                h.stage(planId, reservedNext(planId), instructionId = if (index == 0) "first-stage" else null)
+                h.cancel(planId)
+            }
+            assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
+            assertNull(h.controller.state.value.error)
+            assertTrue(h.socket.isOpen)
+            assertTrue(source.authorized())
+            assertTrue(h.audio.actual.isPlaying)
+            assertEquals(1, h.audio.executions.size)
+            assertEquals(initialAcks, h.frames("ack").size)
+
+            val reports = h.frames("report").size
+            advanceTimeBy(2_000)
+            runCurrent()
+            assertEquals(reports + 1, h.frames("report").size)
+            val renewalBasis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            h.lease("event", renewalBasis)
+            advanceTimeBy(6_000)
+            runCurrent()
+            // Past the original lease deadline: normal reports and renewals still work.
+            assertTrue(source.authorized())
+            assertTrue(h.audio.actual.isPlaying)
+            assertTrue(h.socket.isOpen)
+            assertNull(h.controller.state.value.error)
+
+            // Fresh control IDs cannot bypass plan fences, even after the instruction
+            // receipt cache has evicted the original first-stage delivery.
+            h.stage("retired-0", reservedNext("retired-0"), instructionId = "late-first-stage")
+            h.stage("retired-0", reservedNext("retired-0"), instructionId = "first-stage")
+            h.stage("retired-159", reservedNext("retired-159"), instructionId = "late-unrecorded-stage")
+            h.stage("after-capacity", reservedNext("after-capacity"))
+            assertEquals(1, h.audio.executions.size)
+            val endedFacts = h.audio.actual.copy(ended = true, isPlaying = false, elapsed = 10.0)
+            h.observe(endedFacts)
+            h.observe(endedFacts)
+            val ended = h.frames("report").single { it["ended"]!!.jsonPrimitive.boolean }
+            assertNull(ended["planId"])
+            assertEquals("execution", ended["instructionId"]!!.jsonPrimitive.content)
+            assertEquals(1, h.audio.executions.size)
+            assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
+
+            // No speculative admission occurred. The server can choose fresh ordinary
+            // execution IDs for end fallback without reconnecting or reloading twice.
+            val basis = ended["clientSequence"]!!.jsonPrimitive.long
+            h.instruction(PlaybackInstruction("fallback-execution", "execute", 1, "fallback-event", 0.0, true,
+                track = track("next", 2), lease = LeaseTiming(basis, 8_000)))
+            assertEquals(2, h.audio.executions.size)
+            assertEquals("fallback-execution", h.audio.executions.last().binding.instructionId)
+            assertTrue(h.audio.actual.isPlaying)
+            h.stage("retired-0", reservedNext("retired-0")) // Obsolete source binding.
+            assertEquals(2, h.audio.executions.size)
+
+            // The latch is scoped to the old execution, not the socket or output version.
+            val next = reservedNext("recovered")
+            h.instruction(PlaybackInstruction("recovered-stage", "stageNext", 1, "fallback-event", 0.0, false,
+                planId = "recovered", currentInstructionId = "fallback-execution", next = next))
+            h.observe(h.audio.actual.copy(ended = true, isPlaying = false, elapsed = 10.0))
+            assertEquals(3, h.audio.executions.size)
+            assertEquals(next.instructionId, h.audio.executions.last().binding.instructionId)
+            assertTrue(h.audio.actual.isPlaying)
+            assertEquals("recovered", h.frames("report").last { it["ended"]!!.jsonPrimitive.boolean }["planId"]!!.jsonPrimitive.content)
+            assertTrue(h.socket.isOpen)
+        }
+    }
+
+    @Test fun delayedRetiredPlansCannotReplaceLivePlanAfterInstructionReceiptEviction() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            val retired = reservedNext("retired")
+            h.stage("retired", retired, instructionId = "original-retired-stage")
+            h.cancel("retired")
+            val live = reservedNext("live")
+            repeat(140) { h.stage("live", live) }
+            // Repeated live staging is idempotent and does not consume tombstones.
+            // Both an evicted instruction ID and a different delivery ID remain fenced.
+            h.stage("retired", retired, instructionId = "original-retired-stage")
+            h.stage("retired", retired, instructionId = "different-retired-stage")
+            assertTrue(h.audio.actual.isPlaying)
+            assertEquals(1, h.audio.executions.size)
+            h.observe(h.audio.actual.copy(ended = true, isPlaying = false, elapsed = 10.0))
+            val ended = h.frames("report").single { it["ended"]!!.jsonPrimitive.boolean }
+            assertEquals("live", ended["planId"]!!.jsonPrimitive.content)
+            assertEquals(2, h.audio.executions.size)
+            assertEquals(live.instructionId, h.audio.executions.last().binding.instructionId)
+            assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
+        }
+    }
+
+    @Test fun replacingStageAtCapacityDoesNotAdmitItsReplacementOrStopCurrentAudio() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            // The 129th staging retires the 128th distinct prior plan inside
+            // discardStage, after acceptPlan's initial admission checks.
+            repeat(129) { index -> h.stage("replacement-$index", reservedNext("replacement-$index")) }
+            assertTrue(h.audio.actual.isPlaying)
+            assertTrue(h.audio.executions.single().authorized())
+            assertTrue(h.socket.isOpen)
+            assertNull(h.controller.state.value.error)
+            h.observe(h.audio.actual.copy(ended = true, isPlaying = false, elapsed = 10.0))
+            assertNull(h.frames("report").single { it["ended"]!!.jsonPrimitive.boolean }["planId"])
+            assertEquals(1, h.audio.executions.size)
+        }
+    }
+
+    @Test fun localStageDiscardAtCapacityStillSendsCommandsAndReportsOrdinaryEnd() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            repeat(129) { index ->
+                h.stage("discarded-$index", reservedNext("discarded-$index"))
+                val id = h.controller.setShuffle(index % 2 == 0)
+                assertNotNull(id)
+                h.result(requireNotNull(id))
+            }
+            assertEquals(129, h.frames("command").size)
+            assertTrue(h.audio.actual.isPlaying)
+            assertTrue(h.audio.executions.single().authorized())
+            assertTrue(h.socket.isOpen)
+            h.stage("late-discarded", reservedNext("late-discarded"))
+            h.observe(h.audio.actual.copy(ended = true, isPlaying = false, elapsed = 10.0))
+            assertNull(h.frames("report").single { it["ended"]!!.jsonPrimitive.boolean }["planId"])
+            assertEquals(1, h.audio.executions.size)
+            assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
+        }
+    }
+
     @Test fun playbackAnchorsWaitForExactStructuralVersionAndEvent() = runTest {
         Harness(this).use { h ->
             h.snapshot()
@@ -467,9 +599,13 @@ class PlaybackControllerTest {
             "prepare", "prepare", 0, "event", 0.0, desiredPlaying, track = track()))
         suspend fun activate(basis: Long = 1, desiredPlaying: Boolean = true) = instruction(PlaybackInstruction(
             "execution", "activate", 1, "event", 0.0, desiredPlaying, track = track(), lease = LeaseTiming(basis, 8_000)))
-        suspend fun stage(planId: String) = instruction(PlaybackInstruction(
-            "stage-${++controlId}", "stageNext", 1, "event", 0.0, false, planId = planId,
-            currentInstructionId = "execution", next = NextExecution("next-event", "next-execution", track("next", 2))))
+        suspend fun stage(
+            planId: String,
+            next: NextExecution = NextExecution("next-event", "next-execution", track("next", 2)),
+            instructionId: String? = null,
+        ) = instruction(PlaybackInstruction(
+            instructionId ?: "stage-${++controlId}", "stageNext", 1, "event", 0.0, false, planId = planId,
+            currentInstructionId = "execution", next = next))
         suspend fun cancel(planId: String) = instruction(PlaybackInstruction(
             "cancel-${++controlId}", "cancelNext", 1, "event", 0.0, false, planId = planId,
             currentInstructionId = "execution"))
@@ -548,6 +684,7 @@ class PlaybackControllerTest {
     }
 
     companion object {
+        private fun reservedNext(planId: String) = NextExecution("next-event-$planId", "next-execution-$planId", track("next", 2))
         private fun track(id: String = "track", key: Long = 1) = PlaybackTrack(id, "Song", emptyList(), "Album", "album", 10.0, key, key, "now")
         private fun status(output: Long = 0, version: Long = 1, sequence: Long = 1, event: String = "event", playing: Boolean = false) =
             PlaybackStatus(output, version, sequence, event, playing, 0.0, 10.0, playing, false, false, "")

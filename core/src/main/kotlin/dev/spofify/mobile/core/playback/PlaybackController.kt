@@ -15,6 +15,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonPrimitive
 
+private const val RETIRED_PLAN_CAPACITY = 128
+
 /**
  * One live v2 connection. All decisions are serialized under lock; native work runs
  * outside it and must pass a generation/lease predicate before it can start sound.
@@ -63,6 +65,7 @@ class PlaybackController(
     ) {
         val binding = instruction.binding()
         var confirmed = source == null
+        var speculationDisabled = false
         var parked = false
         var revoked = false
         var endedReported = false
@@ -487,12 +490,13 @@ class PlaybackController(
             }
             return
         }
-        if (!sameSource(instruction, current) || !authorized(current) || !current.instruction.desiredPlaying ||
+        if (current.speculationDisabled || !sameSource(instruction, current) || !authorized(current) || !current.instruction.desiredPlaying ||
             current.endedReported || !targetOutput() || instruction.planId in current.retiredPlans ||
             pending.values.any { it.command["type"]?.jsonPrimitive?.content != "rename" }) return
         if (nextPlan?.planId == instruction.planId) return
         discardStage()
-        nextPlan = instruction
+        // Retiring the replaced plan may have exhausted this execution's tombstones.
+        if (!current.speculationDisabled) nextPlan = instruction
     }
 
     private fun sameSource(plan: PlaybackInstruction, current: Execution) =
@@ -500,8 +504,14 @@ class PlaybackController(
             plan.currentInstructionId == current.binding.instructionId
 
     private fun retirePlan(current: Execution, id: String) {
-        current.retiredPlans.add(id)
-        if (current.retiredPlans.size > 128) disconnectLocked("Playback changed too often. Reconnect explicitly.")
+        if (current.speculationDisabled || id in current.retiredPlans) return
+        if (current.retiredPlans.size < RETIRED_PLAN_CAPACITY) current.retiredPlans.add(id)
+        if (current.retiredPlans.size == RETIRED_PLAN_CAPACITY) {
+            // Never evict a tombstone and later resurrect its authorization. Only
+            // speculation is retired; current audio, reports and its lease continue.
+            current.speculationDisabled = true
+            nextPlan = null
+        }
     }
 
     private fun discardStage() {
@@ -617,7 +627,9 @@ class PlaybackController(
         if (current.parked && current.lastFacts == facts) return
         if (endedEvent && current.endedReported) return
         val ended = endedEvent && facts.ended && !current.endedReported
-        val plan = nextPlan?.takeIf { ended && sameSource(it, current) && current.instruction.desiredPlaying && authorized(current) }
+        val plan = nextPlan?.takeIf {
+            !current.speculationDisabled && ended && sameSource(it, current) && current.instruction.desiredPlaying && authorized(current)
+        }
         val payload = fields("type" to "report", "outputVersion" to current.binding.outputVersion,
             "eventId" to current.binding.eventId, "instructionId" to current.binding.instructionId,
             "elapsed" to facts.elapsed, "duration" to facts.duration, "isPlaying" to facts.isPlaying,
