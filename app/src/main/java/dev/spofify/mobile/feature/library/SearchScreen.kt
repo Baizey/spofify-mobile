@@ -1,6 +1,9 @@
 package dev.spofify.mobile.feature.library
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -12,6 +15,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import dev.spofify.mobile.designsystem.SpofifyGlyph
+import dev.spofify.mobile.designsystem.SpofifyIcon
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -31,6 +39,7 @@ import dev.spofify.mobile.core.playback.*
 internal fun SearchScreen(
     model: SearchViewModel, loader: ImageLoader, focusIntent: Int, onOpen: (MusicItem) -> Unit,
     playback: PlaybackController? = null,
+    onMore: ((MusicItem) -> Unit)? = null,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val scroll = rememberLazyListState()
@@ -38,6 +47,7 @@ internal fun SearchScreen(
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     var editing by remember { mutableStateOf(false) }
+    val illumination by animateFloatAsState(if (editing) 1f else 0f, tween(240), label = "Search focus illumination")
     val player = playback?.state?.collectAsStateWithLifecycle()?.value
     val ready = player?.connection == PlaybackConnectionState.READY
     val imeVisible = WindowInsets.isImeVisible
@@ -69,12 +79,13 @@ internal fun SearchScreen(
     Column(Modifier.fillMaxSize()) {
         if (!editing) Box(Modifier.padding(horizontal = 20.dp)) { PageTitle("Search") }
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll, reverseLayout = true,
-            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp)) {
+            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp)) {
             items(state.items, key = MusicItem::key) { item ->
                 val playable = ready && if (item.kind == MusicKind.TRACK) item.hasAudio else item.availableTracks > 0
                 MusicRow(item, loader,
                     onQueue = if (playable) ({ queue(item, false) }) else null,
-                    onPlayNext = if (playable) ({ queue(item, true) }) else null) { onOpen(item) }
+                    onMore = onMore?.let { more -> { more(item) } },
+                    gestureBinding = Triple(item.key, state.query, player?.snapshot?.stateVersion)) { onOpen(item) }
             }
             if (state.query.isNotBlank()) {
                 item("search-status") {
@@ -87,28 +98,34 @@ internal fun SearchScreen(
                         }
                         if (state.busy) CircularProgressIndicator(Modifier.padding(16.dp).size(24.dp))
                         else if (state.empty) Text("No matches", Modifier.padding(vertical = 24.dp))
-                        else if (state.hasMore) TextButton(model::more) { Text("More") }
+                        else if (state.hasMore) TextButton(model::more, Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("More results") }
                     }
                 }
             }
         }
-        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(start = 20.dp, end = 4.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Text("⌕", color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.titleLarge)
-            BasicTextField(state.query, model::query, Modifier.weight(1f).padding(horizontal = 12.dp)
+        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).background(Brush.verticalGradient(
+            0f to Color.Transparent, .2f to Color.Transparent,
+            1f to MaterialTheme.colorScheme.secondary.copy(alpha = .16f * illumination)))
+            .padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            SpofifyIcon(SpofifyGlyph.Search, null, Modifier.size(20.dp), MaterialTheme.colorScheme.onSurfaceVariant)
+            BasicTextField(state.query, model::query, Modifier.weight(1f).heightIn(min = 54.dp)
+                .padding(horizontal = 8.dp, vertical = 12.dp)
                 .focusRequester(requester).onFocusChanged { editing = it.isFocused }
                 .semantics { contentDescription = "Search music" },
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
                 singleLine = true,
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.secondary),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { focus.clearFocus(); keyboard?.hide() }),
                 decorationBox = { input ->
-                    if (state.query.isEmpty()) Text("Search", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (state.query.isEmpty()) Text("Search your music", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     input()
                 })
-            if (state.query.isNotEmpty()) TextButton({ model.query("") }, Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)
-                .semantics { contentDescription = "Clear search" }) { Text("×") }
+            if (state.query.isNotEmpty()) IconButton({ model.query(""); requester.requestFocus(); keyboard?.show() }, Modifier.size(48.dp)) {
+                SpofifyIcon(SpofifyGlyph.Close, "Clear search", Modifier.size(20.dp))
+            }
         }
-        HorizontalDivider(color = if (editing) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outlineVariant)
+        HorizontalDivider(thickness = if (editing) 2.dp else 1.dp,
+            color = if (editing) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline)
     }
 }
