@@ -27,6 +27,12 @@ class PlaybackService : MediaSessionService() {
         return super.onStartCommand(intent, flags, startId)
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Media3's default cleanup calls setPlayWhenReady(false), even for a remote-only controller.
+        // App-owned output authority, not local isPlaying at one transition instant, owns retention.
+        owner.onTaskRemoved()
+    }
+
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
         if (!controllerInfo.isTrusted && controllerInfo.uid != android.os.Process.myUid()) return null
         synchronizeSession()

@@ -5,36 +5,47 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import dev.spofify.mobile.core.playback.PlaybackController
 
-/** System/headset controls submit server intents, never bypass the executor lease. */
+/** Only a MediaSession controller request is a musical intent; framework cleanup is not. */
 @UnstableApi
-internal class RoutingPlayer(player: Player, private val controller: PlaybackController) : ForwardingPlayer(player) {
-    override fun play() { controller.resume() }
-    override fun pause() { controller.pause() }
-    override fun stop() { controller.pause() }
-    override fun setPlayWhenReady(playWhenReady: Boolean) {
-        if (playWhenReady) controller.resume() else controller.pause()
+internal class RoutingPlayer(
+    player: Player,
+    private val controller: PlaybackController,
+    private val isControllerRequest: () -> Boolean,
+) : ForwardingPlayer(player) {
+    private fun dispatch(command: () -> String?) {
+        if (!isControllerRequest()) return
+        command()
     }
-    override fun seekTo(positionMs: Long) { controller.seek(positionMs.coerceAtLeast(0) / 1000.0) }
+
+    override fun play() { dispatch { controller.resume() } }
+    override fun pause() { dispatch { controller.pause() } }
+    override fun stop() { dispatch { controller.pause() } }
+    override fun setPlayWhenReady(playWhenReady: Boolean) {
+        dispatch { if (playWhenReady) controller.resume() else controller.pause() }
+    }
+    override fun seekTo(positionMs: Long) { dispatch { controller.seek(positionMs.coerceAtLeast(0) / 1000.0) } }
     override fun seekTo(mediaItemIndex: Int, positionMs: Long) { seekTo(positionMs) }
-    override fun seekToDefaultPosition() { controller.seek(0.0) }
-    override fun seekToDefaultPosition(mediaItemIndex: Int) { controller.seek(0.0) }
-    override fun seekToNext() { controller.next() }
-    override fun seekToNextMediaItem() { controller.next() }
-    override fun seekToPrevious() { controller.previous() }
-    override fun seekToPreviousMediaItem() { controller.previous() }
+    override fun seekToDefaultPosition() { dispatch { controller.seek(0.0) } }
+    override fun seekToDefaultPosition(mediaItemIndex: Int) { seekToDefaultPosition() }
+    override fun seekToNext() { dispatch { controller.next() } }
+    override fun seekToNextMediaItem() { seekToNext() }
+    override fun seekToPrevious() { dispatch { controller.previous() } }
+    override fun seekToPreviousMediaItem() { seekToPrevious() }
     override fun seekBack() {
-        controller.seek(((controller.state.value.playback?.elapsed ?: 0.0) - 10).coerceAtLeast(0.0))
+        dispatch { controller.seek(((controller.state.value.playback?.elapsed ?: 0.0) - 10).coerceAtLeast(0.0)) }
     }
     override fun seekForward() {
-        controller.seek((controller.state.value.playback?.elapsed ?: 0.0) + 10)
+        dispatch { controller.seek((controller.state.value.playback?.elapsed ?: 0.0) + 10) }
     }
-    override fun setShuffleModeEnabled(shuffleModeEnabled: Boolean) { controller.setShuffle(shuffleModeEnabled) }
+    override fun setShuffleModeEnabled(shuffleModeEnabled: Boolean) { dispatch { controller.setShuffle(shuffleModeEnabled) } }
     override fun setRepeatMode(repeatMode: Int) {
-        controller.setRepeat(when (repeatMode) {
-            Player.REPEAT_MODE_ONE -> "one"
-            Player.REPEAT_MODE_ALL -> "all"
-            else -> "off"
-        })
+        dispatch {
+            controller.setRepeat(when (repeatMode) {
+                Player.REPEAT_MODE_ONE -> "one"
+                Player.REPEAT_MODE_ALL -> "all"
+                else -> "off"
+            })
+        }
     }
 
     override fun getAvailableCommands(): Player.Commands = super.getAvailableCommands().buildUpon()

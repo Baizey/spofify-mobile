@@ -218,9 +218,8 @@ private fun PlayerConnectionStatus(player: NativePlayer) {
     if (state.connection == PlaybackConnectionState.CONNECTING) LinearProgressIndicator(Modifier.fillMaxWidth())
     else if (state.connection != PlaybackConnectionState.READY || state.error != null) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(state.error ?: "Player disconnected", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (state.connection != PlaybackConnectionState.READY) TextButton({ player.connect() }) { Text("Reconnect") }
+            Text(if (state.connection == PlaybackConnectionState.READY) state.error.orEmpty() else "Reconnecting playback",
+                Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

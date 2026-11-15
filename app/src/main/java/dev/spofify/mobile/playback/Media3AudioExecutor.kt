@@ -42,6 +42,7 @@ internal class Media3AudioExecutor(
     private var endedBinding: AudioBinding? = null
     private var blocked = false
     private var released = false
+    private var playbackAuthority: (() -> Boolean)? = null
 
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
@@ -58,6 +59,7 @@ internal class Media3AudioExecutor(
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            if (released || binding == null) return
             if (!playWhenReady && reason in setOf(Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY,
                     Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS)) onSystemPause()
         }
@@ -78,6 +80,10 @@ internal class Media3AudioExecutor(
         if (result != AudioResult.OK) return result
         if (this.binding != binding || !isAuthorized()) { pause(); return AudioResult.REJECTED }
         if (track != null && desiredPlaying) {
+            val nativeGeneration = generation
+            playbackAuthority = {
+                !released && this.binding == binding && generation == nativeGeneration && isAuthorized()
+            }
             if (!requestPlaybackStart()) {
                 pause()
                 blocked = true
@@ -140,10 +146,18 @@ internal class Media3AudioExecutor(
     override fun pause() {
         checkThread()
         generation++
+        playbackAuthority = null
         val pending = ready
         ready = null
         pending?.cancel()
         player.pause()
+    }
+
+    /** Service reattachment cannot renew or manufacture the Core-owned execution lease. */
+    fun hasPlaybackAuthority(): Boolean {
+        if (released) return false
+        checkThread()
+        return playbackAuthority?.invoke() == true
     }
 
     override fun facts(): AudioFacts {
