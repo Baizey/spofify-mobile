@@ -20,6 +20,21 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PlaybackControllerTest {
+    @Test fun queueUsesIndividualHighAndCollectionLowWithoutStartingAudio() = runTest {
+        Harness(this).use { h ->
+            h.snapshot()
+            assertNotNull(h.controller.queueTrack(PlaybackTrackReference("track")))
+            assertNotNull(h.controller.queueCollection(PlaybackContext("album", "album", "Album")))
+            assertNotNull(h.controller.queueTrack(PlaybackTrackReference("track"), next = true))
+            val intents = h.frames("command").map {
+                it["command"]!!.jsonObject["intent"]!!.jsonPrimitive.content
+            }
+            assertEquals(listOf("high", "low", "next"), intents)
+            assertFalse(h.audio.actual.isPlaying)
+            assertTrue(h.audio.executions.isEmpty())
+        }
+    }
+
     @Test fun leaseUsesAckSendTimeNotGrantReceiptTime() = runTest {
         Harness(this).use { h ->
             h.snapshot()

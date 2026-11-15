@@ -146,8 +146,9 @@ class PlaybackController(
     fun playCollection(context: PlaybackContext, shuffle: Boolean = false): String? =
         issueQueue("now", collectionSelection(context), shuffle)
 
+    // Individual Queue follows existing high-priority additions; collections append below that band.
     fun queueTrack(track: PlaybackTrackReference, context: PlaybackContext? = null, next: Boolean = false): String? =
-        issueQueue(if (next) "next" else "low", trackSelection(track, context))
+        issueQueue(if (next) "next" else "high", trackSelection(track, context))
 
     fun queueCollection(context: PlaybackContext, next: Boolean = false): String? =
         issueQueue(if (next) "next" else "low", collectionSelection(context))
