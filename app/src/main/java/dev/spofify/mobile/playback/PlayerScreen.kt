@@ -71,6 +71,7 @@ internal fun FullPlayer(
     LaunchedEffect(binding) { more = false; lyrics = false }
     val scroll = rememberScrollState()
     Dialog(onDismiss, DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        SpofifyDialogSystemBars()
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
                 val density = LocalDensity.current
