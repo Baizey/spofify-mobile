@@ -7,6 +7,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.geometry.Offset
@@ -21,6 +22,7 @@ import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.PlaybackView
 import dev.spofify.mobile.feature.library.duration
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,12 +60,32 @@ internal fun PlaybackSeek(state: PlaybackView, content: TrackContentState, onSee
                         drawLine(active, Offset(0f, size.height / 2), Offset(x, size.height / 2), strokeWidth = 3.dp.toPx())
                     } else WaveformTrack(waveform, value / total.toFloat().coerceAtLeast(1f), preview != null, focused)
                 })
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(duration(((preview?.toDouble() ?: seconds) * 1000).toLong()),
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.95.sp), color = inactive)
-                Text(duration((total * 1000).toLong()), style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.95.sp), color = inactive)
+            Row(Modifier.fillMaxWidth()) {
+                Box(Modifier.weight(1f).playerTimeLabelColumn(end = false)) {
+                    Text(duration(((preview?.toDouble() ?: seconds) * 1000).toLong()),
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.95.sp), color = inactive)
+                }
+                Box(Modifier.weight(1f).playerTimeLabelColumn(end = true)) {
+                    Text(duration((total * 1000).toLong()),
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.95.sp), color = inactive)
+                }
             }
         }
+    }
+}
+
+// Each label can use half the row for large fonts/long durations, while ordinary
+// labels center above the first/last of the five equal transport columns.
+internal fun playerTimeLabelOffset(halfWidth: Int, textWidth: Int, end: Boolean): Int {
+    require(halfWidth >= 0 && textWidth >= 0)
+    val center = halfWidth * if (end) .8f else .2f
+    return (center - textWidth / 2f).roundToInt().coerceIn(0, (halfWidth - textWidth).coerceAtLeast(0))
+}
+
+private fun Modifier.playerTimeLabelColumn(end: Boolean): Modifier = layout { measurable, constraints ->
+    val label = measurable.measure(constraints.copy(minWidth = 0))
+    layout(constraints.maxWidth, label.height) {
+        label.placeRelative(playerTimeLabelOffset(constraints.maxWidth, label.width, end), 0)
     }
 }
 

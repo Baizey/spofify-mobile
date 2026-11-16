@@ -20,9 +20,23 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.spofify.mobile.core.content.LyricsState
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
 import kotlinx.coroutines.launch
+
+internal val playerLyricFontSize = 20.sp
+internal val playerLyricLineHeight = 28.sp
+
+/** Keep real text and existing retry access available after the player menu is removed. */
+internal fun lyricSheetEntryLabel(content: TrackContentState): String? {
+    if (content.lyricsFailure != null) return "Lyrics"
+    return when (content.lyrics?.state) {
+        LyricsState.PLAIN, LyricsState.TIMED -> "View lyrics"
+        LyricsState.PENDING, LyricsState.ERROR -> "Lyrics"
+        else -> null
+    }
+}
 
 internal data class LyricViewportKey(
     val trackId: String?,
@@ -61,7 +75,7 @@ internal fun PlayerLyricViewport(line: LyricViewportKey, height: Dp, onOpen: () 
         val textHeight = (height - cueHeight).coerceAtLeast(0.dp)
         val overflow = lyricOverflow(scroll.value, scroll.maxValue)
         val page = with(density) { textHeight.roundToPx() }.coerceAtLeast(1)
-        val step = with(density) { 40.26.sp.toPx() }.toInt().coerceAtLeast(1)
+        val step = with(density) { playerLyricLineHeight.toPx() }.toInt().coerceAtLeast(1)
         Column(Modifier.fillMaxWidth().height(height).clipToBounds()
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) false else {
@@ -91,14 +105,12 @@ internal fun PlayerLyricViewport(line: LyricViewportKey, height: Dp, onOpen: () 
             }) {
             Box(Modifier.fillMaxWidth().height(textHeight)) {
                 Box(Modifier.fillMaxSize().verticalScroll(scroll)) {
-                    Box(Modifier.fillMaxWidth().heightIn(min = textHeight).padding(horizontal = 26.dp, vertical = 12.dp),
+                    Box(Modifier.fillMaxWidth().heightIn(min = textHeight).padding(horizontal = 8.dp, vertical = 12.dp),
                         contentAlignment = Alignment.Center) {
-                        Text(line.text, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 33.sp, lineHeight = 40.26.sp,
+                        Text(line.text, style = MaterialTheme.typography.bodyLarge.copy(fontSize = playerLyricFontSize, lineHeight = playerLyricLineHeight,
                             fontWeight = FontWeight.Bold), textAlign = TextAlign.Center)
                     }
                 }
-                SpofifyIcon(SpofifyGlyph.Lyrics, null, Modifier.align(Alignment.CenterStart).size(20.dp),
-                    MaterialTheme.colorScheme.secondary)
             }
             // Reserved space prevents the text viewport moving when overflow is first measured.
             Row(Modifier.fillMaxWidth().height(cueHeight), verticalAlignment = Alignment.CenterVertically,

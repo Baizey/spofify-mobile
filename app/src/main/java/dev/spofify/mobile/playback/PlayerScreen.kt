@@ -62,13 +62,12 @@ internal fun FullPlayer(
     val elapsedMs = ((actual?.elapsed ?: 0.0) * 1000).toLong()
     val durationMs = ((actual?.duration ?: 0.0) * 1000).toLong()
     val inlineLine = lyricViewportKey(currentContent, elapsedMs, durationMs)
-    val inline = inlineLine?.text
+    val lyricsEntryLabel = lyricSheetEntryLabel(currentContent)
     val ready = state.connection == PlaybackConnectionState.READY
     var queue by remember { mutableStateOf(false) }
     var devices by remember { mutableStateOf(false) }
-    var more by remember { mutableStateOf(false) }
     var lyrics by remember { mutableStateOf(false) }
-    LaunchedEffect(binding) { more = false; lyrics = false }
+    LaunchedEffect(binding) { lyrics = false }
     val scroll = rememberScrollState()
     Dialog(onDismiss, DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         SpofifyDialogSystemBars()
@@ -81,25 +80,20 @@ internal fun FullPlayer(
                 PlayerBodyLayout(
                     availableHeight = (maxHeight - 34.dp).coerceAtLeast(0.dp),
                     largeText = largeText,
-                    reserveLyrics = currentContent.lyrics?.state == LyricsState.TIMED,
+                    reserveLyrics = currentContent.lyrics?.state == LyricsState.TIMED || lyricsEntryLabel != null,
                     modifier = Modifier.fillMaxWidth().verticalScroll(scroll)
                         .padding(start = horizontal, end = horizontal, top = 16.dp, bottom = 18.dp)
                         .semantics { customActions = listOf(CustomAccessibilityAction("Dismiss player") { onDismiss(); true }) },
                     header = {
-                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            val canOpenAlbum = onNavigate != null && track.albumId.isNotBlank() && track.albumName.isNotBlank()
-                            Box(Modifier.weight(1f).heightIn(min = 48.dp)
-                                .then(if (canOpenAlbum) Modifier.clickable(role = Role.Button, onClickLabel = "Open album") {
-                                    onNavigate?.invoke(MusicKind.ALBUM, track.albumId)
-                                } else Modifier), contentAlignment = Alignment.CenterStart) {
-                                if (track.albumName.isNotBlank()) Text(track.albumName,
-                                    style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp, lineHeight = 17.82.sp),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            IconButton({ more = true }, Modifier.size(48.dp)) {
-                                SpofifyIcon(SpofifyGlyph.More, "More for this song")
-                            }
+                        val canOpenAlbum = onNavigate != null && track.albumId.isNotBlank()
+                        val albumLabel = track.albumName.ifBlank { if (canOpenAlbum) "Open album" else "" }
+                        Box(Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            .then(if (canOpenAlbum) Modifier.clickable(role = Role.Button, onClickLabel = "Open album") {
+                                onNavigate?.invoke(MusicKind.ALBUM, track.albumId)
+                            } else Modifier), contentAlignment = Alignment.CenterStart) {
+                            if (albumLabel.isNotBlank()) Text(albumLabel,
+                                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp, lineHeight = 17.82.sp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     },
                     artwork = { size ->
@@ -107,10 +101,15 @@ internal fun FullPlayer(
                             Modifier.size(size).clip(RoundedCornerShape(7.dp)).then(dismissGesture))
                     },
                     gap = { height ->
-                        if (inlineLine == null) Spacer(Modifier.fillMaxWidth().height(height).then(dismissGesture))
-                        else Column(Modifier.fillMaxWidth().height(height)) {
-                            PlayerLyricViewport(inlineLine, (height - 8.dp).coerceAtLeast(0.dp)) { lyrics = true }
-                            Spacer(Modifier.height(8.dp))
+                        when {
+                            inlineLine != null -> Column(Modifier.fillMaxWidth().height(height)) {
+                                PlayerLyricViewport(inlineLine, (height - 8.dp).coerceAtLeast(0.dp)) { lyrics = true }
+                                Spacer(Modifier.height(8.dp))
+                            }
+                            lyricsEntryLabel != null -> Box(Modifier.fillMaxWidth().height(height), contentAlignment = Alignment.Center) {
+                                TextButton({ lyrics = true }) { Text(lyricsEntryLabel) }
+                            }
+                            else -> Spacer(Modifier.fillMaxWidth().height(height).then(dismissGesture))
                         }
                     },
                     controls = { Column(Modifier.fillMaxWidth()) {
@@ -163,16 +162,6 @@ internal fun FullPlayer(
         }
         if (queue) QueueSheet(controller, loader) { queue = false }
         if (devices) DevicesSheet(controller) { devices = false }
-        if (more) SpofifySheet({ more = false }) {
-            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
-                SheetHeading(track.name)
-                if (inline == null) SheetAction("Lyrics", SpofifyGlyph.Lyrics) { more = false; lyrics = true }
-                SheetAction("Open album", SpofifyGlyph.Album, onNavigate != null && track.albumId.isNotBlank()) {
-                    more = false
-                    onNavigate?.invoke(MusicKind.ALBUM, track.albumId)
-                }
-            }
-        }
         if (lyrics) PlayerLyricsSheet(track, currentContent, elapsedMs, durationMs, contentModel::refresh) { lyrics = false }
     }
 }

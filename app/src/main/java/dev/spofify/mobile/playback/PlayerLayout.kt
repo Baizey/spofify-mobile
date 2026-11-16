@@ -62,7 +62,7 @@ internal fun PlayerBodyLayout(
         val cueHeight = maxOf(20.dp, 15.4.sp.toDp())
         val budget = playerLayoutBudget(width.toDp().value, availableHeight.value,
             headerPlaceable.height.toDp().value, controlsPlaceable.height.toDp().value,
-            largeText, reserveLyrics, 40.26.sp.toDp().value, cueHeight.value)
+            largeText, reserveLyrics, playerLyricLineHeight.toDp().value, cueHeight.value)
         val artPixels = budget.artwork.dp.roundToPx()
         val headerGapPixels = 8.dp.roundToPx()
         // Use the exact pixel remainder in a fitted layout; rounding must not create a one-pixel scroll.

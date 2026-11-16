@@ -3,20 +3,28 @@
 `docs/reference/index.html` remains frozen. This note records the user's later
 player-specific changes, rather than changing that reference.
 
-- Actual album name and the existing song More menu sit above the artwork.
-  A known album can be opened through the existing navigation callback.
+- Actual album name sits above the artwork and opens a known album through
+  the existing navigation callback. The redundant full-player More menu is removed.
 - Song title and artist remain below the lyric area, immediately before seek.
   The artist text no longer reserves its own 48dp-high layout gap. Existing
   navigation and song menu actions are unchanged.
-- Timed inline lyrics keep **33sp / 40.26sp line height**, with native font
-  scaling. Their viewport has a fixed height for a given layout, independent
-  of the current line's length. Full text wraps and scrolls vertically; it is
-  not ellipsized, shortened, or reduced in font size.
+- Following the later request for substantially smaller lyrics, timed inline
+  text uses **20sp / 28sp line height**, with native font scaling. The decorative
+  lyric icon is removed and horizontal text padding is 8dp rather than 26dp.
+  The viewport still has a fixed height for a given layout, independent of the
+  current line's length. Full text wraps and scrolls vertically without
+  ellipsis, shortening, or per-line font shrinking.
 - A visible up/down “Scroll lyrics” cue appears only when the measured text
   overflows. Space for it is reserved to avoid moving the text after measure.
   Tap opens the existing full lyrics sheet; vertical dragging reads the text,
-  never invokes the player-dismiss gesture. Accessibility scroll semantics and
+  never invokes the player-dismiss gesture. Plain lyrics and timed silent gaps
+  retain a direct “View lyrics” entry; pending/error states retain access to the
+  sheet and its retry action, without restoring the removed menu. Loading-only
+  states do not add a flashing placeholder. Accessibility scroll semantics and
   keyboard arrows/Page Up/Page Down/Home/End are available.
+- Elapsed and total time labels are centered in the first and fifth equal
+  transport columns, directly above Shuffle and Repeat. The seek target remains
+  full width.
 
 ## Height budget
 

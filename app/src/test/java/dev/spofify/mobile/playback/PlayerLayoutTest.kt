@@ -3,6 +3,8 @@ package dev.spofify.mobile.playback
 import dev.spofify.mobile.core.content.LyricLine
 import dev.spofify.mobile.core.content.LyricsState
 import dev.spofify.mobile.core.content.TrackLyrics
+import dev.spofify.mobile.core.content.TrackContentFailure
+import androidx.compose.ui.unit.sp
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -43,7 +45,7 @@ class PlayerLayoutTest {
         assertFalse(largerControls.wholePlayerScrolls)
     }
 
-    @Test fun largeTextUsesThe164CapAndKeepsTheNativeScaledLineAndCueBudget() {
+    @Test fun largeTextUsesThe164CapAndKeepsTheSuppliedMeasuredLineAndCueBudget() {
         val layout = budget(height = 760f, largeText = true, controls = 320f,
             lineHeight = 80.52f, cueHeight = 30.8f)
         assertEquals(164f, layout.artwork, .01f)
@@ -120,8 +122,60 @@ class PlayerLayoutTest {
         assertEquals(text, lyricViewportKey(content, 1_000, 60_000)?.text)
     }
 
+    @Test fun currentInlineFontContractAndScaledLayoutUse20spAnd28sp() {
+        assertEquals(20.sp, playerLyricFontSize)
+        assertEquals(28.sp, playerLyricLineHeight)
+        val scaledLineHeight = playerLyricLineHeight.value * 2f
+        val layout = budget(height = 500f, largeText = true, controls = 360f,
+            lineHeight = scaledLineHeight, cueHeight = 30.8f)
+        assertEquals(scaledLineHeight + 24f + 30.8f, layout.gap - 8f, .01f)
+        assertTrue(layout.wholePlayerScrolls)
+    }
+
+    @Test fun sheetEntryOffersRealPlainTextWithoutRequiringATimedCurrentLine() {
+        val content = timedContent().let { it.copy(lyrics = it.lyrics!!.copy(
+            state = LyricsState.PLAIN, plainText = "Full plain lyrics", lines = emptyList())) }
+        assertNull(lyricViewportKey(content, 1_000, 60_000))
+        assertEquals("View lyrics", lyricSheetEntryLabel(content))
+        assertEquals("View lyrics", lyricSheetEntryLabel(content.copy(loadingLyrics = true)))
+    }
+
+    @Test fun timedClearingLinesAndUnconfirmedDurationRetainTheFullSheetEntry() {
+        val content = timedContent()
+        assertNull(lyricViewportKey(content, 21_000, 60_000))
+        assertNull(lyricViewportKey(content, 1_000, 0))
+        assertEquals("View lyrics", lyricSheetEntryLabel(content))
+    }
+
+    @Test fun pendingAndCachedErrorsOfferTheExistingSheetAndRetryAccess() {
+        val content = timedContent()
+        for (state in listOf(LyricsState.PENDING, LyricsState.ERROR)) {
+            val cached = content.copy(lyrics = content.lyrics!!.copy(state = state))
+            assertEquals("Lyrics", lyricSheetEntryLabel(cached))
+            assertEquals("Lyrics", lyricSheetEntryLabel(cached.copy(loadingLyrics = true)))
+        }
+    }
+
+    @Test fun lyricReadFailuresOfferTheSheetAndDoNotClaimViewableContent() {
+        for (failure in TrackContentFailure.entries) {
+            assertEquals("Lyrics", lyricSheetEntryLabel(TrackContentState(lyricsFailure = failure)))
+            assertEquals("Lyrics", lyricSheetEntryLabel(timedContent().copy(lyricsFailure = failure)))
+        }
+    }
+
+    @Test fun missingLoadingOnlyAndInstrumentalStatesDoNotCreateAnEntryPlaceholder() {
+        assertNull(lyricSheetEntryLabel(TrackContentState()))
+        assertNull(lyricSheetEntryLabel(TrackContentState(loadingLyrics = true)))
+        assertNull(lyricSheetEntryLabel(TrackContentState(loadingWaveform = true,
+            waveformFailure = TrackContentFailure.UNAVAILABLE)))
+        val content = timedContent()
+        for (state in listOf(LyricsState.INSTRUMENTAL, LyricsState.NOT_FOUND, LyricsState.UNAVAILABLE)) {
+            assertNull(lyricSheetEntryLabel(content.copy(lyrics = content.lyrics!!.copy(state = state))))
+        }
+    }
+
     private fun budget(width: Float = 360f, height: Float, header: Float = 48f, controls: Float = 240f,
-        largeText: Boolean = false, reserveLyrics: Boolean = true, lineHeight: Float = 40.26f, cueHeight: Float = 20f) =
+        largeText: Boolean = false, reserveLyrics: Boolean = true, lineHeight: Float = playerLyricLineHeight.value, cueHeight: Float = 20f) =
         playerLayoutBudget(width, height, header, controls, largeText, reserveLyrics, lineHeight, cueHeight)
 
     private fun timedContent() = TrackContentState(trackId = "track", binding = "occurrence:output", lyrics = TrackLyrics(
