@@ -83,6 +83,7 @@ class SearchViewModelTest {
         assertEquals(1, api.firstRequests.size)
         assertNull(api.firstRequests.single().second)
         assertEquals(3, model.state.value.resultCount)
+        assertTrue(model.state.value.scrollResetToken > 0)
         assertFalse(model.state.value.hasMore)
     }
 
@@ -96,11 +97,13 @@ class SearchViewModelTest {
         val model = model(api)
         model.query("love")
         advanceUntilIdle()
+        val scrollToken = model.state.value.scrollResetToken
         model.more()
         advanceUntilIdle()
         assertEquals(1, api.firstRequests.size)
         assertEquals(listOf("cursor-a"), api.cursors)
         assertEquals(first + last, model.state.value.items)
+        assertEquals(scrollToken, model.state.value.scrollResetToken)
         assertEquals(27, model.state.value.resultCount)
         assertFalse(model.state.value.hasMore)
         model.more()
@@ -187,6 +190,24 @@ class SearchViewModelTest {
         assertEquals(fresh, model.state.value.items)
         assertEquals(expiry.plusSeconds(60), model.state.value.expiresAt)
         assertNull(model.state.value.error)
+    }
+
+    @Test fun restartedFirstPageResetsScrollingEvenWhenServerExpiryIsUnchanged() = runTest(dispatcher) {
+        val api = Api().apply {
+            first = { page(batch(0, 25), 27, "cursor-a") }
+            continuation = { throw SearchException(SearchErrorCode.SEARCH_EXPIRED, 410) }
+        }
+        val model = model(api)
+        model.query("love")
+        advanceUntilIdle()
+        val originalToken = model.state.value.scrollResetToken
+        model.more()
+        advanceUntilIdle()
+        assertEquals(originalToken, model.state.value.scrollResetToken)
+        model.retry()
+        advanceUntilIdle()
+        assertEquals(expiry, model.state.value.expiresAt)
+        assertTrue(model.state.value.scrollResetToken > originalToken)
     }
 
     @Test fun inconsistentContinuationNeverPublishesAPartialOrMixedSnapshot() = runTest(dispatcher) {

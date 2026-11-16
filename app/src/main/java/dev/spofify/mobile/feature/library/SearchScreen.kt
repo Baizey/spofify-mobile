@@ -74,7 +74,8 @@ internal fun SearchScreen(
             model.resume()
         }
     }
-    LaunchedEffect(state.query) { scroll.scrollToItem(0) }
+    // Replacing the loading-status row otherwise anchors the list at the weak end.
+    LaunchedEffect(state.query, state.scrollResetToken) { scroll.scrollToItem(0) }
     BackHandler(editing) {
         focus.clearFocus()
         keyboard?.hide()

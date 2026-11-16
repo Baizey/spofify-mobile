@@ -19,8 +19,11 @@ After the 300 ms debounce, the tab requests one unfiltered mixed-kind first page
 with a limit of 25. It retains the exact returned order: there are no local type
 boosts, per-kind quotas, substring sorting or client transliteration. The existing
 reverse-layout list places the first, highest-ranked result nearest the search
-field; subsequent weaker pages extend upward without reordering the prefix.
-Artwork, detail navigation, queue actions, row feedback and IME-aware chrome remain
+field; subsequent weaker pages extend upward without reordering the prefix. An
+accepted first page resets the list anchor, preventing the previous loading-status
+row from anchoring the viewport at the weak end. A local presentation token, not
+a server timestamp/version, owns that reset; cursor appends keep their scroll
+position. Artwork, detail navigation, queue actions, row feedback and IME-aware chrome remain
 owned by the existing native components. A new focus intent clears the old query
 before lifecycle recovery can issue an obsolete read.
 

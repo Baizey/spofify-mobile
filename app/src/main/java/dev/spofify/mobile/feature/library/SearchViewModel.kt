@@ -30,6 +30,8 @@ internal data class SearchState(
     val expiresAt: Instant? = null,
     val error: SearchErrorCode? = null,
     val retryStartsOver: Boolean = false,
+    // Local list anchoring only, never a server snapshot/version claim.
+    val scrollResetToken: Long = 0,
 ) {
     val busy: Boolean get() = waiting || loading
     val hasMore: Boolean get() = nextCursor != null && error == null
@@ -132,6 +134,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
                     nextCursor = page.nextCursor,
                     resultCount = page.resultCount,
                     expiresAt = page.expiresAt,
+                    scrollResetToken = if (request == Request.First) token else before.scrollResetToken,
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
