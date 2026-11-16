@@ -1,9 +1,14 @@
 # Spofify for Android
 
-Native Kotlin / Jetpack Compose client. This source implements connection, explicit
-sign-in, validated session restoration and Account / Sign out. There are no placeholder
-music destinations. The Android-free `:core` owns origin, HTTP and session contracts;
-`:app` owns platform encryption, lifecycle and presentation.
+Native Kotlin / Jetpack Compose client. The Android-free `:core` owns validated
+HTTP/session contracts and server-authoritative playback; `:app` owns platform
+storage, native audio, lifecycle and presentation.
+
+Implemented surfaces include authentication, grouped Search, artist/album details,
+playlists, Recently played, mini/full player, queue/output controls, waveform/lyrics,
+and Settings appearance. Full History insights and artist rankings remain deferred.
+Offline storage, downloads and local-only playback are not yet enabled; API preparation
+must not be mistaken for saved or playable local audio.
 
 ## UI specification
 
@@ -14,6 +19,12 @@ are the specification, not suggestions. The file contains cumulative renderer ov
 so earlier function definitions alone do not describe the final UI. Its synthetic music,
 accounts and playback are fixtures, not production API contracts.
 
+The subsequently approved player changes are recorded in
+[player layout](docs/player-layout.md): album/actions above artwork, fixed-height
+scrollable lyrics without smaller type, and compact identity/seek spacing.
+[Settings appearance](docs/settings-appearance.md) records palette ownership and
+persistence behavior. These documented changes do not rewrite the frozen reference.
+
 ## Development
 
 Open this directory in Android Studio. Use JDK 25, Android platform 37.0 and
@@ -22,11 +33,10 @@ build-tools 36.0.0. The version catalog pins AGP 9.3.1, Kotlin / Compose compile
 the newer KGP loaded by the root JVM plugin; no second Android Kotlin plugin is
 applied. Sources target Java 17; runtime minimum is Android 8 (API 26), target API 36.
 
-The login slice was source-reviewed with a Gradle 9.6.0 pin. Retaining main’s
-9.9.0 wrapper is an explicit integration choice, not a verified compatibility claim.
-It is beyond Kotlin 2.4.21’s previously checked fully tested Gradle range (through
-9.7.0). Compilation, tests and APK execution remain unverified; the agent build
-attempt was blocked by policy before wrapper bootstrap.
+The retained 9.9.0 wrapper has been used for unit tests, lint, APK assembly and
+emulator checks during native integration. Those checks do not establish every
+upstream toolchain combination, deployment readiness or complete feature acceptance.
+Keep toolchain upgrades separate from feature changes.
 
 On an environment with these dependencies legitimately provisioned:
 
@@ -50,7 +60,8 @@ or change signing material to work around an incompatibility.
 See [authentication](docs/authentication.md) for transport, state ownership and
 installed storage compatibility. JetBrains Mono is bundled from the previously
 approved public [JetBrains Mono 2.304](https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304) source; its complete OFL is in
-`app/src/main/assets/licenses/JetBrainsMono-OFL.txt` and locally accessible from Account.
+`app/src/main/assets/licenses/JetBrainsMono-OFL.txt` and locally accessible from
+Settings → Credits → Font license, as well as Account.
 Fonts retain the approved existing regular/medium/semibold/bold bytes.
 
 Unit/contract checks do not establish rendered UI, Keystore behavior on a device,

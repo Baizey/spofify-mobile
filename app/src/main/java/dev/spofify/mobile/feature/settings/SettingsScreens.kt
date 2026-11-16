@@ -26,6 +26,7 @@ import dev.spofify.mobile.core.palette.PaletteTokens
 import dev.spofify.mobile.core.palette.PaletteId
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
+import dev.spofify.mobile.designsystem.SpofifySwitchIndicator
 import dev.spofify.mobile.designsystem.paletteColor
 import dev.spofify.mobile.feature.library.PageTitle
 
@@ -51,7 +52,7 @@ internal fun SettingsScreen(
                 role = Role.Switch, onValueChange = theme::choose),
             verticalAlignment = Alignment.CenterVertically) {
             Text("Light theme", Modifier.weight(1f))
-            Switch(checked = appearance.light, onCheckedChange = null, enabled = appearance.loaded && !appearance.saving)
+            SpofifySwitchIndicator(appearance.light, enabled = appearance.loaded && !appearance.saving)
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         appearance.notice?.let { SettingsNotice(it) }
