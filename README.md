@@ -25,7 +25,20 @@ scrollable lyrics at the 13.2sp album/artist scale with tap-to-open text and no
 menu, lyric icon or scroll hint, compact
 identity/seek spacing, and time labels aligned with Shuffle and Repeat.
 [Settings appearance](docs/settings-appearance.md) records palette ownership and
-persistence behavior. These documented changes do not rewrite the frozen reference.
+persistence behavior. The interactive reference now includes these approved
+native refinements too.
+
+The reference remains self-contained. Its rendered behavior check uses Node.js 24
+and an already provisioned Playwright module plus matching Chromium headless shell:
+
+```sh
+node docs/reference/check.cjs "$PLAYWRIGHT_MODULE" "$CHROMIUM_HEADLESS_SHELL" "$PRIVATE_ARTIFACT_DIR"
+```
+
+Supply a private output directory for the browser profile, temporary state and
+screenshots. The check does not download browsers, start a server or contact a
+backend. It covers player geometry/lyrics/navigation, palette stability and row
+action alignment; it is not a native Android or cross-browser acceptance test.
 
 ## Development
 

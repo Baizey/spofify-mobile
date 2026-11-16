@@ -1,7 +1,8 @@
 # Player layout: approved native revision
 
-`docs/reference/index.html` remains frozen. This note records the user's later
-player-specific changes, rather than changing that reference.
+`docs/reference/index.html` now includes the approved native refinements below.
+This note records their layout and ownership constraints alongside that
+interactive visual reference.
 
 - Actual album name sits above the artwork and opens a known album through
   the existing navigation callback. The redundant full-player More menu is removed.
