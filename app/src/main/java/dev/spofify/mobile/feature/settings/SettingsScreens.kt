@@ -15,9 +15,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -72,12 +75,20 @@ internal fun AccountColoursScreen(identity: AccountIdentity, palettes: AccountPa
     SettingsPage("Account colours") {
         Text(identity.username, color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp, bottom = 24.dp))
-        if (state?.loading == true || state?.saving == true) LinearProgressIndicator(Modifier.fillMaxWidth())
         state?.notice?.let { SettingsNotice(it) }
-        if (confirmed == null && state?.loading != true) {
-            SettingsNotice("Account colours are unavailable. Reload before choosing a palette.")
+        if (confirmed == null) {
+            SettingsNotice(if (state?.loading == true) "Loading account colours…"
+                else "Account colours are unavailable. Reload before choosing a palette.")
         }
-        Column(Modifier.fillMaxWidth().selectableGroup()) {
+        // Save/refresh feedback must not insert a row and move the palette choices.
+        Column(Modifier.fillMaxWidth().selectableGroup().semantics {
+            liveRegion = LiveRegionMode.Polite
+            stateDescription = when {
+                state?.saving == true -> "Saving account colours"
+                state?.loading == true -> "Loading account colours"
+                else -> "Account colours"
+            }
+        }) {
             confirmed?.presets?.forEach { preset ->
                 val tokens = if (lightTheme) preset.light else preset.dark
                 Row(Modifier.fillMaxWidth().heightIn(min = 76.dp)
@@ -98,8 +109,11 @@ internal fun AccountColoursScreen(identity: AccountIdentity, palettes: AccountPa
                         if (selection == preset.id) SpofifyIcon(SpofifyGlyph.Check, null, tint = MaterialTheme.colorScheme.secondary)
                     }
                 }
-                HorizontalDivider(thickness = if (selection == preset.id) 2.dp else 1.dp,
-                    color = MaterialTheme.colorScheme.outlineVariant)
+                // Keep the selected underline from moving the following choices.
+                Box(Modifier.fillMaxWidth().height(2.dp), contentAlignment = Alignment.Center) {
+                    HorizontalDivider(thickness = if (selection == preset.id) 2.dp else 1.dp,
+                        color = MaterialTheme.colorScheme.outlineVariant)
+                }
             }
         }
         if (confirmed != null) {
