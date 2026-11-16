@@ -4,7 +4,7 @@ Native Kotlin / Jetpack Compose client. The Android-free `:core` owns validated
 HTTP/session contracts and server-authoritative playback; `:app` owns platform
 storage, native audio, lifecycle and presentation.
 
-Implemented surfaces include authentication, grouped Search, artist/album details,
+Implemented surfaces include authentication, server-ranked Search, artist/album details,
 playlists, Recently played, mini/full player, queue/output controls, waveform/lyrics,
 and Settings appearance. Full History insights and artist rankings remain deferred.
 Offline storage, downloads and local-only playback are not yet enabled; API preparation
@@ -26,7 +26,10 @@ menu, lyric icon or scroll hint, compact
 identity/seek spacing, and time labels aligned with Shuffle and Repeat.
 [Settings appearance](docs/settings-appearance.md) records palette ownership and
 persistence behavior. The interactive reference now includes these approved
-native refinements too.
+native refinements too. [Unified search](docs/search.md) records the subsequent
+search migration: the server now owns matching and cross-kind ranking, rather than
+the reference fixture’s local ranking heuristic. Search layout and bottom-oriented
+results remain unchanged.
 
 The reference remains self-contained. Its rendered behavior check uses Node.js 24
 and an already provisioned Playwright module plus matching Chromium headless shell:
@@ -73,7 +76,8 @@ or change signing material to work around an incompatibility.
 ## Contracts
 
 See [authentication](docs/authentication.md) for transport, state ownership and
-installed storage compatibility. JetBrains Mono is bundled from the previously
+installed storage compatibility, and [unified search](docs/search.md) for ranked
+snapshots, cursor continuation and typed search failures. JetBrains Mono is bundled from the previously
 approved public [JetBrains Mono 2.304](https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304) source; its complete OFL is in
 `app/src/main/assets/licenses/JetBrainsMono-OFL.txt` and locally accessible from
 Settings → Credits → Font license, as well as Account.

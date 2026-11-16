@@ -109,7 +109,8 @@ class OfflineCancellationTest {
         override fun validateCookie(cookie: String) = Unit
         override fun cancel() = Unit // Deliberately ignores cancellation to exercise failure-side fences.
         override suspend fun get(segments: List<String>, query: List<Pair<String, String>>, cookie: String,
-            artwork: Boolean, onHeaders: (Int, String?) -> Unit): FeatureResponse {
+            artwork: Boolean, preserveUnavailableBody: Boolean, onHeaders: (Int, String?) -> Unit): FeatureResponse {
+            check(!preserveUnavailableBody)
             reads.incrementAndGet()
             return exchange().also { onHeaders(it.status, null) }
         }

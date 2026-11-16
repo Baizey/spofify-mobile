@@ -41,15 +41,22 @@ internal class OkHttpAuthApi(
     }
 
     // Ordinary GET connection recovery is safe; HTTP status responses are never replayed.
-    private class ReadStatus(val status: Int) : java.net.ProtocolException("Read status received")
+    private enum class UnavailableBodyPolicy { DISCARD, BOUNDED_JSON }
+    private class ReadStatus(val response: FeatureResponse) : java.net.ProtocolException("Read status received")
     private val readClient = client.newBuilder()
         .retryOnConnectionFailure(true)
         .addNetworkInterceptor { chain ->
             val response = chain.proceed(chain.request())
             if (response.code in setOf(408, 421, 503)) {
-                val status = response.code
-                response.close()
-                throw ReadStatus(status)
+                // JSON services use bounded 503 codes (for example search index readiness).
+                // Throw before OkHttp's status follow-up logic, without losing that safe body.
+                val rejected = response.use {
+                    if (it.code == 503 && chain.request().header("Accept") == "application/json" &&
+                        chain.request().tag(UnavailableBodyPolicy::class.java) == UnavailableBodyPolicy.BOUNDED_JSON)
+                        featureErrorResponse(it, artwork = false)
+                    else FeatureResponse(it.code, byteArrayOf(), null)
+                }
+                throw ReadStatus(rejected)
             }
             response
         }.build()
@@ -70,14 +77,17 @@ internal class OkHttpAuthApi(
         query: List<Pair<String, String>>,
         cookie: String,
         artwork: Boolean,
+        preserveUnavailableBody: Boolean,
         onHeaders: (Int, String?) -> Unit,
     ): FeatureResponse {
-        val request = featureRequest(segments, query, cookie, artwork).get().build()
+        val policy = if (preserveUnavailableBody) UnavailableBodyPolicy.BOUNDED_JSON else UnavailableBodyPolicy.DISCARD
+        val request = featureRequest(segments, query, cookie, artwork)
+            .tag(UnavailableBodyPolicy::class.java, policy).get().build()
         return try {
             execute(request, readClient) { featureResponse(it, artwork, onHeaders) }
         } catch (status: ReadStatus) {
-            onHeaders(status.status, null)
-            FeatureResponse(status.status, byteArrayOf(), null)
+            onHeaders(status.response.status, null)
+            status.response
         }
     }
 
@@ -118,22 +128,26 @@ internal class OkHttpAuthApi(
         if (response.code == 204) return FeatureResponse(response.code, byteArrayOf(), null)
         val body = response.body
         val mime = body.contentType()
-        if (!response.isSuccessful) {
-            // Preserve bounded semantic mutation errors, never arbitrary HTML or unbounded bodies.
-            val bound = 8L * 1024
-            if (artwork || mime?.type != "application" || mime.subtype != "json" || body.contentLength() > bound)
-                return FeatureResponse(response.code, byteArrayOf(), null)
-            val source = body.source()
-            source.request(bound + 1)
-            if (source.buffer.size > bound) return FeatureResponse(response.code, byteArrayOf(), null)
-            return FeatureResponse(response.code, source.readByteArray(), mime.toString())
-        }
+        if (!response.isSuccessful) return featureErrorResponse(response, artwork)
         require(if (artwork) mime?.type == "image" && mime.subtype in setOf("jpeg", "png")
             else mime?.type == "application" && mime.subtype == "json")
         val bound = if (artwork) 8L * 1024 * 1024 else 2L * 1024 * 1024
         val source = body.source()
         source.request(bound + 1)
         require(source.buffer.size <= bound)
+        return FeatureResponse(response.code, source.readByteArray(), mime.toString())
+    }
+
+    private fun featureErrorResponse(response: Response, artwork: Boolean): FeatureResponse {
+        // Keep one bound for semantic read/mutation errors; never retain arbitrary HTML.
+        val body = response.body
+        val mime = body.contentType()
+        val bound = 8L * 1024
+        if (artwork || mime?.type != "application" || mime.subtype != "json" || body.contentLength() > bound)
+            return FeatureResponse(response.code, byteArrayOf(), null)
+        val source = body.source()
+        source.request(bound + 1)
+        if (source.buffer.size > bound) return FeatureResponse(response.code, byteArrayOf(), null)
         return FeatureResponse(response.code, source.readByteArray(), mime.toString())
     }
 

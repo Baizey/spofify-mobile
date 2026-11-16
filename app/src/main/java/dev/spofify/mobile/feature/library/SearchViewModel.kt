@@ -2,139 +2,204 @@ package dev.spofify.mobile.feature.library
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import dev.spofify.mobile.core.library.*
-import java.util.Locale
+import dev.spofify.mobile.core.library.MusicItem
+import dev.spofify.mobile.core.library.validSearchQuery
+import dev.spofify.mobile.core.search.SearchApi
+import dev.spofify.mobile.core.search.SearchErrorCode
+import dev.spofify.mobile.core.search.SearchException
+import dev.spofify.mobile.core.search.SearchPage
+import java.time.Instant
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-internal data class SearchGroup(
-    val items: List<MusicItem> = emptyList(),
-    val loading: Boolean = false,
-    val loaded: Boolean = false,
-    val nextOffset: Int? = null,
-    val revision: Long? = null,
-    val failed: Boolean = false,
-)
-
 internal data class SearchState(
     val query: String = "",
+    val items: List<MusicItem> = emptyList(),
     val waiting: Boolean = false,
-    val groups: Map<MusicKind, SearchGroup> = MusicKind.entries.associateWith { SearchGroup() },
+    val loading: Boolean = false,
+    val loaded: Boolean = false,
+    val nextCursor: String? = null,
+    val resultCount: Int? = null,
+    val expiresAt: Instant? = null,
+    val error: SearchErrorCode? = null,
+    val retryStartsOver: Boolean = false,
 ) {
-    val busy: Boolean get() = waiting || groups.values.any { it.loading }
-    val hasMore: Boolean get() = groups.values.any { it.nextOffset != null }
-    val empty: Boolean get() = groups.values.all { it.loaded && !it.failed && it.items.isEmpty() }
-    val items: List<MusicItem> get() = groups.values.flatMap { it.items }
-        .sortedWith(compareByDescending<MusicItem> { searchRank(it, query) }.thenBy { it.key })
+    val busy: Boolean get() = waiting || loading
+    val hasMore: Boolean get() = nextCursor != null && error == null
+    val empty: Boolean get() = loaded && !busy && error == null && items.isEmpty()
 }
 
-/** Each kind paints independently, matching the working server client; no mixed-kind blocking read. */
-internal class SearchViewModel(private val api: LibraryApi) : ViewModel() {
+/** One ranked snapshot; cursor continuation never mixes it with a fresh search. */
+internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
+    private sealed interface Request {
+        data object First : Request
+        data class Next(val cursor: String) : Request
+    }
+
     private val mutable = MutableStateFlow(SearchState())
     val state = mutable.asStateFlow()
     private var generation = 0L
     private var consumedFocusIntent = 0
+    private var timer: Job? = null
+    private var requestJob: Job? = null
+    private var activeRequest: Request? = null
+    private var retryRequest: Request? = null
+    private var interruptedRequest: Request? = null
+    private var seenCursors: Set<String> = emptySet()
 
     fun consumeFocusIntent(value: Int): Boolean {
         if (value <= consumedFocusIntent) return false
         consumedFocusIntent = value
         return true
     }
-    private var timer: Job? = null
-    private val requests = mutableMapOf<MusicKind, Job>()
 
     fun query(value: String) {
-        if (!validSearchQuery(value)) return
-        if (value == mutable.value.query) return
+        if (!validSearchQuery(value) || value == mutable.value.query) return
         cancelRequests()
+        retryRequest = null
+        interruptedRequest = null
+        seenCursors = emptySet()
         mutable.value = SearchState(query = value, waiting = value.isNotBlank())
         if (value.isBlank()) return
+        val token = generation
         timer = viewModelScope.launch {
             delay(300)
+            if (token != generation) return@launch
+            timer = null
             mutable.value = mutable.value.copy(waiting = false)
-            MusicKind.entries.forEach { load(it, 0) }
+            // A collector can pause/clear synchronously when the debounce finishes.
+            if (token != generation) return@launch
+            load(Request.First)
         }
     }
 
     fun resume() {
-        if (mutable.value.query.isBlank() || mutable.value.waiting) return
-        MusicKind.entries.filter { !mutable.value.groups.getValue(it).loaded }.forEach { load(it, 0) }
+        val current = mutable.value
+        if (current.query.isBlank() || current.busy || current.error != null) return
+        val interrupted = interruptedRequest
+        interruptedRequest = null
+        if (interrupted != null) load(interrupted)
+        else if (!current.loaded) load(Request.First)
     }
 
     fun pause() {
+        interruptedRequest = activeRequest ?: if (mutable.value.waiting) Request.First else interruptedRequest
         cancelRequests()
-        mutable.value = mutable.value.copy(waiting = false,
-            groups = mutable.value.groups.mapValues { (_, group) -> group.copy(loading = false) })
+        mutable.value = mutable.value.copy(waiting = false, loading = false)
     }
 
     fun more() {
-        mutable.value.groups.forEach { (kind, group) ->
-            if (!group.failed) group.nextOffset?.let { load(kind, it) }
-        }
+        val current = mutable.value
+        if (!current.busy && current.error == null) current.nextCursor?.let { load(Request.Next(it)) }
     }
 
-    fun retry(kind: MusicKind) = load(kind, 0)
+    fun retry() {
+        if (!mutable.value.busy && mutable.value.error != null) load(retryRequest ?: Request.First)
+    }
 
-    private fun load(kind: MusicKind, offset: Int) {
-        if (mutable.value.groups.getValue(kind).loading) return
-        val token = generation
-        val query = mutable.value.query.trim()
-        if (query.isBlank()) return
-        update(kind) { it.copy(loading = true, failed = false) }
-        requests[kind] = viewModelScope.launch {
+    private fun load(request: Request) {
+        val before = mutable.value
+        if (before.busy || before.query.isBlank()) return
+        val token = ++generation
+        val query = before.query.trim()
+        activeRequest = request
+        interruptedRequest = null
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             try {
-                val page = api.search(kind, query, offset)
+                val page = when (request) {
+                    Request.First -> api.search(query)
+                    is Request.Next -> api.next(request.cursor)
+                }
+                currentCoroutineContext().ensureActive()
                 if (token != generation) return@launch
-                val previous = mutable.value.groups.getValue(kind)
-                check(offset == 0 || previous.revision == page.revision)
-                val items = if (offset == 0) page.items else previous.items + page.items
-                check(items.distinctBy(MusicItem::key).size == items.size)
-                check(!page.hasMore || page.items.isNotEmpty())
-                update(kind) { SearchGroup(items, loaded = true,
-                    nextOffset = if (page.hasMore) page.offset + page.items.size else null, revision = page.revision) }
+                val items = validatePage(request, before, page)
+                seenCursors = if (request == Request.First) emptySet() else seenCursors
+                page.nextCursor?.let { seenCursors = seenCursors + it }
+                retryRequest = null
+                activeRequest = null
+                requestJob = null
+                mutable.value = SearchState(
+                    query = mutable.value.query,
+                    items = items,
+                    loaded = true,
+                    nextCursor = page.nextCursor,
+                    resultCount = page.resultCount,
+                    expiresAt = page.expiresAt,
+                )
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Exception) {
-                if (token == generation) update(kind) { it.copy(loading = false, loaded = true, failed = true) }
+            } catch (failure: Exception) {
+                currentCoroutineContext().ensureActive()
+                if (token != generation) return@launch
+                val code = (failure as? SearchException)?.code ?: SearchErrorCode.INVALID_RESPONSE
+                val restart = code == SearchErrorCode.SEARCH_EXPIRED || request is Request.Next &&
+                    code in setOf(SearchErrorCode.INVALID_SEARCH_REQUEST, SearchErrorCode.INVALID_RESPONSE)
+                retryRequest = if (restart) Request.First else request
+                activeRequest = null
+                requestJob = null
+                mutable.value = mutable.value.copy(
+                    loading = false,
+                    error = code,
+                    nextCursor = if (restart) null else mutable.value.nextCursor,
+                    retryStartsOver = restart || request == Request.First && before.loaded,
+                )
             } finally {
-                if (token == generation) update(kind) { it.copy(loading = false) }
+                if (token == generation) {
+                    activeRequest = null
+                    requestJob = null
+                    mutable.value = mutable.value.copy(loading = false)
+                }
             }
         }
+        requestJob = job
+        mutable.value = before.copy(loading = true, error = null)
+        job.start()
     }
 
-    private fun update(kind: MusicKind, change: (SearchGroup) -> SearchGroup) {
-        val current = mutable.value
-        mutable.value = current.copy(groups = current.groups + (kind to change(current.groups.getValue(kind))))
+    private fun validatePage(request: Request, before: SearchState, page: SearchPage): List<MusicItem> {
+        val items = when (request) {
+            Request.First -> page.items.toList()
+            is Request.Next -> {
+                check(before.loaded && before.nextCursor == request.cursor)
+                check(before.resultCount == page.resultCount && before.expiresAt == page.expiresAt)
+                check(page.items.isNotEmpty())
+                before.items + page.items
+            }
+        }
+        check(items.distinctBy(MusicItem::key).size == items.size)
+        check(items.size <= page.resultCount)
+        check((page.nextCursor != null) == (items.size < page.resultCount))
+        if (page.nextCursor != null) {
+            check(page.items.isNotEmpty())
+            if (request is Request.Next) check(page.nextCursor !in seenCursors)
+        }
+        return items
     }
 
     private fun cancelRequests() {
         generation++
         timer?.cancel()
-        requests.values.forEach { it.cancel() }
-        requests.clear()
+        timer = null
+        requestJob?.cancel()
+        requestJob = null
+        activeRequest = null
     }
 }
 
-/** Display ranking comes directly from the accepted wireframe, not invented server counts. */
-internal fun searchRank(item: MusicItem, query: String): Int {
-    val q = query.trim().lowercase(Locale.ROOT)
-    fun score(value: String, exact: Int, prefix: Int, contains: Int): Int {
-        val name = value.lowercase(Locale.ROOT)
-        return when {
-            name == q -> exact
-            name.startsWith(q) -> prefix
-            q in name -> contains
-            else -> 0
-        }
-    }
-    return when (item.kind) {
-        MusicKind.ARTIST -> score(item.name, 110, 95, 80)
-        MusicKind.ALBUM -> score(item.name, 115, 88, 70).takeIf { it > 0 } ?: 30
-        MusicKind.TRACK -> score(item.name, 120, 90, 75).takeIf { it > 0 }
-            ?: score(item.artists.joinToString(" ") { it.name }, 50, 45, 40).takeIf { it > 0 } ?: 35
-    }
+internal fun searchErrorMessage(code: SearchErrorCode): String = when (code) {
+    SearchErrorCode.SEARCH_EXPIRED -> "Search expired. Search again to refresh results."
+    SearchErrorCode.SEARCH_INDEX_NOT_READY -> "The search index isn’t ready yet."
+    SearchErrorCode.SEARCH_UNAVAILABLE -> "Search is unavailable."
+    SearchErrorCode.SEARCH_BUSY -> "Search is busy. Try again shortly."
+    SearchErrorCode.INVALID_SEARCH_REQUEST -> "This search couldn’t be completed. Try a new search."
+    SearchErrorCode.INVALID_RESPONSE -> "Can’t read search results."
+    SearchErrorCode.CONNECTION_FAILED -> "Can’t connect to search."
+    SearchErrorCode.HTTP_ERROR -> "Can’t load search results."
 }

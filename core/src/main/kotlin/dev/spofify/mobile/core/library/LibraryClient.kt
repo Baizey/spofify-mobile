@@ -106,37 +106,11 @@ class LibraryClient(private val sessions: SessionRepository, private val identit
         return response.bytes
     }
 
-    private fun project(wire: WireItem): MusicItem {
-        val kind = MusicKind.entries.single { it.plural == wire.kind + "s" }
-        require(wire.durationMs >= 0 && wire.trackNumber >= 0)
-        require(wire.coverage.inLibrary >= 0 && wire.coverage.tracks >= wire.coverage.inLibrary)
-        // The documented admin projection has libraryPath, while /listen has hasAudio.
-        // Consume the former here only; operational paths never enter presentation state.
-        val audio = wire.hasAudio ?: if (sessions.isAdministrator(identity)) !wire.libraryPath.isNullOrEmpty()
-            else throw IllegalArgumentException("Missing audio availability")
-        // Manual credits may lack an identity; nonempty IDs must still be valid.
-        val artists = wire.artists.map { artist ->
-            Artist(if (artist.id.isEmpty()) "" else validId(artist.id), artist.name)
-        }
-        return MusicItem(kind, validId(wire.id), wire.name,
-            artists, wire.albumId, wire.albumName,
-            wire.releaseDate, wire.durationMs, wire.trackNumber, audio,
-            wire.coverage.inLibrary, wire.coverage.tracks, wire.genres)
-    }
+    private fun project(wire: MusicItemWire): MusicItem = projectMusicItem(wire,
+        legacyAdministratorFallback = wire.hasAudio == null && sessions.isAdministrator(identity))
 
-    private fun validId(value: String): String = value.also {
-        require(it.isNotBlank() && it.toByteArray().size <= 512 && it.none(Char::isISOControl))
-    }
+    private fun validId(value: String): String = validMusicEntityId(value)
 
-    @Serializable private class WireArtist(val id: String, val name: String)
-    @Serializable private class WireCoverage(val tracks: Long, val inLibrary: Long)
-    @Serializable private class WireItem(
-        val kind: String, val id: String, val name: String = "",
-        val artists: List<WireArtist> = emptyList(), val albumId: String = "", val albumName: String = "",
-        val releaseDate: String = "", val durationMs: Long = 0, val trackNumber: Int = 0,
-        val hasAudio: Boolean? = null, val libraryPath: String? = null, val coverage: WireCoverage,
-        val genres: List<String> = emptyList(),
-    )
-    @Serializable private class WirePage(val items: List<WireItem>, val total: Long, val offset: Int, val limit: Int, val revision: Long)
-    @Serializable private class WireDetail(val item: WireItem, val revision: Long)
+    @Serializable private class WirePage(val items: List<MusicItemWire>, val total: Long, val offset: Int, val limit: Int, val revision: Long)
+    @Serializable private class WireDetail(val item: MusicItemWire, val revision: Long)
 }

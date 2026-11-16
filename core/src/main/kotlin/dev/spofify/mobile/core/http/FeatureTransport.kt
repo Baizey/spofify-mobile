@@ -10,6 +10,8 @@ internal interface FeatureTransport {
         query: List<Pair<String, String>>,
         cookie: String,
         artwork: Boolean,
+        // Opt-in bounded JSON 503 diagnostics; never enables automatic status replay.
+        preserveUnavailableBody: Boolean = false,
         onHeaders: (status: Int, renewedCookie: String?) -> Unit,
     ): FeatureResponse
 

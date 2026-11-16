@@ -37,6 +37,7 @@ import dev.spofify.mobile.feature.personal.PlaylistsScreen
 import dev.spofify.mobile.feature.personal.PlaylistDetailScreen
 import dev.spofify.mobile.feature.personal.RecentScreen
 import dev.spofify.mobile.feature.settings.*
+import dev.spofify.mobile.core.search.SearchClient
 import dev.spofify.mobile.playback.*
 
 private enum class MusicTab(val route: String, val title: String, val glyph: SpofifyGlyph) {
@@ -59,6 +60,7 @@ internal fun MusicRoot(
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     val api = remember(identity, sessions) { LibraryClient(sessions, identity) }
+    val searchApi = remember(identity, sessions) { SearchClient(sessions, identity) }
     val personal = remember(identity, sessions) { PersonalLibraryClient(sessions, identity) }
     val trackContent = remember(identity, sessions) { TrackContentClient(sessions, identity) }
     val loader = remember(api) { artworkLoader(context.applicationContext, api) }
@@ -105,11 +107,11 @@ internal fun MusicRoot(
         }
     }
     // The graph and its models must not be replaced by playback ticks or IME recomposition.
-    val graph: NavGraphBuilder.() -> Unit = remember(navigation, api, personal, loader, open, navigate, openActions, theme, palettes) {
+    val graph: NavGraphBuilder.() -> Unit = remember(navigation, api, searchApi, personal, loader, open, navigate, openActions, theme, palettes) {
         {
             composable("history") { RecentScreen(personal, loader, currentController.value, navigate) }
             composable("search") { owner ->
-                val model: SearchViewModel = viewModel(owner, factory = viewModelFactory { initializer { SearchViewModel(api) } })
+                val model: SearchViewModel = viewModel(owner, factory = viewModelFactory { initializer { SearchViewModel(searchApi) } })
                 SearchScreen(model, loader, currentFocusIntent.value, open, currentController.value,
                     onMore = { openActions(it, null) })
             }

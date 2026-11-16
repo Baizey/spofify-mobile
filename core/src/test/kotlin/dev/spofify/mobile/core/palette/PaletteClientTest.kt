@@ -248,8 +248,10 @@ class PaletteClientTest {
 
         override suspend fun get(
             segments: List<String>, query: List<Pair<String, String>>, cookie: String, artwork: Boolean,
+            preserveUnavailableBody: Boolean,
             onHeaders: (Int, String?) -> Unit,
         ): FeatureResponse {
+            check(!preserveUnavailableBody)
             requests += Request("GET", segments, query, cookie, artwork = artwork)
             return exchange().also { onHeaders(it.status, null) }
         }

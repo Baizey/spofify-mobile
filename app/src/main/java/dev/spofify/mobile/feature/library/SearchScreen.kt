@@ -25,7 +25,9 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -61,14 +63,15 @@ internal fun SearchScreen(
         else playback?.queueCollection(PlaybackContext(item.kind.name.lowercase(java.util.Locale.ROOT), item.id, item.name), next)
     }
     DisposableEffect(model) {
-        model.resume()
         onDispose { model.pause() }
     }
-    LaunchedEffect(focusIntent) {
+    LaunchedEffect(model, focusIntent) {
         if (model.consumeFocusIntent(focusIntent)) {
             model.query("")
             requester.requestFocus()
             keyboard?.show()
+        } else {
+            model.resume()
         }
     }
     LaunchedEffect(state.query) { scroll.scrollToItem(0) }
@@ -89,12 +92,13 @@ internal fun SearchScreen(
             }
             if (state.query.isNotBlank()) {
                 item("search-status") {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp),
+                    Column(Modifier.fillMaxWidth().padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp)
+                        .semantics { liveRegion = LiveRegionMode.Polite },
                         horizontalAlignment = Alignment.CenterHorizontally) {
-                        state.groups.filterValues { it.failed }.forEach { (kind, _) ->
+                        state.error?.let { error ->
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text("Can't load ${kind.plural}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                                TextButton({ model.retry(kind) }) { Text("Retry") }
+                                Text(searchErrorMessage(error), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                                TextButton(model::retry) { Text(if (state.retryStartsOver) "Search again" else "Retry") }
                             }
                         }
                         if (state.busy) CircularProgressIndicator(Modifier.padding(16.dp).size(24.dp))

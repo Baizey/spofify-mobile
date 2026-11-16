@@ -102,8 +102,9 @@ class SessionRepository(
         segments: List<String>,
         query: List<Pair<String, String>> = emptyList(),
         artwork: Boolean = false,
+        preserveUnavailableBody: Boolean = false,
     ): FeatureResponse = featureExchange(expected) { client, record, headers, _ ->
-        featureTransport(client).get(segments, query, record.cookie, artwork, headers)
+        featureTransport(client).get(segments, query, record.cookie, artwork, preserveUnavailableBody, headers)
     }
 
     internal suspend fun postJson(
