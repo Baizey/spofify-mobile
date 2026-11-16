@@ -35,6 +35,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.*
 import dev.spofify.mobile.core.playback.*
+import kotlinx.coroutines.flow.collect
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -45,6 +46,7 @@ internal fun SearchScreen(
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val scroll = rememberLazyListState()
+    val latestState = rememberUpdatedState(state)
     val requester = remember { FocusRequester() }
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -66,16 +68,28 @@ internal fun SearchScreen(
         onDispose { model.pause() }
     }
     LaunchedEffect(model, focusIntent) {
-        if (model.consumeFocusIntent(focusIntent)) {
-            model.query("")
+        val newFocus = model.consumeFocusIntent(focusIntent)
+        if (newFocus) model.query("")
+        model.resume()
+        if (newFocus) {
             requester.requestFocus()
             keyboard?.show()
-        } else {
-            model.resume()
         }
     }
     // Replacing the loading-status row otherwise anchors the list at the weak end.
     LaunchedEffect(state.query, state.scrollResetToken) { scroll.scrollToItem(0) }
+    LaunchedEffect(scroll, model) {
+        snapshotFlow {
+            val current = latestState.value
+            val layout = scroll.layoutInfo
+            val lastVisible = layout.visibleItemsInfo.maxOfOrNull { it.index } ?: -1
+            // Cursor/count changes re-arm even if a fast response conflates the busy=true frame.
+            Triple(shouldLoadNextSearchPage(current, lastVisible, layout.totalItemsCount),
+                current.nextCursor, current.items.size)
+        }.collect { (loadNext, _, _) ->
+            if (loadNext) model.more()
+        }
+    }
     BackHandler(editing) {
         focus.clearFocus()
         keyboard?.hide()
@@ -99,12 +113,11 @@ internal fun SearchScreen(
                         state.error?.let { error ->
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                 Text(searchErrorMessage(error), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                                TextButton(model::retry) { Text(if (state.retryStartsOver) "Search again" else "Retry") }
+                                TextButton(model::retry) { Text("Retry") }
                             }
                         }
                         if (state.busy) CircularProgressIndicator(Modifier.padding(16.dp).size(24.dp))
                         else if (state.empty) Text("No matches", Modifier.padding(vertical = 24.dp))
-                        else if (state.hasMore) TextButton(model::more, Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("More results") }
                     }
                 }
             }

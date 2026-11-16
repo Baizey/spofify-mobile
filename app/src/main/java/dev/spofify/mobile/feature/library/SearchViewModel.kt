@@ -7,7 +7,6 @@ import dev.spofify.mobile.core.library.validSearchQuery
 import dev.spofify.mobile.core.search.SearchApi
 import dev.spofify.mobile.core.search.SearchErrorCode
 import dev.spofify.mobile.core.search.SearchException
-import dev.spofify.mobile.core.search.SearchPage
 import java.time.Instant
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -23,13 +22,13 @@ internal data class SearchState(
     val query: String = "",
     val items: List<MusicItem> = emptyList(),
     val waiting: Boolean = false,
+    val paused: Boolean = false,
     val loading: Boolean = false,
     val loaded: Boolean = false,
     val nextCursor: String? = null,
     val resultCount: Int? = null,
     val expiresAt: Instant? = null,
     val error: SearchErrorCode? = null,
-    val retryStartsOver: Boolean = false,
     // Local list anchoring only, never a server snapshot/version claim.
     val scrollResetToken: Long = 0,
 ) {
@@ -43,6 +42,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
     private sealed interface Request {
         data object First : Request
         data class Next(val cursor: String) : Request
+        data class Rebuild(val minimumItems: Int) : Request
     }
 
     private val mutable = MutableStateFlow(SearchState())
@@ -54,7 +54,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
     private var activeRequest: Request? = null
     private var retryRequest: Request? = null
     private var interruptedRequest: Request? = null
-    private var seenCursors: Set<String> = emptySet()
+    private var snapshot: SearchResultSnapshot? = null
 
     fun consumeFocusIntent(value: Int): Boolean {
         if (value <= consumedFocusIntent) return false
@@ -67,9 +67,10 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
         cancelRequests()
         retryRequest = null
         interruptedRequest = null
-        seenCursors = emptySet()
-        mutable.value = SearchState(query = value, waiting = value.isNotBlank())
-        if (value.isBlank()) return
+        snapshot = null
+        val paused = mutable.value.paused
+        mutable.value = SearchState(query = value, paused = paused, waiting = value.isNotBlank() && !paused)
+        if (value.isBlank() || paused) return
         val token = generation
         timer = viewModelScope.launch {
             delay(300)
@@ -84,17 +85,21 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
 
     fun resume() {
         val current = mutable.value
-        if (current.query.isBlank() || current.busy || current.error != null) return
+        if (current.query.isBlank() || current.busy || current.error != null) {
+            mutable.value = current.copy(paused = false)
+            return
+        }
         val interrupted = interruptedRequest
         interruptedRequest = null
-        if (interrupted != null) load(interrupted)
-        else if (!current.loaded) load(Request.First)
+        if (interrupted != null) load(interrupted, resuming = true)
+        else if (!current.loaded) load(Request.First, resuming = true)
+        else mutable.value = current.copy(paused = false)
     }
 
     fun pause() {
         interruptedRequest = activeRequest ?: if (mutable.value.waiting) Request.First else interruptedRequest
         cancelRequests()
-        mutable.value = mutable.value.copy(waiting = false, loading = false)
+        mutable.value = mutable.value.copy(waiting = false, loading = false, paused = true)
     }
 
     fun more() {
@@ -106,35 +111,31 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
         if (!mutable.value.busy && mutable.value.error != null) load(retryRequest ?: Request.First)
     }
 
-    private fun load(request: Request) {
+    private fun load(request: Request, resuming: Boolean = false) {
         val before = mutable.value
-        if (before.busy || before.query.isBlank()) return
+        if (before.busy || before.query.isBlank() || before.paused && !resuming) return
         val token = ++generation
         val query = before.query.trim()
+        val base = snapshot
         activeRequest = request
         interruptedRequest = null
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             try {
-                val page = when (request) {
-                    Request.First -> api.search(query)
-                    is Request.Next -> api.next(request.cursor)
-                }
+                val result = readSnapshot(request, base, query)
                 currentCoroutineContext().ensureActive()
                 if (token != generation) return@launch
-                val items = validatePage(request, before, page)
-                seenCursors = if (request == Request.First) emptySet() else seenCursors
-                page.nextCursor?.let { seenCursors = seenCursors + it }
+                snapshot = result
                 retryRequest = null
                 activeRequest = null
                 requestJob = null
                 mutable.value = SearchState(
                     query = mutable.value.query,
-                    items = items,
+                    items = result.items,
                     loaded = true,
-                    nextCursor = page.nextCursor,
-                    resultCount = page.resultCount,
-                    expiresAt = page.expiresAt,
-                    scrollResetToken = if (request == Request.First) token else before.scrollResetToken,
+                    nextCursor = result.nextCursor,
+                    resultCount = result.resultCount,
+                    expiresAt = result.expiresAt,
+                    scrollResetToken = if (base == null) token else before.scrollResetToken,
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -142,16 +143,16 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
                 currentCoroutineContext().ensureActive()
                 if (token != generation) return@launch
                 val code = (failure as? SearchException)?.code ?: SearchErrorCode.INVALID_RESPONSE
-                val restart = code == SearchErrorCode.SEARCH_EXPIRED || request is Request.Next &&
-                    code in setOf(SearchErrorCode.INVALID_SEARCH_REQUEST, SearchErrorCode.INVALID_RESPONSE)
-                retryRequest = if (restart) Request.First else request
+                val failedRequest = activeRequest ?: request
+                retryRequest = if (failedRequest is Request.Next && code in
+                    setOf(SearchErrorCode.INVALID_SEARCH_REQUEST, SearchErrorCode.INVALID_RESPONSE))
+                    Request.Rebuild((base?.items?.size ?: 0) + 1)
+                else failedRequest
                 activeRequest = null
                 requestJob = null
                 mutable.value = mutable.value.copy(
                     loading = false,
                     error = code,
-                    nextCursor = if (restart) null else mutable.value.nextCursor,
-                    retryStartsOver = restart || request == Request.First && before.loaded,
                 )
             } finally {
                 if (token == generation) {
@@ -162,28 +163,48 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
             }
         }
         requestJob = job
-        mutable.value = before.copy(loading = true, error = null)
+        mutable.value = before.copy(loading = true, paused = false, error = null)
         job.start()
     }
 
-    private fun validatePage(request: Request, before: SearchState, page: SearchPage): List<MusicItem> {
-        val items = when (request) {
-            Request.First -> page.items.toList()
-            is Request.Next -> {
-                check(before.loaded && before.nextCursor == request.cursor)
-                check(before.resultCount == page.resultCount && before.expiresAt == page.expiresAt)
-                check(page.items.isNotEmpty())
-                before.items + page.items
+    private suspend fun readSnapshot(request: Request, base: SearchResultSnapshot?, query: String): SearchResultSnapshot {
+        return try {
+            when (request) {
+                Request.First -> readFirst(query)
+                is Request.Next -> readNext(requireNotNull(base), request.cursor)
+                is Request.Rebuild -> rebuild(query, request.minimumItems)
             }
+        } catch (failure: SearchException) {
+            if (failure.code != SearchErrorCode.SEARCH_EXPIRED) throw failure
+            currentCoroutineContext().ensureActive()
+            val recovery = if (request is Request.Rebuild) request
+                else Request.Rebuild((base?.items?.size ?: 0) + 1)
+            activeRequest = recovery
+            // One quiet recovery attempt per operation, not an unbounded retry loop.
+            rebuild(query, recovery.minimumItems)
         }
-        check(items.distinctBy(MusicItem::key).size == items.size)
-        check(items.size <= page.resultCount)
-        check((page.nextCursor != null) == (items.size < page.resultCount))
-        if (page.nextCursor != null) {
-            check(page.items.isNotEmpty())
-            if (request is Request.Next) check(page.nextCursor !in seenCursors)
+    }
+
+    private suspend fun rebuild(query: String, minimumItems: Int): SearchResultSnapshot {
+        var staged = readFirst(query)
+        while (staged.items.size < minimumItems) {
+            val cursor = staged.nextCursor ?: break
+            staged = readNext(staged, cursor)
         }
-        return items
+        // Publish only a complete fresh prefix through the old depth plus a new page.
+        return staged
+    }
+
+    private suspend fun readFirst(query: String): SearchResultSnapshot {
+        val page = api.search(query)
+        currentCoroutineContext().ensureActive()
+        return SearchResultSnapshot.first(page)
+    }
+
+    private suspend fun readNext(base: SearchResultSnapshot, cursor: String): SearchResultSnapshot {
+        val page = api.next(cursor)
+        currentCoroutineContext().ensureActive()
+        return base.append(cursor, page)
     }
 
     private fun cancelRequests() {
@@ -197,7 +218,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
 }
 
 internal fun searchErrorMessage(code: SearchErrorCode): String = when (code) {
-    SearchErrorCode.SEARCH_EXPIRED -> "Search expired. Search again to refresh results."
+    SearchErrorCode.SEARCH_EXPIRED -> "Can’t load search results. Try again."
     SearchErrorCode.SEARCH_INDEX_NOT_READY -> "The search index isn’t ready yet."
     SearchErrorCode.SEARCH_UNAVAILABLE -> "Search is unavailable."
     SearchErrorCode.SEARCH_BUSY -> "Search is busy. Try again shortly."

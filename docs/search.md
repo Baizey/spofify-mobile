@@ -11,20 +11,23 @@ the Search tab does not call it or fall back to it.
 
 `core.search.SearchClient` owns validated account/session-bound requests and safe
 failures. `SearchViewModel` owns the editable query, debounce, accepted snapshot
-prefix, continuation cursors and interrupted/retry requests. A changed query or
-paused screen cancels pending work and retires its generation; stale successes,
-failures and cleanup cannot change the successor request.
+prefix, continuation cursors and interrupted/retry requests. `SearchResultSnapshot`
+validates accepted and staged coherent prefixes. A changed query or paused screen
+cancels pending work and retires its generation; stale successes, failures and
+cleanup cannot change the successor request. Paused state also blocks new paging
+admission, including reentrant requests from scroll observers during disposal.
 
 After the 300 ms debounce, the tab requests one unfiltered mixed-kind first page
 with a limit of 25. It retains the exact returned order: there are no local type
 boosts, per-kind quotas, substring sorting or client transliteration. The existing
 reverse-layout list places the first, highest-ranked result nearest the search
 field; subsequent weaker pages extend upward without reordering the prefix. An
-accepted first page resets the list anchor, preventing the previous loading-status
-row from anchoring the viewport at the weak end. A local presentation token, not
-a server timestamp/version, owns that reset; cursor appends keep their scroll
-position. Artwork, detail navigation, queue actions, row feedback and IME-aware chrome remain
-owned by the existing native components. A new focus intent clears the old query
+accepted first page for a new user query resets the list anchor, preventing the
+previous loading-status row from anchoring the viewport at the weak end. A local
+presentation token, not a server timestamp/version, owns that reset; cursor appends
+and quiet cache recovery keep their scroll position. Artwork, detail navigation,
+queue actions, row feedback and IME-aware chrome remain owned by the existing
+native components. A new focus intent clears the old query
 before lifecycle recovery can issue an obsolete read.
 
 ## Snapshot continuation
@@ -41,19 +44,36 @@ that timestamp and count, add unique kind/ID identities, advance the cursor and
 account for the retained count. Cyclic cursors, empty nonterminal pages, changed
 snapshot metadata and incomplete terminal pages never publish a partial append.
 
-A failed continuation keeps the accepted prefix and retries the same cursor only
-on user action. Expired or inconsistent snapshots offer **Search again**. A fresh
-first page replaces, rather than appends to, the old prefix; the old rows remain
-visible until that replacement succeeds. Returning to an interrupted read resumes
-its first-page/cursor operation; returning to a completed or failed view does not
-silently rerun it.
+Paging is automatic near the weak end of the reverse list, with a five-row
+prefetch margin and no normal **More results** button. The scroll observer requires
+a measured current layout, a continuation cursor, an active view and no loading
+or error state. Cursor/count changes re-arm it even if a fast response conflates
+a loading frame. It does not repeatedly retry failures or fetch against stale
+layout measurements.
+
+Cache expiry is internal protocol maintenance, not a user-facing search state.
+An expired cursor quietly starts a fresh search and stages coherent pages through
+the previously loaded depth plus another page, or until the fresh results end.
+The old rows remain visible while this work runs; only the complete fresh prefix
+replaces them. Fresh pages never append to the old snapshot. Stable row keys and
+an unchanged presentation token preserve the viewport when those results still
+exist; catalogue changes that remove the visible row can necessarily change its
+position. No local-clock deadline clears results.
+
+Each operation permits only one automatic expiry recovery attempt. Further expiry,
+network/service failure or invalid data retains the old prefix and offers generic
+**Retry**, without exposing cache-expiry language. An ordinary failed continuation
+retries its cursor; an interrupted or failed rebuild restarts coherent staging to
+the same target depth. Returning to a completed or failed view does not silently
+rerun it. No query read occurs while the view is paused.
 
 ## Errors and trust boundaries
 
-Index-not-ready, unavailable, busy, expired, invalid-response and connection errors
-are distinct from successful empty results. UI notices use fixed client text, never
-backend diagnostics. No status retry or old-search fallback hides an unconfigured
-service. Index maintenance remains an explicit server administrator operation.
+Index-not-ready, unavailable, busy, invalid-response and connection errors are
+distinct from successful empty results. UI notices use fixed client text, never
+backend diagnostics. Exhausted cache recovery uses a generic load failure rather
+than an expiration notice. No automatic 503 retry or old-search fallback hides an
+unconfigured service. Index maintenance remains an explicit server administrator operation.
 
 The GET transport prevents automatic 408/421/503 status follow-ups. Search explicitly
 opts into bounded JSON 503 diagnostics, at most 8 KiB, so stable search codes survive.
@@ -78,7 +98,7 @@ search never selects an output, fabricates playback success or replays commands.
 
 Contract tests exercise local HTTP fixtures, parsing, account retirement, safe
 error handling and absence of status replay. View-model tests cover order, debounce,
-continuation consistency, explicit restart, lifecycle recovery and stale/reentrant
-asynchronous ownership. These tests do not measure production relevance or latency,
+continuation consistency, atomic cache recovery, automatic scroll paging,
+lifecycle recovery and stale/reentrant asynchronous ownership. These tests do not measure production relevance or latency,
 prove index readiness, or replace device acceptance. No live-server performance
 claim follows from fewer requests or synthetic fixtures.

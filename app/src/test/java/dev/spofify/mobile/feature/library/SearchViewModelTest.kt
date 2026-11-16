@@ -143,7 +143,6 @@ class SearchViewModelTest {
         assertEquals(first, model.state.value.items)
         assertEquals(SearchErrorCode.SEARCH_BUSY, model.state.value.error)
         assertFalse(model.state.value.empty)
-        assertFalse(model.state.value.retryStartsOver)
         model.more()
         advanceUntilIdle()
         assertEquals(1, api.cursors.size)
@@ -155,47 +154,65 @@ class SearchViewModelTest {
         assertNull(model.state.value.error)
     }
 
-    @Test fun expiredContinuationNeedsExplicitRestartAndNeverMixesSnapshots() = runTest(dispatcher) {
+    @Test fun expiredContinuationQuietlyStagesTheWholeFreshPrefixAndKeepsTheAnchor() = runTest(dispatcher) {
         val prefix = batch(0, 25)
-        val gate = CompletableDeferred<Unit>()
-        val fresh = listOf(item(MusicKind.ALBUM, "fresh"))
+        val firstGate = CompletableDeferred<Unit>()
+        val suffixGate = CompletableDeferred<Unit>()
+        val freshPrefix = prefix.map { it.copy(name = "Fresh ${it.name}") }
+        val suffix = batch(25, 2)
+        val freshExpiry = expiry.plusSeconds(60)
         val api = Api().apply {
-            first = { page(prefix, 26, "old-cursor") }
-            continuation = { throw SearchException(SearchErrorCode.SEARCH_EXPIRED, 410) }
+            first = {
+                if (firstRequests.size == 1) page(prefix, 27, "old-cursor")
+                else {
+                    firstGate.await()
+                    page(freshPrefix, 27, "fresh-cursor", freshExpiry)
+                }
+            }
+            continuation = { cursor ->
+                when (cursor) {
+                    "old-cursor" -> throw SearchException(SearchErrorCode.SEARCH_EXPIRED, 410)
+                    "fresh-cursor" -> {
+                        suffixGate.await()
+                        page(suffix, 27, expiresAt = freshExpiry)
+                    }
+                    else -> error("Unexpected cursor")
+                }
+            }
         }
         val model = model(api)
         model.query("love")
         advanceUntilIdle()
+        val scrollToken = model.state.value.scrollResetToken
         model.more()
-        advanceUntilIdle()
-        assertEquals(prefix, model.state.value.items)
-        assertEquals(SearchErrorCode.SEARCH_EXPIRED, model.state.value.error)
-        assertTrue(model.state.value.retryStartsOver)
-        assertNull(model.state.value.nextCursor)
-        model.resume()
-        advanceUntilIdle()
-        assertEquals(1, api.firstRequests.size)
-        api.first = {
-            gate.await()
-            page(fresh, expiresAt = expiry.plusSeconds(60))
-        }
-        model.retry()
         runCurrent()
-        assertTrue(model.state.value.busy)
         assertEquals(prefix, model.state.value.items)
-        gate.complete(Unit)
+        assertTrue(model.state.value.busy)
+        assertNull(model.state.value.error)
+        firstGate.complete(Unit)
+        runCurrent()
+        assertEquals(prefix, model.state.value.items)
+        assertEquals(expiry, model.state.value.expiresAt)
+        suffixGate.complete(Unit)
         advanceUntilIdle()
         assertEquals(2, api.firstRequests.size)
-        assertEquals(listOf("old-cursor"), api.cursors)
-        assertEquals(fresh, model.state.value.items)
-        assertEquals(expiry.plusSeconds(60), model.state.value.expiresAt)
+        assertEquals(listOf("old-cursor", "fresh-cursor"), api.cursors)
+        assertEquals(freshPrefix + suffix, model.state.value.items)
+        assertEquals(freshExpiry, model.state.value.expiresAt)
+        assertEquals(scrollToken, model.state.value.scrollResetToken)
         assertNull(model.state.value.error)
     }
 
-    @Test fun restartedFirstPageResetsScrollingEvenWhenServerExpiryIsUnchanged() = runTest(dispatcher) {
+    @Test fun onlyANewUserQueryResetsScrollingNotQuietCacheRecovery() = runTest(dispatcher) {
         val api = Api().apply {
-            first = { page(batch(0, 25), 27, "cursor-a") }
-            continuation = { throw SearchException(SearchErrorCode.SEARCH_EXPIRED, 410) }
+            first = { query ->
+                if (query == "other") page(listOf(item(MusicKind.ALBUM, "other")))
+                else page(batch(0, 25), 27, if (firstRequests.size == 1) "old" else "fresh")
+            }
+            continuation = { cursor ->
+                if (cursor == "old") throw SearchException(SearchErrorCode.SEARCH_EXPIRED, 410)
+                page(batch(25, 2), 27)
+            }
         }
         val model = model(api)
         model.query("love")
@@ -203,11 +220,13 @@ class SearchViewModelTest {
         val originalToken = model.state.value.scrollResetToken
         model.more()
         advanceUntilIdle()
-        assertEquals(originalToken, model.state.value.scrollResetToken)
-        model.retry()
-        advanceUntilIdle()
         assertEquals(expiry, model.state.value.expiresAt)
+        assertEquals(27, model.state.value.items.size)
+        assertEquals(originalToken, model.state.value.scrollResetToken)
+        model.query("other")
+        advanceUntilIdle()
         assertTrue(model.state.value.scrollResetToken > originalToken)
+        assertEquals(listOf("other"), model.state.value.items.map { it.id })
     }
 
     @Test fun inconsistentContinuationNeverPublishesAPartialOrMixedSnapshot() = runTest(dispatcher) {
@@ -233,8 +252,10 @@ class SearchViewModelTest {
             advanceUntilIdle()
             assertEquals(prefix, model.state.value.items)
             assertEquals(SearchErrorCode.INVALID_RESPONSE, model.state.value.error)
-            assertTrue(model.state.value.retryStartsOver)
+            model.more()
+            advanceUntilIdle()
             assertEquals(1, api.firstRequests.size)
+            assertEquals(1, api.cursors.size)
         }
     }
 
@@ -269,7 +290,8 @@ class SearchViewModelTest {
             assertTrue(model.state.value.items.isEmpty())
             model.resume()
             advanceUntilIdle()
-            assertEquals(1, api.firstRequests.size)
+            assertEquals(if (code == SearchErrorCode.SEARCH_EXPIRED) 2 else 1, api.firstRequests.size)
+            assertFalse(searchErrorMessage(code).contains("expired", ignoreCase = true))
             api.first = { page(emptyList()) }
             model.retry()
             advanceUntilIdle()
@@ -480,6 +502,46 @@ class SearchViewModelTest {
         assertEquals(1, api.firstRequests.size)
         assertTrue(api.cursors.isEmpty())
         assertEquals("cursor-a", model.state.value.nextCursor)
+    }
+
+    @Test fun pausedViewRejectsPagingAndDefersEditedQueriesUntilResume() = runTest(dispatcher) {
+        val api = Api().apply { first = { query -> page(batch(0, 25), 27, "$query-cursor") } }
+        val model = model(api)
+        model.query("old")
+        advanceUntilIdle()
+        model.pause()
+        model.more()
+        model.query("new")
+        advanceUntilIdle()
+        assertTrue(model.state.value.paused)
+        assertFalse(model.state.value.busy)
+        assertEquals(1, api.firstRequests.size)
+        assertTrue(api.cursors.isEmpty())
+        model.resume()
+        advanceUntilIdle()
+        assertFalse(model.state.value.paused)
+        assertEquals(listOf("old", "new"), api.firstRequests.map { it.first })
+        assertEquals("new-cursor", model.state.value.nextCursor)
+    }
+
+    @Test fun pausePublicationCannotAdmitAReentrantPagingRequest() = runTest(dispatcher) {
+        val api = Api().apply { first = { page(batch(0, 25), 27, "cursor-a") } }
+        val model = model(api)
+        model.query("love")
+        advanceUntilIdle()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            model.state.collect { current ->
+                if (current.paused && current.hasMore) model.more()
+            }
+        }
+        model.pause()
+        advanceUntilIdle()
+        assertTrue(model.state.value.paused)
+        assertTrue(api.cursors.isEmpty())
+        model.resume()
+        advanceUntilIdle()
+        assertFalse(model.state.value.paused)
+        assertEquals(1, api.firstRequests.size)
     }
 
     @Test fun manualArtistNamesAndFocusIntentsSurviveTheNewSearchContract() = runTest(dispatcher) {

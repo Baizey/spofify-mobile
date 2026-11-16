@@ -23,7 +23,7 @@ internal object SearchParser {
         require(root.keys.all { it in setOf("items", "resultCount", "expiresAt", "nextCursor") })
         val count = root.getValue("resultCount") as? JsonPrimitive ?: error("Invalid count")
         require(!count.isString && integer.matches(count.content))
-        val resultCount = count.content.toInt().also { require(it in 0..300) }
+        val resultCount = count.content.toInt().also { require(it in 0..MAX_RETAINED_SEARCH_RESULTS) }
         val wireItems = root.getValue("items") as? JsonArray ?: error("Invalid items")
         require(wireItems.size <= 100 && wireItems.size <= resultCount)
         val items = wireItems.map(PositiveMusicItemProjection::decode)

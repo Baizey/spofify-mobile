@@ -4,6 +4,9 @@ import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
 import java.time.Instant
 
+/** The service retains at most this many ranked results per snapshot, not all matches. */
+const val MAX_RETAINED_SEARCH_RESULTS = 300
+
 interface SearchApi {
     suspend fun search(query: String, kind: MusicKind? = null, limit: Int = 25): SearchPage
     suspend fun next(cursor: String): SearchPage
