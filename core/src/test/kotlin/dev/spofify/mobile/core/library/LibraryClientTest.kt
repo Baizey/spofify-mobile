@@ -5,6 +5,13 @@ import dev.spofify.mobile.core.http.OkHttpAuthApi
 import dev.spofify.mobile.core.origin.ServerOrigin
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.*
@@ -48,6 +55,156 @@ class LibraryClientTest {
         .setHeader("Content-Type", "application/json").setBody(body)
     private fun page(kind: String = "track", availability: String = "\"hasAudio\":true") =
         """{"items":[{"kind":"$kind","id":"one","name":"Love",$availability,"coverage":{"tracks":1,"inLibrary":1}}],"total":1,"limit":10,"offset":0,"revision":1}"""
+
+    private val manualAlbumId = "manual-album-fixture"
+    private val manualAlbumArtist = Artist("manual-artist-fixture", "Manual artist")
+
+    private fun manualItem(role: String, kind: String, id: String, artists: List<Artist>): JsonObject =
+        buildJsonObject {
+            put("kind", kind)
+            put("id", id)
+            put("name", if (kind == "album") "Manual album" else "Manual recording")
+            put("source", "manual")
+            putJsonArray("artists") {
+                artists.forEach { artist ->
+                    add(buildJsonObject {
+                        put("id", artist.id)
+                        put("name", artist.name)
+                    })
+                }
+            }
+            if (kind == "track") {
+                put("albumId", manualAlbumId)
+                put("albumName", "Manual album")
+                put("durationMs", 180_000)
+                put("trackNumber", 1)
+            }
+            if (role == "admin") {
+                if (kind == "track") put("libraryPath", "private-manual-recording.flac")
+            } else {
+                put("hasAudio", kind == "track")
+            }
+            putJsonObject("coverage") {
+                put("tracks", if (kind == "album") 2 else 1)
+                put("inLibrary", if (kind == "album") 2 else 1)
+            }
+        }
+
+    private fun libraryPage(items: List<JsonObject>, limit: Int): String = buildJsonObject {
+        putJsonArray("items") { items.forEach { add(it) } }
+        put("total", items.size)
+        put("limit", limit)
+        put("offset", 0)
+        put("revision", 1)
+    }.toString()
+
+    @Test fun manualAlbumAndTrackReadsPreserveNameOnlyCreditsForBothRoles() = runBlocking {
+        for (role in listOf("user", "admin")) {
+            fixture(role) { server, sessions, identity ->
+                val api = LibraryClient(sessions, identity)
+                val album = manualItem(role, "album", manualAlbumId, listOf(manualAlbumArtist))
+                server.enqueue(json(libraryPage(listOf(album), 10)))
+                assertEquals(manualAlbumId, api.search(MusicKind.ALBUM, "Manual album").items.single().id)
+                server.enqueue(json(buildJsonObject {
+                    put("item", album)
+                    put("revision", 1)
+                }.toString()))
+                assertEquals(listOf(manualAlbumArtist), api.detail(MusicKind.ALBUM, manualAlbumId).artists)
+
+                val mixedCredits = listOf(Artist("", "独立 artist"), Artist("catalog-artist", "Known artist"))
+                val nameOnlyCredits = listOf(Artist("", "Manual artist"))
+                val tracks = listOf(
+                    manualItem(role, "track", "manual-one", mixedCredits),
+                    manualItem(role, "track", "manual-two", nameOnlyCredits),
+                )
+                server.enqueue(json(libraryPage(tracks, 40)))
+                val page = api.albumTracks(manualAlbumId)
+                assertEquals(listOf("manual-one", "manual-two"), page.items.map { it.id })
+                assertEquals(mixedCredits, page.items[0].artists)
+                assertEquals(nameOnlyCredits, page.items[1].artists)
+                assertTrue(page.items.all { it.hasAudio })
+                assertFalse(page.toString().contains("private-manual-recording.flac"))
+                assertFalse(page.hasMore)
+
+                server.enqueue(json(buildJsonObject {
+                    put("item", tracks.first())
+                    put("revision", 1)
+                }.toString()))
+                assertEquals(mixedCredits, api.detail(MusicKind.TRACK, "manual-one").artists)
+            }
+        }
+    }
+
+    @Test fun trackSearchPreservesNameOnlyAndVerifiedArtistCreditsForBothRoles() = runBlocking {
+        for (role in listOf("user", "admin")) {
+            fixture(role) { server, sessions, identity ->
+                val credits = listOf(Artist("known-artist", "Known artist"), Artist("", "Manual guest"))
+                val track = manualItem(role, "track", "manual-one", credits)
+                server.enqueue(json(libraryPage(listOf(track), 10)))
+                val item = LibraryClient(sessions, identity).search(MusicKind.TRACK, "Manual recording").items.single()
+                assertEquals(credits, item.artists)
+                assertEquals(manualAlbumId, item.albumId)
+                assertTrue(item.hasAudio)
+            }
+        }
+    }
+
+    @Test fun nonemptyArtistIdsRemainValidatedForBothRoles() = runBlocking {
+        for (role in listOf("user", "admin")) {
+            fixture(role) { server, sessions, identity ->
+                val api = LibraryClient(sessions, identity)
+                for (invalidId in listOf(" ", "bad\nartist", "bad\u0000artist", "a".repeat(513), "é".repeat(257))) {
+                    val track = manualItem(role, "track", "manual-one", listOf(Artist(invalidId, "Artist")))
+                    server.enqueue(json(libraryPage(listOf(track), 40)))
+                    assertTrue(runCatching { api.albumTracks(manualAlbumId) }.exceptionOrNull() is IllegalArgumentException)
+                }
+                val credits = listOf(Artist("", "Manual guest"), Artist("é".repeat(256), "Known artist"))
+                server.enqueue(json(libraryPage(listOf(manualItem(role, "track", "manual-one", credits)), 40)))
+                assertEquals(credits, api.albumTracks(manualAlbumId).items.single().artists)
+            }
+        }
+    }
+
+    @Test fun nameOnlyCreditsDoNotMakeMissingOrNullArtistFieldsValid() = runBlocking {
+        fixture { server, sessions, identity ->
+            val api = LibraryClient(sessions, identity)
+            val track = manualItem("user", "track", "manual-one", emptyList())
+            val malformedCredits = listOf(
+                buildJsonObject { put("name", "Artist") },
+                buildJsonObject {
+                    put("id", JsonNull)
+                    put("name", "Artist")
+                },
+                buildJsonObject { put("id", "") },
+            )
+            for (credit in malformedCredits) {
+                val malformed = JsonObject(track + ("artists" to buildJsonArray { add(credit) }))
+                server.enqueue(json(libraryPage(listOf(malformed), 40)))
+                assertTrue(runCatching { api.albumTracks(manualAlbumId) }.isFailure)
+            }
+        }
+    }
+
+    @Test fun entityAndRequestIdsRemainMandatory() = runBlocking {
+        fixture { server, sessions, identity ->
+            val api = LibraryClient(sessions, identity)
+            for (kind in MusicKind.entries) {
+                val wireKind = when (kind) {
+                    MusicKind.ARTIST -> "artist"
+                    MusicKind.ALBUM -> "album"
+                    MusicKind.TRACK -> "track"
+                }
+                val item = manualItem("user", wireKind, "", listOf(Artist("", "Manual artist")))
+                server.enqueue(json(libraryPage(listOf(item), 10)))
+                assertTrue(runCatching { api.search(kind, "Manual") }.exceptionOrNull() is IllegalArgumentException)
+            }
+            val requests = server.requestCount
+            assertTrue(runCatching { api.albumTracks("") }.exceptionOrNull() is IllegalArgumentException)
+            assertTrue(runCatching { api.artistAlbums("") }.exceptionOrNull() is IllegalArgumentException)
+            assertTrue(runCatching { api.detail(MusicKind.ALBUM, "") }.exceptionOrNull() is IllegalArgumentException)
+            assertEquals(requests, server.requestCount)
+        }
+    }
 
     @Test fun searchMatchesWorkingWebRequestAndEncodesQueryOnce() = runBlocking { fixture { server, sessions, identity ->
         server.enqueue(json(page()))

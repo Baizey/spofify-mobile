@@ -1,6 +1,7 @@
 package dev.spofify.mobile.feature.library
 
 import androidx.lifecycle.ViewModelStore
+import dev.spofify.mobile.core.library.Artist
 import dev.spofify.mobile.core.library.LibraryApi
 import dev.spofify.mobile.core.library.LibraryException
 import dev.spofify.mobile.core.library.MusicItem
@@ -61,6 +62,29 @@ class DetailViewModelTest {
         assertEquals("200", model.state.value.rows.last().id)
         assertTrue(model.state.value.loaded)
         assertNull(model.state.value.nextOffset)
+    }
+
+    @Test fun manualAlbumPublishesEveryTrackWithoutDiscardingNameOnlyCredits() = runTest(dispatcher) {
+        val credits = listOf(Artist("", "Manual artist"), Artist("known-artist", "Known guest"))
+        val api = Api().apply {
+            readDetail = {
+                item(MusicKind.ALBUM, "collection").copy(
+                    artists = listOf(Artist("manual-artist-group", "Manual artist")),
+                )
+            }
+            readPage = { offset ->
+                val page = page(offset, 41)
+                page.copy(items = page.items.map { it.copy(artists = credits) })
+            }
+        }
+        val model = model(api)
+        advanceUntilIdle()
+        assertTrue(model.state.value.loaded)
+        assertFalse(model.state.value.failed)
+        assertEquals(listOf(0, 40), api.offsets)
+        assertEquals((0..40).map(Int::toString), model.state.value.rows.map { it.id })
+        assertTrue(model.state.value.rows.all { it.artists == credits && it.hasAudio })
+        assertEquals("manual-artist-group", model.state.value.item?.artists?.single()?.id)
     }
 
     @Test fun incompleteAlbumCannotReplaceAConsistentSnapshot() = runTest(dispatcher) {

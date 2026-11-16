@@ -71,8 +71,9 @@ internal fun MusicActionsSheet(
             if (item.kind == MusicKind.TRACK) {
                 SheetGroup("Library")
                 SheetAction("Add to playlist", SpofifyGlyph.Plus, item.hasAudio) { adding = true }
-                if (item.artists.isNotEmpty() || item.albumId.isNotBlank()) SheetGroup("Go to")
-                item.artists.forEach { artist ->
+                val navigableArtists = item.artists.filter { it.id.isNotBlank() }
+                if (navigableArtists.isNotEmpty() || item.albumId.isNotBlank()) SheetGroup("Go to")
+                navigableArtists.forEach { artist ->
                     SheetAction(artist.name, SpofifyGlyph.Artist) {
                         onDismiss()
                         onNavigate(MusicKind.ARTIST, artist.id)

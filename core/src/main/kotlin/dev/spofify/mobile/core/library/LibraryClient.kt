@@ -10,6 +10,7 @@ import kotlinx.serialization.json.Json
 /** Entity names match the documented API, including the web client's grouped Search. */
 enum class MusicKind(val plural: String) { ARTIST("artists"), ALBUM("albums"), TRACK("tracks") }
 
+/** An empty [id] is a name-only credit, not an artist navigation target. */
 data class Artist(val id: String, val name: String)
 data class MusicItem(
     val kind: MusicKind,
@@ -113,8 +114,12 @@ class LibraryClient(private val sessions: SessionRepository, private val identit
         // Consume the former here only; operational paths never enter presentation state.
         val audio = wire.hasAudio ?: if (sessions.isAdministrator(identity)) !wire.libraryPath.isNullOrEmpty()
             else throw IllegalArgumentException("Missing audio availability")
+        // Manual credits may lack an identity; nonempty IDs must still be valid.
+        val artists = wire.artists.map { artist ->
+            Artist(if (artist.id.isEmpty()) "" else validId(artist.id), artist.name)
+        }
         return MusicItem(kind, validId(wire.id), wire.name,
-            wire.artists.map { Artist(validId(it.id), it.name) }, wire.albumId, wire.albumName,
+            artists, wire.albumId, wire.albumName,
             wire.releaseDate, wire.durationMs, wire.trackNumber, audio,
             wire.coverage.inLibrary, wire.coverage.tracks, wire.genres)
     }
