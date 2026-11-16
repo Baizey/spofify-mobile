@@ -20,6 +20,8 @@ class NativePreparationTest {
         assertEquals(AudioResult.OK, preparation.outcome(Player.STATE_ENDED, false, 120_000))
         assertFalse(preparation.reportsNativeEnd(Player.STATE_ENDED, false, 120_000))
         assertFalse(preparation.result.isCompleted)
+        preparation.result.complete(AudioResult.OK)
+        assertFalse(preparation.reportsNativeEnd(Player.STATE_ENDED, false, 120_000))
     }
 
     @Test fun millisecondConversionRoundingDoesNotLeaveEofPreparationHanging() {

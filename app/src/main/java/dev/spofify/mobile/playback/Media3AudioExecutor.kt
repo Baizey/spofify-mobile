@@ -40,6 +40,8 @@ internal class Media3AudioExecutor(
     private var generation = 0L
     private var preparation: NativePreparation? = null
     private var endedBinding: AudioBinding? = null
+    // A late EOF after stopped setup is not a new traversal, even after its readiness waiter completes.
+    private var traversalBinding: AudioBinding? = null
     private var blocked = false
     private var released = false
     private var playbackAuthority: (() -> Boolean)? = null
@@ -53,7 +55,7 @@ internal class Media3AudioExecutor(
             val state = player.playbackState
             val hasError = player.playerError != null
             if (events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED) && state == Player.STATE_ENDED && !hasError &&
-                (pending == null || pending.reportsNativeEnd(state, hasError, player.duration))) endedBinding = current
+                traversalBinding == current && (pending == null || pending.reportsNativeEnd(state, hasError, player.duration))) endedBinding = current
             pending?.outcome(state, hasError, player.duration)?.let { outcome ->
                 if (state == Player.STATE_ENDED) Log.i("SpofifyPlayer",
                     "Native terminal preparation: playRequested=${pending.playRequested}, result=$outcome")
@@ -109,6 +111,7 @@ internal class Media3AudioExecutor(
         checkThread()
         pause()
         binding = next
+        traversalBinding = next.takeIf { playRequested }
         endedBinding = null
         blocked = false
         val token = generation
@@ -153,6 +156,7 @@ internal class Media3AudioExecutor(
         checkThread()
         generation++
         playbackAuthority = null
+        traversalBinding = null
         val pending = preparation
         preparation = null
         pending?.result?.cancel()
