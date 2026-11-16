@@ -83,45 +83,73 @@ internal fun MusicRow(
     onOpen: () -> Unit,
 ) {
     var menu by remember(item.key) { mutableStateOf(false) }
-    SwipeActionSurface(binding = gestureBinding, onRight = onQueue) {
+    val geometry = MusicRowGeometry(numbered = trackNumber != null)
+    val hasMore = onMore != null || onQueue != null || onPlayNext != null
+    SwipeActionSurface(binding = gestureBinding, onRight = onQueue,
+        excludeEnd = geometry.swipeEndExclusion(hasMore).dp) {
         Surface(color = containerColor) {
-            Column {
-                Row(Modifier.fillMaxWidth().heightIn(min = 72.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Row(Modifier.weight(1f).heightIn(min = 70.dp).clickable(role = Role.Button, onClick = onOpen)
-                        .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(if (trackNumber != null) 10.dp else 13.dp)) {
-                        if (trackNumber != null) Text(trackNumber.toString(), Modifier.width(22.dp),
+            // The parent owns the full-row press indication, including both gutters and More's column.
+            // IconButton consumes its own click; it never bubbles a second Play/Open to this parent.
+            Column(Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onOpen)) {
+                Row(Modifier.fillMaxWidth().heightIn(min = MusicRowGeometry.MIN_HEIGHT.dp)
+                    .padding(horizontal = geometry.gutter.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    if (trackNumber != null) {
+                        Text(trackNumber.toString(), Modifier.width(MusicRowGeometry.NUMBER_WIDTH.dp),
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        MusicArtwork(item, loader)
-                        Column(Modifier.weight(1f)) {
-                            Text(item.name.ifBlank { "Unknown title" }, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 14.7.sp, lineHeight = 19.1.sp,
-                                    fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold))
-                            val credit = item.artists.joinToString(", ") { it.name }
-                            val subtitle = when (item.kind) {
-                                MusicKind.ARTIST -> "Artist"
-                                MusicKind.ALBUM -> if (credit.isBlank()) "Album" else "$credit · Album"
-                                MusicKind.TRACK -> credit
-                            }
-                            Text(subtitle, Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall.copy(lineHeight = 16.8.sp),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
+                        Spacer(Modifier.width(MusicRowGeometry.NUMBER_GAP.dp))
                     }
-                    if (reservePopularity) Spacer(Modifier.width(24.dp).height(48.dp))
-                    if (onMore != null || onQueue != null || onPlayNext != null) Box(Modifier.width(40.dp)) {
-                        IconButton({ if (onMore != null) onMore() else menu = true }, Modifier.size(48.dp)) {
-                            SpofifyIcon(SpofifyGlyph.More, "More actions for ${item.name}")
+                    MusicArtwork(item, loader, Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp))
+                    Spacer(Modifier.width(geometry.identityGap.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(item.name.ifBlank { "Unknown title" }, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodyLarge.copy(fontSize = 14.7.sp, lineHeight = 19.1.sp,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold))
+                        val credit = item.artists.joinToString(", ") { it.name }
+                        val subtitle = when (item.kind) {
+                            MusicKind.ARTIST -> "Artist"
+                            MusicKind.ALBUM -> if (credit.isBlank()) "Album" else "$credit · Album"
+                            MusicKind.TRACK -> credit
                         }
-                        DropdownMenu(menu, onDismissRequest = { menu = false }) {
-                            onQueue?.let { queue -> DropdownMenuItem(text = { Text("Queue") }, onClick = { menu = false; queue() }) }
-                            onPlayNext?.let { next -> DropdownMenuItem(text = { Text("Play next") }, onClick = { menu = false; next() }) }
+                        Text(subtitle, Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall.copy(lineHeight = 16.8.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    if (reservePopularity) Spacer(Modifier.width(MusicRowGeometry.POPULARITY_SLOT.dp)
+                        .height(MusicRowGeometry.ACTION_SLOT.dp))
+                    Box(Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
+                        if (hasMore) {
+                            IconButton({ if (onMore != null) onMore() else menu = true }, Modifier.fillMaxSize()) {
+                                SpofifyIcon(SpofifyGlyph.More, "More actions for ${item.name}")
+                            }
+                            DropdownMenu(menu, onDismissRequest = { menu = false }) {
+                                onQueue?.let { queue -> DropdownMenuItem(text = { Text("Queue") }, onClick = { menu = false; queue() }) }
+                                onPlayNext?.let { next -> DropdownMenuItem(text = { Text("Play next") }, onClick = { menu = false; next() }) }
+                            }
                         }
                     }
                 }
-                HorizontalDivider(color = MaterialTheme.colorScheme.surface)
+                HorizontalDivider(Modifier.padding(horizontal = geometry.gutter.dp), color = MaterialTheme.colorScheme.surface)
             }
         }
+    }
+}
+
+/** Play occupies the artwork column; More occupies the same trailing target as every listening row. */
+@Composable
+internal fun MusicCollectionControls(
+    modifier: Modifier = Modifier,
+    numbered: Boolean = false,
+    gutter: Int = MusicRowGeometry.EDGE_GUTTER,
+    play: @Composable () -> Unit,
+    more: @Composable () -> Unit,
+) {
+    val geometry = MusicRowGeometry(numbered, gutter)
+    Row(modifier.fillMaxWidth().padding(horizontal = geometry.gutter.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (geometry.leadingWidth > 0) Spacer(Modifier.width(geometry.leadingWidth.dp))
+        Box(Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), contentAlignment = Alignment.Center) { play() }
+        Spacer(Modifier.weight(1f)) // No invented offline status; the identity/status columns remain available.
+        Box(Modifier.size(MusicRowGeometry.ACTION_SLOT.dp), contentAlignment = Alignment.Center) { more() }
     }
 }
 

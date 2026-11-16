@@ -25,6 +25,8 @@ import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.*
 import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.PlaybackController
+import dev.spofify.mobile.feature.library.MusicCollectionControls
+import dev.spofify.mobile.feature.library.MusicRowGeometry
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
 
@@ -85,20 +87,18 @@ fun PlaylistDetailScreen(
                 }
             }
             item("controls") {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                MusicCollectionControls(Modifier.padding(vertical = 12.dp),
+                    play = {
                         if (state.rows.isNotEmpty()) FilledIconButton({ context?.let { send { playback?.playCollection(it) } } },
-                            Modifier.size(48.dp), enabled = playable) {
+                            Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), enabled = playable) {
                             SpofifyIcon(SpofifyGlyph.Play, "Play ${summary?.name.orEmpty()}", Modifier.size(24.dp))
                         }
-                    }
-                    Spacer(Modifier.weight(1f).height(48.dp))
-                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                        IconButton({ menu = true }, Modifier.size(48.dp)) {
+                    },
+                    more = {
+                        IconButton({ menu = true }, Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
                             SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary?.name ?: "playlist"}", Modifier.size(24.dp))
                         }
-                    }
-                }
+                    })
             }
             val failure = state.error ?: state.message ?: actionError ?: player?.error ?:
                 if (state.loaded && !state.completeCollection) "Rules result unavailable." else null
@@ -114,11 +114,9 @@ fun PlaylistDetailScreen(
                 PersonalSongFilter(state.filter, model::filter)
             }
             items(state.visibleRows, key = { it.identity }) { row ->
-                Box(Modifier.padding(horizontal = 20.dp)) {
-                    PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
-                        onQueue = if (playable && row.reference(context) != null) ({ queueRow(row) }) else null,
-                        gestureBinding = personalGestureBinding(row, context, player))
-                }
+                PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
+                    onQueue = if (playable && row.reference(context) != null) ({ queueRow(row) }) else null,
+                    gestureBinding = personalGestureBinding(row, context, player))
             }
             if (state.noMatches) item("no-matches") {
                 Text("No matches", Modifier.padding(horizontal = 20.dp, vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)

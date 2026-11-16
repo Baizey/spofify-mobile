@@ -30,6 +30,7 @@ import dev.spofify.mobile.core.personal.PersonalPlaylistSummary
 import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.PlaybackController
 import dev.spofify.mobile.designsystem.*
+import dev.spofify.mobile.feature.library.MusicRowGeometry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -101,7 +102,7 @@ fun PlaylistsScreen(
                     Text("No playlists", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             } else LazyColumn(Modifier.fillMaxSize(), reverseLayout = true,
-                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 8.dp)) {
+                contentPadding = PaddingValues(top = 20.dp, bottom = 8.dp)) {
                 // Ascending state is used directly. reverseLayout puts A at the bottom, Z at the top.
                 items(state.items, key = { it.id }) { summary ->
                     PlaylistSummaryRow(summary,
@@ -130,28 +131,28 @@ internal fun PlaylistSummaryRow(
     gestureBinding: Any = summary,
     onClick: () -> Unit,
 ) {
-    SwipeActionSurface(binding = gestureBinding, onRight = onQueue) {
-        Column {
-            Row(Modifier.fillMaxWidth().heightIn(min = 72.dp), verticalAlignment = Alignment.CenterVertically) {
-                Row(Modifier.weight(1f).heightIn(min = 70.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-                    .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(13.dp)) {
-                    PlaylistArtwork(Modifier.size(48.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(summary.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodyLarge.copy(fontSize = 14.7.sp, lineHeight = 19.11.sp, fontWeight = FontWeight(560)))
-                        Text(playlistCount(summary), Modifier.padding(top = 3.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp, lineHeight = 16.8.sp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
+    val geometry = MusicRowGeometry()
+    SwipeActionSurface(binding = gestureBinding, onRight = onQueue,
+        excludeEnd = geometry.swipeEndExclusion(onMore != null).dp) {
+        Column(Modifier.fillMaxWidth().clickable(enabled = enabled, role = Role.Button, onClick = onClick)) {
+            Row(Modifier.fillMaxWidth().heightIn(min = MusicRowGeometry.MIN_HEIGHT.dp)
+                .padding(horizontal = geometry.gutter.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                PlaylistArtwork(Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp))
+                Spacer(Modifier.width(geometry.identityGap.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(summary.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodyLarge.copy(fontSize = 14.7.sp, lineHeight = 19.11.sp, fontWeight = FontWeight(560)))
+                    Text(playlistCount(summary), Modifier.padding(top = 3.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp, lineHeight = 16.8.sp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                onMore?.let { action -> Box(Modifier.width(40.dp)) {
-                    IconButton(action, Modifier.size(48.dp)) {
+                Box(Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
+                    onMore?.let { action -> IconButton(action, Modifier.fillMaxSize()) {
                         SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary.name}", Modifier.size(24.dp))
-                    }
-                } }
+                    } }
+                }
             }
-            HorizontalDivider(color = MaterialTheme.colorScheme.surface)
+            HorizontalDivider(Modifier.padding(horizontal = geometry.gutter.dp), color = MaterialTheme.colorScheme.surface)
         }
     }
 }

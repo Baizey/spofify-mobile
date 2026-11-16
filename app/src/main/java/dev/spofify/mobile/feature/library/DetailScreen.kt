@@ -120,10 +120,10 @@ internal fun DetailScreen(
         }
     } else {
         LazyColumn(Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 28.dp)) {
+            contentPadding = PaddingValues(top = 20.dp, bottom = 28.dp)) {
             if (item != null) {
                 item("heading") {
-                    Column {
+                    Column(Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp)) {
                         DetailHeading(item, loader, onNavigate)
                         DetailControls(item, ready && item.canPlay(), playCollection, { menuItem = item })
                         DetailActionError(actionError)
@@ -132,7 +132,8 @@ internal fun DetailScreen(
                 if (item.kind == MusicKind.TRACK) {
                     item("track-metadata") {
                         if (item.albumName.isNotBlank() && onNavigate != null && item.albumId.isNotBlank()) {
-                            TextButton({ onNavigate(MusicKind.ALBUM, item.albumId) }, contentPadding = PaddingValues(0.dp)) {
+                            TextButton({ onNavigate(MusicKind.ALBUM, item.albumId) },
+                                Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp), contentPadding = PaddingValues(0.dp)) {
                                 Text(item.albumName)
                             }
                         }
@@ -147,7 +148,9 @@ internal fun DetailScreen(
                     onMore = { if (onMore != null) onMore(row, context) else menuItem = row },
                 ) { playRow(row) }
             }
-            item("load-state") { DetailLoadState(state, model) }
+            item("load-state") {
+                Box(Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp)) { DetailLoadState(state, model) }
+            }
         }
     }
 
@@ -257,21 +260,20 @@ private fun DetailSongMenuHeading(item: MusicItem, loader: ImageLoader) {
 
 @Composable
 private fun DetailControls(item: MusicItem, playable: Boolean, onPlay: () -> Unit, onMore: () -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+    // Heading content already has the same edge gutter as the full-width rows below it.
+    MusicCollectionControls(Modifier.padding(bottom = 12.dp), numbered = item.kind == MusicKind.ALBUM, gutter = 0,
+        play = {
             if (item.canPlay()) {
-                FilledIconButton(onPlay, Modifier.size(48.dp), enabled = playable, shape = CircleShape) {
+                FilledIconButton(onPlay, Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), enabled = playable, shape = CircleShape) {
                     SpofifyIcon(SpofifyGlyph.Play, "Play ${item.name}")
                 }
             }
-        }
-        Spacer(Modifier.weight(1f)) // Reserved for real offline readiness; no fabricated status.
-        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            IconButton(onMore, Modifier.size(48.dp)) {
+        },
+        more = {
+            IconButton(onMore, Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
                 SpofifyIcon(SpofifyGlyph.More, "More actions for ${item.name}")
             }
-        }
-    }
+        })
 }
 
 @Composable

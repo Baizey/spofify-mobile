@@ -79,7 +79,7 @@ internal fun SearchScreen(
     Column(Modifier.fillMaxSize()) {
         if (!editing) Box(Modifier.padding(horizontal = 20.dp)) { PageTitle("Search") }
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll, reverseLayout = true,
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp)) {
+            contentPadding = PaddingValues(top = 8.dp)) {
             items(state.items, key = MusicItem::key) { item ->
                 val playable = ready && if (item.kind == MusicKind.TRACK) item.hasAudio else item.availableTracks > 0
                 MusicRow(item, loader,
@@ -89,7 +89,8 @@ internal fun SearchScreen(
             }
             if (state.query.isNotBlank()) {
                 item("search-status") {
-                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally) {
                         state.groups.filterValues { it.failed }.forEach { (kind, _) ->
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                 Text("Can't load ${kind.plural}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)

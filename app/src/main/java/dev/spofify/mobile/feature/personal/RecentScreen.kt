@@ -22,6 +22,7 @@ import dev.spofify.mobile.core.personal.PersonalLibraryClient
 import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.PlaybackController
 import dev.spofify.mobile.core.playback.PlaybackTrackReference
+import dev.spofify.mobile.feature.library.MusicRowGeometry
 
 /** Recently played only. Retained recent rows do not establish period rankings or year completeness. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -54,15 +55,17 @@ fun RecentScreen(
     LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
     LaunchedEffect(state.items) { menu = null }
     PullToRefreshBox(state.loading, onRefresh = model::refresh, modifier = Modifier.fillMaxSize()) {
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 28.dp)) {
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(top = 20.dp, bottom = 28.dp)) {
             item("heading") {
-                Text("History", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.semantics { heading() })
-                Text("Recently played", style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(top = 24.dp, bottom = 12.dp).semantics { heading() })
-                val error = state.error ?: actionError ?: player?.error
-                if (error != null) PersonalStatus(false, error) {
-                    actionError = null
-                    model.refresh()
+                Column(Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp)) {
+                    Text("History", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.semantics { heading() })
+                    Text("Recently played", style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(top = 24.dp, bottom = 12.dp).semantics { heading() })
+                    val error = state.error ?: actionError ?: player?.error
+                    if (error != null) PersonalStatus(false, error) {
+                        actionError = null
+                        model.refresh()
+                    }
                 }
             }
             items(state.items, key = { it.track.id }) { entry ->
@@ -71,7 +74,8 @@ fun RecentScreen(
                     gestureBinding = personalGestureBinding(entry, null, player))
             }
             if (state.loaded && state.items.isEmpty()) item("empty") {
-                Text("Nothing played yet", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Nothing played yet", Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp, vertical = 16.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
