@@ -8,7 +8,6 @@ import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import kotlin.math.max
 import kotlin.math.min
 
@@ -28,13 +27,12 @@ internal fun playerLayoutBudget(
     largeText: Boolean,
     reserveLyrics: Boolean,
     lyricLineHeight: Float,
-    lyricCueHeight: Float,
 ): PlayerLayoutBudget {
-    require(listOf(width, height, header, controls, lyricLineHeight, lyricCueHeight).all { it.isFinite() && it >= 0f })
+    require(listOf(width, height, header, controls, lyricLineHeight).all { it.isFinite() && it >= 0f })
     val artCap = if (largeText) 164f else 330f
     val artFloor = min(width, 164f)
-    // Keep one full scaled line, padding and the overflow cue accessible in the fallback viewport.
-    val minimumGap = if (reserveLyrics) max(96f, lyricLineHeight + 24f + lyricCueHeight) + 8f else 16f
+    // Keep one full scaled line and its padding accessible in the fallback viewport.
+    val minimumGap = if (reserveLyrics) max(96f, lyricLineHeight + 24f) + 8f else 16f
     val fixed = header + 8f + controls
     val artwork = min(min(width, artCap), max(artFloor, height - fixed - minimumGap))
     val gap = max(minimumGap, height - fixed - artwork)
@@ -59,10 +57,9 @@ internal fun PlayerBodyLayout(
         val natural = Constraints(minWidth = width, maxWidth = width, maxHeight = Constraints.Infinity)
         val headerPlaceable = subcompose("header") { Box(Modifier.fillMaxWidth()) { header() } }.single().measure(natural)
         val controlsPlaceable = subcompose("controls") { Box(Modifier.fillMaxWidth()) { controls() } }.single().measure(natural)
-        val cueHeight = maxOf(20.dp, 15.4.sp.toDp())
         val budget = playerLayoutBudget(width.toDp().value, availableHeight.value,
             headerPlaceable.height.toDp().value, controlsPlaceable.height.toDp().value,
-            largeText, reserveLyrics, playerLyricLineHeight.toDp().value, cueHeight.value)
+            largeText, reserveLyrics, playerSupportingTextStyle.lineHeight.toDp().value)
         val artPixels = budget.artwork.dp.roundToPx()
         val headerGapPixels = 8.dp.roundToPx()
         // Use the exact pixel remainder in a fitted layout; rounding must not create a one-pixel scroll.

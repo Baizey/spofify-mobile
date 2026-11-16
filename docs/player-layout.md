@@ -6,16 +6,16 @@ player-specific changes, rather than changing that reference.
 - Actual album name sits above the artwork and opens a known album through
   the existing navigation callback. The redundant full-player More menu is removed.
 - Song title and artist remain below the lyric area, immediately before seek.
-  The artist text no longer reserves its own 48dp-high layout gap. Existing
-  navigation and song menu actions are unchanged.
-- Following the later request for substantially smaller lyrics, timed inline
-  text uses **20sp / 28sp line height**, with native font scaling. The decorative
-  lyric icon is removed and horizontal text padding is 8dp rather than 26dp.
+  The artist text no longer reserves its own 48dp-high layout gap. Artist
+  navigation remains available through the compact identity block.
+- Timed inline lyrics use the same supporting text style as album and artist:
+  **13.2sp / 17.82sp line height, normal weight**, with native font scaling.
+  The decorative lyric icon is removed and horizontal text padding is 8dp
+  rather than 26dp.
   The viewport still has a fixed height for a given layout, independent of the
   current line's length. Full text wraps and scrolls vertically without
   ellipsis, shortening, or per-line font shrinking.
-- A visible up/down “Scroll lyrics” cue appears only when the measured text
-  overflows. Space for it is reserved to avoid moving the text after measure.
+- There is no visible “Scroll lyrics” hint, arrow row, or reserved hint space.
   Tap opens the existing full lyrics sheet; vertical dragging reads the text,
   never invokes the player-dismiss gesture. Plain lyrics and timed silent gaps
   retain a direct “View lyrics” entry; pending/error states retain access to the
@@ -28,14 +28,14 @@ player-specific changes, rather than changing that reference.
 
 ## Height budget
 
-The body measures the top album/menu row and all lower controls in the same
+The body measures the top album header and all lower controls in the same
 layout pass. Safe insets and the existing 16dp top / 18dp bottom padding are
 outside that body. Inside it, the header-to-art gap is 8dp.
 
 Artwork is capped at 330dp (164dp for large text) and at available width. It
 can shrink toward 164dp to protect the controls and lyric viewport. The lyric
 viewport uses the residual gap, retaining at least one natively scaled line,
-24dp vertical text padding, the overflow cue, and an 8dp gap before identity.
+24dp vertical text padding and an 8dp gap before identity.
 Its base minimum is 96dp before that final gap. Timed clearing lines retain
 this same space, without claiming an old line is still current.
 

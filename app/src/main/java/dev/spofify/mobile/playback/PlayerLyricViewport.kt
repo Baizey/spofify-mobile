@@ -15,18 +15,11 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import dev.spofify.mobile.core.content.LyricsState
-import dev.spofify.mobile.designsystem.SpofifyGlyph
-import dev.spofify.mobile.designsystem.SpofifyIcon
 import kotlinx.coroutines.launch
-
-internal val playerLyricFontSize = 20.sp
-internal val playerLyricLineHeight = 28.sp
 
 /** Keep real text and existing retry access available after the player menu is removed. */
 internal fun lyricSheetEntryLabel(content: TrackContentState): String? {
@@ -71,12 +64,10 @@ internal fun PlayerLyricViewport(line: LyricViewportKey, height: Dp, onOpen: () 
         val scroll = rememberScrollState()
         val scope = rememberCoroutineScope()
         val density = LocalDensity.current
-        val cueHeight = maxOf(20.dp, with(density) { 15.4.sp.toDp() })
-        val textHeight = (height - cueHeight).coerceAtLeast(0.dp)
         val overflow = lyricOverflow(scroll.value, scroll.maxValue)
-        val page = with(density) { textHeight.roundToPx() }.coerceAtLeast(1)
-        val step = with(density) { playerLyricLineHeight.toPx() }.toInt().coerceAtLeast(1)
-        Column(Modifier.fillMaxWidth().height(height).clipToBounds()
+        val page = with(density) { height.roundToPx() }.coerceAtLeast(1)
+        val step = with(density) { playerSupportingTextStyle.lineHeight.toPx() }.toInt().coerceAtLeast(1)
+        Box(Modifier.fillMaxWidth().height(height).clipToBounds()
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) false else {
                     val target = when (event.key) {
@@ -103,23 +94,11 @@ internal fun PlayerLyricViewport(line: LyricViewportKey, height: Dp, onOpen: () 
                     else -> "Current lyric"
                 }
             }) {
-            Box(Modifier.fillMaxWidth().height(textHeight)) {
-                Box(Modifier.fillMaxSize().verticalScroll(scroll)) {
-                    Box(Modifier.fillMaxWidth().heightIn(min = textHeight).padding(horizontal = 8.dp, vertical = 12.dp),
-                        contentAlignment = Alignment.Center) {
-                        Text(line.text, style = MaterialTheme.typography.bodyLarge.copy(fontSize = playerLyricFontSize, lineHeight = playerLyricLineHeight,
-                            fontWeight = FontWeight.Bold), textAlign = TextAlign.Center)
-                    }
-                }
-            }
-            // Reserved space prevents the text viewport moving when overflow is first measured.
-            Row(Modifier.fillMaxWidth().height(cueHeight), verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center) {
-                if (overflow.above || overflow.below) {
-                    if (overflow.above) SpofifyIcon(SpofifyGlyph.Up, null, Modifier.size(16.dp), MaterialTheme.colorScheme.secondary)
-                    Text("Scroll lyrics", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, lineHeight = 15.4.sp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (overflow.below) SpofifyIcon(SpofifyGlyph.Down, null, Modifier.size(16.dp), MaterialTheme.colorScheme.secondary)
+            Box(Modifier.fillMaxSize().verticalScroll(scroll)) {
+                Box(Modifier.fillMaxWidth().heightIn(min = height).padding(horizontal = 8.dp, vertical = 12.dp),
+                    contentAlignment = Alignment.Center) {
+                    Text(line.text, style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle),
+                        textAlign = TextAlign.Center)
                 }
             }
         }

@@ -4,6 +4,7 @@ import dev.spofify.mobile.core.content.LyricLine
 import dev.spofify.mobile.core.content.LyricsState
 import dev.spofify.mobile.core.content.TrackLyrics
 import dev.spofify.mobile.core.content.TrackContentFailure
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import org.junit.Assert.*
 import org.junit.Test
@@ -45,16 +46,16 @@ class PlayerLayoutTest {
         assertFalse(largerControls.wholePlayerScrolls)
     }
 
-    @Test fun largeTextUsesThe164CapAndKeepsTheSuppliedMeasuredLineAndCueBudget() {
+    @Test fun largeTextUsesThe164CapAndKeepsTheSuppliedMeasuredLineAndPadding() {
         val layout = budget(height = 760f, largeText = true, controls = 320f,
-            lineHeight = 80.52f, cueHeight = 30.8f)
+            lineHeight = 80.52f)
         assertEquals(164f, layout.artwork, .01f)
         assertEquals(220f, layout.gap, .01f)
         assertFalse(layout.wholePlayerScrolls)
         val short = budget(height = 500f, largeText = true, controls = 360f,
-            lineHeight = 80.52f, cueHeight = 30.8f)
+            lineHeight = 80.52f)
         assertTrue(short.wholePlayerScrolls)
-        assertEquals(80.52f + 24f + 30.8f, short.gap - 8f, .01f)
+        assertEquals(80.52f + 24f, short.gap - 8f, .01f)
     }
 
     @Test fun narrowScreensNeverProduceArtworkWiderThanTheAvailableContent() {
@@ -73,7 +74,7 @@ class PlayerLayoutTest {
         assertEquals(timedLine, timedSilentGap)
     }
 
-    @Test fun overflowCueReflectsActualScrollRangeIncludingBothEnds() {
+    @Test fun accessibleOverflowDescriptionReflectsActualScrollRangeIncludingBothEnds() {
         assertEquals(LyricOverflow(false, false), lyricOverflow(0, 0))
         assertEquals(LyricOverflow(false, true), lyricOverflow(0, 400))
         assertEquals(LyricOverflow(true, true), lyricOverflow(200, 400))
@@ -122,13 +123,21 @@ class PlayerLayoutTest {
         assertEquals(text, lyricViewportKey(content, 1_000, 60_000)?.text)
     }
 
-    @Test fun currentInlineFontContractAndScaledLayoutUse20spAnd28sp() {
-        assertEquals(20.sp, playerLyricFontSize)
-        assertEquals(28.sp, playerLyricLineHeight)
-        val scaledLineHeight = playerLyricLineHeight.value * 2f
+    @Test fun inlineLyricsShareTheAlbumAndArtistScaleAndNormalWeight() {
+        assertEquals(13.2.sp, playerSupportingTextStyle.fontSize)
+        assertEquals(17.82.sp, playerSupportingTextStyle.lineHeight)
+        assertEquals(FontWeight.Normal, playerSupportingTextStyle.fontWeight)
         val layout = budget(height = 500f, largeText = true, controls = 360f,
-            lineHeight = scaledLineHeight, cueHeight = 30.8f)
-        assertEquals(scaledLineHeight + 24f + 30.8f, layout.gap - 8f, .01f)
+            lineHeight = playerSupportingTextStyle.lineHeight.value * 2f)
+        assertEquals(96f, layout.gap - 8f, .01f)
+        assertTrue(layout.wholePlayerScrolls)
+    }
+
+    @Test fun veryLargeScaledLyricsKeepOneFullLineAndPaddingWithoutAHintRow() {
+        val scaledLineHeight = playerSupportingTextStyle.lineHeight.value * 6f
+        val layout = budget(height = 500f, largeText = true, controls = 360f,
+            lineHeight = scaledLineHeight)
+        assertEquals(scaledLineHeight + 24f, layout.gap - 8f, .01f)
         assertTrue(layout.wholePlayerScrolls)
     }
 
@@ -175,8 +184,9 @@ class PlayerLayoutTest {
     }
 
     private fun budget(width: Float = 360f, height: Float, header: Float = 48f, controls: Float = 240f,
-        largeText: Boolean = false, reserveLyrics: Boolean = true, lineHeight: Float = playerLyricLineHeight.value, cueHeight: Float = 20f) =
-        playerLayoutBudget(width, height, header, controls, largeText, reserveLyrics, lineHeight, cueHeight)
+        largeText: Boolean = false, reserveLyrics: Boolean = true,
+        lineHeight: Float = playerSupportingTextStyle.lineHeight.value) =
+        playerLayoutBudget(width, height, header, controls, largeText, reserveLyrics, lineHeight)
 
     private fun timedContent() = TrackContentState(trackId = "track", binding = "occurrence:output", lyrics = TrackLyrics(
         "track", LyricsState.TIMED, "recording", "source", lines = listOf(

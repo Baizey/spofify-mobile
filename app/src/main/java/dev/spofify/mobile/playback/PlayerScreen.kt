@@ -92,7 +92,7 @@ internal fun FullPlayer(
                                 onNavigate?.invoke(MusicKind.ALBUM, track.albumId)
                             } else Modifier), contentAlignment = Alignment.CenterStart) {
                             if (albumLabel.isNotBlank()) Text(albumLabel,
-                                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp, lineHeight = 17.82.sp),
+                                style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     },
@@ -124,7 +124,7 @@ internal fun FullPlayer(
                                 lineHeight = 26.1.sp, fontWeight = FontWeight.Bold))
                             if (credit.isNotBlank()) Text(credit, Modifier.fillMaxWidth().padding(top = 2.dp),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp, lineHeight = 17.82.sp))
+                                style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle))
                         }
                         PlaybackSeek(state, currentContent) { controller.seek(it) }
                         Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {

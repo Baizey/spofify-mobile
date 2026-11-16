@@ -21,7 +21,8 @@ accounts and playback are fixtures, not production API contracts.
 
 The subsequently approved player changes are recorded in
 [player layout](docs/player-layout.md): album navigation above artwork, fixed-height
-scrollable 20sp lyrics with tap-to-open text instead of a menu/icon, compact
+scrollable lyrics at the 13.2sp album/artist scale with tap-to-open text and no
+menu, lyric icon or scroll hint, compact
 identity/seek spacing, and time labels aligned with Shuffle and Repeat.
 [Settings appearance](docs/settings-appearance.md) records palette ownership and
 persistence behavior. These documented changes do not rewrite the frozen reference.
