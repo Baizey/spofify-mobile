@@ -19,6 +19,11 @@ internal fun PlaybackView.isLocalTransferTarget(): Boolean =
 /** Pending target execution may legitimately arrive before the selected-connection publication. */
 internal fun PlaybackView.isLocalOutputConnection(): Boolean = isLocalSelectedConnection() || isLocalTransferTarget()
 
+/** A terminal native failure cannot keep an unpromotable FGS alive on stale server intent. */
+private fun nativePlaybackFailedWithoutWork(facts: AudioFacts, localPlayWhenReady: Boolean): Boolean =
+    (facts.error == "media" || (facts.error == "blocked" && !localPlayWhenReady)) &&
+        !facts.isPlaying && !facts.isBuffering && !facts.isLoading
+
 /** Intent and native playWhenReady retain service lifetime; neither is presented as proof of sound. */
 internal fun retainLocalPlaybackService(
     view: PlaybackView,
@@ -26,12 +31,24 @@ internal fun retainLocalPlaybackService(
     localPlayWhenReady: Boolean = false,
 ): Boolean {
     if (view.connection != PlaybackConnectionState.READY || view.connectionId.isEmpty()) return false
+    if (nativePlaybackFailedWithoutWork(facts, localPlayWhenReady)) return false
     val pendingNativePlay = localPlayWhenReady && !facts.ended
     val nativeWork = facts.isPlaying || facts.isBuffering || facts.isLoading || pendingNativePlay
     if (view.isLocalTransferTarget()) return true
     if (view.isLocalSelectedConnection()) return view.desiredPlaying || nativeWork
     return view.snapshot?.transfer?.sourceConnectionId == view.connectionId && nativeWork
 }
+
+/**
+ * Reconcile failed starts even while still selected. Ordinary paused local services
+ * may remain attached; task removal uses the stricter retention policy separately.
+ */
+internal fun shouldStopPlaybackService(
+    view: PlaybackView,
+    facts: AudioFacts,
+    localPlayWhenReady: Boolean = false,
+): Boolean = !retainLocalPlaybackService(view, facts, localPlayWhenReady) &&
+    (!view.isLocalOutputConnection() || nativePlaybackFailedWithoutWork(facts, localPlayWhenReady))
 
 /**
  * Reattach a genuinely playing/pending local executor without pausing it. A

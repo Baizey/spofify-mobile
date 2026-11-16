@@ -316,6 +316,66 @@ class PlaybackLifetimeTest {
         assertEquals(0, starts)
     }
 
+    @Test fun failedLocalStartupCannotRetainOrReattachServiceOnStaleDesiredIntent() {
+        val local = view(local = true)
+        assertTrue(local.desiredPlaying)
+        for (failure in listOf("blocked", "media")) {
+            val failed = AudioFacts(error = failure)
+            assertFalse(retainLocalPlaybackService(local, failed))
+            assertTrue(shouldStopPlaybackService(local, failed))
+            handlePlaybackServiceLoss(local, failed, false, true,
+                restartLocalService = { error("Failed startup must not reattach") },
+                pauseNative = { error("Quiescent failed startup has no native work to pause") },
+                reportLocalBlocked = { error("Cleanup must not manufacture another failure") })
+        }
+    }
+
+    @Test fun transientFocusAndRemainingNativeWorkRetainServiceEvenWithAnError() {
+        val local = view(local = true)
+        for (error in listOf("", "blocked", "media")) {
+            val pendingFocus = AudioFacts(error = error)
+            if (error != "media") {
+                assertTrue(retainLocalPlaybackService(local, pendingFocus, localPlayWhenReady = true))
+                assertFalse(shouldStopPlaybackService(local, pendingFocus, localPlayWhenReady = true))
+            }
+            for (active in listOf(AudioFacts(error = error, isPlaying = true),
+                    AudioFacts(error = error, isLoading = true), AudioFacts(error = error, isBuffering = true))) {
+                assertTrue(retainLocalPlaybackService(local, active))
+                assertFalse(shouldStopPlaybackService(local, active))
+            }
+        }
+    }
+
+    @Test fun terminalMediaFailureCannotKeepAnUnpromotableServiceOnLatchedPlayIntent() {
+        val local = view(local = true)
+        val failed = AudioFacts(error = "media")
+        assertFalse(retainLocalPlaybackService(local, failed, localPlayWhenReady = true))
+        assertTrue(shouldStopPlaybackService(local, failed, localPlayWhenReady = true))
+    }
+
+    @Test fun preparingTargetIsRetainedUnlessNativeWorkHasActuallyFailed() {
+        val remote = view(local = false)
+        val target = remote.copy(snapshot = remote.snapshot!!.copy(transfer = PlaybackTransfer(
+            "remote", "phone", "remote-executor", "connection-1", "preparing")))
+        assertTrue(target.isLocalTransferTarget())
+        assertTrue(retainLocalPlaybackService(target, AudioFacts()))
+        assertFalse(shouldStopPlaybackService(target, AudioFacts()))
+        val failed = AudioFacts(error = "blocked")
+        assertFalse(retainLocalPlaybackService(target, failed))
+        assertTrue(shouldStopPlaybackService(target, failed))
+        assertTrue(retainLocalPlaybackService(target, failed.copy(isLoading = true)))
+        assertFalse(shouldStopPlaybackService(target, failed.copy(isLoading = true)))
+    }
+
+    @Test fun ordinaryPausedLocalServiceRemainsAttachedUntilTaskRemoval() {
+        val local = view(local = true)
+        val snapshot = requireNotNull(local.snapshot)
+        val paused = local.copy(snapshot = snapshot.copy(state = snapshot.state.copy(desiredPlaying = false)))
+        assertFalse(retainLocalPlaybackService(paused, AudioFacts()))
+        assertFalse(shouldStopPlaybackService(paused, AudioFacts()))
+        assertTrue(shouldStopPlaybackService(view(local = false), AudioFacts()))
+    }
+
     @Test fun taskRemovalRetainsLocalIntentBufferingPendingPlayAndTransferButNotRemoteFacts() {
         val local = view(local = true)
         val remote = view(local = false)

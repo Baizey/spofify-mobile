@@ -60,13 +60,13 @@ class PlaybackOwner(
                         requestPlaybackStart = { ensureService(identity) })
                     mutable.value = player
                     player.scope.launch {
-                        player.controller.state.collect { view ->
-                            // Never start a foreground service for a remote controller.
-                            // Release an old local service when output really moved away;
-                            // keep a working source until its release finishes.
-                            if (!view.isLocalOutputConnection() && !retainLocalPlaybackService(view,
-                                    player.audio.facts(), player.audio.player.playWhenReady)) stopServiceFor(player)
-                        }
+                        player.controller.state.collect { reconcileServiceFor(player) }
+                    }
+                    player.scope.launch {
+                        // A failed native start must cancel its FGS deadline without
+                        // waiting for a server round trip. Sample current facts rather
+                        // than letting a queued observation retire a newer operation.
+                        player.audio.observations.collect { reconcileServiceFor(player) }
                     }
                     player.connect()
                 }
@@ -94,8 +94,7 @@ class PlaybackOwner(
         serviceSession = session
         startingSession = null
         stoppingSession = null
-        if (!player.controller.state.value.isLocalOutputConnection() &&
-            !retainLocalPlaybackService(player.controller.state.value, player.audio.facts(), player.audio.player.playWhenReady)) stopServiceFor(player)
+        reconcileServiceFor(player)
     }
 
     internal fun serviceStopped(session: MediaSession?) {
@@ -116,6 +115,7 @@ class PlaybackOwner(
         val player = current?.takeIf { it.mediaSession === session } ?: return
         handlePlaybackServiceStartRefusal(player.controller.state.value, player.audio.hasPlaybackAuthority(),
             pauseNative = player.audio::pause, reportLocalBlocked = player.audio::backgroundStartBlocked)
+        reconcileServiceFor(player)
     }
 
     /** Called only by an authorized desired-playing native execution, immediately before play. */
@@ -138,6 +138,12 @@ class PlaybackOwner(
             Log.w("SpofifyPlayer", "Local playback service start denied")
             false
         }
+    }
+
+    private fun reconcileServiceFor(player: NativePlayer) {
+        if (current !== player) return
+        if (shouldStopPlaybackService(player.controller.state.value, player.audio.facts(), player.audio.player.playWhenReady))
+            stopServiceFor(player)
     }
 
     private fun stopServiceFor(player: NativePlayer) {
