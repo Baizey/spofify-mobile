@@ -16,8 +16,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
@@ -32,6 +32,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
+import dev.spofify.mobile.core.content.LyricsState
 import dev.spofify.mobile.core.content.TrackContentApi
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.playback.*
@@ -60,7 +61,8 @@ internal fun FullPlayer(
     val actual = state.playback?.takeIf { it.hasReportedPlayback }
     val elapsedMs = ((actual?.elapsed ?: 0.0) * 1000).toLong()
     val durationMs = ((actual?.duration ?: 0.0) * 1000).toLong()
-    val inline = currentContent.currentLine(elapsedMs, durationMs)?.text?.takeIf { it.isNotBlank() }
+    val inlineLine = lyricViewportKey(currentContent, elapsedMs, durationMs)
+    val inline = inlineLine?.text
     val ready = state.connection == PlaybackConnectionState.READY
     var queue by remember { mutableStateOf(false) }
     var devices by remember { mutableStateOf(false) }
@@ -72,46 +74,57 @@ internal fun FullPlayer(
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
                 val density = LocalDensity.current
-                val coverWidth = (maxWidth - 40.dp).coerceAtMost(if (density.fontScale >= 1.5f) 164.dp else 330.dp)
-                var controlsPixels by remember { mutableIntStateOf(0) }
-                val controlsHeight = with(density) { controlsPixels.toDp() }
-                val breathing = (maxHeight - coverWidth - controlsHeight - 34.dp).coerceAtLeast(16.dp)
+                val largeText = density.fontScale >= 1.5f
+                val horizontal = if (largeText) 16.dp else 20.dp
                 val dismissGesture = Modifier.playerDismissGesture(binding, scroll.maxValue == 0 && scroll.value == 0, onDismiss)
-                Column(Modifier.fillMaxWidth().verticalScroll(scroll).padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 18.dp)
-                    .semantics { customActions = listOf(CustomAccessibilityAction("Dismiss player") { onDismiss(); true }) }) {
-                    MusicArtwork(MusicKind.TRACK, track.id, loader,
-                        Modifier.size(coverWidth).align(Alignment.CenterHorizontally).clip(RoundedCornerShape(7.dp)).then(dismissGesture))
-                    if (inline == null) Spacer(Modifier.fillMaxWidth().height(breathing).then(dismissGesture))
-                    else {
-                        Box(Modifier.fillMaxWidth().heightIn(min = breathing.coerceAtLeast(128.dp))
-                            .clickable { lyrics = true }.padding(start = 26.dp, end = 26.dp, top = 22.dp, bottom = 22.dp),
-                            contentAlignment = Alignment.Center) {
-                            Text(inline, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 33.sp, lineHeight = 40.26.sp,
-                                fontWeight = FontWeight.Bold), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-                            SpofifyIcon(SpofifyGlyph.Lyrics, "Open lyrics", Modifier.align(Alignment.CenterStart).offset(x = (-26).dp).size(20.dp),
-                                MaterialTheme.colorScheme.secondary)
-                        }
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    Column(Modifier.fillMaxWidth().onSizeChanged { controlsPixels = it.height }) {
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                PlayerBodyLayout(
+                    availableHeight = (maxHeight - 34.dp).coerceAtLeast(0.dp),
+                    largeText = largeText,
+                    reserveLyrics = currentContent.lyrics?.state == LyricsState.TIMED,
+                    modifier = Modifier.fillMaxWidth().verticalScroll(scroll)
+                        .padding(start = horizontal, end = horizontal, top = 16.dp, bottom = 18.dp)
+                        .semantics { customActions = listOf(CustomAccessibilityAction("Dismiss player") { onDismiss(); true }) },
+                    header = {
+                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Column(Modifier.weight(1f)) {
-                                Text(track.name, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 22.5.sp,
-                                    lineHeight = 26.1.sp, fontWeight = FontWeight.Bold))
-                                val artist = track.artists.firstOrNull { !it.id.isNullOrBlank() }
-                                val credit = track.artists.joinToString(", ") { it.name }
-                                Box(Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                                    .then(if (artist != null && onNavigate != null) Modifier.clickable {
-                                        onNavigate(MusicKind.ARTIST, requireNotNull(artist.id))
-                                    } else Modifier).padding(top = 2.dp)) {
-                                    Text(credit, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp))
-                                }
+                            val canOpenAlbum = onNavigate != null && track.albumId.isNotBlank() && track.albumName.isNotBlank()
+                            Box(Modifier.weight(1f).heightIn(min = 48.dp)
+                                .then(if (canOpenAlbum) Modifier.clickable(role = Role.Button, onClickLabel = "Open album") {
+                                    onNavigate?.invoke(MusicKind.ALBUM, track.albumId)
+                                } else Modifier), contentAlignment = Alignment.CenterStart) {
+                                if (track.albumName.isNotBlank()) Text(track.albumName,
+                                    style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp, lineHeight = 17.82.sp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             IconButton({ more = true }, Modifier.size(48.dp)) {
                                 SpofifyIcon(SpofifyGlyph.More, "More for this song")
                             }
+                        }
+                    },
+                    artwork = { size ->
+                        MusicArtwork(MusicKind.TRACK, track.id, loader,
+                            Modifier.size(size).clip(RoundedCornerShape(7.dp)).then(dismissGesture))
+                    },
+                    gap = { height ->
+                        if (inlineLine == null) Spacer(Modifier.fillMaxWidth().height(height).then(dismissGesture))
+                        else Column(Modifier.fillMaxWidth().height(height)) {
+                            PlayerLyricViewport(inlineLine, (height - 8.dp).coerceAtLeast(0.dp)) { lyrics = true }
+                            Spacer(Modifier.height(8.dp))
+                        }
+                    },
+                    controls = { Column(Modifier.fillMaxWidth()) {
+                        val artist = track.artists.firstOrNull { !it.id.isNullOrBlank() }
+                        val credit = track.artists.joinToString(", ") { it.name }
+                        Column(Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            .then(if (artist != null && onNavigate != null) Modifier.clickable(
+                                role = Role.Button, onClickLabel = "Open artist") {
+                                onNavigate(MusicKind.ARTIST, requireNotNull(artist.id))
+                            } else Modifier)) {
+                            Text(track.name, style = MaterialTheme.typography.bodyLarge.copy(fontSize = 22.5.sp,
+                                lineHeight = 26.1.sp, fontWeight = FontWeight.Bold))
+                            if (credit.isNotBlank()) Text(credit, Modifier.fillMaxWidth().padding(top = 2.dp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 13.2.sp, lineHeight = 17.82.sp))
                         }
                         PlaybackSeek(state, currentContent) { controller.seek(it) }
                         Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -144,7 +157,7 @@ internal fun FullPlayer(
                             }
                         }
                     }
-                }
+                })
             }
         }
         if (queue) QueueSheet(controller, loader) { queue = false }
