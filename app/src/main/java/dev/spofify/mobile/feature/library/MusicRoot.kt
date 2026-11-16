@@ -36,6 +36,7 @@ import dev.spofify.mobile.designsystem.SpofifyIcon
 import dev.spofify.mobile.feature.personal.PlaylistsScreen
 import dev.spofify.mobile.feature.personal.PlaylistDetailScreen
 import dev.spofify.mobile.feature.personal.RecentScreen
+import dev.spofify.mobile.feature.settings.*
 import dev.spofify.mobile.playback.*
 
 private enum class MusicTab(val route: String, val title: String, val glyph: SpofifyGlyph) {
@@ -50,6 +51,8 @@ internal fun MusicRoot(
     identity: AccountIdentity,
     sessions: SessionRepository,
     playbackOwner: PlaybackOwner,
+    theme: DeviceThemeController,
+    palettes: AccountPaletteController,
     account: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
@@ -102,7 +105,7 @@ internal fun MusicRoot(
         }
     }
     // The graph and its models must not be replaced by playback ticks or IME recomposition.
-    val graph: NavGraphBuilder.() -> Unit = remember(navigation, api, personal, loader, open, navigate, openActions) {
+    val graph: NavGraphBuilder.() -> Unit = remember(navigation, api, personal, loader, open, navigate, openActions, theme, palettes) {
         {
             composable("history") { RecentScreen(personal, loader, currentController.value, navigate) }
             composable("search") { owner ->
@@ -132,7 +135,16 @@ internal fun MusicRoot(
                         expanded = true
                 }, open, playback = currentController.value, onNavigate = navigate, onMore = openActions)
             }
-            composable("settings") { MusicSettingsScreen { navigation.navigate("account") } }
+            composable("settings") {
+                SettingsScreen(identity, theme, palettes, onAccount = { navigation.navigate("account") },
+                    onColours = { navigation.navigate("colours") }, onCredits = { navigation.navigate("credits") })
+            }
+            composable("colours") {
+                val appearance by theme.state.collectAsStateWithLifecycle()
+                AccountColoursScreen(identity, palettes, appearance.light)
+            }
+            composable("credits") { CreditsScreen { navigation.navigate("font-license") } }
+            composable("font-license") { FontLicenseScreen() }
             composable("account") { currentAccount.value() }
         }
     }
@@ -196,20 +208,6 @@ internal fun MusicRoot(
     }
     actions?.let { selection ->
         MusicActionsSheet(selection, currentController.value, personal, loader, navigate) { actions = null }
-    }
-}
-
-@Composable
-private fun MusicSettingsScreen(onAccount: () -> Unit) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
-        PageTitle("Settings")
-        Text("Account", style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 24.dp, bottom = 6.dp))
-        TextButton(onAccount, Modifier.fillMaxWidth().heightIn(min = 66.dp), contentPadding = PaddingValues(0.dp)) {
-            Text("Account and server", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurface)
-            Text("›", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        HorizontalDivider(color = MaterialTheme.colorScheme.surface)
     }
 }
 
