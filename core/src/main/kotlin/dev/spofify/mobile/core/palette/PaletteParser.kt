@@ -1,13 +1,13 @@
 package dev.spofify.mobile.core.palette
 
 import java.util.Locale
+import dev.spofify.mobile.core.json.StrictJsonObject
 import kotlinx.serialization.json.*
 
 /** Bounded positive projection of the immutable v1 catalog; no CSS interpreter or fallback. */
 internal object PaletteParser {
     const val MAX_REVISION = 9_007_199_254_740_991L
     private const val MAX_BODY = 16 * 1024
-    private val json = Json
     private val integer = Regex("-?(0|[1-9][0-9]*)")
     private val hex = Regex("#[0-9a-fA-F]{6}")
     private val catalog = listOf(
@@ -75,42 +75,6 @@ internal object PaletteParser {
         return value.content.toLong()
     }
 
-    private fun document(bytes: ByteArray, limit: Int): JsonObject {
-        require(bytes.size <= limit)
-        val source = bytes.decodeToString(throwOnInvalidSequence = true)
-        rejectDuplicateKeys(source)
-        return json.parseToJsonElement(source) as? JsonObject ?: error("Invalid document")
-    }
-
-    /** Same bounded ambiguity check as TrackContentParser, including escaped duplicate keys. */
-    private fun rejectDuplicateKeys(source: String) {
-        data class Frame(val keys: MutableSet<String>?, var expectingKey: Boolean)
-        val stack = mutableListOf<Frame>()
-        var index = 0
-        while (index < source.length) {
-            when (source[index]) {
-                '{' -> { require(stack.size < 16); stack.add(Frame(mutableSetOf(), true)) }
-                '[' -> { require(stack.size < 16); stack.add(Frame(null, false)) }
-                '}', ']' -> { require(stack.isNotEmpty()); stack.removeAt(stack.lastIndex) }
-                ',' -> stack.lastOrNull()?.let { it.expectingKey = it.keys != null }
-                '"' -> {
-                    val start = index++
-                    while (index < source.length && source[index] != '"') {
-                        if (source[index] == '\\') index++
-                        index++
-                    }
-                    require(index < source.length)
-                    stack.lastOrNull()?.let { frame ->
-                        if (frame.expectingKey) {
-                            val key = json.decodeFromString<String>(source.substring(start, index + 1))
-                            require(frame.keys!!.add(key))
-                            frame.expectingKey = false
-                        }
-                    }
-                }
-            }
-            index++
-        }
-        require(stack.isEmpty())
-    }
+    private fun document(bytes: ByteArray, limit: Int): JsonObject =
+        StrictJsonObject.parse(bytes, limit, maxDepth = 16)
 }

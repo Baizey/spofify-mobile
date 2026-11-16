@@ -1,6 +1,7 @@
 package dev.spofify.mobile.core.content
 
 import kotlinx.serialization.json.*
+import dev.spofify.mobile.core.json.StrictJsonObject
 import java.net.URI
 import java.time.Instant
 import kotlin.math.abs
@@ -9,7 +10,6 @@ import kotlin.math.max
 /** Strict, bounded v1 projections. No wire diagnostics or unknown fields enter presentation state. */
 internal object TrackContentParser {
     private const val ALGORITHM = "peak-u8-two-pass-v1-half-up"
-    private val json = Json
     private val integer = Regex("-?(0|[1-9][0-9]*)")
     private val utc = Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z")
 
@@ -101,10 +101,7 @@ internal object TrackContentParser {
     }
 
     private fun document(bytes: ByteArray, limit: Int, fields: Set<String>): JsonObject {
-        require(bytes.size <= limit)
-        val source = bytes.decodeToString(throwOnInvalidSequence = true)
-        rejectDuplicateKeys(source)
-        val root = json.parseToJsonElement(source) as? JsonObject ?: error("Invalid document")
+        val root = StrictJsonObject.parse(bytes, limit, maxDepth = 32)
         require(root.keys.all { it in fields })
         return root
     }
@@ -154,38 +151,6 @@ internal object TrackContentParser {
     private fun timestamp(value: String): Instant {
         require(utc.matches(value))
         return Instant.parse(value)
-    }
-
-    /** JsonObject normally keeps the last duplicate; ambiguity must instead reject the whole DTO. */
-    private fun rejectDuplicateKeys(source: String) {
-        data class Frame(val objectKeys: MutableSet<String>?, var expectingKey: Boolean)
-        val stack = mutableListOf<Frame>()
-        var index = 0
-        while (index < source.length) {
-            when (source[index]) {
-                '{' -> { require(stack.size < 32); stack.add(Frame(mutableSetOf(), true)) }
-                '[' -> { require(stack.size < 32); stack.add(Frame(null, false)) }
-                '}', ']' -> { require(stack.isNotEmpty()); stack.removeAt(stack.lastIndex) }
-                ',' -> stack.lastOrNull()?.let { it.expectingKey = it.objectKeys != null }
-                '"' -> {
-                    val start = index++
-                    while (index < source.length && source[index] != '"') {
-                        if (source[index] == '\\') index++
-                        index++
-                    }
-                    require(index < source.length)
-                    stack.lastOrNull()?.let { frame ->
-                        if (frame.expectingKey) {
-                            val key = json.decodeFromString<String>(source.substring(start, index + 1))
-                            require(frame.objectKeys!!.add(key))
-                            frame.expectingKey = false
-                        }
-                    }
-                }
-            }
-            index++
-        }
-        require(stack.isEmpty())
     }
 
     private inline fun <T> safely(block: () -> T): T = try { block() } catch (_: Exception) {
