@@ -1,0 +1,56 @@
+package dev.spofify.mobile.core.http
+
+import dev.spofify.mobile.core.origin.ServerOrigin
+import java.util.UUID
+import kotlinx.coroutines.runBlocking
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import org.junit.Assert.*
+import org.junit.Test
+
+class FeatureErrorResponseTest {
+    @Test fun mutationPreservesBoundedSemanticErrorWithoutRetrying() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val body = """{"code":"PALETTE_CATALOG_CONFLICT","error":"Refresh the catalog"}"""
+            server.enqueue(MockResponse().setResponseCode(409).setHeader("Content-Type", "application/json").setBody(body))
+            val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
+            try {
+                val statuses = mutableListOf<Int>()
+                val response = api.mutate(listOf("api", "me", "palette"), "PUT", "{}", cookie(), "fixture-csrf") { code, _ -> statuses += code }
+                assertEquals(409, response.status)
+                assertEquals(body, response.bytes.decodeToString())
+                assertEquals(listOf(409), statuses)
+                assertEquals(1, server.requestCount)
+                assertEquals("PUT", server.takeRequest().method)
+            } finally {
+                api.cancel()
+            }
+        }
+    }
+
+    @Test fun oversizedAndNonJsonErrorsPreserveStatusButNotTheirBodies() = runBlocking {
+        val responses = listOf(
+            MockResponse().setResponseCode(409).setHeader("Content-Type", "application/json").setBody("x".repeat(8193)),
+            MockResponse().setResponseCode(503).setHeader("Content-Type", "application/json").setChunkedBody("x".repeat(8193), 512),
+            MockResponse().setResponseCode(500).setHeader("Content-Type", "text/html").setBody("<html>not a semantic error</html>"),
+        )
+        for (fixture in responses) {
+            MockWebServer().use { server ->
+                server.start()
+                server.enqueue(fixture)
+                val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
+                try {
+                    val response = api.mutate(listOf("api", "me", "palette"), "PUT", "{}", cookie(), "fixture-csrf") { _, _ -> }
+                    assertTrue(response.status >= 400)
+                    assertTrue(response.bytes.isEmpty())
+                    assertEquals(1, server.requestCount)
+                } finally {
+                    api.cancel()
+                }
+            }
+        }
+    }
+
+    private fun cookie() = "spofify_session=${UUID.randomUUID()}; Path=/; HttpOnly; Expires=Tue, 01 Jan 2030 00:00:00 GMT"
+}

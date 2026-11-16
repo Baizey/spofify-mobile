@@ -115,9 +115,19 @@ internal class OkHttpAuthApi(
         response: Response, artwork: Boolean, onHeaders: (Int, String?) -> Unit,
     ): FeatureResponse {
         onHeaders(response.code, renewedCookie(response))
-        if (!response.isSuccessful || response.code == 204) return FeatureResponse(response.code, byteArrayOf(), null)
+        if (response.code == 204) return FeatureResponse(response.code, byteArrayOf(), null)
         val body = response.body
         val mime = body.contentType()
+        if (!response.isSuccessful) {
+            // Preserve bounded semantic mutation errors, never arbitrary HTML or unbounded bodies.
+            val bound = 8L * 1024
+            if (artwork || mime?.type != "application" || mime.subtype != "json" || body.contentLength() > bound)
+                return FeatureResponse(response.code, byteArrayOf(), null)
+            val source = body.source()
+            source.request(bound + 1)
+            if (source.buffer.size > bound) return FeatureResponse(response.code, byteArrayOf(), null)
+            return FeatureResponse(response.code, source.readByteArray(), mime.toString())
+        }
         require(if (artwork) mime?.type == "image" && mime.subtype in setOf("jpeg", "png")
             else mime?.type == "application" && mime.subtype == "json")
         val bound = if (artwork) 8L * 1024 * 1024 else 2L * 1024 * 1024
