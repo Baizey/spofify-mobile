@@ -52,7 +52,6 @@ class TrackContentViewModel(private val api: TrackContentApi) : ViewModel() {
     private var waveformSource: String? = null
     private var waveformProduct: String? = null
     private var lyricRecording: String? = null
-    private var lyricSource: String? = null
 
     init {
         viewModelScope.launch {
@@ -68,13 +67,12 @@ class TrackContentViewModel(private val api: TrackContentApi) : ViewModel() {
         waveformSource = null
         waveformProduct = null
         lyricRecording = null
-        lyricSource = null
         // Clearing happens synchronously, before a successor job can start.
         mutable.value = TrackContentState(trackId = trackId, binding = if (trackId == null) "" else binding)
         if (trackId != null) fetch()
     }
 
-    /** Explicit bounded cache re-read only. A pending response is not a promise of external work. */
+    /** Explicit content re-read only. This never starts a fetching/import job. */
     fun refresh() {
         if (!api.isCurrent || retired) { retire(); return }
         if (mutable.value.trackId == null || waveformRequest?.isActive == true || lyricsRequest?.isActive == true) return
@@ -113,9 +111,9 @@ class TrackContentViewModel(private val api: TrackContentApi) : ViewModel() {
                 if (!current(token, trackId, binding)) return@launch
                 check(result.trackId == trackId)
                 check(lyricRecording == null || lyricRecording == result.recordingVersion)
-                check(lyricSource == null || lyricSource == result.sourceGeneration)
+                // Jobs may add or replace lyrics without replacing the audio.
+                // Pin the recording, not the lyric source or its cache history.
                 lyricRecording = result.recordingVersion
-                lyricSource = result.sourceGeneration
                 mutable.value = mutable.value.copy(lyrics = result, loadingLyrics = false)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -138,7 +136,6 @@ class TrackContentViewModel(private val api: TrackContentApi) : ViewModel() {
         waveformSource = null
         waveformProduct = null
         lyricRecording = null
-        lyricSource = null
         mutable.value = TrackContentState()
     }
 

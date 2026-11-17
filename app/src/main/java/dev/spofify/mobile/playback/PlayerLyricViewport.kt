@@ -21,13 +21,13 @@ import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.content.LyricsState
 import kotlinx.coroutines.launch
 
-/** Keep real text and existing retry access available after the player menu is removed. */
+/** Keep lyric reads accessible when jobs add files after the player opens. */
 internal fun lyricSheetEntryLabel(content: TrackContentState): String? {
     if (content.lyricsFailure != null) return "Lyrics"
     return when (content.lyrics?.state) {
         LyricsState.PLAIN, LyricsState.TIMED -> "View lyrics"
-        LyricsState.PENDING, LyricsState.ERROR -> "Lyrics"
-        else -> null
+        null -> null
+        else -> "Lyrics"
     }
 }
 

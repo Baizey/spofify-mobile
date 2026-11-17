@@ -56,7 +56,10 @@ internal fun PlayerLyricsSheet(
             }, contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             stickyHeader("heading") {
                 Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(bottom = 16.dp)) {
-                    SheetHeading(track.name)
+                    Row(Modifier.fillMaxWidth()) {
+                        Box(Modifier.weight(1f)) { SheetHeading(track.name) }
+                        TextButton(onClick = onRefresh, enabled = !content.loading) { Text("Refresh") }
+                    }
                     Text(track.artists.joinToString(", ") { it.name }, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (lyrics?.state in setOf(LyricsState.PLAIN, LyricsState.TIMED)) {
@@ -90,9 +93,6 @@ internal fun PlayerLyricsSheet(
                         else -> "Lyrics unavailable"
                     }
                     Text(label, Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (!content.loadingLyrics && (content.lyricsFailure != null || lyrics?.state in setOf(LyricsState.PENDING, LyricsState.ERROR))) {
-                        SheetAction("Retry", SpofifyGlyph.Lyrics, onClick = onRefresh)
-                    }
                 }
             }
         }

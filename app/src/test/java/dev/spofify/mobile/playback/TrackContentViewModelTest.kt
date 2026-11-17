@@ -165,8 +165,8 @@ class TrackContentViewModelTest {
         assertEquals("First", state.currentLine(500, 2000)?.text)
     }
 
-    @Test fun sourceProductAndRecordingChangesWithinImmutableOccurrenceDiscardRatherThanRebind() = runTest(dispatcher) {
-        for (change in listOf("wave-source", "wave-product", "lyric-source", "lyric-recording")) {
+    @Test fun waveformSourceProductAndRecordingChangesDiscardRatherThanRebind() = runTest(dispatcher) {
+        for (change in listOf("wave-source", "wave-product", "lyric-recording")) {
             val api = Api()
             val model = model(api)
             model.select("one", change)
@@ -177,7 +177,6 @@ class TrackContentViewModelTest {
                 else -> wave(id)
             } }
             api.readLyrics = { id -> when (change) {
-                "lyric-source" -> text(id).copy(sourceGeneration = "replacement")
                 "lyric-recording" -> text(id).copy(recordingVersion = "replacement")
                 else -> text(id)
             } }
@@ -265,6 +264,36 @@ class TrackContentViewModelTest {
         assertNotNull(model.state.value.waveform)
         assertNull(model.state.value.waveformFailure)
         assertEquals(TrackContentFailure.NOT_FOUND, model.state.value.lyricsFailure)
+    }
+
+    @Test fun newlySavedOrUpdatedLyricsRefreshForTheSameRecordingWithoutReopening() = runTest(dispatcher) {
+        for (initial in LyricsState.entries) {
+            val api = Api().apply {
+                readLyrics = { id -> when (initial) {
+                    LyricsState.TIMED -> text(id).copy(sourceGeneration = "provider-before")
+                    LyricsState.PLAIN -> text(id).copy(state = initial, sourceGeneration = "provider-before",
+                        plainText = "Previous text", lines = emptyList())
+                    else -> TrackLyrics(id, initial, "recording", "source-disabled-v1")
+                } }
+            }
+            val model = model(api)
+            model.select("one", "occurrence-$initial")
+            advanceUntilIdle()
+            api.readLyrics = { id -> text(id).copy(sourceGeneration = "local-v1",
+                attribution = LyricAttribution("LRCLIB", "https://lrclib.net/", LyricOwnership.PROVIDER)) }
+            model.refresh()
+            advanceUntilIdle()
+            assertEquals(LyricsState.TIMED, model.state.value.lyrics?.state)
+            assertEquals("local-v1", model.state.value.lyrics?.sourceGeneration)
+            assertEquals("First", model.state.value.currentLine(500, 2000)?.text)
+            assertNull(model.state.value.lyricsFailure)
+            api.readLyrics = { id -> text(id).copy(state = LyricsState.PLAIN, sourceGeneration = "local-v1",
+                plainText = "Updated local file", lines = emptyList()) }
+            model.refresh()
+            advanceUntilIdle()
+            assertEquals("Updated local file", model.state.value.lyrics?.plainText)
+            assertNull(model.state.value.lyricsFailure)
+        }
     }
 
     companion object {

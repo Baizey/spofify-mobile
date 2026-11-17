@@ -118,4 +118,38 @@ class TrackContentClientTest {
         assertTrue(runCatching { current.lyrics("one") }.exceptionOrNull() is CancellationException)
         assertEquals(2, server.requestCount)
     } }
+
+    @Test fun physicalLyricResponsesPreserveCreditsAndNeverStartAcquisition() = runBlocking { fixture { server, sessions, identity ->
+        val api = TrackContentClient(sessions, identity)
+        val sidecar = """{"version":1,"trackId":"one","recordingVersion":"recording","sourceGeneration":"local-v1","state":"timed","provenance":"local_lrc","lines":[{"startMs":0,"text":"Saved lyrics"}],"attribution":{"name":"LRCLIB","url":"https://lrclib.net/","ownership":"provider"},"offlineTransferAllowed":false}"""
+        val plain = sidecar.replace("\"state\":\"timed\"", "\"state\":\"plain\"")
+            .replace("[{\"startMs\":0,\"text\":\"Saved lyrics\"}]", "[]").dropLast(1) + ",\"plainText\":\"Saved plain lyrics\"}"
+        val missing = lyrics("one").replace("source-disabled-v1", "local-v1")
+            .replace("\"state\":\"unavailable\"", "\"state\":\"not_found\"").dropLast(1) + ",\"reason\":\"no_match\"}"
+        val awaiting = lyrics("one").dropLast(1) + ",\"reason\":\"awaiting_processing\"}"
+        val cases = listOf(
+            sidecar to LyricsState.TIMED,
+            sidecar.replace("local_lrc", "embedded") to LyricsState.TIMED,
+            (sidecar.dropLast(1) + ",\"storedAt\":\"2019-01-01T00:00:00Z\",\"expiresAt\":\"2020-01-01T00:00:00Z\"}") to LyricsState.TIMED,
+            plain to LyricsState.PLAIN,
+            missing to LyricsState.NOT_FOUND,
+            awaiting to LyricsState.UNAVAILABLE,
+        )
+        for ((body, expected) in cases) {
+            server.enqueue(json(body))
+            val result = api.lyrics("one")
+            assertEquals(expected, result.state)
+            if (expected in setOf(LyricsState.TIMED, LyricsState.PLAIN)) {
+                assertEquals("LRCLIB", result.attribution?.name)
+                assertFalse(result.offlineTransferAllowed)
+            }
+            if (expected == LyricsState.PLAIN) assertEquals("Saved plain lyrics", result.plainText)
+            val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+            assertEquals("GET", request.method)
+            assertEquals("/api/library/tracks/one/lyrics", request.path)
+            assertNull(request.requestUrl!!.query)
+            assertNull(request.getHeader("X-CSRF-Token"))
+        }
+        assertEquals(1 + cases.size, server.requestCount)
+    } }
 }

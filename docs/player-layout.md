@@ -19,8 +19,8 @@ interactive visual reference.
 - There is no visible “Scroll lyrics” hint, arrow row, or reserved hint space.
   Tap opens the existing full lyrics sheet; vertical dragging reads the text,
   never invokes the player-dismiss gesture. Plain lyrics and timed silent gaps
-  retain a direct “View lyrics” entry; pending/error states retain access to the
-  sheet and its retry action, without restoring the removed menu. Loading-only
+  retain a direct “View lyrics” entry; missing/pending/error states retain access
+  to the sheet and its refresh action, without restoring the removed menu. Loading-only
   states do not add a flashing placeholder. Accessibility scroll semantics and
   keyboard arrows/Page Up/Page Down/Home/End are available.
 - Elapsed and total time labels are centered in the first and fifth equal
@@ -48,5 +48,15 @@ or with large text. Non-lyric breathing space retains its 16dp minimum.
 Inline scroll resets by resource/occurrence binding, recording/source version,
 and timed line index/start/text—not by playback ticks or seeking within the
 same line. Reset is immediate, with no added motion or animation. The existing
-actual-duration gates, account/content fences, seek behavior and full lyrics
-sheet are unchanged.
+actual-duration gates, account/content fences and seek behavior are unchanged.
+
+## Lyric delivery
+
+Fetching jobs save lyrics beside the music. Display reads use the adjacent `.lrc`
+first, otherwise embedded lyrics; they never fetch or require an imported cache.
+Mobile renders that response, including plain text and retained provider credits.
+Attribution and old cache expiry dates do not gate file-backed lyrics. Refresh may
+pick up new lyrics for the same recording without reopening the player; recording,
+account and occurrence fences still reject stale responses. The sheet has one
+read-only **Refresh** action, including when no lyrics were present on the initial
+read. No automatic polling or acquisition is introduced.

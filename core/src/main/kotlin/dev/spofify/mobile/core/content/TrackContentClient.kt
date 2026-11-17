@@ -10,7 +10,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
-/** Only the two documented authenticated cache reads. No source work, retry loop, or storage. */
+/** Authenticated content reads only. No fetching/import jobs, retry loop, or storage. */
 class TrackContentClient(
     private val sessions: SessionRepository,
     private val identity: AccountIdentity,

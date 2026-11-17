@@ -172,14 +172,14 @@ class PlayerLayoutTest {
         }
     }
 
-    @Test fun missingLoadingOnlyAndInstrumentalStatesDoNotCreateAnEntryPlaceholder() {
+    @Test fun initialLoadingHasNoPlaceholderButReportedMissingLyricsRemainRefreshable() {
         assertNull(lyricSheetEntryLabel(TrackContentState()))
         assertNull(lyricSheetEntryLabel(TrackContentState(loadingLyrics = true)))
         assertNull(lyricSheetEntryLabel(TrackContentState(loadingWaveform = true,
             waveformFailure = TrackContentFailure.UNAVAILABLE)))
         val content = timedContent()
         for (state in listOf(LyricsState.INSTRUMENTAL, LyricsState.NOT_FOUND, LyricsState.UNAVAILABLE)) {
-            assertNull(lyricSheetEntryLabel(content.copy(lyrics = content.lyrics!!.copy(state = state))))
+            assertEquals("Lyrics", lyricSheetEntryLabel(content.copy(lyrics = content.lyrics!!.copy(state = state))))
         }
     }
 

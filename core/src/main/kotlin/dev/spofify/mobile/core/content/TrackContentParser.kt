@@ -41,7 +41,7 @@ internal object TrackContentParser {
         }
     }
 
-    fun lyrics(bytes: ByteArray, requestedId: String, now: Instant = Instant.now()): TrackLyrics = safely {
+    fun lyrics(bytes: ByteArray, requestedId: String): TrackLyrics = safely {
         val root = document(bytes, 260 * 1024, setOf("version", "trackId", "recordingVersion", "sourceGeneration",
             "state", "plainText", "lines", "provenance", "attribution", "reason", "storedAt", "expiresAt",
             "nextAttemptAt", "offlineTransferAllowed"))
@@ -84,18 +84,12 @@ internal object TrackContentParser {
         }
         val content = state in setOf(LyricsState.PLAIN, LyricsState.TIMED, LyricsState.INSTRUMENTAL)
         if (content) require(attribution != null)
-        when (provenance) {
-            LyricProvenance.LOCAL_LRC, LyricProvenance.EMBEDDED -> require(attribution?.ownership == LyricOwnership.LIBRARY)
-            LyricProvenance.PROVIDER -> require(attribution?.ownership == LyricOwnership.PROVIDER)
-            null -> Unit
-        }
         val stored = root.optionalString("storedAt")?.also { timestamp(it) }
         val expires = root.optionalString("expiresAt")?.also { timestamp(it) }
         val next = root.optionalString("nextAttemptAt")?.also { timestamp(it) }
-        if (content && attribution?.ownership == LyricOwnership.PROVIDER) {
-            require(stored != null && expires != null)
-            require(timestamp(stored) <= timestamp(expires) && now < timestamp(expires))
-        }
+        // Attribution and historical cache dates are metadata, not permission
+        // to display a physical lyric file. Availability belongs to the server.
+        if (stored != null && expires != null) require(timestamp(stored) <= timestamp(expires))
         TrackLyrics(requestedId, state, recording, source, plain, lines, provenance, attribution, reason,
             stored, expires, next)
     }

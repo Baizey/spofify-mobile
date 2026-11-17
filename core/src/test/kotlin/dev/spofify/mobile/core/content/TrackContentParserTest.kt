@@ -2,14 +2,12 @@ package dev.spofify.mobile.core.content
 
 import org.junit.Assert.*
 import org.junit.Test
-import java.time.Instant
 
 class TrackContentParserTest {
-    private val now = Instant.parse("2026-01-01T00:00:00Z")
     private fun waveform(body: String = WAVEFORM, id: String = "one") =
         TrackContentParser.waveform(body.toByteArray(), id)
     private fun lyrics(body: String = LYRICS, id: String = "one") =
-        TrackContentParser.lyrics(body.toByteArray(), id, now)
+        TrackContentParser.lyrics(body.toByteArray(), id)
 
     private fun rejected(block: () -> Any?) {
         val error = runCatching(block).exceptionOrNull()
@@ -170,20 +168,45 @@ class TrackContentParserTest {
             "https:///missing-host", "https://example.test:99999/", "https://example.test/\\n")) {
             rejected { lyrics(linked.replace("https://example.test/credits", url)) }
         }
-        rejected { lyrics(linked.replace("\"ownership\":\"library\"", "\"ownership\":\"provider\"")) }
+        assertEquals(LyricOwnership.PROVIDER, lyrics(linked.replace("\"ownership\":\"library\"", "\"ownership\":\"provider\"")).attribution?.ownership)
         rejected { lyrics(LYRICS.replace("Library text", "")) }
         rejected { lyrics(LYRICS.replace(",\"attribution\":{\"name\":\"Library text\",\"ownership\":\"library\"}", "")) }
     }
 
-    @Test fun providerExpiryAndUtcCacheDatesAreValidatedButNeverStartWork() {
+    @Test fun historicalCacheDatesAreValidatedButDoNotDecideAvailability() {
         val provider = LYRICS.replace("local_lrc", "provider").replace("\"ownership\":\"library\"", "\"ownership\":\"provider\"")
             .dropLast(1) + ",\"storedAt\":\"2025-01-01T00:00:00Z\",\"expiresAt\":\"2027-01-01T00:00:00Z\"}"
         assertEquals(LyricProvenance.PROVIDER, lyrics(provider).provenance)
-        rejected { lyrics(provider.replace("2027-01-01", "2026-01-01")) }
+        assertEquals(LyricsState.TIMED, lyrics(provider.replace("2027-01-01", "2026-01-01")).state)
         rejected { lyrics(provider.replace("2027-01-01", "2024-01-01")) }
         rejected { lyrics(provider.replace("2027-01-01T00:00:00Z", "2027-01-01T00:00:00+00:00")) }
         rejected { lyrics(MISSING.dropLast(1) + ",\"reason\":\"raw operational failure\"}") }
         rejected { lyrics(MISSING.dropLast(1) + ",\"nextAttemptAt\":\"tomorrow\"}") }
+    }
+
+    @Test fun physicalFileLyricsKeepProviderCreditsWithoutRequiringCacheFreshness() {
+        for (origin in listOf("local_lrc", "embedded")) {
+            val file = LYRICS.replace("local_lrc", origin)
+                .replace("Library text", "LRCLIB").replace("\"ownership\":\"library\"", "\"ownership\":\"provider\"")
+            val result = lyrics(file)
+            assertEquals(LyricsState.TIMED, result.state)
+            assertEquals("local-v1", result.sourceGeneration)
+            assertEquals("LRCLIB", result.attribution?.name)
+            assertEquals(LyricOwnership.PROVIDER, result.attribution?.ownership)
+            assertNull(result.expiresAt)
+            val expiredMetadata = file.dropLast(1) + ",\"storedAt\":\"2019-01-01T00:00:00Z\",\"expiresAt\":\"2020-01-01T00:00:00Z\"}"
+            assertEquals(result.lines, lyrics(expiredMetadata).lines)
+            val plain = file.replace("\"state\":\"timed\"", "\"state\":\"plain\"")
+                .replace(LINES, "[]").replace("\"lines\":[]", "\"lines\":[],\"plainText\":\"Saved plain text\"")
+            assertEquals("Saved plain text", lyrics(plain).plainText)
+        }
+    }
+
+    @Test fun olderServerAwaitingProcessingIsAnOrdinaryUnavailableResponse() {
+        val pending = lyrics(MISSING.replace("source_not_configured", "awaiting_processing"))
+        assertEquals(LyricsState.UNAVAILABLE, pending.state)
+        assertEquals(LyricReason.AWAITING_PROCESSING, pending.reason)
+        assertTrue(pending.lines.isEmpty())
     }
 
     companion object {

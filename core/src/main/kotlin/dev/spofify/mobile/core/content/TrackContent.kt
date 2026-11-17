@@ -33,7 +33,7 @@ enum class LyricProvenance { LOCAL_LRC, EMBEDDED, PROVIDER }
 enum class LyricOwnership { LIBRARY, PROVIDER }
 enum class LyricReason {
     SOURCE_NOT_CONFIGURED, LOCAL_INVALID, SOURCE_FAILED, NO_MATCH, SOURCE_DEFERRED,
-    SOURCE_INVALID, RECORDING_UNAVAILABLE, AWAITING_PLAYBACK,
+    SOURCE_INVALID, RECORDING_UNAVAILABLE, AWAITING_PLAYBACK, AWAITING_PROCESSING,
 }
 
 data class LyricAttribution(val name: String, val url: String?, val ownership: LyricOwnership)
