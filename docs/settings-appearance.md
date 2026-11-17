@@ -8,4 +8,4 @@ A choice previews its palette while the revisioned PUT is pending. Save/refresh 
 
 Account colours use the dark tokens from each preset. They only replace primary/on-primary, secondary and tertiary roles; neutral surfaces and text stay dark-themed. The v1 palette response format is unchanged. Palette changes do not replace the navigation graph, reconnect playback, or issue musical commands.
 
-Offline mode, temporary cache controls and Saved music are not enabled by this slice. They require the verified download/store and local playback owners; semantic palette preview text does not claim those features exist.
+The [wireframe palette study](reference/index.html) explores a different mapping: primary tints the canvas, secondary tints supporting surfaces, and tertiary highlights one focal point. Its Oxblood, Pine and Ink Blue presets are review fixtures only, not changes to the native palette catalog.

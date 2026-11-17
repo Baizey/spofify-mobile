@@ -24,9 +24,10 @@ The subsequently approved player changes are recorded in
 scrollable lyrics at the 13.2sp album/artist scale with tap-to-open text and no
 menu, lyric icon or scroll hint, compact
 identity/seek spacing, and time labels aligned with Shuffle and Repeat.
-[Settings appearance](docs/settings-appearance.md) records palette ownership and
-persistence behavior. The interactive reference now includes these approved
-native refinements too. [Unified search](docs/search.md) records the subsequent
+[Settings appearance](docs/settings-appearance.md) records native palette ownership
+and persistence. The wireframe’s **Palette study** is a separate proposal: use the
+preview picker to compare Oxblood, Pine, and Ink Blue on the same screen. It does
+not change Android or the palette API. [Unified search](docs/search.md) records the subsequent
 search migration: the server now owns matching and cross-kind ranking, rather than
 the reference fixture’s local ranking heuristic. Search layout and bottom-oriented
 results remain unchanged. [Artist discography](docs/artist-discography.md) records

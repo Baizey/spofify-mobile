@@ -203,17 +203,75 @@ function sameGeometry(before, after) {
             return [bounds.y, bounds.height];
         }));
         const originalChoices = await paletteGeometry();
-        for (const [palette, primary] of [['ember', '#ffad89'], ['violet', '#c8b5ff'], ['jade', '#66e3b4']]) {
-            await page.locator(`[data-action="palette:${palette}"]`).click();
+        const palettes = ['oxblood', 'pine', 'ink-blue'];
+        const phone = page.locator('#phone');
+        const preview = page.getByLabel('Preview palette');
+        const paletteRoles = new Map();
+        for (const palette of palettes) {
+            const choice = page.locator(`[data-action="palette:${palette}"]`);
+            await choice.click();
+            assert.equal(await choice.getAttribute('aria-pressed'), 'true');
             assert.deepEqual(await paletteGeometry(), originalChoices);
             assert.equal(await page.locator('.content .progress, .content .refresh-progress').count(), 0);
-            const rootColors = await page.locator('html').evaluate(root => {
-                const style = getComputedStyle(root);
-                return [style.colorScheme, style.getPropertyValue('--bg').trim(), style.getPropertyValue('--primary').trim()];
+            const { scheme, canvas, layer, accent, contrast } = await phone.evaluate(element => {
+                const style = getComputedStyle(element);
+                const canvas = style.backgroundColor;
+                const layer = getComputedStyle(element.querySelector('.palette-sample')).backgroundColor;
+                const accent = getComputedStyle(element.querySelector('.sample-play'));
+                const pixel = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+                function luminance(color) {
+                    pixel.fillStyle = color;
+                    pixel.fillRect(0, 0, 1, 1);
+                    const [r, g, b] = [...pixel.getImageData(0, 0, 1, 1).data].slice(0, 3).map(n => {
+                        const c = n / 255;
+                        return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4;
+                    });
+                    return .2126 * r + .7152 * g + .0722 * b;
+                }
+                const ratio = (a, b) => (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
+                const muted = luminance(style.getPropertyValue('--muted'));
+                const fill = luminance(accent.backgroundColor);
+                return {
+                    scheme: style.colorScheme, canvas, layer, accent: accent.backgroundColor,
+                    contrast: [ratio(muted, luminance(canvas)), ratio(muted, luminance(layer)),
+                        ratio(fill, luminance(accent.color)), ratio(fill, luminance(layer))],
+                };
             });
-            assert.deepEqual(rootColors, ['dark', '#101216', primary]);
+            assert.equal(scheme, 'dark');
+            assert.notEqual(canvas, layer);
+            assert.notEqual(layer, accent);
+            assert.ok(contrast.slice(0, 3).every(ratio => ratio >= 4.5) && contrast[3] >= 3, `Contrast for ${palette}: ${contrast}`);
+            paletteRoles.set(palette, { canvas, layer, accent });
         }
-        await page.locator('#phone').screenshot({ path: path.join(output, 'colours-dark.png') });
+        assert.equal(new Set([...paletteRoles.values()].map(role => role.canvas)).size, 3);
+        await phone.screenshot({ path: path.join(output, 'colours-dark.png') });
+
+        // Reviewer changes are visual only: the same player, artwork and saved choice survive.
+        await page.locator('[data-scenario="player"]').click();
+        const playerSurface = page.locator('.player');
+        const originalPlayer = await playerSurface.elementHandle();
+        const cover = page.locator('.player-cover');
+        const artworkColour = await cover.evaluate(node => getComputedStyle(node).backgroundColor);
+        for (const palette of palettes) {
+            await preview.selectOption(palette);
+            assert.equal(await phone.getAttribute('data-palette'), palette);
+            assert.equal(await playerSurface.evaluate((node, original) => node === original, originalPlayer), true);
+            assert.equal(await cover.evaluate(node => getComputedStyle(node).backgroundColor), artworkColour);
+            assert.deepEqual(await playerSurface.evaluate(node => {
+                const background = target => getComputedStyle(target).backgroundColor;
+                return { canvas: background(node), layer: background(node.querySelector('.player-controls')),
+                    accent: background(node.querySelector('.transport .play')) };
+            }), paletteRoles.get(palette));
+            await phone.screenshot({ path: path.join(output, `player-${palette}.png`) });
+        }
+        await originalPlayer.dispose();
+        await preview.selectOption('');
+        assert.equal(await phone.getAttribute('data-palette'), 'ink-blue');
+        await page.locator('.developer-panel > summary').click();
+        await page.getByLabel('Account fixture').selectOption('secondary');
+        assert.equal(await phone.getAttribute('data-palette'), 'pine');
+        await page.getByLabel('Account fixture').selectOption('primary');
+        assert.equal(await phone.getAttribute('data-palette'), 'ink-blue');
 
         for (const kind of ['album', 'artist', 'playlist']) {
             await page.evaluate(kind => { scenario('history'); openRoute({ kind, id: 0 }); }, kind);
@@ -262,7 +320,7 @@ function sameGeometry(before, after) {
         assert.equal(await page.evaluate(() => state.sheet.type), 'song');
         assert.deepEqual(errors, []);
         assert.deepEqual(externalRequests, []);
-        console.log('PASS: syntax, player geometry/type, scrolling/reset, lyrics/album access, responsive bounds, dark-only palettes, row columns, More isolation, no external requests.');
+        console.log('PASS: syntax, player geometry/type, scrolling/reset, lyrics/album access, responsive bounds, palette roles/contrast/isolation, row columns, More isolation, no external requests.');
     } finally {
         await browser.close();
     }
