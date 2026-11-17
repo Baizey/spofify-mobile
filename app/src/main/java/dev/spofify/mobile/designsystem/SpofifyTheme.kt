@@ -54,27 +54,16 @@ private val dark = darkColorScheme(
     outline = Color(0xFF68778A), outlineVariant = Color(0xFF353E49),
 )
 
-private val light = lightColorScheme(
-    background = Color(0xFFF8FAFC), onBackground = Color(0xFF1B2636),
-    surface = Color(0xFFEDF1F5), onSurface = Color(0xFF1B2636),
-    surfaceVariant = Color(0xFFE1E8EF), onSurfaceVariant = Color(0xFF4C5E74),
-    primary = Color(0xFF08704E), onPrimary = Color.White,
-    secondary = Color(0xFF2759A4), tertiary = Color(0xFF77551B),
-    outline = Color(0xFF728097), outlineVariant = Color(0xFFC0CBD6),
-)
-
 /** Palette tokens have already passed the coordinated v1 catalog validation in core. */
 internal fun paletteColor(hex: String): Color = Color(0xFF000000L or hex.removePrefix("#").toLong(16))
 
-internal fun spofifyColorScheme(lightTheme: Boolean, palette: PaletteTokens? = null): ColorScheme {
-    val base = if (lightTheme) light else dark
-    return if (palette == null) base else base.copy(
+internal fun spofifyColorScheme(palette: PaletteTokens? = null): ColorScheme =
+    if (palette == null) dark else dark.copy(
         primary = paletteColor(palette.primary), onPrimary = paletteColor(palette.onPrimary),
         secondary = paletteColor(palette.secondary), tertiary = paletteColor(palette.tertiary),
     )
-}
 
 @Composable
-fun SpofifyTheme(lightTheme: Boolean = false, palette: PaletteTokens? = null, content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = spofifyColorScheme(lightTheme, palette), typography = typography, content = content)
+fun SpofifyTheme(palette: PaletteTokens? = null, content: @Composable () -> Unit) {
+    MaterialTheme(colorScheme = spofifyColorScheme(palette), typography = typography, content = content)
 }

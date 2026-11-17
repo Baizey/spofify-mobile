@@ -52,7 +52,6 @@ internal fun MusicRoot(
     identity: AccountIdentity,
     sessions: SessionRepository,
     playbackOwner: PlaybackOwner,
-    theme: DeviceThemeController,
     palettes: AccountPaletteController,
     account: @Composable () -> Unit,
 ) {
@@ -107,7 +106,7 @@ internal fun MusicRoot(
         }
     }
     // The graph and its models must not be replaced by playback ticks or IME recomposition.
-    val graph: NavGraphBuilder.() -> Unit = remember(navigation, api, searchApi, personal, loader, open, navigate, openActions, theme, palettes) {
+    val graph: NavGraphBuilder.() -> Unit = remember(navigation, api, searchApi, personal, loader, open, navigate, openActions, palettes) {
         {
             composable("history") { RecentScreen(personal, loader, currentController.value, navigate) }
             composable("search") { owner ->
@@ -138,13 +137,10 @@ internal fun MusicRoot(
                 }, open, playback = currentController.value, onNavigate = navigate, onMore = openActions)
             }
             composable("settings") {
-                SettingsScreen(identity, theme, palettes, onAccount = { navigation.navigate("account") },
+                SettingsScreen(identity, palettes, onAccount = { navigation.navigate("account") },
                     onColours = { navigation.navigate("colours") }, onCredits = { navigation.navigate("credits") })
             }
-            composable("colours") {
-                val appearance by theme.state.collectAsStateWithLifecycle()
-                AccountColoursScreen(identity, palettes, appearance.light)
-            }
+            composable("colours") { AccountColoursScreen(identity, palettes) }
             composable("credits") { CreditsScreen { navigation.navigate("font-license") } }
             composable("font-license") { FontLicenseScreen() }
             composable("account") { currentAccount.value() }

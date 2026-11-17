@@ -2,6 +2,7 @@ package dev.spofify.mobile
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.*
@@ -27,33 +28,24 @@ import dev.spofify.mobile.playback.PlaybackOwner
 import dev.spofify.mobile.designsystem.SpofifyTheme
 import dev.spofify.mobile.feature.auth.*
 import dev.spofify.mobile.feature.settings.AccountPaletteController
-import dev.spofify.mobile.feature.settings.DeviceThemeController
 import dev.spofify.mobile.feature.settings.accountPaletteTokens
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
-            statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
-            navigationBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
         val app = application as SpofifyApplication
         val repository = app.sessions
         setContent {
             val authentication by repository.state.collectAsStateWithLifecycle()
-            val appearance by app.theme.state.collectAsStateWithLifecycle()
             val palette by app.palettes.state.collectAsStateWithLifecycle()
             val identity = (authentication as? AuthState.Authenticated)?.identity
-            SideEffect {
-                val style = if (appearance.light) androidx.activity.SystemBarStyle.light(
-                    android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
-                else androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
-                enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
-            }
-            SpofifyTheme(appearance.light, accountPaletteTokens(palette, identity, appearance.light)) {
+            SpofifyTheme(accountPaletteTokens(palette, identity)) {
                 val model: AuthViewModel = viewModel(factory = AuthViewModel.Factory(repository))
-                if (appearance.loaded) AuthRoot(model, repository, app.playback, app.theme, app.palettes)
-                else Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {}
+                AuthRoot(model, repository, app.playback, app.palettes)
             }
         }
     }
@@ -64,7 +56,6 @@ private fun AuthRoot(
     model: AuthViewModel,
     sessions: SessionRepository,
     playback: PlaybackOwner,
-    theme: DeviceThemeController,
     palettes: AccountPaletteController,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
@@ -101,7 +92,7 @@ private fun AuthRoot(
                 is AuthState.Authenticated -> {
                     pages.SaveableStateProvider(requireNotNull(pageKey)) {
                         var credits by rememberSaveable { mutableStateOf(false) }
-                        MusicRoot(current.identity, sessions, playback, theme, palettes) {
+                        MusicRoot(current.identity, sessions, playback, palettes) {
                             AccountScreen(current, model::signOut) { credits = true }
                         }
                         if (credits) FontCredits { credits = false }

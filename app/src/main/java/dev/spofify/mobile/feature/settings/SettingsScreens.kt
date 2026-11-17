@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -29,43 +28,31 @@ import dev.spofify.mobile.core.palette.PaletteTokens
 import dev.spofify.mobile.core.palette.PaletteId
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
-import dev.spofify.mobile.designsystem.SpofifySwitchIndicator
 import dev.spofify.mobile.designsystem.paletteColor
 import dev.spofify.mobile.feature.library.PageTitle
 
 @Composable
 internal fun SettingsScreen(
     identity: AccountIdentity,
-    theme: DeviceThemeController,
     palettes: AccountPaletteController,
     onAccount: () -> Unit,
     onColours: () -> Unit,
     onCredits: () -> Unit,
 ) {
-    val appearance by theme.state.collectAsStateWithLifecycle()
     val paletteState by palettes.state.collectAsStateWithLifecycle()
     val palette = paletteState.takeIf { it.owner == identity }?.confirmed
     SettingsPage("Settings") {
         SettingsGroup("Account")
         SettingsLink("Account and server", identity.username, onAccount)
         SettingsLink("Account colours", palette?.selected?.name, onColours)
-        SettingsGroup("Appearance")
-        Row(Modifier.fillMaxWidth().heightIn(min = 66.dp)
-            .toggleable(value = appearance.light, enabled = appearance.loaded && !appearance.saving,
-                role = Role.Switch, onValueChange = theme::choose),
-            verticalAlignment = Alignment.CenterVertically) {
-            Text("Light theme", Modifier.weight(1f))
-            SpofifySwitchIndicator(appearance.light, enabled = appearance.loaded && !appearance.saving)
-        }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        appearance.notice?.let { SettingsNotice(it) }
+        SettingsGroup("About")
         SettingsLink("Credits", null, onCredits)
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun AccountColoursScreen(identity: AccountIdentity, palettes: AccountPaletteController, lightTheme: Boolean) {
+internal fun AccountColoursScreen(identity: AccountIdentity, palettes: AccountPaletteController) {
     val current by palettes.state.collectAsStateWithLifecycle()
     // The graph may outlive an auth callback for a frame; never render another owner's state.
     val state = current.takeIf { it.owner == identity }
@@ -90,12 +77,11 @@ internal fun AccountColoursScreen(identity: AccountIdentity, palettes: AccountPa
             }
         }) {
             confirmed?.presets?.forEach { preset ->
-                val tokens = if (lightTheme) preset.light else preset.dark
                 Row(Modifier.fillMaxWidth().heightIn(min = 76.dp)
                     .selectable(selected = selection == preset.id, enabled = enabled, role = Role.RadioButton,
                         onClick = { palettes.choose(preset.id) }).padding(vertical = 14.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    PaletteSwatches(tokens)
+                    PaletteSwatches(preset.dark)
                     Column(Modifier.weight(1f)) {
                         Text(preset.name, style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.SemiBold))
                         Text(when (preset.id) {

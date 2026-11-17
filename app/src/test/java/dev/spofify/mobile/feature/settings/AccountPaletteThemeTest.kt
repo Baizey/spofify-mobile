@@ -17,21 +17,20 @@ class AccountPaletteThemeTest {
 
     @Test fun signedOutDifferentOriginAccountAndSessionCannotRenderCachedColours() {
         val state = AccountPaletteState(owner = owner, confirmed = confirmed, draft = PaletteId.EMBER)
-        assertNull(accountPaletteTokens(state, null, false))
-        assertNull(accountPaletteTokens(state, owner.copy(origin = "https://other.example"), false))
-        assertNull(accountPaletteTokens(state, owner.copy(accountId = "other"), false))
-        assertNull(accountPaletteTokens(state, owner.copy(incarnation = 2), false))
+        assertNull(accountPaletteTokens(state, null))
+        assertNull(accountPaletteTokens(state, owner.copy(origin = "https://other.example")))
+        assertNull(accountPaletteTokens(state, owner.copy(accountId = "other")))
+        assertNull(accountPaletteTokens(state, owner.copy(incarnation = 2)))
     }
 
-    @Test fun liveOwnerUsesConfirmedModeOrCurrentDraftWithoutWritingAnything() {
+    @Test fun liveOwnerUsesDarkTokensForConfirmedPaletteOrCurrentDraft() {
         val state = AccountPaletteState(owner = owner, confirmed = confirmed)
-        assertEquals(jade, accountPaletteTokens(state, owner, false))
-        assertEquals(jadeLight, accountPaletteTokens(state, owner, true))
-        assertEquals(ember, accountPaletteTokens(state.copy(draft = PaletteId.EMBER), owner, false))
+        assertEquals(jade, accountPaletteTokens(state, owner))
+        assertEquals(ember, accountPaletteTokens(state.copy(draft = PaletteId.EMBER), owner))
     }
 
     @Test fun unconfirmedOwnerOrUnknownDraftHasNoEffectiveAccountTokens() {
-        assertNull(accountPaletteTokens(AccountPaletteState(owner = owner), owner, false))
-        assertNull(accountPaletteTokens(AccountPaletteState(owner = owner, confirmed = confirmed, draft = PaletteId.VIOLET), owner, false))
+        assertNull(accountPaletteTokens(AccountPaletteState(owner = owner), owner))
+        assertNull(accountPaletteTokens(AccountPaletteState(owner = owner, confirmed = confirmed, draft = PaletteId.VIOLET), owner))
     }
 }

@@ -69,7 +69,7 @@ function sameGeometry(before, after) {
         downloadsPath: path.join(output, 'downloads'),
     });
     try {
-        const page = await browser.newPage({ viewport: { width: 1280, height: 1200 } });
+        const page = await browser.newPage({ viewport: { width: 1280, height: 1200 }, colorScheme: 'light' });
         const errors = [];
         const externalRequests = [];
         page.on('pageerror', error => errors.push(error.message));
@@ -192,21 +192,28 @@ function sameGeometry(before, after) {
             document.documentElement.style.setProperty('--height', '906px');
             document.querySelector('#phone').classList.remove('large');
             scenario('history');
-            openRoute({ kind: 'colours', id: 0 });
         });
+        await page.locator('[data-action="tab:settings"]').click();
+        assert.equal(await page.getByRole('switch', { name: 'Light theme' }).count(), 0);
+        assert.equal(await page.getByRole('switch', { name: 'Offline mode' }).count(), 1);
+        assert.equal(await page.getByRole('button', { name: 'Credits' }).count(), 1);
+        await page.getByRole('button', { name: /Account colours/ }).click();
         const paletteGeometry = () => page.locator('.palette-option').evaluateAll(elements => elements.map(element => {
             const bounds = element.getBoundingClientRect();
             return [bounds.y, bounds.height];
         }));
         const originalChoices = await paletteGeometry();
-        for (const palette of ['ember', 'violet', 'jade']) {
+        for (const [palette, primary] of [['ember', '#ffad89'], ['violet', '#c8b5ff'], ['jade', '#66e3b4']]) {
             await page.locator(`[data-action="palette:${palette}"]`).click();
             assert.deepEqual(await paletteGeometry(), originalChoices);
             assert.equal(await page.locator('.content .progress, .content .refresh-progress').count(), 0);
+            const rootColors = await page.locator('html').evaluate(root => {
+                const style = getComputedStyle(root);
+                return [style.colorScheme, style.getPropertyValue('--bg').trim(), style.getPropertyValue('--primary').trim()];
+            });
+            assert.deepEqual(rootColors, ['dark', '#101216', primary]);
         }
-        await page.evaluate(() => handle('theme'));
-        assert.deepEqual(await paletteGeometry(), originalChoices);
-        await page.locator('#phone').screenshot({ path: path.join(output, 'colours-light.png') });
+        await page.locator('#phone').screenshot({ path: path.join(output, 'colours-dark.png') });
 
         for (const kind of ['album', 'artist', 'playlist']) {
             await page.evaluate(kind => { scenario('history'); openRoute({ kind, id: 0 }); }, kind);
@@ -255,7 +262,7 @@ function sameGeometry(before, after) {
         assert.equal(await page.evaluate(() => state.sheet.type), 'song');
         assert.deepEqual(errors, []);
         assert.deepEqual(externalRequests, []);
-        console.log('PASS: syntax, player geometry/type, scrolling/reset, lyrics/album access, responsive bounds, palette stability, row columns, More isolation, no external requests.');
+        console.log('PASS: syntax, player geometry/type, scrolling/reset, lyrics/album access, responsive bounds, dark-only palettes, row columns, More isolation, no external requests.');
     } finally {
         await browser.close();
     }
