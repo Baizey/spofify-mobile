@@ -14,13 +14,13 @@
 .phone .license{overflow-wrap:anywhere}
 /* END EMBEDDED JETBRAINS MONO */
 *{box-sizing:border-box}[hidden]{display:none!important} :root{color-scheme:dark;--bg:#101216;--surface:#1a1e24;--raised:#252b34;--line:#353e49;--field-line:#78889b;--ink:#f4f6fa;--muted:#b4bdcb;--focus:#bac6d5;--disabled-opacity:.5;--outside:#14191f;--scale:1;--width:412px;--height:906px}
-[data-palette=oxblood]{--primary:#9c5358;--secondary:#795d82;--tertiary:#ffb879}
-[data-palette=pine]{--primary:#43856c;--secondary:#526d7d;--tertiary:#eed087}
-[data-palette=ink-blue]{--primary:#526fba;--secondary:#6c618d;--tertiary:#92ead7}
+[data-palette=pulse-green]{--primary:#1ed760;--secondary:#83bfff;--tertiary:#ffd15c}
+[data-palette=electric-blue]{--primary:#529bff;--secondary:#6dcec4;--tertiary:#ffae6b}
+[data-palette=hot-coral]{--primary:#ff706e;--secondary:#bdabff;--tertiary:#dced73}
 /* Account palettes colour controls, never the canvas or its layers. */
-.phone{--action:color-mix(in srgb,var(--primary) 73%,var(--ink));
+.phone{--action:var(--primary);
     --on-action:#15141a;
-    --state:color-mix(in srgb,var(--secondary) 60%,var(--ink));
+    --state:var(--secondary);
     --focus:var(--state);
     --glow:color-mix(in srgb,var(--secondary) 29%,transparent)}
 /* Neutral controls reveal the action colour on interaction; filled actions and state markers keep their roles. */
@@ -73,7 +73,7 @@ body{margin:0;background:var(--outside);color:var(--ink);font:15px/1.5 system-ui
 </section>
 <section class="stage" aria-label="Interactive mobile wireframe">
 <div class="caption">Approx. 412 × 906 CSS px · OnePlus 13 proportions</div>
-<div class="phone" id="phone" data-palette="pine"><div class="status" aria-hidden="true"><span>9:41</span><span>▂▃▅ ▰</span></div><div class="app" id="app"></div><div class="native"><button id="system-back" aria-label="Android system Back"><svg viewBox="0 0 24 24"><path d="M17 4 5 12l12 8Z"/></svg></button><span aria-hidden="true"></span></div></div>
+<div class="phone" id="phone"><div class="status" aria-hidden="true"><span>9:41</span><span>▂▃▅ ▰</span></div><div class="app" id="app"></div><div class="native"><button id="system-back" aria-label="Android system Back"><svg viewBox="0 0 24 24"><path d="M17 4 5 12l12 8Z"/></svg></button><span aria-hidden="true"></span></div></div>
 
 </section>
 <section class="notes">
@@ -87,7 +87,7 @@ body{margin:0;background:var(--outside);color:var(--ink);font:15px/1.5 system-ui
 <p>Individual Queue is implicitly high; collections low. Deliberate Play replaces the queue with one rotated pass: selecting 3 from [1,2,3,4,5] plays 3,4,5,1,2, then stops with Repeat Off. Repeat Queue permits another round; Repeat One binds the exact occurrence. Queue and returning online never autoplay. Offline saved music and temporary cache are distinct; preserve safe preparation, cancellation, Retry and saved-data confirmation.</p>
 <h2>Colour tokens and account boundary</h2>
 <p>Account colours is a study, not the native palette catalog. Backgrounds, panels and artwork do not change with the palette. Primary marks clickables: Play and Sign in use it at rest; ordinary controls show it on interaction. Secondary marks states such as the current tab, enabled playback modes, offline availability and input focus. Tertiary draws attention to the scrubber while dragging, the current lyric in the full lyrics view, or a popular track’s flame. Labels, shapes and state markers still carry meaning without colour.</p>
-<p>Preview palette changes only the wireframe’s appearance, including on the sign-in sample. Settings → Account colours changes the in-memory choice for the current fixture account and returns the preview to Follow account. Fixture accounts are isolated by origin and immutable account ID; with no choice, Pine is the study baseline. Nothing is stored or sent to a service.</p>
+<p>Preview palette changes only the wireframe’s appearance, including on the sign-in sample. Settings → Account colours changes the in-memory choice for the current fixture account and returns the preview to Follow account. Fixture accounts are isolated by origin and immutable account ID; with no choice, Pulse Green is the study baseline. Nothing is stored or sent to a service.</p>
 <h2>Source feasibility and illustrative data</h2>
 <p>Reference derived from accepted feature sketch v4, SHA256 2c0fa908e84d2673b9fdce4961f34e24d53dc63c66c5d7d3c7f7fd53a3ff5f25. Exact bundled JetBrains Mono 400/500/600/700 and full local OFL remain embedded; Settings → Credits works offline. No sibling reference files or external assets are required.</p>
 <p>All words, waveform shapes, ranking and listening occurrences are synthetic. Existing native Models/CatalogApi support optional genres and ordinary details/browsing, not listener lyrics/analysis/popularity/aggregate-insight or account-preference contracts. PlaybackService.sampleHistory is a no-op; native offline receipts are not implemented. History needs source/timing/licensing, coverage/timezone/retention and privacy reconciliation; a bounded retained server window cannot prove full-year completeness. Previously inspected backend history retains occurrences while recent deduplicates; recorded-history clear must coordinate pending receipts/replay ledger without automatic mutation replay. These are source feasibility notes, not deployment claims. Suggestions remain shelved.</p>
@@ -245,17 +245,18 @@ function switchRow(action,title,on){return `<button class="preference" data-acti
 const demoOrigin='http://100.88.20.14:6030';
 const demoAccounts={primary:{id:'fixture-account-a',name:'sample-listener',origin:demoOrigin},secondary:{id:'fixture-account-b',name:'second-listener',origin:demoOrigin},unknown:{id:null,name:'Unknown account',origin:demoOrigin}};
 const accountPalettes=new Map(),palettePresets=[
- {id:'oxblood',name:'Oxblood',family:'Red',colours:'Plum / apricot'},
- {id:'pine',name:'Pine',family:'Green',colours:'Blue slate / honey'},
- {id:'ink-blue',name:'Ink Blue',family:'Blue',colours:'Slate violet / sea glass'},
+ {id:'pulse-green',name:'Pulse Green',family:'Green',colours:'Sky blue / gold'},
+ {id:'electric-blue',name:'Electric Blue',family:'Blue',colours:'Turquoise / tangerine'},
+ {id:'hot-coral',name:'Hot Coral',family:'Red',colours:'Lilac / lime'},
 ];
 const palettePreview=$('#palette-preview');
 for(const {id,name,family} of palettePresets)palettePreview.add(new Option(family+' — '+name,id));
 palettePreview.addEventListener('change',applyAccountColours);
 let activeAccount=demoAccounts.primary;
 function accountColourKey(){return activeAccount?.id&&activeAccount.origin?JSON.stringify([activeAccount.origin,activeAccount.id]):null;}
-function effectivePalette(){return accountPalettes.get(accountColourKey())||'pine';}
+function effectivePalette(){return accountPalettes.get(accountColourKey())||palettePresets[0].id;}
 function applyAccountColours(){$('#phone').dataset.palette=palettePreview.value||effectivePalette();}
+applyAccountColours();
 function chooseAccountPalette(value,owner=accountColourKey()){const key=accountColourKey();if(!key||owner!==key||!palettePresets.some(p=>p.id===value)||state.route?.kind!=='colours'||state.sheet||state.player)return false;accountPalettes.set(key,value);palettePreview.value='';applyAccountColours();render({action:'palette:'+value});return true;}
 function accountColours(){const current=effectivePalette(),known=!!accountColourKey();return `<h1 class="heading">Account colours</h1><p class="colour-owner">${escapeHtml(activeAccount?.name||'Account unavailable')}</p>${!known?'<p class="feature-state" role="status">Sign in again to choose colours.</p>':''}<div class="palette-choices" role="group" aria-label="Account palette">${palettePresets.map(p=>`<button class="palette-option" data-action="palette:${p.id}" data-colour-owner="${escapeHtml(accountColourKey()||'')}" data-palette="${p.id}" aria-pressed="${current===p.id}" ${known?'':'disabled'}><span class="palette-swatches" aria-hidden="true"><i></i><i></i><i></i></span><span class="identity"><strong>${p.name}</strong><small>${p.family} base · ${p.colours}</small></span><span class="palette-selected" aria-hidden="true">${current===p.id?'✓':''}</span></button>`).join('')}</div><section class="colour-preview" aria-labelledby="palette-sample-title"><h2 id="palette-sample-title">Palette preview</h2><div class="palette-sample"><span class="sample-play" aria-hidden="true">${icon('play')}</span><span class="identity"><strong>First Light</strong><small>Mira Vale</small></span><span class="sample-saved" role="img" aria-label="Available offline">${icon('offline-save')}</span></div></section>`;}
 function settings(){return `<h1 class="heading">Settings</h1>${switchRow('offline','Offline mode',state.offline)}${cacheSetting()}${preference('saved','Saved music',`${[...retention.values()].filter(r=>r.desired).length} collections`)}<div class="group">Account</div>${preference('account','Account and server',escapeHtml(activeAccount?.name||'Account unavailable'))}${preference('colours','Account colours',palettePresets.find(p=>p.id===effectivePalette()).name)}<div class="group">About</div>${preference('credits','Credits')}`;}

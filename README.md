@@ -26,7 +26,7 @@ menu, lyric icon or scroll hint, compact
 identity/seek spacing, and time labels aligned with Shuffle and Repeat.
 [Settings appearance](docs/settings-appearance.md) records native palette ownership
 and persistence. The wireframe’s **Palette study** is a separate proposal: use the
-preview picker to compare Oxblood, Pine, and Ink Blue on the same screen. It does
+preview picker to compare Pulse Green, Electric Blue, and Hot Coral on the same screen. It does
 not change Android or the palette API. [Unified search](docs/search.md) records the subsequent
 search migration: the server now owns matching and cross-kind ranking, rather than
 the reference fixture’s local ranking heuristic. Search layout and bottom-oriented

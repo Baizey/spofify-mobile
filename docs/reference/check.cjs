@@ -203,8 +203,9 @@ function sameGeometry(before, after) {
             return [bounds.y, bounds.height];
         }));
         const originalChoices = await paletteGeometry();
-        const palettes = ['oxblood', 'pine', 'ink-blue'];
+        const palettes = ['pulse-green', 'electric-blue', 'hot-coral'];
         const phone = page.locator('#phone');
+        assert.equal(await phone.getAttribute('data-palette'), palettes[0]);
         const preview = page.getByLabel('Preview palette');
         const paletteRoles = new Map();
         for (const palette of palettes) {
@@ -213,14 +214,15 @@ function sameGeometry(before, after) {
             assert.equal(await choice.getAttribute('aria-pressed'), 'true');
             assert.deepEqual(await paletteGeometry(), originalChoices);
             assert.equal(await page.locator('.content .progress, .content .refresh-progress').count(), 0);
-            const { scheme, canvas, layer, raised, action, focus, tertiary, textContrast, controlContrast } = await phone.evaluate(element => {
+            const { scheme, canvas, layer, raised, action, focus, tertiary, swatchesMatch, textContrast, controlContrast } = await phone.evaluate(element => {
                 const style = getComputedStyle(element);
                 const canvas = style.backgroundColor;
                 const layer = getComputedStyle(element.querySelector('.palette-sample')).backgroundColor;
                 const raised = style.getPropertyValue('--raised').trim();
                 const play = getComputedStyle(element.querySelector('.sample-play'));
                 const focus = getComputedStyle(element.querySelector('.sample-saved')).color;
-                const tertiary = getComputedStyle(element.querySelector('[aria-pressed=true] .palette-swatches i:last-child')).backgroundColor;
+                const [primary, secondary, tertiary] = [...element.querySelectorAll('[aria-pressed=true] .palette-swatches i')]
+                    .map(swatch => getComputedStyle(swatch).backgroundColor);
                 const pixel = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
                 function luminance(color) {
                     pixel.fillStyle = color;
@@ -237,12 +239,15 @@ function sameGeometry(before, after) {
                 const fill = luminance(play.backgroundColor);
                 return {
                     scheme: style.colorScheme, canvas, layer, raised, action: play.backgroundColor, focus, tertiary,
+                    swatchesMatch: play.backgroundColor === primary && focus === secondary,
                     textContrast: Math.min(ratio(fill, luminance(play.color)), ...backgrounds.map(bg => ratio(muted, bg))),
                     controlContrast: Math.min(...[fill, luminance(focus), luminance(tertiary)]
                         .flatMap(colour => backgrounds.map(bg => ratio(colour, bg)))),
                 };
             });
             assert.equal(scheme, 'dark');
+            assert.ok(swatchesMatch);
+            if (palette === 'pulse-green') assert.equal(action, 'rgb(30, 215, 96)');
             assert.deepEqual([canvas, layer, raised], ['rgb(16, 18, 22)', 'rgb(26, 30, 36)', '#252b34']);
             assert.ok(textContrast >= 4.5, `Text contrast for ${palette}: ${textContrast}`);
             assert.ok(controlContrast >= 3, `Control contrast for ${palette}: ${controlContrast}`);
@@ -322,17 +327,18 @@ function sameGeometry(before, after) {
         }
         assert.equal(glows.size, 3);
         await preview.selectOption('');
-        assert.equal(await phone.getAttribute('data-palette'), 'ink-blue');
+        const lastChoice = palettes.at(-1);
+        assert.equal(await phone.getAttribute('data-palette'), lastChoice);
         await page.locator('.developer-panel > summary').click();
         await page.getByLabel('Account fixture').selectOption('secondary');
-        assert.equal(await phone.getAttribute('data-palette'), 'pine');
+        assert.equal(await phone.getAttribute('data-palette'), palettes[0]);
         await page.getByLabel('Account fixture').selectOption('primary');
-        assert.equal(await phone.getAttribute('data-palette'), 'ink-blue');
+        assert.equal(await phone.getAttribute('data-palette'), lastChoice);
 
         for (const kind of ['album', 'artist', 'playlist']) {
             await page.evaluate(kind => { scenario('history'); openRoute({ kind, id: 0 }); }, kind);
             if (kind === 'album') {
-                const { focus, tertiary } = paletteRoles.get('ink-blue');
+                const { focus, tertiary } = paletteRoles.get(lastChoice);
                 assert.equal(await colour(page.getByRole('img', { name: 'Available offline on this phone' })), focus);
                 assert.equal(await colour(page.getByRole('img', { name: 'Popular track' }).first()), tertiary);
                 assert.equal(await colour(page.locator('.nav [aria-current=page] svg')), focus);
