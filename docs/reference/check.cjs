@@ -219,8 +219,8 @@ function sameGeometry(before, after) {
                 const layer = getComputedStyle(element.querySelector('.palette-sample')).backgroundColor;
                 const raised = style.getPropertyValue('--raised').trim();
                 const play = getComputedStyle(element.querySelector('.sample-play'));
-                const focus = getComputedStyle(element.querySelector('.sample-more')).color;
-                const tertiary = style.getPropertyValue('--tertiary').trim();
+                const focus = getComputedStyle(element.querySelector('.sample-saved')).color;
+                const tertiary = getComputedStyle(element.querySelector('[aria-pressed=true] .palette-swatches i:last-child')).backgroundColor;
                 const pixel = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
                 function luminance(color) {
                     pixel.fillStyle = color;
@@ -256,6 +256,11 @@ function sameGeometry(before, after) {
         // Reviewer changes are visual only: the same player, artwork and saved choice survive.
         await page.locator('[data-scenario="player"]').click();
         const playerSurface = page.locator('.player');
+        const shuffle = playerSurface.getByRole('button', { name: 'Shuffle' });
+        await shuffle.click();
+        assert.equal(await shuffle.getAttribute('aria-pressed'), 'true');
+        const next = playerSurface.getByRole('button', { name: 'Next song' });
+        const colour = locator => locator.evaluate(node => getComputedStyle(node).color);
         const originalPlayer = await playerSurface.elementHandle();
         const cover = page.locator('.player-cover');
         const artworkColour = await cover.evaluate(node => getComputedStyle(node).backgroundColor);
@@ -264,7 +269,7 @@ function sameGeometry(before, after) {
             assert.equal(await phone.getAttribute('data-palette'), palette);
             assert.equal(await playerSurface.evaluate((node, original) => node === original, originalPlayer), true);
             assert.equal(await cover.evaluate(node => getComputedStyle(node).backgroundColor), artworkColour);
-            const { canvas, action } = paletteRoles.get(palette);
+            const { canvas, action, focus, tertiary } = paletteRoles.get(palette);
             assert.deepEqual(await playerSurface.evaluate(node => {
                 const controls = getComputedStyle(node.querySelector('.player-controls'));
                 return {
@@ -274,13 +279,33 @@ function sameGeometry(before, after) {
                     action: getComputedStyle(node.querySelector('.transport .play')).backgroundColor,
                 };
             }), { canvas, controls: 'rgba(0, 0, 0, 0)', shadow: 'none', action });
+            await page.mouse.move(0, 0);
+            assert.notEqual(await colour(next), action);
+            await next.hover();
+            assert.equal(await colour(next), action);
+            assert.equal(await colour(shuffle), focus);
+            assert.equal(await playerSurface.locator('.wave-played').first().evaluate(node => getComputedStyle(node).fill), action);
             await phone.screenshot({ path: path.join(output, `player-${palette}.png`) });
+
+            await playerSurface.getByRole('slider', { name: 'Waveform seek' }).hover();
+            await page.mouse.down();
+            const playhead = playerSurface.locator('.wave-playhead');
+            const stroke = () => playhead.evaluate(node => getComputedStyle(node).stroke);
+            assert.equal(await stroke(), tertiary);
+            await page.mouse.up();
+            assert.notEqual(await stroke(), tertiary);
         }
         await originalPlayer.dispose();
 
         await page.locator('[data-scenario="search"]').click();
         const field = page.locator('.search-field');
         const glows = new Set();
+        await page.getByRole('searchbox').blur();
+        await field.hover();
+        assert.equal(await field.evaluate(async node => {
+            await Promise.all(node.getAnimations().map(animation => animation.finished));
+            return getComputedStyle(node).backgroundSize;
+        }), '100% 35%');
         for (const palette of palettes) {
             await preview.selectOption(palette);
             await page.getByRole('searchbox').focus();
@@ -306,6 +331,12 @@ function sameGeometry(before, after) {
 
         for (const kind of ['album', 'artist', 'playlist']) {
             await page.evaluate(kind => { scenario('history'); openRoute({ kind, id: 0 }); }, kind);
+            if (kind === 'album') {
+                const { focus, tertiary } = paletteRoles.get('ink-blue');
+                assert.equal(await colour(page.getByRole('img', { name: 'Available offline on this phone' })), focus);
+                assert.equal(await colour(page.getByRole('img', { name: 'Popular track' }).first()), tertiary);
+                assert.equal(await colour(page.locator('.nav [aria-current=page] svg')), focus);
+            }
             const alignment = await page.evaluate(() => {
                 const center = element => { const bounds = element.getBoundingClientRect(); return bounds.x + bounds.width / 2; };
                 const row = document.querySelector('.motion-face .row');
@@ -351,7 +382,7 @@ function sameGeometry(before, after) {
         assert.equal(await page.evaluate(() => state.sheet.type), 'song');
         assert.deepEqual(errors, []);
         assert.deepEqual(externalRequests, []);
-        console.log('PASS: syntax, player geometry/type, scrolling/reset, lyrics/album access, responsive bounds, palette roles/contrast/isolation, row columns, More isolation, no external requests.');
+        console.log('PASS: syntax, player geometry/type, scrolling/reset, lyrics/album access, responsive bounds, palette roles/contrast/isolation, hover and playback feedback, row columns, More isolation, no external requests.');
     } finally {
         await browser.close();
     }
