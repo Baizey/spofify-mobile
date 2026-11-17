@@ -284,13 +284,14 @@ function sameGeometry(before, after) {
         for (const palette of palettes) {
             await preview.selectOption(palette);
             await page.getByRole('searchbox').focus();
-            const { dock, edge, glow } = await field.evaluate(async node => {
+            const { dock, fill, edge, glow } = await field.evaluate(async node => {
                 await Promise.all(node.getAnimations().map(animation => animation.finished));
                 const style = getComputedStyle(node);
                 return { dock: getComputedStyle(node.closest('.search-dock')).backgroundColor,
-                    edge: style.borderBottomColor, glow: style.backgroundImage };
+                    fill: style.backgroundColor, edge: style.borderBottomColor, glow: style.backgroundImage };
             });
-            assert.equal(dock, paletteRoles.get(palette).layer);
+            assert.equal(dock, paletteRoles.get(palette).canvas);
+            assert.equal(fill, 'rgba(0, 0, 0, 0)');
             assert.equal(edge, paletteRoles.get(palette).focus);
             glows.add(glow);
         }
