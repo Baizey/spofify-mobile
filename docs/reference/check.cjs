@@ -218,7 +218,7 @@ function sameGeometry(before, after) {
                 const style = getComputedStyle(element);
                 const canvas = style.backgroundColor;
                 const layer = getComputedStyle(element.querySelector('.palette-sample')).backgroundColor;
-                const raised = getComputedStyle(element.querySelector('.nav [aria-current=page]')).backgroundColor;
+                const raised = style.getPropertyValue('--raised').trim();
                 const accent = getComputedStyle(element.querySelector('.sample-play'));
                 const pixel = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
                 function luminance(color) {
@@ -237,7 +237,7 @@ function sameGeometry(before, after) {
                     scheme: style.colorScheme, canvas, layer, raised, accent: accent.backgroundColor,
                     textContrast: [...[canvas, layer, raised].map(surface => ratio(muted, luminance(surface))),
                         ratio(fill, luminance(accent.color))],
-                    controlContrast: ratio(fill, luminance(layer)),
+                    controlContrast: Math.min(ratio(fill, luminance(layer)), ratio(fill, luminance(canvas))),
                 };
             });
             assert.equal(scheme, 'dark');
@@ -263,11 +263,16 @@ function sameGeometry(before, after) {
             assert.equal(await phone.getAttribute('data-palette'), palette);
             assert.equal(await playerSurface.evaluate((node, original) => node === original, originalPlayer), true);
             assert.equal(await cover.evaluate(node => getComputedStyle(node).backgroundColor), artworkColour);
+            const { canvas, accent } = paletteRoles.get(palette);
             assert.deepEqual(await playerSurface.evaluate(node => {
-                const background = target => getComputedStyle(target).backgroundColor;
-                return { canvas: background(node), layer: background(node.querySelector('.player-controls')),
-                    accent: background(node.querySelector('.transport .play')) };
-            }), paletteRoles.get(palette));
+                const controls = getComputedStyle(node.querySelector('.player-controls'));
+                return {
+                    canvas: getComputedStyle(node).backgroundColor,
+                    controls: controls.backgroundColor,
+                    shadow: controls.boxShadow,
+                    accent: getComputedStyle(node.querySelector('.transport .play')).backgroundColor,
+                };
+            }), { canvas, controls: 'rgba(0, 0, 0, 0)', shadow: 'none', accent });
             await phone.screenshot({ path: path.join(output, `player-${palette}.png`) });
         }
         await originalPlayer.dispose();

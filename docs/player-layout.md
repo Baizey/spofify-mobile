@@ -25,7 +25,8 @@ interactive visual reference.
   keyboard arrows/Page Up/Page Down/Home/End are available.
 - Elapsed and total time labels are centered in the first and fifth equal
   transport columns, directly above Shuffle and Repeat. The seek target remains
-  full width.
+  full width. The wireframe lays the identities and controls directly on the
+  player canvas, without a backing card.
 
 ## Height budget
 
