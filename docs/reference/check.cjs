@@ -207,16 +207,18 @@ function sameGeometry(before, after) {
         const phone = page.locator('#phone');
         const preview = page.getByLabel('Preview palette');
         const paletteRoles = new Map();
+        const raisedLayers = new Set();
         for (const palette of palettes) {
             const choice = page.locator(`[data-action="palette:${palette}"]`);
             await choice.click();
             assert.equal(await choice.getAttribute('aria-pressed'), 'true');
             assert.deepEqual(await paletteGeometry(), originalChoices);
             assert.equal(await page.locator('.content .progress, .content .refresh-progress').count(), 0);
-            const { scheme, canvas, layer, accent, contrast } = await phone.evaluate(element => {
+            const { scheme, canvas, layer, raised, accent, textContrast, controlContrast } = await phone.evaluate(element => {
                 const style = getComputedStyle(element);
                 const canvas = style.backgroundColor;
                 const layer = getComputedStyle(element.querySelector('.palette-sample')).backgroundColor;
+                const raised = getComputedStyle(element.querySelector('.nav [aria-current=page]')).backgroundColor;
                 const accent = getComputedStyle(element.querySelector('.sample-play'));
                 const pixel = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
                 function luminance(color) {
@@ -232,18 +234,22 @@ function sameGeometry(before, after) {
                 const muted = luminance(style.getPropertyValue('--muted'));
                 const fill = luminance(accent.backgroundColor);
                 return {
-                    scheme: style.colorScheme, canvas, layer, accent: accent.backgroundColor,
-                    contrast: [ratio(muted, luminance(canvas)), ratio(muted, luminance(layer)),
-                        ratio(fill, luminance(accent.color)), ratio(fill, luminance(layer))],
+                    scheme: style.colorScheme, canvas, layer, raised, accent: accent.backgroundColor,
+                    textContrast: [...[canvas, layer, raised].map(surface => ratio(muted, luminance(surface))),
+                        ratio(fill, luminance(accent.color))],
+                    controlContrast: ratio(fill, luminance(layer)),
                 };
             });
             assert.equal(scheme, 'dark');
-            assert.notEqual(canvas, layer);
-            assert.notEqual(layer, accent);
-            assert.ok(contrast.slice(0, 3).every(ratio => ratio >= 4.5) && contrast[3] >= 3, `Contrast for ${palette}: ${contrast}`);
+            assert.equal(canvas, 'rgb(16, 18, 22)');
+            assert.equal(new Set([canvas, layer, raised, accent]).size, 4);
+            assert.ok(textContrast.every(ratio => ratio >= 4.5), `Text contrast for ${palette}: ${textContrast}`);
+            assert.ok(controlContrast >= 3, `Accent contrast for ${palette}: ${controlContrast}`);
             paletteRoles.set(palette, { canvas, layer, accent });
+            raisedLayers.add(raised);
         }
-        assert.equal(new Set([...paletteRoles.values()].map(role => role.canvas)).size, 3);
+        assert.equal(new Set([...paletteRoles.values()].map(role => role.layer)).size, 3);
+        assert.equal(raisedLayers.size, 3);
         await phone.screenshot({ path: path.join(output, 'colours-dark.png') });
 
         // Reviewer changes are visual only: the same player, artwork and saved choice survive.
