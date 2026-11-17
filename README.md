@@ -29,7 +29,9 @@ persistence behavior. The interactive reference now includes these approved
 native refinements too. [Unified search](docs/search.md) records the subsequent
 search migration: the server now owns matching and cross-kind ranking, rather than
 the reference fixture’s local ranking heuristic. Search layout and bottom-oriented
-results remain unchanged.
+results remain unchanged. [Artist discography](docs/artist-discography.md) records
+the subsequent native grouping refinement: separate own Albums and Singles, with
+Appears on collapsed at the bottom using backend release relationships.
 
 The reference remains self-contained. Its rendered behavior check uses Node.js 24
 and an already provisioned Playwright module plus matching Chromium headless shell:

@@ -26,6 +26,8 @@ data class MusicItem(
     val availableTracks: Long,
     val totalTracks: Long,
     val genres: List<String> = emptyList(),
+    val albumType: String = "",
+    val relation: String = "",
 ) {
     val key: String get() = "${kind.name}:$id"
 }

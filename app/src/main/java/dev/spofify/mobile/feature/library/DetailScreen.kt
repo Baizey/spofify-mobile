@@ -2,14 +2,9 @@ package dev.spofify.mobile.feature.library
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.GridItemSpan
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -20,7 +15,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.selected
@@ -84,40 +78,21 @@ internal fun DetailScreen(
 
     BackHandler(onBack = onBack)
     if (item?.kind == MusicKind.ARTIST) {
-        val largeText = LocalDensity.current.fontScale > 1.4f
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(if (largeText) 1 else 2),
-            modifier = Modifier.fillMaxSize(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 28.dp),
-        ) {
-            item("heading", span = { GridItemSpan(maxLineSpan) }) {
+        ArtistDiscographyGrid(
+            artistId = item.id,
+            releases = state.rows,
+            loader = loader,
+            onOpen = onOpen,
+            header = {
                 Column {
                     DetailHeading(item, loader, onNavigate)
                     DetailControls(item, ready && item.canPlay(), playCollection, { menuItem = item })
                     DetailActionError(actionError)
                     DetailTopTracks(state.rankMode, model::toggleRankMode)
-                    Text("Albums", style = MaterialTheme.typography.bodyLarge.copy(
-                        fontSize = 17.4.sp, lineHeight = 21.75.sp, fontWeight = FontWeight(620)),
-                        modifier = Modifier.padding(top = 24.dp, bottom = 4.dp).semantics { heading() })
                 }
-            }
-            items(state.rows, key = MusicItem::key) { album ->
-                Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button) { onOpen(album) }) {
-                    MusicArtwork(album, loader, Modifier.fillMaxWidth().aspectRatio(1f)
-                        .clip(RoundedCornerShape(7.dp)).background(MaterialTheme.colorScheme.surfaceVariant))
-                    Text(album.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyLarge.copy(
-                        fontSize = 14.1.sp, lineHeight = 19.04.sp, fontWeight = FontWeight.SemiBold),
-                        modifier = Modifier.padding(top = 7.dp))
-                    releaseYear(album.releaseDate).takeIf(String::isNotBlank)?.let { year ->
-                        Text(year, style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.7.sp, lineHeight = 16.38.sp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp))
-                    }
-                }
-            }
-            item("load-state", span = { GridItemSpan(maxLineSpan) }) { DetailLoadState(state, model) }
-        }
+            },
+            loadState = { DetailLoadState(state, model) },
+        )
     } else {
         LazyColumn(Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = 20.dp, bottom = 28.dp)) {
@@ -317,7 +292,7 @@ private fun DetailLoadState(state: DetailState, model: DetailViewModel) {
             TextButton(model::retry, Modifier.heightIn(min = 48.dp)) { Text("Retry") }
         }
         state.loaded && state.rows.isEmpty() && state.item?.kind != MusicKind.TRACK ->
-            Text(if (state.item?.kind == MusicKind.ARTIST) "No albums yet" else "No songs yet",
+            Text(if (state.item?.kind == MusicKind.ARTIST) "No releases yet" else "No songs yet",
                 Modifier.padding(vertical = 24.dp), style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
     }

@@ -7,6 +7,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -90,13 +91,97 @@ class LibraryClientTest {
             }
         }
 
-    private fun libraryPage(items: List<JsonObject>, limit: Int): String = buildJsonObject {
+    private fun libraryPage(items: List<JsonObject>, limit: Int, total: Int = items.size, offset: Int = 0): String = buildJsonObject {
         putJsonArray("items") { items.forEach { add(it) } }
-        put("total", items.size)
+        put("total", total)
         put("limit", limit)
-        put("offset", 0)
+        put("offset", offset)
         put("revision", 1)
     }.toString()
+
+    private fun releaseItem(role: String, id: String, albumType: String? = null, relation: String? = null): JsonObject =
+        JsonObject(manualItem(role, "album", id, listOf(manualAlbumArtist)) + buildJsonObject {
+            albumType?.let { put("albumType", it) }
+            relation?.let { put("relation", it) }
+        })
+
+    @Test fun artistAlbumPagesRetainReleaseTypesAndRelationsAcrossContinuationForBothRoles() = runBlocking {
+        for (role in listOf("user", "admin")) fixture(role) { server, sessions, identity ->
+            val artistId = "artist/%日本"
+            val metadata = (0 until 40).map { index ->
+                when (index % 4) {
+                    0 -> "album" to "release"
+                    1 -> "single" to "release"
+                    2 -> "ep" to "release"
+                    else -> "compilation" to "compilation"
+                }
+            }
+            val firstRows = metadata.mapIndexed { index, values -> releaseItem(role, "release-$index", values.first, values.second) }
+            val tail = listOf(
+                releaseItem(role, "guest", "album", "appearance"),
+                releaseItem(role, "future", "future-release-type", "future-credit-relation"),
+                releaseItem(role, "missing"),
+                releaseItem(role, "blank", "", ""),
+            )
+            server.enqueue(json(libraryPage(firstRows, 40, total = 44)))
+            server.enqueue(json(libraryPage(tail, 40, total = 44, offset = 40)))
+            val api = LibraryClient(sessions, identity)
+            val first = api.artistAlbums(artistId)
+            val next = api.artistAlbums(artistId, offset = 40)
+            assertEquals(metadata, first.items.map { it.albumType to it.relation })
+            assertEquals(listOf("album" to "appearance", "future-release-type" to "future-credit-relation",
+                "" to "", "" to ""), next.items.map { it.albumType to it.relation })
+            assertEquals((0 until 40).map { "release-$it" }, first.items.map { it.id })
+            assertEquals(listOf("guest", "future", "missing", "blank"), next.items.map { it.id })
+            assertEquals(44L, first.total)
+            assertEquals(44L, next.total)
+            assertTrue(first.hasMore)
+            assertFalse(next.hasMore)
+            assertTrue((first.items + next.items).all { !it.hasAudio })
+            for (offset in listOf(0, 40)) {
+                val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+                assertEquals("GET", request.method)
+                assertEquals("/api/library", request.requestUrl!!.encodedPath)
+                assertEquals(setOf("kind", "artistId", "releaseGroup", "scope", "availability", "offset", "limit"),
+                    request.requestUrl!!.queryParameterNames)
+                for ((key, value) in listOf("kind" to "albums", "artistId" to artistId, "releaseGroup" to "all",
+                        "scope" to "all", "availability" to "in-library", "limit" to "40", "offset" to "$offset"))
+                    assertEquals(value, request.requestUrl!!.queryParameter(key))
+                assertEquals("spofify_session=fixture-token", request.getHeader("Cookie"))
+                assertEquals(identity.origin, request.getHeader("Origin"))
+            }
+        }
+    }
+
+    @Test fun albumDetailDefaultsMissingReleaseMetadataAndPreservesUnknownFutureStringsForBothRoles() = runBlocking {
+        for (role in listOf("user", "admin")) fixture(role) { server, sessions, identity ->
+            val api = LibraryClient(sessions, identity)
+            val metadata = listOf(null to null, " Future / 日本 " to " future-relation-v2 ")
+            for ((albumType, relation) in metadata) {
+                server.enqueue(json(buildJsonObject {
+                    put("item", releaseItem(role, "release", albumType, relation))
+                    put("revision", 1)
+                }.toString()))
+                val item = api.detail(MusicKind.ALBUM, "release")
+                assertEquals(albumType.orEmpty(), item.albumType)
+                assertEquals(relation.orEmpty(), item.relation)
+                assertEquals(listOf(manualAlbumArtist), item.artists)
+            }
+        }
+    }
+
+    @Test fun presentMalformedReleaseMetadataRejectsTheWholeAuthenticatedPageForBothRoles() = runBlocking {
+        for (role in listOf("user", "admin")) fixture(role) { server, sessions, identity ->
+            val api = LibraryClient(sessions, identity)
+            val valid = releaseItem(role, "valid", "single", "release")
+            val invalidValues = listOf(JsonNull, JsonPrimitive(true), JsonPrimitive(7), buildJsonArray {}, buildJsonObject {})
+            for (field in listOf("albumType", "relation")) for (value in invalidValues) {
+                val invalid = JsonObject(releaseItem(role, "invalid", "album", "appearance") + (field to value))
+                server.enqueue(json(libraryPage(listOf(valid, invalid), 40)))
+                assertTrue("Malformed $field must not produce a partial page", runCatching { api.artistAlbums("artist") }.isFailure)
+            }
+        }
+    }
 
     @Test fun manualAlbumAndTrackReadsPreserveNameOnlyCreditsForBothRoles() = runBlocking {
         for (role in listOf("user", "admin")) {

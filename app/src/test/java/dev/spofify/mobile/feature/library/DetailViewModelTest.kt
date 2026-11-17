@@ -142,6 +142,35 @@ class DetailViewModelTest {
         assertEquals(41, model.state.value.rows.size)
     }
 
+    @Test fun artistPagesRetainReleaseRelationshipsAndTypesAcrossContinuation() = runTest(dispatcher) {
+        val appearances = (0 until 40).map { index ->
+            item(MusicKind.ALBUM, "appearance-$index").copy(
+                albumType = if (index % 2 == 0) "album" else "single",
+                relation = "appearance",
+            )
+        }
+        val album = item(MusicKind.ALBUM, "own-album").copy(albumType = "album", relation = "release")
+        val single = item(MusicKind.ALBUM, "own-single").copy(albumType = "single", relation = "release")
+        val releases = appearances + album + single
+        val api = Api().apply {
+            readDetail = { item(MusicKind.ARTIST, "collection") }
+            readPage = { offset ->
+                MusicPage(releases.drop(offset).take(40), releases.size.toLong(), offset, 40, 1)
+            }
+        }
+        val model = model(api, MusicKind.ARTIST)
+        advanceUntilIdle()
+        assertEquals(appearances, model.state.value.rows)
+        assertEquals(40, model.state.value.nextOffset)
+        model.more()
+        advanceUntilIdle()
+        assertEquals(listOf(0, 40), api.offsets)
+        assertEquals(releases, model.state.value.rows)
+        assertEquals(listOf("album", "single"), model.state.value.rows.takeLast(2).map { it.albumType })
+        assertTrue(model.state.value.rows.takeLast(2).all { it.relation == "release" })
+        assertNull(model.state.value.nextOffset)
+    }
+
     @Test fun artistContinuationFailureRetriesTheFailedPageNotTheFirstPage() = runTest(dispatcher) {
         val api = Api().apply {
             readDetail = { item(MusicKind.ARTIST, "collection") }

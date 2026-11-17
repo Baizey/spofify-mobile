@@ -12,6 +12,7 @@ import kotlinx.serialization.json.*
     val releaseDate: String = "", val durationMs: Long = 0, val trackNumber: Int = 0,
     val hasAudio: Boolean? = null, private val libraryPath: String? = null, val coverage: MusicCoverageWire,
     val genres: List<String> = emptyList(),
+    val albumType: String = "", val relation: String = "",
 ) {
     fun audio(legacyAdministratorFallback: Boolean): Boolean = hasAudio ?: if (legacyAdministratorFallback)
         !libraryPath.isNullOrEmpty() else throw IllegalArgumentException("Missing audio availability")
@@ -32,7 +33,8 @@ internal fun projectMusicItem(wire: MusicItemWire, legacyAdministratorFallback: 
     }
     return MusicItem(kind, validMusicEntityId(wire.id), wire.name, artists, wire.albumId, wire.albumName,
         wire.releaseDate, wire.durationMs, wire.trackNumber, audio,
-        wire.coverage.inLibrary, wire.coverage.tracks, wire.genres)
+        wire.coverage.inLibrary, wire.coverage.tracks, wire.genres,
+        albumType = wire.albumType, relation = wire.relation)
 }
 
 /** Strict positive wire types, followed by the same metadata rules as Library browsing. */
