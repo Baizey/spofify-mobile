@@ -71,7 +71,6 @@ fun PlaylistDetailScreen(
     LaunchedEffect(state.deleted) { if (state.deleted) onBack() }
     BackHandler(onBack = onBack)
 
-    val manual = summary?.kind == PersonalPlaylistKind.MANUAL
     val visibleRows = state.visibleRows
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(top = 20.dp)) {
@@ -118,10 +117,9 @@ fun PlaylistDetailScreen(
             }
             if (emptyMessage != null) Text(emptyMessage, Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-            // Manual entries append in playlist order. Reversing only the lazy indices keeps that visual
-            // order and starts beside the last entry. Derived playlists keep their ranked start.
-            LazyColumn(Modifier.fillMaxSize(), reverseLayout = manual, contentPadding = PaddingValues(bottom = 8.dp)) {
-                items(if (manual) visibleRows.asReversed() else visibleRows, key = { it.identity }) { row ->
+            // Index 0 is at the visual bottom. Reverse the lazy indices, not the playlist order.
+            LazyColumn(Modifier.fillMaxSize(), reverseLayout = true, contentPadding = PaddingValues(bottom = 8.dp)) {
+                items(visibleRows.asReversed(), key = { it.identity }) { row ->
                     PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
                         onQueue = if (playable && row.reference(context) != null) ({ queueRow(row) }) else null,
                         gestureBinding = personalGestureBinding(row, context, player))
