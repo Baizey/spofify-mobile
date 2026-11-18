@@ -214,15 +214,16 @@ function sameGeometry(before, after) {
             assert.equal(await choice.getAttribute('aria-pressed'), 'true');
             assert.deepEqual(await paletteGeometry(), originalChoices);
             assert.equal(await page.locator('.content .progress, .content .refresh-progress').count(), 0);
-            const { scheme, canvas, layer, raised, action, focus, tertiary, swatchesMatch, textContrast, controlContrast } = await phone.evaluate(element => {
+            const { scheme, canvas, layer, raised, action, accent, swatchesMatch, textContrast, controlContrast } = await phone.evaluate(element => {
                 const style = getComputedStyle(element);
                 const canvas = style.backgroundColor;
                 const layer = getComputedStyle(element.querySelector('.palette-sample')).backgroundColor;
                 const raised = style.getPropertyValue('--raised').trim();
                 const play = getComputedStyle(element.querySelector('.sample-play'));
                 const focus = getComputedStyle(element.querySelector('.sample-saved')).color;
-                const [primary, secondary, tertiary] = [...element.querySelectorAll('[aria-pressed=true] .palette-swatches i')]
+                const swatches = [...element.querySelectorAll('[aria-pressed=true] .palette-swatches i')]
                     .map(swatch => getComputedStyle(swatch).backgroundColor);
+                const [primary, accent] = swatches;
                 const pixel = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
                 function luminance(color) {
                     pixel.fillStyle = color;
@@ -238,10 +239,10 @@ function sameGeometry(before, after) {
                 const backgrounds = [canvas, layer, raised].map(luminance);
                 const fill = luminance(play.backgroundColor);
                 return {
-                    scheme: style.colorScheme, canvas, layer, raised, action: play.backgroundColor, focus, tertiary,
-                    swatchesMatch: play.backgroundColor === primary && focus === secondary,
+                    scheme: style.colorScheme, canvas, layer, raised, action: play.backgroundColor, accent,
+                    swatchesMatch: swatches.length === 2 && play.backgroundColor === primary && focus === primary && primary !== accent,
                     textContrast: Math.min(ratio(fill, luminance(play.color)), ...backgrounds.map(bg => ratio(muted, bg))),
-                    controlContrast: Math.min(...[fill, luminance(focus), luminance(tertiary)]
+                    controlContrast: Math.min(...[fill, luminance(accent)]
                         .flatMap(colour => backgrounds.map(bg => ratio(colour, bg)))),
                 };
             });
@@ -251,9 +252,9 @@ function sameGeometry(before, after) {
             assert.deepEqual([canvas, layer, raised], ['rgb(16, 18, 22)', 'rgb(26, 30, 36)', '#252b34']);
             assert.ok(textContrast >= 4.5, `Text contrast for ${palette}: ${textContrast}`);
             assert.ok(controlContrast >= 3, `Control contrast for ${palette}: ${controlContrast}`);
-            paletteRoles.set(palette, { canvas, layer, action, focus, tertiary });
+            paletteRoles.set(palette, { canvas, action, accent });
         }
-        for (const role of ['action', 'focus', 'tertiary']) {
+        for (const role of ['action', 'accent']) {
             assert.equal(new Set([...paletteRoles.values()].map(palette => palette[role])).size, 3);
         }
         await phone.screenshot({ path: path.join(output, 'colours-dark.png') });
@@ -274,7 +275,7 @@ function sameGeometry(before, after) {
             assert.equal(await phone.getAttribute('data-palette'), palette);
             assert.equal(await playerSurface.evaluate((node, original) => node === original, originalPlayer), true);
             assert.equal(await cover.evaluate(node => getComputedStyle(node).backgroundColor), artworkColour);
-            const { canvas, action, focus, tertiary } = paletteRoles.get(palette);
+            const { canvas, action, accent } = paletteRoles.get(palette);
             assert.deepEqual(await playerSurface.evaluate(node => {
                 const controls = getComputedStyle(node.querySelector('.player-controls'));
                 return {
@@ -288,7 +289,7 @@ function sameGeometry(before, after) {
             assert.notEqual(await colour(next), action);
             await next.hover();
             assert.equal(await colour(next), action);
-            assert.equal(await colour(shuffle), focus);
+            assert.equal(await colour(shuffle), action);
             assert.equal(await playerSurface.locator('.wave-played').first().evaluate(node => getComputedStyle(node).fill), action);
             await phone.screenshot({ path: path.join(output, `player-${palette}.png`) });
 
@@ -296,9 +297,9 @@ function sameGeometry(before, after) {
             await page.mouse.down();
             const playhead = playerSurface.locator('.wave-playhead');
             const stroke = () => playhead.evaluate(node => getComputedStyle(node).stroke);
-            assert.equal(await stroke(), tertiary);
+            assert.equal(await stroke(), accent);
             await page.mouse.up();
-            assert.notEqual(await stroke(), tertiary);
+            assert.notEqual(await stroke(), accent);
         }
         await originalPlayer.dispose();
 
@@ -322,7 +323,7 @@ function sameGeometry(before, after) {
             });
             assert.equal(dock, paletteRoles.get(palette).canvas);
             assert.equal(fill, 'rgba(0, 0, 0, 0)');
-            assert.equal(edge, paletteRoles.get(palette).focus);
+            assert.equal(edge, paletteRoles.get(palette).action);
             glows.add(glow);
         }
         assert.equal(glows.size, 3);
@@ -338,10 +339,10 @@ function sameGeometry(before, after) {
         for (const kind of ['album', 'artist', 'playlist']) {
             await page.evaluate(kind => { scenario('history'); openRoute({ kind, id: 0 }); }, kind);
             if (kind === 'album') {
-                const { focus, tertiary } = paletteRoles.get(lastChoice);
-                assert.equal(await colour(page.getByRole('img', { name: 'Available offline on this phone' })), focus);
-                assert.equal(await colour(page.getByRole('img', { name: 'Popular track' }).first()), tertiary);
-                assert.equal(await colour(page.locator('.nav [aria-current=page] svg')), focus);
+                const { action, accent } = paletteRoles.get(lastChoice);
+                assert.equal(await colour(page.getByRole('img', { name: 'Available offline on this phone' })), action);
+                assert.equal(await colour(page.getByRole('img', { name: 'Popular track' }).first()), accent);
+                assert.equal(await colour(page.locator('.nav [aria-current=page] svg')), action);
             }
             const alignment = await page.evaluate(() => {
                 const center = element => { const bounds = element.getBoundingClientRect(); return bounds.x + bounds.width / 2; };
