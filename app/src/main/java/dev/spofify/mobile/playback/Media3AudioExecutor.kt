@@ -6,9 +6,7 @@ import android.os.Looper
 import android.util.Log
 import androidx.media3.common.*
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DataSource
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import dev.spofify.mobile.core.auth.AccountIdentity
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.playback.*
@@ -24,11 +22,12 @@ internal class Media3AudioExecutor(
     context: Context,
     sessions: SessionRepository,
     identity: AccountIdentity,
+    cache: AutomaticMusicCache,
     private val onSystemPause: () -> Unit,
     private val requestPlaybackStart: () -> Boolean,
 ) : AudioExecutor, Closeable {
     val player: ExoPlayer = ExoPlayer.Builder(context)
-        .setMediaSourceFactory(DefaultMediaSourceFactory(DataSource.Factory { SessionAudioDataSource(sessions, identity) }))
+        .setMediaSourceFactory(SessionMusicSourceFactory(sessions, identity, cache))
         .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(), true)
         .setHandleAudioBecomingNoisy(true)
         .setWakeMode(C.WAKE_MODE_LOCAL)

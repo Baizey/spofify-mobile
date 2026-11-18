@@ -35,6 +35,8 @@ import dev.spofify.mobile.feature.library.PageTitle
 internal fun SettingsScreen(
     identity: AccountIdentity,
     palettes: AccountPaletteController,
+    cache: dev.spofify.mobile.playback.AutomaticMusicCache?,
+    onCache: () -> Unit,
     onAccount: () -> Unit,
     onColours: () -> Unit,
     onCredits: () -> Unit,
@@ -45,6 +47,8 @@ internal fun SettingsScreen(
         SettingsGroup("Account")
         SettingsLink("Account and server", identity.username, onAccount)
         SettingsLink("Account colours", palette?.selected?.name, onColours)
+        SettingsGroup("Storage")
+        SettingsLink("Automatic music cache", cache?.let { cacheSummary(it.songs.collectAsStateWithLifecycle().value) }, onCache)
         SettingsGroup("About")
         SettingsLink("Credits", null, onCredits)
     }
@@ -154,13 +158,13 @@ private fun SettingsPage(title: String, content: @Composable ColumnScope.() -> U
 }
 
 @Composable
-private fun SettingsGroup(label: String) {
+internal fun SettingsGroup(label: String) {
     Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(top = 24.dp, bottom = 6.dp).semantics { heading() })
 }
 
 @Composable
-private fun SettingsLink(label: String, value: String?, onClick: () -> Unit) {
+internal fun SettingsLink(label: String, value: String?, onClick: () -> Unit) {
     Column {
         Row(Modifier.fillMaxWidth().heightIn(min = 66.dp).clickable(role = Role.Button, onClick = onClick)
             .padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically,

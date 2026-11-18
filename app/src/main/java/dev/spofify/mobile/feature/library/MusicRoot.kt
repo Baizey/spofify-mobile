@@ -144,9 +144,10 @@ internal fun MusicRoot(
                 }, open, playback = currentController.value, onNavigate = navigate, onMore = openActions)
             }
             composable("settings") {
-                SettingsScreen(identity, palettes, onAccount = { navigation.navigate("account") },
+                SettingsScreen(identity, palettes, currentPlayer.value?.cache, onCache = { navigation.navigate("music-cache") }, onAccount = { navigation.navigate("account") },
                     onColours = { navigation.navigate("colours") }, onCredits = { navigation.navigate("credits") })
             }
+            composable("music-cache") { currentPlayer.value?.let { dev.spofify.mobile.feature.settings.MusicCacheScreen(it.cache) } }
             composable("colours") { AccountColoursScreen(identity, palettes) }
             composable("credits") { CreditsScreen { navigation.navigate("font-license") } }
             composable("font-license") { FontLicenseScreen() }

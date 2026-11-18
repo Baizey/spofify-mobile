@@ -31,6 +31,11 @@ internal interface FeatureTransport {
         onHeaders: (status: Int, renewedCookie: String?) -> Unit,
     ): AudioStream
 
+    suspend fun versionedAudio(
+        media: dev.spofify.mobile.core.offline.OfflineMediaDescriptor, cookie: String,
+        authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
+    ): AudioStream = throw UnsupportedOperationException()
+
     suspend fun post(
         segments: List<String>, body: String, cookie: String, csrfToken: String,
         onHeaders: (status: Int, renewedCookie: String?) -> Unit,

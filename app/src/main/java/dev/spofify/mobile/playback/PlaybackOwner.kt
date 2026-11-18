@@ -37,6 +37,7 @@ class PlaybackOwner(
     private val mutable = MutableStateFlow<NativePlayer?>(null)
     internal val state = mutable.asStateFlow()
     internal val current: NativePlayer? get() = mutable.value?.takeIf { sessions.isCurrent(it.identity) }
+    private val storage = MusicStorage(app, scope)
     private var started = false
     private var serviceSession: MediaSession? = null
     private var startingSession: MediaSession? = null
@@ -57,7 +58,7 @@ class PlaybackOwner(
                 retired?.close()
                 app.stopService(Intent(app, PlaybackService::class.java))
                 if (identity != null && sessions.isCurrent(identity)) {
-                    val player = NativePlayer(app, identity, sessions, scope,
+                    val player = NativePlayer(app, identity, sessions, scope, storage,
                         requestPlaybackStart = { ensureService(identity) })
                     mutable.value = player
                     player.scope.launch {
@@ -143,7 +144,10 @@ class PlaybackOwner(
 
     private fun reconcileServiceFor(player: NativePlayer) {
         if (current !== player) return
-        if (shouldStopPlaybackService(player.controller.state.value, player.audio.facts(), player.audio.player.playWhenReady))
+        val view = player.controller.state.value
+        val facts = player.audio.facts()
+        player.cache.observe(view, facts, player.audio.hasPlaybackAuthority())
+        if (shouldStopPlaybackService(view, facts, player.audio.player.playWhenReady))
             stopServiceFor(player)
     }
 
@@ -162,11 +166,13 @@ internal class NativePlayer(
     val identity: AccountIdentity,
     private val sessions: SessionRepository,
     parentScope: CoroutineScope,
+    storage: MusicStorage,
     requestPlaybackStart: () -> Boolean,
 ) {
     val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]))
     private var commandTarget: PlaybackController? = null
-    val audio = Media3AudioExecutor(app, sessions, identity, {
+    val cache = AutomaticMusicCache(app, sessions, identity, storage, scope)
+    val audio = Media3AudioExecutor(app, sessions, identity, cache, {
         commandTarget?.let { if (it.isLocalSelectedConnection()) it.pause() }
     }, requestPlaybackStart)
     val controller = PlaybackController(sessions.playbackTransport(identity), audio, scope, object : PlaybackClock {

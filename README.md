@@ -7,8 +7,11 @@ storage, native audio, lifecycle and presentation.
 Implemented surfaces include authentication, server-ranked Search, artist/album details,
 playlists, Recently played, mini/full player, queue/output controls, waveform/lyrics,
 and Settings appearance. Full History insights and artist rankings remain deferred.
-Offline storage, downloads and local-only playback are not yet enabled; API preparation
-must not be mistaken for saved or playable local audio.
+Settings → Automatic music cache controls a byte cache, not an offline playback mode.
+Keep 3 / 10 / 100 / 1000 distinct songs to look ahead 1 / 3 / 6 / 12 songs respectively.
+Prefetch defaults to unmetered connections; requested streams are unrestricted. Clear removes
+only automatic retention. The count excludes songs held for offline use; stored bytes include
+shared and still-playing blobs. Playlist downloads and local-only playback are not enabled.
 
 ## UI specification
 
@@ -49,12 +52,12 @@ action alignment; it is not a native Android or cross-browser acceptance test.
 ## Development
 
 Open this directory in Android Studio. Use JDK 25, Android platform 37.0 and
-build-tools 36.0.0. The version catalog pins AGP 9.3.1, Kotlin / Compose compiler
-2.4.21. The wrapper retains Gradle 9.9.0 from main. AGP built-in Kotlin consumes
+build-tools 36.0.0. The version catalog pins AGP 9.5.1, Kotlin / Compose compiler
+2.4.21. The wrapper pins Gradle 9.9.1. AGP built-in Kotlin consumes
 the newer KGP loaded by the root JVM plugin; no second Android Kotlin plugin is
 applied. Sources target Java 17; runtime minimum is Android 8 (API 26), target API 36.
 
-The retained 9.9.0 wrapper has been used for unit tests, lint, APK assembly and
+The earlier 9.9.0 wrapper was used for unit tests, lint, APK assembly and
 emulator checks during native integration. Those checks do not establish every
 upstream toolchain combination, deployment readiness or complete feature acceptance.
 Keep toolchain upgrades separate from feature changes.

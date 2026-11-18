@@ -92,6 +92,11 @@ class SessionRepository(
         featureTransport(client).audio(trackId, position, length, record.cookie, authority, headers)
     }
 
+    suspend fun versionedAudio(expected: AccountIdentity, media: dev.spofify.mobile.core.offline.OfflineMediaDescriptor): AudioStream =
+        featureExchange(expected) { client, record, headers, authority ->
+            featureTransport(client).versionedAudio(media, record.cookie, authority, headers)
+        }
+
     internal fun isAdministrator(expected: AccountIdentity): Boolean = synchronized(lock) {
         require(isCurrent(expected))
         saved?.session?.role == "admin"

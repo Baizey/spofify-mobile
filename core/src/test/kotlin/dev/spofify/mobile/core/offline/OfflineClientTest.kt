@@ -95,6 +95,27 @@ class OfflineClientTest {
         }
     }
 
+    @Test fun cacheFillUsesOnlyAuthenticatedVersionedWholeBodyWithExactStrongEtagAndLength() = runBlocking {
+        fixture { server, sessions, identity ->
+            val id = "a+日本:%"
+            server.enqueue(json(OfflineTestData.media(id, "a+%E6%97%A5%E6%9C%AC:%25")))
+            val descriptor = OfflineClient(sessions, identity).prepareMedia(id)
+            server.takeRequest()
+            val tag = "\"${descriptor.mediaVersion}\""
+            val body = "x".repeat(123)
+            for ((etag, payload) in listOf(tag to body, "W/$tag" to body, tag to "short", "\"other\"" to body)) {
+                server.enqueue(MockResponse().setHeader("ETag", etag).setBody(payload))
+                val result = runCatching { sessions.versionedAudio(identity, descriptor).use { it.input.readBytes().size } }
+                if (etag == tag && payload == body) assertEquals(123, result.getOrThrow()) else assertTrue(result.isFailure)
+                val request = server.takeRequest()
+                assertEquals(listOf("api", "me", "offline", "v1", "tracks", id, "audio"), request.requestUrl!!.pathSegments)
+                assertEquals(descriptor.mediaVersion, request.requestUrl!!.queryParameter("version"))
+                assertEquals("spofify_session=fixture-token", request.getHeader("Cookie"))
+                assertEquals("identity", request.getHeader("Accept-Encoding")); assertNull(request.getHeader("Range"))
+            }
+        }
+    }
+
     @Test fun changedFenceCountsOrMetadataDiscardTheEntireStagedSnapshot() = runBlocking {
         for (change in listOf("fence", "count", "revision")) fixture { server, sessions, identity ->
             server.enqueue(json(OfflineTestData.page(ids = listOf("one", "two"), total = 3, next = "of1_next")))

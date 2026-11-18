@@ -367,6 +367,21 @@ class PlaybackLifetimeTest {
         assertFalse(shouldStopPlaybackService(target, failed.copy(isLoading = true)))
     }
 
+    @Test fun musicCacheRequiresLiveSelectedPlaybackAndYieldsToNativeLoading() {
+        val local = view(local = true)
+        val binding = AudioBinding("instruction", 0, "event", "track")
+        val facts = AudioFacts(binding = binding, isPlaying = true)
+        assertTrue(local.readyForMusicCache(facts, true))
+        assertFalse(local.readyForMusicCache(facts, false))
+        assertFalse(view(local = false).readyForMusicCache(facts, true))
+        for (stale in listOf(binding.copy(eventId = "old"), binding.copy(trackId = "other"), binding.copy(outputVersion = 1)))
+            assertFalse(local.readyForMusicCache(facts.copy(binding = stale), true))
+        assertFalse(local.readyForMusicCache(facts.copy(isLoading = true), true))
+        assertFalse(local.readyForMusicCache(facts.copy(isBuffering = true), true))
+        assertFalse(local.readyForMusicCache(facts.copy(isPlaying = false), true))
+        assertFalse(local.copy(connection = PlaybackConnectionState.DISCONNECTED).readyForMusicCache(facts, true))
+    }
+
     @Test fun ordinaryPausedLocalServiceRemainsAttachedUntilTaskRemoval() {
         val local = view(local = true)
         val snapshot = requireNotNull(local.snapshot)

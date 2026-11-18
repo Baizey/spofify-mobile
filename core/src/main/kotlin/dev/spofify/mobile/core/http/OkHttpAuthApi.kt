@@ -72,6 +72,11 @@ internal class OkHttpAuthApi(
         authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
     ): AudioStream = media.audio(trackId, position, length, cookie, authority, onHeaders)
 
+    override suspend fun versionedAudio(
+        media: dev.spofify.mobile.core.offline.OfflineMediaDescriptor, cookie: String,
+        authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
+    ) = this.media.audio(media.trackId, 0, null, cookie, authority, onHeaders, media)
+
     override suspend fun get(
         segments: List<String>,
         query: List<Pair<String, String>>,

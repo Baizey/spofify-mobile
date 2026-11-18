@@ -87,12 +87,19 @@ internal class OriginMediaTransport(
     suspend fun audio(
         trackId: String, position: Long, length: Long?, cookie: String,
         authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
+        media: dev.spofify.mobile.core.offline.OfflineMediaDescriptor? = null,
     ): AudioStream {
         require(trackId.isNotBlank() && trackId.toByteArray().size <= 512 && trackId.none(Char::isISOControl))
         require(position >= 0 && (length == null || length > 0))
         val end = length?.let { Math.addExact(position, it - 1) }
         val ranged = position > 0 || length != null
-        val request = request(listOf("api", "library", "tracks", trackId, "audio"), cookie)
+        if (media != null) {
+            require(!ranged && dev.spofify.mobile.core.offline.OfflineParser.validSegment(trackId))
+            require(media.byteLength > 0 && media.mediaVersion == "sha256:${media.sha256}" && SHA.matches(media.sha256))
+        }
+        val path = if (media == null) listOf("api", "library", "tracks", trackId, "audio")
+            else listOf("api", "me", "offline", "v1", "tracks", trackId, "audio")
+        val request = request(path, cookie, media?.mediaVersion)
             .header("Accept-Encoding", "identity").apply {
             if (ranged) header("Range", "bytes=$position-${end ?: ""}")
         }.build()
@@ -118,6 +125,9 @@ internal class OriginMediaTransport(
                         val body = response.body
                         require(response.header("Content-Encoding").let { it == null || it.equals("identity", true) })
                         var bytes = body.contentLength()
+                        if (media != null) {
+                            require(!ranged && bytes == media.byteLength && response.headers.values("ETag") == listOf("\"${media.mediaVersion}\""))
+                        }
                         if (ranged) {
                             val range = RANGE.matchEntire(response.header("Content-Range").orEmpty())
                                 ?: throw IOException("Invalid audio range")
@@ -149,8 +159,11 @@ internal class OriginMediaTransport(
         }
     }
 
-    private fun request(segments: List<String>, cookie: String): Request.Builder {
-        val url = origin.url.newBuilder().apply { segments.forEach(::addPathSegment) }.build()
+    private fun request(segments: List<String>, cookie: String, version: String? = null): Request.Builder {
+        val url = origin.url.newBuilder().apply {
+            segments.forEach(::addPathSegment)
+            if (version != null) addQueryParameter("version", version)
+        }.build()
         check(origin.contains(url))
         return Request.Builder().url(url).get().header("Origin", origin.value)
             .header("Cookie", cookieHeader(cookie)).header("Cache-Control", "no-store")
@@ -164,6 +177,7 @@ internal class OriginMediaTransport(
 
     private companion object {
         const val PROTOCOL = "spofify.library-playback.v2"
+        val SHA = Regex("[0-9a-f]{64}")
         val RANGE = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+|\\*)")
     }
 }
