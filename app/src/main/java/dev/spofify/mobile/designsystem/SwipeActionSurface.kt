@@ -27,8 +27,8 @@ import kotlin.math.max
 fun SwipeActionSurface(
     binding: Any,
     onRight: (() -> Unit)?,
-    onLeft: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
+    onLeft: (() -> Unit)? = null,
     excludeEnd: Dp = 48.dp,
     slideOutOnCommit: Boolean = false,
     slideOutOnLeft: Boolean = false,

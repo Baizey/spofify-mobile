@@ -64,7 +64,6 @@ internal fun PlayerLyricViewport(line: LyricViewportKey, height: Dp, onOpen: () 
         val scroll = rememberScrollState()
         val scope = rememberCoroutineScope()
         val density = LocalDensity.current
-        val overflow = lyricOverflow(scroll.value, scroll.maxValue)
         val page = with(density) { height.roundToPx() }.coerceAtLeast(1)
         val step = with(density) { playerSupportingTextStyle.lineHeight.toPx() }.toInt().coerceAtLeast(1)
         Box(Modifier.fillMaxWidth().height(height).clipToBounds()
@@ -87,6 +86,7 @@ internal fun PlayerLyricViewport(line: LyricViewportKey, height: Dp, onOpen: () 
             }
             .clickable(role = Role.Button, onClickLabel = "Open full lyrics", onClick = onOpen)
             .semantics {
+                val overflow = lyricOverflow(scroll.value, scroll.maxValue)
                 stateDescription = when {
                     overflow.above && overflow.below -> "More lyric text above and below. Scroll to read."
                     overflow.below -> "More lyric text below. Scroll to read."

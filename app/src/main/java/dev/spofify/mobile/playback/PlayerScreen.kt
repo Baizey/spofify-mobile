@@ -69,6 +69,9 @@ internal fun FullPlayer(
     var lyrics by remember { mutableStateOf(false) }
     LaunchedEffect(binding) { lyrics = false }
     val scroll = rememberScrollState()
+    val dismissWithoutScrolling by remember(scroll) {
+        derivedStateOf { scroll.maxValue == 0 && scroll.value == 0 }
+    }
     Dialog(onDismiss, DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         SpofifyDialogSystemBars()
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -76,7 +79,7 @@ internal fun FullPlayer(
                 val density = LocalDensity.current
                 val largeText = density.fontScale >= 1.5f
                 val horizontal = if (largeText) 16.dp else 20.dp
-                val dismissGesture = Modifier.playerDismissGesture(binding, scroll.maxValue == 0 && scroll.value == 0, onDismiss)
+                val dismissGesture = Modifier.playerDismissGesture(binding, dismissWithoutScrolling, onDismiss)
                 PlayerBodyLayout(
                     availableHeight = (maxHeight - 34.dp).coerceAtLeast(0.dp),
                     largeText = largeText,

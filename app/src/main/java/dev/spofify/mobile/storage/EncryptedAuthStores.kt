@@ -1,5 +1,6 @@
 package dev.spofify.mobile.storage
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
@@ -51,6 +52,8 @@ private class EncryptedValue(
         }
     }
 
+    // The KTX edit helper discards commit()'s result. Auth writes must report persistence failures.
+    @SuppressLint("UseKtx")
     @Synchronized
     fun write(value: String?) {
         if (value == null) {

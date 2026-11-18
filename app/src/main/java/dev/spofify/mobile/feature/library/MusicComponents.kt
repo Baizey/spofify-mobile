@@ -48,11 +48,11 @@ internal fun artworkLoader(context: android.content.Context, api: LibraryApi): I
     }.build()
 
 @Composable
-internal fun MusicArtwork(item: MusicItem, loader: ImageLoader, modifier: Modifier = Modifier.size(48.dp)) =
+internal fun MusicArtwork(item: MusicItem, loader: ImageLoader, modifier: Modifier = Modifier) =
     MusicArtwork(item.kind, item.id, loader, modifier)
 
 @Composable
-internal fun MusicArtwork(kind: MusicKind, id: String, loader: ImageLoader, modifier: Modifier = Modifier.size(48.dp)) {
+internal fun MusicArtwork(kind: MusicKind, id: String, loader: ImageLoader, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     var loaded by remember(kind, id, loader) { mutableStateOf(false) }
     val request = remember(context, kind, id) {
@@ -60,7 +60,7 @@ internal fun MusicArtwork(kind: MusicKind, id: String, loader: ImageLoader, modi
     }
     val shape = if (kind == MusicKind.ARTIST) androidx.compose.foundation.shape.CircleShape
         else androidx.compose.foundation.shape.RoundedCornerShape(4.dp)
-    Box(modifier.clip(shape).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
+    Box(modifier.size(48.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
         if (!loaded) SpofifyIcon(SpofifyGlyph.Note, null, Modifier.size(22.dp),
             MaterialTheme.colorScheme.onSurfaceVariant)
         AsyncImage(model = request, imageLoader = loader, contentDescription = null,

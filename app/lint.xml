@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- Targeting Android 17 enforces runtime local-network permission. Keep LAN-hosted
+         servers working until the app can request and explain that permission. -->
+    <issue id="OldTargetApi">
+        <ignore path="build.gradle.kts" />
+    </issue>
+</lint>

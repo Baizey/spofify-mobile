@@ -1,5 +1,6 @@
 package dev.spofify.mobile.playback
 
+import android.annotation.SuppressLint
 import android.app.Application
 import android.app.PendingIntent
 import android.content.Intent
@@ -179,6 +180,9 @@ internal class NativePlayer(
         .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build().also { requestSession = it }
 
+    // Preserve the registered playback device and its chosen name. Android 8+ scopes
+    // ANDROID_ID to this signer/user/device; only the origin/account-scoped digest is sent.
+    @SuppressLint("HardwareIds")
     private val deviceId: String = run {
         val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID)
             ?: "${android.os.Build.BRAND}:${android.os.Build.MODEL}"
