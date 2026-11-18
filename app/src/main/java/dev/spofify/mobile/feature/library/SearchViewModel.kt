@@ -29,8 +29,8 @@ internal data class SearchState(
     val resultCount: Int? = null,
     val expiresAt: Instant? = null,
     val error: SearchErrorCode? = null,
-    // Local list anchoring only, never a server snapshot/version claim.
-    val scrollResetToken: Long = 0,
+    // A user edit, not a request attempt or a server snapshot/version.
+    val queryGeneration: Long = 0,
 ) {
     val busy: Boolean get() = waiting || loading
     val hasMore: Boolean get() = nextCursor != null && error == null
@@ -48,6 +48,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
     private val mutable = MutableStateFlow(SearchState())
     val state = mutable.asStateFlow()
     private var generation = 0L
+    private var consumedAnchorGeneration = 0L
     private var consumedFocusIntent = 0
     private var timer: Job? = null
     private var requestJob: Job? = null
@@ -62,14 +63,24 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
         return true
     }
 
+    fun consumeInitialAnchor(queryGeneration: Long): Boolean {
+        val current = mutable.value
+        if (queryGeneration != current.queryGeneration || queryGeneration <= consumedAnchorGeneration ||
+            !current.loaded || current.items.isEmpty()) return false
+        consumedAnchorGeneration = queryGeneration
+        return true
+    }
+
     fun query(value: String) {
-        if (!validSearchQuery(value) || value == mutable.value.query) return
+        val current = mutable.value
+        if (!validSearchQuery(value) || value == current.query) return
         cancelRequests()
         retryRequest = null
         interruptedRequest = null
         snapshot = null
-        val paused = mutable.value.paused
-        mutable.value = SearchState(query = value, paused = paused, waiting = value.isNotBlank() && !paused)
+        val paused = current.paused
+        mutable.value = SearchState(query = value, paused = paused, waiting = value.isNotBlank() && !paused,
+            queryGeneration = current.queryGeneration + 1)
         if (value.isBlank() || paused) return
         val token = generation
         timer = viewModelScope.launch {
@@ -135,7 +146,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
                     nextCursor = result.nextCursor,
                     resultCount = result.resultCount,
                     expiresAt = result.expiresAt,
-                    scrollResetToken = if (base == null) token else before.scrollResetToken,
+                    queryGeneration = before.queryGeneration,
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled

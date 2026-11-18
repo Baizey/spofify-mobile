@@ -71,7 +71,7 @@ class SearchRecoveryTest {
         assertEquals(100, rebuilt.resultCount)
         assertEquals(freshExpiry, rebuilt.expiresAt)
         assertEquals("fresh:75", rebuilt.nextCursor)
-        assertEquals(old.scrollResetToken, rebuilt.scrollResetToken)
+        assertEquals(old.queryGeneration, rebuilt.queryGeneration)
         assertNull(rebuilt.error)
         assertFalse(rebuilt.busy)
         assertEquals(listOf(Triple("query", null, 25), Triple("query", null, 25)), api.firstRequests)
@@ -118,7 +118,7 @@ class SearchRecoveryTest {
         assertEquals(3, api.firstRequests.size)
         assertEquals(listOf("old:25", "old:50", "failed:25", "retry:25", "retry:50"), api.cursors)
         assertEquals(batch("retry", 0, 75), model.state.value.items)
-        assertEquals(old.scrollResetToken, model.state.value.scrollResetToken)
+        assertEquals(old.queryGeneration, model.state.value.queryGeneration)
         assertNull(model.state.value.error)
     }
 
@@ -198,7 +198,7 @@ class SearchRecoveryTest {
         runCurrent()
         assertFalse(model.state.value.paused)
         assertEquals(batch("resumed", 0, 75), model.state.value.items)
-        assertEquals(old.scrollResetToken, model.state.value.scrollResetToken)
+        assertEquals(old.queryGeneration, model.state.value.queryGeneration)
         val accepted = model.state.value
         gate.complete(Unit)
         advanceUntilIdle()
@@ -283,7 +283,7 @@ class SearchRecoveryTest {
             assertEquals(batch("shrunken", 0, total), result.items)
             assertEquals(total, result.resultCount)
             assertEquals(freshExpiry, result.expiresAt)
-            assertEquals(old.scrollResetToken, result.scrollResetToken)
+            assertEquals(old.queryGeneration, result.queryGeneration)
             assertEquals(total == 0, result.empty)
             assertNull(result.nextCursor)
             assertNull(result.error)
@@ -392,7 +392,7 @@ class SearchRecoveryTest {
             assertEquals(old.items, current.items)
             assertEquals(old.resultCount, current.resultCount)
             assertEquals(old.expiresAt, current.expiresAt)
-            assertEquals(old.scrollResetToken, current.scrollResetToken)
+            assertEquals(old.queryGeneration, current.queryGeneration)
             assertTrue(current.busy)
             assertNull(current.error)
         }

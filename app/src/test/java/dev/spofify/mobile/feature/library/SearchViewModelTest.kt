@@ -83,7 +83,7 @@ class SearchViewModelTest {
         assertEquals(1, api.firstRequests.size)
         assertNull(api.firstRequests.single().second)
         assertEquals(3, model.state.value.resultCount)
-        assertTrue(model.state.value.scrollResetToken > 0)
+        assertTrue(model.consumeInitialAnchor(model.state.value.queryGeneration))
         assertFalse(model.state.value.hasMore)
     }
 
@@ -97,13 +97,15 @@ class SearchViewModelTest {
         val model = model(api)
         model.query("love")
         advanceUntilIdle()
-        val scrollToken = model.state.value.scrollResetToken
+        val generation = model.state.value.queryGeneration
+        assertTrue(model.consumeInitialAnchor(generation))
         model.more()
         advanceUntilIdle()
         assertEquals(1, api.firstRequests.size)
         assertEquals(listOf("cursor-a"), api.cursors)
         assertEquals(first + last, model.state.value.items)
-        assertEquals(scrollToken, model.state.value.scrollResetToken)
+        assertEquals(generation, model.state.value.queryGeneration)
+        assertFalse(model.consumeInitialAnchor(generation))
         assertEquals(27, model.state.value.resultCount)
         assertFalse(model.state.value.hasMore)
         model.more()
@@ -183,7 +185,8 @@ class SearchViewModelTest {
         val model = model(api)
         model.query("love")
         advanceUntilIdle()
-        val scrollToken = model.state.value.scrollResetToken
+        val generation = model.state.value.queryGeneration
+        assertTrue(model.consumeInitialAnchor(generation))
         model.more()
         runCurrent()
         assertEquals(prefix, model.state.value.items)
@@ -199,7 +202,8 @@ class SearchViewModelTest {
         assertEquals(listOf("old-cursor", "fresh-cursor"), api.cursors)
         assertEquals(freshPrefix + suffix, model.state.value.items)
         assertEquals(freshExpiry, model.state.value.expiresAt)
-        assertEquals(scrollToken, model.state.value.scrollResetToken)
+        assertEquals(generation, model.state.value.queryGeneration)
+        assertFalse(model.consumeInitialAnchor(generation))
         assertNull(model.state.value.error)
     }
 
@@ -217,16 +221,69 @@ class SearchViewModelTest {
         val model = model(api)
         model.query("love")
         advanceUntilIdle()
-        val originalToken = model.state.value.scrollResetToken
+        val generation = model.state.value.queryGeneration
+        assertTrue(model.consumeInitialAnchor(generation))
         model.more()
         advanceUntilIdle()
         assertEquals(expiry, model.state.value.expiresAt)
         assertEquals(27, model.state.value.items.size)
-        assertEquals(originalToken, model.state.value.scrollResetToken)
+        assertFalse(model.consumeInitialAnchor(model.state.value.queryGeneration))
         model.query("other")
         advanceUntilIdle()
-        assertTrue(model.state.value.scrollResetToken > originalToken)
+        assertFalse(model.consumeInitialAnchor(generation))
+        assertTrue(model.consumeInitialAnchor(model.state.value.queryGeneration))
         assertEquals(listOf("other"), model.state.value.items.map { it.id })
+    }
+
+    @Test fun anchorWaitsForRowsThroughLoadingFailureAndRetryAndIsNotReissuedOnReentry() = runTest(dispatcher) {
+        val gate = CompletableDeferred<Unit>()
+        val api = Api().apply {
+            first = { gate.await(); throw SearchException(SearchErrorCode.SEARCH_BUSY) }
+        }
+        val model = model(api)
+        model.query("love")
+        val generation = model.state.value.queryGeneration
+        assertTrue(model.state.value.waiting)
+        assertFalse(model.consumeInitialAnchor(generation))
+        advanceTimeBy(300)
+        runCurrent()
+        assertTrue(model.state.value.loading)
+        assertFalse(model.consumeInitialAnchor(generation))
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertFalse(model.consumeInitialAnchor(generation))
+        api.first = { page(batch(0, 25)) }
+        model.retry()
+        advanceUntilIdle()
+        assertTrue(model.consumeInitialAnchor(generation))
+        assertFalse(model.consumeInitialAnchor(generation))
+        model.pause()
+        model.resume()
+        advanceUntilIdle()
+        assertFalse(model.consumeInitialAnchor(generation))
+        assertEquals(batch(0, 25), model.state.value.items)
+        assertEquals(2, api.firstRequests.size)
+    }
+
+    @Test fun fastClearAndRetypeOfTheSameQueryGetsItsOwnAnchorEvenWithIdenticalRows() = runTest(dispatcher) {
+        val api = Api()
+        val model = model(api)
+        model.query("love")
+        advanceUntilIdle()
+        val original = model.state.value
+        assertTrue(model.consumeInitialAnchor(original.queryGeneration))
+        model.query("love") // An unchanged input is not a new query.
+        assertEquals(original, model.state.value)
+        model.query("")
+        assertFalse(model.consumeInitialAnchor(model.state.value.queryGeneration))
+        model.query("love")
+        advanceUntilIdle() // The UI need not observe the intermediate empty/loading states.
+        val retyped = model.state.value
+        assertEquals(original.items, retyped.items)
+        assertFalse(model.consumeInitialAnchor(original.queryGeneration))
+        assertTrue(model.consumeInitialAnchor(retyped.queryGeneration))
+        assertFalse(model.consumeInitialAnchor(retyped.queryGeneration))
+        assertEquals(listOf("love", "love"), api.firstRequests.map { it.first })
     }
 
     @Test fun inconsistentContinuationNeverPublishesAPartialOrMixedSnapshot() = runTest(dispatcher) {
@@ -297,6 +354,7 @@ class SearchViewModelTest {
             advanceUntilIdle()
             assertNull(model.state.value.error)
             assertTrue(model.state.value.empty)
+            assertFalse(model.consumeInitialAnchor(model.state.value.queryGeneration))
         }
     }
 
@@ -334,11 +392,14 @@ class SearchViewModelTest {
         model.query("old")
         advanceTimeBy(300)
         runCurrent()
+        val staleGeneration = model.state.value.queryGeneration
         model.query("new")
         advanceTimeBy(300)
         runCurrent()
         oldGate.complete(Unit)
         advanceUntilIdle()
+        assertFalse(model.consumeInitialAnchor(staleGeneration))
+        assertTrue(model.consumeInitialAnchor(model.state.value.queryGeneration))
         assertEquals(listOf("new"), model.state.value.items.map { it.id })
         assertEquals("new", model.state.value.query)
         assertNull(model.state.value.error)

@@ -77,6 +77,7 @@ internal fun MusicRoot(
     var devices by rememberSaveable { mutableStateOf(false) }
     var actions by remember { mutableStateOf<MusicActionSelection?>(null) }
     val entry by navigation.currentBackStackEntryAsState()
+    var rowPlaybackNotice by remember(navigation) { mutableStateOf<Pair<String, String>?>(null) }
     val search = entry?.destination?.route == "search"
     val imeOcclusion = WindowInsets.ime.getBottom(LocalDensity.current)
     val navigate: (MusicKind, String) -> Unit = remember(navigation) {
@@ -85,7 +86,10 @@ internal fun MusicRoot(
             val sameDetail = current?.destination?.route == "music/{kind}/{id}" &&
                 current.arguments?.getString("kind") == kind.name && current.arguments?.getString("id") == id
             // Different entities share a destination pattern, not a model or Back-stack entry.
-            if (!sameDetail) navigation.navigate("music/${kind.name}/${Uri.encode(id)}")
+            if (!sameDetail) {
+                rowPlaybackNotice = null
+                navigation.navigate("music/${kind.name}/${Uri.encode(id)}")
+            }
         }
     }
     val openActions: (MusicItem, PlaybackContext?) -> Unit = remember(focus, keyboard) {
@@ -99,9 +103,12 @@ internal fun MusicRoot(
         { item ->
             focus.clearFocus()
             keyboard?.hide()
-            val controller = currentController.value
-            if (item.kind == MusicKind.TRACK && item.hasAudio && controller?.state?.value?.connection == PlaybackConnectionState.READY)
-                controller.playTrack(PlaybackTrackReference(item.id))
+            if (item.kind == MusicKind.TRACK) activateTrackRow(item.id, item.hasAudio,
+                play = { currentController.value?.playTrack(it) },
+                openDetails = { navigate(item.kind, item.id) },
+                notice = { text -> rowPlaybackNotice = text?.let { message ->
+                    navigation.currentBackStackEntry?.id?.let { it to message }
+                } })
             else navigate(item.kind, item.id)
         }
     }
@@ -154,7 +161,7 @@ internal fun MusicRoot(
         } else player.controller.state.collect { if (it.current == null) expanded = false }
     }
     Column(Modifier.fillMaxSize()) {
-        player?.let { PlayerConnectionStatus(it) }
+        PlayerConnectionStatus(player, rowPlaybackNotice?.takeIf { it.first == entry?.id }?.second)
         NavHost(navigation, startDestination = "history", modifier = Modifier.weight(1f), builder = graph)
         if (!search || imeOcclusion == 0) {
             player?.let {
@@ -173,6 +180,7 @@ internal fun MusicRoot(
                         keyboard?.hide()
                         expanded = false
                         actions = null
+                        rowPlaybackNotice = null
                         tab = destination
                         if (destination == MusicTab.SEARCH) focusIntent++
                         navigation.navigate(destination.route) {
@@ -210,13 +218,14 @@ internal fun MusicRoot(
 }
 
 @Composable
-private fun PlayerConnectionStatus(player: NativePlayer) {
-    val state by player.controller.state.collectAsStateWithLifecycle()
-    if (state.connection == PlaybackConnectionState.CONNECTING) LinearProgressIndicator(Modifier.fillMaxWidth())
-    else if (state.connection != PlaybackConnectionState.READY || state.error != null || state.commandFailure != null) {
+private fun PlayerConnectionStatus(player: NativePlayer?, rowNotice: String?) {
+    val state = player?.controller?.state?.collectAsStateWithLifecycle()?.value
+    val notice = listOfNotNull(state?.let(::playbackNotice), rowNotice).joinToString(" · ")
+    if (rowNotice == null && state?.connection == PlaybackConnectionState.CONNECTING) LinearProgressIndicator(Modifier.fillMaxWidth())
+    else if (notice.isNotEmpty()) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             SelectionContainer(Modifier.weight(1f)) {
-                Text(playbackNotice(state).orEmpty(), style = MaterialTheme.typography.bodySmall,
+                Text(notice, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }

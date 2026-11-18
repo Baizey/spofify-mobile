@@ -22,6 +22,7 @@ import dev.spofify.mobile.core.playback.PlaybackController
 import dev.spofify.mobile.core.playback.PlaybackTrackReference
 import dev.spofify.mobile.feature.library.MusicRowGeometry
 import dev.spofify.mobile.feature.library.PageTitle
+import dev.spofify.mobile.feature.library.activateTrackRow
 
 /** History's Recent list: persisted occurrences, latest first. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -42,11 +43,10 @@ fun RecentScreen(
     var actionError by remember(model) { mutableStateOf<String?>(null) }
     val send: (() -> String?) -> Unit = { action -> actionError = if (action() == null) "Playback action wasn't sent." else null }
     val play: (PersonalHistoryEntry) -> Unit = { entry ->
-        when {
-            entry.track.hasAudio && ready -> send { playback?.playTrack(PlaybackTrackReference(entry.track.id)) }
-            !entry.metadataMissing -> onNavigate(MusicKind.TRACK, entry.track.id)
-            else -> actionError = "Track unavailable."
-        }
+        activateTrackRow(entry.track.id, entry.track.hasAudio,
+            play = { playback?.playTrack(it) },
+            openDetails = if (entry.metadataMissing) null else ({ onNavigate(MusicKind.TRACK, entry.track.id) }),
+            notice = { actionError = it })
     }
     val queue: (PersonalHistoryEntry) -> Unit = { entry ->
         if (ready && entry.track.hasAudio) send { playback?.queueTrack(PlaybackTrackReference(entry.track.id)) }

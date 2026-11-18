@@ -76,8 +76,13 @@ internal fun SearchScreen(
             keyboard?.show()
         }
     }
-    // Replacing the loading-status row otherwise anchors the list at the weak end.
-    LaunchedEffect(state.query, state.scrollResetToken) { scroll.scrollToItem(0) }
+    val hasResults = state.items.isNotEmpty()
+    LaunchedEffect(model, state.queryGeneration, hasResults) {
+        if (hasResults && model.consumeInitialAnchor(state.queryGeneration)) {
+            // Override the loading row's key anchor on the next measure. In reverseLayout, 0 is by the input.
+            scroll.requestScrollToItem(0)
+        }
+    }
     LaunchedEffect(scroll, model) {
         snapshotFlow {
             val current = latestState.value

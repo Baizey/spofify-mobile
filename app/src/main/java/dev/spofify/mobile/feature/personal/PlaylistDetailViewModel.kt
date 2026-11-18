@@ -34,7 +34,11 @@ internal data class PlaylistDetailState(
     val canEdit: Boolean get() = summary != null && loaded && !loading && !writing && !needsRefresh && !deleted
 }
 
-internal class PlaylistDetailViewModel(private val api: PersonalLibraryApi, private val id: String) : ViewModel() {
+internal class PlaylistDetailViewModel(
+    private val api: PersonalLibraryApi,
+    private val id: String,
+    private val onMutationAcknowledged: () -> Unit = {},
+) : ViewModel() {
     private val mutable = MutableStateFlow(PlaylistDetailState())
     val state = mutable.asStateFlow()
     private var generation = 0L
@@ -146,6 +150,7 @@ internal class PlaylistDetailViewModel(private val api: PersonalLibraryApi, priv
             try {
                 api.deletePlaylist(id, expectedRevision)
                 mutable.value = mutable.value.copy(writing = false, deleted = true)
+                onMutationAcknowledged()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) { failedChange(failure) }
@@ -158,6 +163,7 @@ internal class PlaylistDetailViewModel(private val api: PersonalLibraryApi, priv
             try {
                 action()
                 mutable.value = mutable.value.copy(writing = false, message = null)
+                onMutationAcknowledged()
                 refresh()
             } catch (cancelled: CancellationException) {
                 throw cancelled

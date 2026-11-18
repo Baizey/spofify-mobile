@@ -221,6 +221,65 @@ class PersonalViewModelsTest {
         assertEquals(2L, model.state.value.summary!!.revision)
     }
 
+    @Test fun summaryMenuAuthorityReadsAndFailedEditDoNotReloadThePlaylistList() = runTest(dispatcher) {
+        val api = Api().apply {
+            current = summary(count = 1)
+            entries = listOf(PersonalManualEntry("entry", 0, track()))
+            list = listOf(current)
+            renameAction = { _, _, _ -> throw unavailable() }
+        }
+        val playlists = keep(PlaylistsViewModel(api))
+        val menu = keep(PlaylistDetailViewModel(api, "playlist", playlists::refresh))
+        advanceUntilIdle()
+        assertEquals(PlaybackContext("playlist", "playlist", "Playlist"), menu.state.value.context)
+        menu.refresh() // Opening a retained More model still rechecks playback authority.
+        advanceUntilIdle()
+        assertEquals(4, api.summaryReads)
+        assertEquals(listOf(0, 0), api.manualOffsets)
+        menu.rename("Unconfirmed", "", 1)
+        advanceUntilIdle()
+        assertTrue(menu.state.value.needsRefresh)
+        assertEquals(listOf(0), api.listOffsets)
+        assertEquals("Playlist", playlists.state.value.items.single().name)
+    }
+
+    @Test fun summaryMenuReloadsThePlaylistListOncePerAcknowledgedEditAndDelete() = runTest(dispatcher) {
+        val edited = CompletableDeferred<Unit>()
+        val deleted = CompletableDeferred<Unit>()
+        val api = Api().apply {
+            list = listOf(current)
+            renameAction = { name, description, revision ->
+                edited.await()
+                current.copy(name = name, description = description, revision = revision + 1).also {
+                    current = it
+                    list = listOf(it)
+                }
+            }
+            deleteAction = {
+                deleted.await()
+                list = emptyList()
+            }
+        }
+        val playlists = keep(PlaylistsViewModel(api))
+        val menu = keep(PlaylistDetailViewModel(api, "playlist", playlists::refresh))
+        advanceUntilIdle()
+        menu.rename("Renamed", "", 1)
+        runCurrent()
+        assertEquals(listOf(0), api.listOffsets)
+        edited.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(listOf(0, 0), api.listOffsets)
+        assertEquals("Renamed", playlists.state.value.items.single().name)
+        menu.delete(2)
+        runCurrent()
+        assertEquals(listOf(0, 0), api.listOffsets)
+        deleted.complete(Unit)
+        advanceUntilIdle()
+        assertTrue(menu.state.value.deleted)
+        assertEquals(listOf(0, 0, 0), api.listOffsets)
+        assertTrue(playlists.state.value.items.isEmpty())
+    }
+
     @Test fun renameConflictRefreshesWithoutReplayingAndRejectsAnOldDialogRevision() = runTest(dispatcher) {
         val api = Api().apply { current = summary(count = 0) }
         val model = keep(PlaylistDetailViewModel(api, "playlist"))

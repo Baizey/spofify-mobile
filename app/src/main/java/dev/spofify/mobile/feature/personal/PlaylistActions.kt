@@ -55,11 +55,17 @@ internal fun PlaylistCollectionSheet(
 
 /** A summary's More sheet resolves fresh action authority before enabling musical actions. */
 @Composable
-internal fun PlaylistSummaryActions(api: PersonalLibraryClient, summary: PersonalPlaylistSummary, playback: PlaybackController?, onDismiss: () -> Unit) {
+internal fun PlaylistSummaryActions(
+    api: PersonalLibraryClient,
+    summary: PersonalPlaylistSummary,
+    playback: PlaybackController?,
+    onMutationAcknowledged: () -> Unit,
+    onDismiss: () -> Unit,
+) {
     val id = summary.id
     val owner = requireNotNull(LocalViewModelStoreOwner.current)
     val model: PlaylistDetailViewModel = viewModel(owner, key = "playlist-menu-${System.identityHashCode(api)}-$id",
-        factory = viewModelFactory { initializer { PlaylistDetailViewModel(api, id) } })
+        factory = viewModelFactory { initializer { PlaylistDetailViewModel(api, id, onMutationAcknowledged) } })
     val state by model.state.collectAsStateWithLifecycle()
     val player = playback?.state?.collectAsStateWithLifecycle()?.value
     val context = state.context

@@ -116,10 +116,9 @@ fun PlaylistsScreen(
         creating = false
         model.create(name, description)
     }
-    more?.let { summary -> PlaylistSummaryActions(api, summary, playback) {
-        more = null
-        model.refresh()
-    } }
+    more?.let { summary ->
+        PlaylistSummaryActions(api, summary, playback, onMutationAcknowledged = model::refresh, onDismiss = { more = null })
+    }
 }
 
 @Composable
