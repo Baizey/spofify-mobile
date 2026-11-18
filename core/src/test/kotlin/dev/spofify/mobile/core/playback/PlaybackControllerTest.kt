@@ -221,6 +221,35 @@ class PlaybackControllerTest {
         }
     }
 
+    @Test fun pauseExecuteConfirmsPhysicalStopInsteadOfRewindingToReportBasis() = runTest {
+        for (remote in listOf(false, true)) Harness(this).use { h ->
+            h.start()
+            h.observe(h.audio.actual.copy(elapsed = 30.0), seekCompleted = true)
+            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            h.audio.actual = h.audio.actual.copy(elapsed = 30.4) // not reported yet
+            val id = if (remote) "remote-id" else requireNotNull(h.controller.pause())
+            h.instruction(PlaybackInstruction("stop", "execute", 1, "event", 30.0, false,
+                commandId = id, track = track(), lease = LeaseTiming(basis, 8_000)))
+            val frames = h.socket.sent.filter { it["instructionId"]?.jsonPrimitive?.content == "stop" }
+            assertEquals(listOf("ack", "report"), frames.map { it["type"]!!.jsonPrimitive.content })
+            assertEquals("ok", frames.first()["status"]!!.jsonPrimitive.content)
+            assertEquals("30.4", frames.last()["elapsed"]!!.jsonPrimitive.content)
+            assertFalse(frames.last()["isPlaying"]!!.jsonPrimitive.boolean)
+        }
+    }
+
+    @Test fun stoppedAbsolutePositionAndDifferentOccurrenceDoNotInheritNativeTail() = runTest {
+        for ((event, target) in listOf("event" to 31.0, "new-event" to 30.0)) Harness(this).use { h ->
+            h.start()
+            h.observe(h.audio.actual.copy(elapsed = 30.0), seekCompleted = true)
+            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            h.audio.actual = h.audio.actual.copy(elapsed = 30.4)
+            h.instruction(PlaybackInstruction("absolute", "execute", 1, event, target, false,
+                track = track(), lease = LeaseTiming(basis, 8_000)))
+            assertEquals(target, h.audio.actual.elapsed, 0.0)
+        }
+    }
+
     @Test fun completedSeekReportsImmediatelyButAnOldExecutionEndIsFenced() = runTest {
         Harness(this).use { h ->
             h.start()

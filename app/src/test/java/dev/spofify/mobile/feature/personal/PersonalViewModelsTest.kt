@@ -301,26 +301,60 @@ class PersonalViewModelsTest {
         assertEquals(response, model.state.value.added)
     }
 
-    @Test fun recentUsesOneLimit100ReadAndRetainsRealUnavailableAndMissingMetadataFacts() = runTest(dispatcher) {
+    @Test fun recentReadsOnlyTheBoundedLatestHistoryAndKeepsRepeatedTracksInServerOrder() = runTest(dispatcher) {
         val api = Api().apply {
-            recentValue = PersonalRecent(listOf(
-                PersonalHistoryEntry("new", "2026-01-02T00:00:00Z", track("new", audio = false)),
-                PersonalHistoryEntry("old", "2026-01-01T00:00:00Z", track("old", name = "", audio = false), metadataMissing = true),
-            ), 800, 100)
+            historyRows = (0..1005).map { i -> PersonalHistoryEntry("event-$i", "2026-01-02T00:00:00Z",
+                track("same", audio = false), origin = if (i % 2 == 0) null else "offline", metadataMissing = i == 39) }
         }
         val model = keep(RecentViewModel(api))
-        advanceUntilIdle()
-        assertEquals(listOf(100), api.recentLimits)
-        assertEquals(listOf("new", "old"), model.state.value.items.map { it.id })
-        assertFalse(model.state.value.items.first().metadataMissing)
-        assertTrue(model.state.value.items.last().metadataMissing)
-        assertEquals(800L, model.state.value.total)
-        val old = model.state.value.items
-        api.recentFailure = unavailable()
         model.refresh()
         advanceUntilIdle()
-        assertEquals(old, model.state.value.items)
-        assertEquals(800L, model.state.value.total)
+        assertEquals(listOf(40 to 0), api.historyRequests)
+        assertEquals(api.historyRows.take(40), model.state.value.items)
+    }
+
+    @Test fun recentRefreshUsesLatestForReentryAndPullToRefreshWithoutOverlappingReads() = runTest(dispatcher) {
+        val first = PersonalHistoryEntry("first", "2026-01-01T00:00:00Z", track())
+        val api = Api().apply { historyRows = listOf(first) }
+        val model = keep(RecentViewModel(api))
+        model.refresh()
+        advanceUntilIdle()
+        for (id in listOf("reentry", "pull")) {
+            api.historyRows = listOf(first.copy(id = id, playedAt = "2026-01-02T00:00:00Z")) + api.historyRows
+            model.refresh()
+            assertTrue(model.state.value.loading)
+            model.refresh()
+            advanceUntilIdle()
+            assertEquals(api.historyRows, model.state.value.items)
+        }
+        assertEquals(List(3) { 40 to 0 }, api.historyRequests)
+    }
+
+    @Test fun recentDistinguishesFailedReadsFromEmptyAndKeepsRowsOnRefreshError() = runTest(dispatcher) {
+        val api = Api().apply { historyFailure = unavailable() }
+        val model = keep(RecentViewModel(api))
+        model.refresh()
+        advanceUntilIdle()
+        assertNull(model.state.value.items)
+        assertNotNull(model.state.value.error)
+        assertFalse(model.state.value.loading)
+
+        api.historyFailure = null
+        model.refresh()
+        advanceUntilIdle()
+        assertEquals(emptyList<PersonalHistoryEntry>(), model.state.value.items)
+        assertNull(model.state.value.error)
+
+        api.historyRows = listOf(PersonalHistoryEntry("event", "2026-01-02T00:00:00Z", track()))
+        model.refresh()
+        advanceUntilIdle()
+        val displayed = model.state.value.items
+        assertEquals(api.historyRows, displayed)
+        api.historyRows = emptyList()
+        api.historyFailure = unavailable()
+        model.refresh()
+        advanceUntilIdle()
+        assertEquals(displayed, model.state.value.items)
         assertNotNull(model.state.value.error)
     }
 
@@ -371,8 +405,8 @@ class PersonalViewModelsTest {
         var current = summary(count = 0)
         var list = emptyList<PersonalPlaylistSummary>()
         var entries = emptyList<PersonalManualEntry>()
-        var recentValue = PersonalRecent(emptyList(), 0, 100)
-        var recentFailure: Exception? = null
+        var historyRows = emptyList<PersonalHistoryEntry>()
+        var historyFailure: Exception? = null
         var summaryReads = 0
         var creates = 0
         val writes = mutableListOf<Write>()
@@ -380,7 +414,7 @@ class PersonalViewModelsTest {
         val kinds = mutableListOf<PersonalPlaylistKind?>()
         val manualOffsets = mutableListOf<Int>()
         val cursors = mutableListOf<String?>()
-        val recentLimits = mutableListOf<Int>()
+        val historyRequests = mutableListOf<Pair<Int, Int>>()
         var summaryAction: suspend (Int) -> PersonalPlaylistSummary = { current }
         var listGate: suspend (Int) -> Unit = {}
         var manualGate: suspend (Int) -> Unit = {}
@@ -431,17 +465,17 @@ class PersonalViewModelsTest {
             writes.add(Write("remove", id, entryId, expectedRevision))
             return removeAction(entryId, expectedRevision)
         }
-        override suspend fun recent(limit: Int): PersonalRecent {
-            recentLimits.add(limit)
-            recentFailure?.let { throw it }
-            return recentValue
-        }
+        override suspend fun recent(limit: Int): PersonalRecent = error("History Recent must use occurrences")
         override suspend fun likes(limit: Int, offset: Int): PersonalLikesPage = error("Unexpected Likes read")
         override suspend fun likeStatus(trackIds: List<String>): List<PersonalLikeStatus> = error("Unexpected status read")
         override suspend fun setLike(trackId: String, liked: Boolean): PersonalLikeStatus = error("Unexpected Like write")
         override suspend fun toggleLike(trackId: String, currentlyLiked: Boolean): PersonalLikeStatus = error("Unexpected toggle")
         override suspend fun reorderEntries(id: String, entryIds: List<String>, expectedRevision: Long): PersonalPlaylistSummary = error("Unexpected reorder")
-        override suspend fun history(limit: Int, offset: Int): PersonalPage<PersonalHistoryEntry> = error("History must not substitute for recent")
+        override suspend fun history(limit: Int, offset: Int): PersonalPage<PersonalHistoryEntry> {
+            historyRequests.add(limit to offset)
+            historyFailure?.let { throw it }
+            return PersonalPage(historyRows.drop(offset).take(limit), historyRows.size.toLong(), limit, offset)
+        }
     }
 
     companion object {

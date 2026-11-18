@@ -134,7 +134,10 @@ internal class Media3AudioExecutor(
                 player.setMediaItem(MediaItem.Builder().setMediaId(track.id).setUri(uri)
                     .setMimeType("application/octet-stream").setMediaMetadata(metadata).build(), position)
                 player.prepare()
-            } else player.seekTo(position)
+            } else if (playRequested || elapsed != player.currentPosition / 1000.0) {
+                // In-place stop: don't round-trip an already exact native millisecond through a seek.
+                player.seekTo(position)
+            }
             if (!wait.matches(generation, binding, player.currentMediaItem?.mediaId)) return AudioResult.REJECTED
             wait.outcome(player.playbackState, player.playerError != null, player.duration)?.let(wait.result::complete)
             val outcome = wait.result.await()

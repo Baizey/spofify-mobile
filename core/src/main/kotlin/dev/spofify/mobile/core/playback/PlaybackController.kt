@@ -49,7 +49,8 @@ class PlaybackController(
     private var execution: Execution? = null
     private var nextPlan: PlaybackInstruction? = null
     private var futurePlayback: PlaybackStatus? = null
-    private val sendTimes = linkedMapOf<Long, Long>()
+    private data class SendBasis(val at: Long, val facts: AudioFacts?)
+    private val sendBases = linkedMapOf<Long, SendBasis>()
     private val seenInstructions = linkedSetOf<String>()
     private val pending = linkedMapOf<String, PendingCommand>()
     private var undo: UndoState? = null
@@ -418,13 +419,32 @@ class PlaybackController(
             ready.instruction.eventId == instruction.eventId && ready.basis == instruction.lease!!.clientSequence &&
             ready.instruction.track?.id == instruction.track?.id && ready.instruction.track?.key == instruction.track?.key
         val validExecution = execution?.binding?.outputVersion == instruction.outputVersion && execution?.parked != true
+        val wasAuthorized = current != null && authorized(current)
         if (!targetOutput() || (instruction.type == "activate" && !validPrepare) ||
             (instruction.type == "execute" && !validExecution) || !grant(instruction.lease!!)) {
             invalidateExecution()
             ack(instruction, AudioResult.REJECTED)
             return
         }
-        beginExecution(instruction)
+        // A playing-to-stopped execute anchored to this exact playing report
+        // requests a stop, not a rewind to the last sampled position. Match
+        // the server's sequence basis, not a local command ID (remote Pause)
+        // or the most recent send (a later report may still be in flight).
+        val basis = sendBases[instruction.lease.clientSequence]?.facts
+        var elapsed = instruction.elapsed
+        if (instruction.type == "execute" && !instruction.desiredPlaying && wasAuthorized &&
+            state.value.snapshot?.selectedConnectionId == state.value.connectionId &&
+            current.confirmed && current.outcome == AudioResult.OK && current.instruction.desiredPlaying &&
+            basis != null && basis.binding == current.binding && basis.isPlaying && !basis.isBuffering &&
+            basis.elapsed == elapsed && instruction.eventId == current.binding.eventId &&
+            instruction.track != null && instruction.track.id == current.binding.trackId &&
+            instruction.track.key == current.instruction.track?.key) {
+            audio.pause()
+            val stopped = audio.facts()
+            if (stopped.binding == current.binding && !stopped.isPlaying && !stopped.ended && stopped.error.isEmpty() &&
+                safeSeconds(stopped.elapsed)) elapsed = stopped.elapsed
+        }
+        beginExecution(instruction, elapsed = elapsed)
     }
 
     private fun prepare(instruction: PlaybackInstruction) {
@@ -444,7 +464,7 @@ class PlaybackController(
         }
     }
 
-    private fun beginExecution(instruction: PlaybackInstruction, source: PlaybackInstruction? = null) {
+    private fun beginExecution(instruction: PlaybackInstruction, source: PlaybackInstruction? = null, elapsed: Double = instruction.elapsed) {
         operation++
         mediaJob?.cancel()
         prepared = null
@@ -456,7 +476,7 @@ class PlaybackController(
         mediaJob = scope.launch {
             if (!synchronized(lock) { life == lifecycle && authorized(current) }) return@launch
             val outcome = try {
-                audio.execute(current.binding, instruction.track, instruction.elapsed, instruction.desiredPlaying) {
+                audio.execute(current.binding, instruction.track, elapsed, instruction.desiredPlaying) {
                     synchronized(lock) { authorized(current) }
                 }
             } catch (_: Exception) { AudioResult.MEDIA }
@@ -542,7 +562,7 @@ class PlaybackController(
     }
 
     private fun grant(timing: LeaseTiming): Boolean {
-        val basis = sendTimes[timing.clientSequence] ?: return false
+        val basis = sendBases[timing.clientSequence]?.at ?: return false
         if (timing.durationMs !in 1..MAX_LEASE_MS) return false
         val deadline = basis + timing.durationMs
         if (deadline <= clock.monotonicMs()) return false
@@ -646,7 +666,7 @@ class PlaybackController(
             "eventId" to current.binding.eventId, "instructionId" to current.binding.instructionId,
             "elapsed" to facts.elapsed, "duration" to facts.duration, "isPlaying" to facts.isPlaying,
             "isBuffering" to facts.isBuffering, "isLoading" to facts.isLoading, "error" to facts.error, "ended" to ended)
-        val sent = numbered(JsonObject(payload + if (plan != null) fields("planId" to plan.planId) else emptyMap()))
+        val sent = numbered(JsonObject(payload + if (plan != null) fields("planId" to plan.planId) else emptyMap()), facts)
         if (sent == null) return
         current.lastFacts = facts
         current.lastReportAt = clock.monotonicMs()
@@ -664,16 +684,16 @@ class PlaybackController(
         "eventId" to instruction.eventId, "status" to outcome.name.lowercase(),
     ))
 
-    private fun numbered(payload: JsonObject): Long? {
+    private fun numbered(payload: JsonObject, facts: AudioFacts? = null): Long? {
         if (clientSequence >= MAX_SAFE_INTEGER) {
             disconnectLocked("Playback counter exhausted. Reconnect explicitly.")
             return null
         }
         val sequence = ++clientSequence
-        sendTimes[sequence] = clock.monotonicMs()
-        while (sendTimes.size > 256) sendTimes.remove(sendTimes.keys.first())
+        sendBases[sequence] = SendBasis(clock.monotonicMs(), facts)
+        while (sendBases.size > 256) sendBases.remove(sendBases.keys.first())
         if (!send(JsonObject(payload + fields("clientSequence" to sequence)))) {
-            sendTimes.remove(sequence)
+            sendBases.remove(sequence)
             return null
         }
         return sequence
@@ -716,7 +736,7 @@ class PlaybackController(
         samplerJob = null
         old?.close()
         pending.clear()
-        sendTimes.clear()
+        sendBases.clear()
         seenInstructions.clear()
         futurePlayback = null
         undo = null

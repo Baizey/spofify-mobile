@@ -71,57 +71,61 @@ fun PlaylistDetailScreen(
     LaunchedEffect(state.deleted) { if (state.deleted) onBack() }
     BackHandler(onBack = onBack)
 
-    PullToRefreshBox(state.loading, onRefresh = { if (!state.writing) model.refresh() }, modifier = Modifier.fillMaxSize()) {
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(top = 20.dp, bottom = 28.dp)) {
-            item("heading") {
-                Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 16.dp),
-                    verticalAlignment = if (largeText) Alignment.Top else Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(15.dp)) {
-                    PlaylistArtwork(Modifier.size(if (largeText) 52.dp else 76.dp), large = true)
-                    Column(Modifier.weight(1f)) {
-                        Text(summary?.name ?: "Playlist", style = MaterialTheme.typography.titleLarge.copy(
-                            fontSize = 22.5.sp, fontWeight = FontWeight(650), lineHeight = 26.1.sp), modifier = Modifier.semantics { heading() })
-                        summary?.let { Text(playlistCount(it), Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    }
+    val manual = summary?.kind == PersonalPlaylistKind.MANUAL
+    val visibleRows = state.visibleRows
+    Column(Modifier.fillMaxSize()) {
+        Column(Modifier.padding(top = 20.dp)) {
+            Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 16.dp),
+                verticalAlignment = if (largeText) Alignment.Top else Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(15.dp)) {
+                PlaylistArtwork(Modifier.size(if (largeText) 52.dp else 76.dp), large = true)
+                Column(Modifier.weight(1f)) {
+                    Text(summary?.name ?: "Playlist", style = MaterialTheme.typography.titleLarge.copy(
+                        fontSize = 22.5.sp, fontWeight = FontWeight(650), lineHeight = 26.1.sp), modifier = Modifier.semantics { heading() })
+                    summary?.let { Text(playlistCount(it), Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 }
             }
-            item("controls") {
-                MusicCollectionControls(Modifier.padding(vertical = 12.dp),
-                    play = {
-                        if (state.rows.isNotEmpty()) FilledIconButton({ context?.let { send { playback?.playCollection(it) } } },
-                            Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), enabled = playable) {
-                            SpofifyIcon(SpofifyGlyph.Play, "Play ${summary?.name.orEmpty()}", Modifier.size(24.dp))
-                        }
-                    },
-                    more = {
-                        IconButton({ menu = true }, Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
-                            SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary?.name ?: "playlist"}", Modifier.size(24.dp))
-                        }
-                    })
-            }
-            val failure = state.error ?: state.message ?: actionError ?: player?.error ?:
-                if (state.loaded && !state.completeCollection) "Rules result unavailable." else null
-            if (failure != null || state.writing) item("failure") {
-                Box(Modifier.padding(horizontal = 20.dp)) {
-                    PersonalStatus(state.writing, failure) {
-                        actionError = null
-                        model.refresh()
+            MusicCollectionControls(Modifier.padding(vertical = 12.dp),
+                play = {
+                    if (state.rows.isNotEmpty()) FilledIconButton({ context?.let { send { playback?.playCollection(it) } } },
+                        Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), enabled = playable) {
+                        SpofifyIcon(SpofifyGlyph.Play, "Play ${summary?.name.orEmpty()}", Modifier.size(24.dp))
                     }
+                },
+                more = {
+                    IconButton({ menu = true }, Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
+                        SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary?.name ?: "playlist"}", Modifier.size(24.dp))
+                    }
+                })
+        }
+        val failure = state.error ?: state.message ?: actionError ?: player?.error ?:
+            if (state.loaded && !state.completeCollection) "Rules result unavailable." else null
+        if (failure != null || state.writing) {
+            Box(Modifier.padding(horizontal = 20.dp)) {
+                PersonalStatus(state.writing, failure) {
+                    actionError = null
+                    model.refresh()
                 }
             }
-            if (state.rows.isNotEmpty() || state.filter.isNotBlank()) item("filter") {
-                PersonalSongFilter(state.filter, model::filter)
+        }
+        if (state.rows.isNotEmpty() || state.filter.isNotBlank()) PersonalSongFilter(state.filter, model::filter)
+        PullToRefreshBox(state.loading, onRefresh = { if (!state.writing) model.refresh() }, modifier = Modifier.weight(1f).fillMaxWidth()) {
+            val emptyMessage = when {
+                state.noMatches -> "No matches"
+                state.loaded && state.completeCollection && state.rows.isEmpty() -> "No songs yet"
+                else -> null
             }
-            items(state.visibleRows, key = { it.identity }) { row ->
-                PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
-                    onQueue = if (playable && row.reference(context) != null) ({ queueRow(row) }) else null,
-                    gestureBinding = personalGestureBinding(row, context, player))
-            }
-            if (state.noMatches) item("no-matches") {
-                Text("No matches", Modifier.padding(horizontal = 20.dp, vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            } else if (state.loaded && state.completeCollection && state.rows.isEmpty()) item("empty") {
-                Text("No songs yet", Modifier.padding(horizontal = 20.dp, vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (emptyMessage != null) Text(emptyMessage, Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // Manual entries append in playlist order. Reversing only the lazy indices keeps that visual
+            // order and starts beside the last entry. Derived playlists keep their ranked start.
+            LazyColumn(Modifier.fillMaxSize(), reverseLayout = manual, contentPadding = PaddingValues(bottom = 8.dp)) {
+                items(if (manual) visibleRows.asReversed() else visibleRows, key = { it.identity }) { row ->
+                    PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
+                        onQueue = if (playable && row.reference(context) != null) ({ queueRow(row) }) else null,
+                        gestureBinding = personalGestureBinding(row, context, player))
+                }
             }
         }
     }
