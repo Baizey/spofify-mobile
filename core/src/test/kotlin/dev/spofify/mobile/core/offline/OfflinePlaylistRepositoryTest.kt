@@ -100,7 +100,8 @@ class OfflinePlaylistRepositoryTest {
         fail = false
         updates.clear()
         repository.refresh("p", 3, onProgress = { updates += it }) { true }
-        assertEquals(listOf(OfflinePlaylistProgress(0, 3), OfflinePlaylistProgress(2, 3), OfflinePlaylistProgress(3, 3)), updates)
+        assertEquals(listOf(OfflinePlaylistProgress(2, 3), OfflinePlaylistProgress(3, 3)), updates)
+        assertEquals(listOf("a", "b", "b"), touched)
         assertEquals(setOf("p"), repository.completeIds().first())
     }
 
@@ -122,7 +123,7 @@ class OfflinePlaylistRepositoryTest {
         assertEquals(setOf("two"), repo(MusicBlobStore(root.root)).completeIds().first())
     }
 
-    @Test fun pendingIsNotPlayableAndReopenReapsVerifiedButUncommittedStages() = runBlocking {
+    @Test fun pendingIsNotPlayableAndReopenResumesVerifiedTracksWithoutAnotherTransfer() = runBlocking {
         val dir = root.newFolder("music"); val crash = root.newFolder("process-image")
         val store = MusicBlobStore(dir)
         val original = playlist("p", 1, "a")
@@ -142,8 +143,19 @@ class OfflinePlaylistRepositoryTest {
             dir.copyRecursively(crash, overwrite = true) // Process death after verified .meta, before manifest rename.
         } finally { task.cancelAndJoin() }
         val recovered = MusicBlobStore(crash)
-        assertEquals(listOf(original), repo(recovered).complete()); assertEquals(1, blobCount(crash))
-        assertEquals(1, blobCount(dir)); assertEquals(original, repo(MusicBlobStore(dir)).select("p"))
+        assertEquals(listOf(original), repo(recovered).complete()); assertEquals(2, blobCount(crash))
+        assertNull(recovered.pin(key("b")) { true })
+        assertEquals(2, blobCount(dir)); assertEquals(original, repo(MusicBlobStore(dir)).select("p"))
+        val transfers = mutableListOf<String>()
+        val progress = mutableListOf<OfflinePlaylistProgress>()
+        val resumed = repo(recovered, manifest = { next }, open = { transfers += it.trackId; audio() })
+        resumed.refresh("p", 3, onProgress = { progress += it }) { true }
+        assertEquals(listOf("c"), transfers)
+        assertEquals(listOf(OfflinePlaylistProgress(1, 2), OfflinePlaylistProgress(2, 2)), progress)
+        assertEquals(next, resumed.select("p")); assertEquals(2, blobCount(crash))
+        recovered.pin(key("b")) { true }!!.use { pin ->
+            pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
+        }
     }
 
     @Test fun deathAfterReplacementRenameBeforeReclaimRecoversOnlyNewMembership() = runBlocking {
@@ -174,10 +186,27 @@ class OfflinePlaylistRepositoryTest {
         for ((i, failing) in broken.withIndex()) {
             if (i == broken.lastIndex) free = 0
             assertTrue(runCatching { failing.save() }.isFailure)
-            assertEquals(old, failing.select("p")); assertEquals(1, blobCount(root.root))
+            assertEquals(old, failing.select("p")); assertEquals(if (i == 2) 2 else 1, blobCount(root.root))
             assertFalse(root.root.listFiles()!!.any { it.extension == "tmp" })
         }
         assertEquals(listOf(old), repo(MusicBlobStore(root.root)).complete())
+    }
+
+    @Test fun removingIncompletePlaylistReleasesOnlyItsPrivateDraftHolds() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val repository = repo(store, manifest = { playlist(it.id, 1, "shared", it.id, "fail") }, open = {
+            if (it.trackId == "fail") throw IOException("fixture interrupted")
+            audio()
+        })
+        for (id in listOf("p", "q")) assertTrue(runCatching { repository.save(id) }.isFailure)
+        val reopened = repo(MusicBlobStore(root.root))
+        assertEquals(setOf("p", "q"), reopened.retainedIds())
+        assertTrue(reopened.complete().isEmpty())
+        assertTrue(reopened.remove("p", 3) { true })
+        assertEquals(setOf("q"), reopened.retainedIds())
+        assertEquals(2, blobCount(root.root))
+        assertTrue(reopened.remove("q", 3) { true })
+        assertEquals(0, blobCount(root.root))
     }
 
     @Test fun laterRetirementFencesNoncooperativePrepareAndTransientFailureIsBounded() = runBlocking {

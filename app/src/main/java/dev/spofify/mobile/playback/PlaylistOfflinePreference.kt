@@ -13,6 +13,7 @@ internal class PlaylistOfflinePreference(
     private val persist: suspend (Set<String>) -> Unit,
     private val readComplete: suspend () -> List<OfflineManifest>,
     remove: suspend (String, () -> Boolean) -> Unit,
+    readRetainedIds: suspend () -> Set<String> = { readComplete().mapTo(hashSetOf()) { it.collection.reference.id } },
 ) {
     private val choices = Mutex()
     private val desired = MutableStateFlow<Set<String>?>(null)
@@ -29,10 +30,7 @@ internal class PlaylistOfflinePreference(
         scope.launch {
             wanted.filterNotNull().collectLatest { ids ->
                 retryPlaylistWork {
-                    for (manifest in readComplete()) {
-                        val id = manifest.collection.reference.id
-                        if (id !in ids) remove(id) { id !in desired.value.orEmpty() }
-                    }
+                    for (id in readRetainedIds() - ids) remove(id) { id !in desired.value.orEmpty() }
                 }
             }
         }

@@ -26,6 +26,7 @@ class OfflinePlaylistRepository(
     suspend fun complete(): List<OfflineManifest> = withContext(Dispatchers.IO) { store.complete(owner) }
     suspend fun select(id: String): OfflineManifest? = withContext(Dispatchers.IO) { store.select(owner, id) }
     fun completeIds() = store.completePlaylistIds(owner)
+    suspend fun retainedIds(): Set<String> = withContext(Dispatchers.IO) { store.retainedPlaylistIds(owner) }
 
     suspend fun refresh(id: String, cap: Int, onProgress: (OfflinePlaylistProgress) -> Unit = {},
         current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
@@ -41,14 +42,15 @@ class OfflinePlaylistRepository(
                 checkCurrent()
                 validatePlaylist(id, result)
                 val remaining = result.items.groupingBy { it.track.id }.eachCount().toMutableMap()
-                var verified = 0
+                val ready = store.resumePlaylist(owner, id, trackKeys(owner, result), ::checkCurrent)
+                var verified = ready.sumOf { remaining.remove(it.id) ?: 0 }
                 checkCurrent()
                 onProgress(OfflinePlaylistProgress(verified, result.items.size))
                 for (item in result.items) {
                     val track = item.track
                     val occurrences = remaining.remove(track.id) ?: continue
                     checkCurrent()
-                    store.stage(SongKey(owner, track.id), track.name, cap, ::live,
+                    store.stage(id, SongKey(owner, track.id), track.name, cap, ::live,
                         { transient(::checkCurrent) { prepare(track.id) } }) { media, consume ->
                         checkCurrent()
                         open(media).consumeBody(::checkCurrent, consume)
@@ -64,7 +66,7 @@ class OfflinePlaylistRepository(
             } catch (e: Exception) {
                 checkCurrent() // Late errors from non-cooperative functions must not escape retirement.
                 throw e
-            } finally { store.finishStage() }
+            }
         }
     }
 

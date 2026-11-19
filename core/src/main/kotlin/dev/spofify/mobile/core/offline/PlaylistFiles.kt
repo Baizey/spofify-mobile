@@ -39,7 +39,7 @@ internal class PlaylistFiles(private val dir: File) {
     // A rename/unlink linearizes the operation. Don't delete any superseded bytes before the
     // directory entry is durable (including reopen after process death before this barrier).
     private var flushNeeded = true
-    private fun syncDirectory() = FileChannel.open(dir.toPath(), READ).use { it.force(true) }
+    fun syncDirectory() = FileChannel.open(dir.toPath(), READ).use { it.force(true) }
     fun beforeReclaim() {
         if (flushNeeded) { syncDirectory(); flushNeeded = false }
     }
@@ -55,6 +55,7 @@ internal class PlaylistFiles(private val dir: File) {
             replace(key, Saved(file, trackKeys(doc.owner, manifest)))
         }
     }
+    fun contains(owner: MusicOwner, id: String, key: SongKey) = saved[owner to id]?.tracks?.contains(key) == true
     fun select(owner: MusicOwner, id: String): OfflineManifest? = saved[owner to id]?.let { read(it.file).manifest() }
     fun complete(owner: MusicOwner): List<OfflineManifest> = saved.filterKeys { it.first == owner }.values.map { read(it.file).manifest() }
 

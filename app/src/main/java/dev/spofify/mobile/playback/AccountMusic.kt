@@ -36,6 +36,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         persist = ::persistOfflinePlaylists,
         readComplete = { repository.await()?.complete().orEmpty() },
         remove = { id, current -> repository.await()?.remove(id, cache.options.value.cap, current) },
+        readRetainedIds = { repository.await()?.retainedIds().orEmpty() },
     )
     private val committedPlaylistIds: Flow<Set<String>> = flow {
         emitAll(repository.await()?.completeIds() ?: flowOf(emptySet()))
