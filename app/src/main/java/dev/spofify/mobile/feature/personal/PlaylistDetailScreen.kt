@@ -8,10 +8,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -23,7 +23,6 @@ import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.*
 import dev.spofify.mobile.playback.AppPlayback
-import dev.spofify.mobile.feature.library.MusicCollectionControls
 import dev.spofify.mobile.feature.library.MusicRowGeometry
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
@@ -49,7 +48,7 @@ internal fun PlaylistDetailScreen(
     val summary = state.summary
     val playable = ready && context != null && !state.loading && !state.writing && !state.needsRefresh &&
         summary?.capabilities?.play == true && state.rows.isNotEmpty()
-    val largeText = LocalDensity.current.fontScale >= 1.5f
+    val saved = music?.availableOfflinePlaylists?.collectAsStateWithLifecycle(initialValue = emptySet())?.value?.contains(id) == true
     var menu by remember(model) { mutableStateOf(false) }
     var songMenu by remember(model) { mutableStateOf<PlaylistSong?>(null) }
     var renaming by remember(model) { mutableStateOf<PersonalPlaylistSummary?>(null) }
@@ -72,30 +71,20 @@ internal fun PlaylistDetailScreen(
 
     val visibleRows = state.visibleRows
     Column(Modifier.fillMaxSize()) {
-        Column(Modifier.padding(top = 20.dp)) {
-            Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 16.dp),
-                verticalAlignment = if (largeText) Alignment.Top else Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(15.dp)) {
-                PlaylistArtwork(Modifier.size(if (largeText) 52.dp else 76.dp), large = true)
-                Column(Modifier.weight(1f)) {
-                    Text(summary?.name ?: "Playlist", style = MaterialTheme.typography.titleLarge.copy(
-                        fontSize = 22.5.sp, fontWeight = FontWeight(650), lineHeight = 26.1.sp), modifier = Modifier.semantics { heading() })
-                    summary?.let { Text(playlistCount(it), Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                }
+        Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                Text(summary?.name ?: "Playlist", style = MaterialTheme.typography.titleLarge.copy(
+                    fontSize = 22.5.sp, fontWeight = FontWeight(650), lineHeight = 26.1.sp),
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.semantics { heading() })
+                summary?.let { Text(playlistCount(it), Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
-            MusicCollectionControls(Modifier.padding(vertical = 12.dp),
-                play = {
-                    if (state.rows.isNotEmpty()) FilledIconButton({ context?.let { send { playback?.playCollection(it) } } },
-                        Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), enabled = playable) {
-                        SpofifyIcon(SpofifyGlyph.Play, "Play ${summary?.name.orEmpty()}", Modifier.size(24.dp))
-                    }
-                },
-                more = {
-                    IconButton({ menu = true }, Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
-                        SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary?.name ?: "playlist"}", Modifier.size(24.dp))
-                    }
-                })
+            if (saved) SpofifyIcon(SpofifyGlyph.Downloaded, "Saved for offline", Modifier.size(20.dp),
+                tint = MaterialTheme.colorScheme.primary)
+            IconButton({ menu = true }, Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
+                SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary?.name ?: "playlist"}", Modifier.size(24.dp))
+            }
         }
         val failure = state.error ?: state.message ?: actionError ?: player?.error ?:
             if (state.loaded && !state.completeCollection) "Rules result unavailable." else null

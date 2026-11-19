@@ -34,6 +34,7 @@ internal class PlaylistFiles(private val dir: File) {
     private val saved = mutableMapOf<Pair<MusicOwner, String>, Saved>()
     private val counts = mutableMapOf<SongKey, Int>()
     val required: Set<SongKey> get() = counts.keys
+    fun committedIds(): Set<Pair<MusicOwner, String>> = saved.keys.toSet()
 
     // A rename/unlink linearizes the operation. Don't delete any superseded bytes before the
     // directory entry is durable (including reopen after process death before this barrier).

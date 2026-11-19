@@ -37,6 +37,13 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         readComplete = { repository.await()?.complete().orEmpty() },
         remove = { id, current -> repository.await()?.remove(id, cache.options.value.cap, current) },
     )
+    private val committedPlaylistIds: Flow<Set<String>> = flow {
+        emitAll(repository.await()?.completeIds() ?: flowOf(emptySet()))
+    }
+    val availableOfflinePlaylists = combine(offlinePlaylists.wanted, committedPlaylistIds) { wanted, committed ->
+        wanted.orEmpty().intersect(committed)
+    }.distinctUntilChanged()
+
     // The KTX edit helper discards commit's result; don't publish an unpersisted choice.
     @SuppressLint("UseKtx")
     private suspend fun persistOfflinePlaylists(ids: Set<String>) = withContext(Dispatchers.IO) {

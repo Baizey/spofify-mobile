@@ -22,6 +22,7 @@ class OfflinePlaylistRepository(
 ) {
     suspend fun complete(): List<OfflineManifest> = withContext(Dispatchers.IO) { store.complete(owner) }
     suspend fun select(id: String): OfflineManifest? = withContext(Dispatchers.IO) { store.select(owner, id) }
+    fun completeIds() = store.completePlaylistIds(owner)
 
     suspend fun refresh(id: String, cap: Int, current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
         val ref = OfflineCollectionRef(OfflineCollectionKind.PLAYLIST, id)

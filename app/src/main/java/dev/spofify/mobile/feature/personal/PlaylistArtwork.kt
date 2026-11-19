@@ -15,8 +15,8 @@ import androidx.compose.ui.unit.dp
 
 /** Reference placeholder only: summaries contain no catalog-art identity to request. */
 @Composable
-internal fun PlaylistArtwork(modifier: Modifier, large: Boolean = false) {
-    val shape = RoundedCornerShape(if (large) 5.dp else 4.dp)
+internal fun PlaylistArtwork(modifier: Modifier) {
+    val shape = RoundedCornerShape(4.dp)
     val ink = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .55f)
     Canvas(modifier.clip(shape).background(MaterialTheme.colorScheme.surfaceVariant)
         .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)) {

@@ -12,6 +12,7 @@ import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.*
@@ -82,6 +83,24 @@ class OfflinePlaylistRepositoryTest {
         }
     }
 
+    @Test fun completedIdsFollowDurableMembershipEvenWhenNoAudioBlobsChange() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val first = repo(store, manifest = { playlist(it.id, 1, "shared") })
+        val other = repo(store, owner.copy(accountId = "other"))
+        val completed = first.completeIds()
+        assertEquals(emptySet<String>(), completed.first())
+        first.save("one")
+        val audio = store.songs.value
+        first.save("two")
+        assertEquals(audio, store.songs.value)
+        assertEquals(setOf("one", "two"), completed.first())
+        assertEquals(emptySet<String>(), other.completeIds().first())
+        first.remove("one", 3) { true }
+        assertEquals(audio, store.songs.value)
+        assertEquals(setOf("two"), completed.first())
+        assertEquals(setOf("two"), repo(MusicBlobStore(root.root)).completeIds().first())
+    }
+
     @Test fun pendingIsNotPlayableAndReopenReapsVerifiedButUncommittedStages() = runBlocking {
         val dir = root.newFolder("music"); val crash = root.newFolder("process-image")
         val store = MusicBlobStore(dir)
@@ -96,6 +115,7 @@ class OfflinePlaylistRepositoryTest {
         try {
             withTimeout(5000) { entered.await() }
             assertEquals(listOf(original), saved.complete()); assertEquals(2, blobCount(dir))
+            assertEquals(setOf("p"), saved.completeIds().first())
             assertNull(store.pin(key("b")) { true }); assertFalse(store.hasOfflineReference(key("b")))
             assertEquals(listOf("a"), store.songs.value.map { it.key.id })
             dir.copyRecursively(crash, overwrite = true) // Process death after verified .meta, before manifest rename.

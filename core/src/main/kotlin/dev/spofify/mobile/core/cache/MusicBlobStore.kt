@@ -18,6 +18,8 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -52,6 +54,10 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
     private val autoJoining = mutableMapOf<SongKey, Ticket>()
     private val mutable = MutableStateFlow<List<StoredSong>>(emptyList())
     val songs = mutable.asStateFlow()
+    private val committedPlaylists = MutableStateFlow<Set<Pair<MusicOwner, String>>>(emptySet())
+    internal fun completePlaylistIds(owner: MusicOwner) = committedPlaylists.map { playlists ->
+        playlists.filter { it.first == owner }.mapTo(hashSetOf()) { it.second }
+    }.distinctUntilChanged()
     private var clock = 0L
 
     init {
@@ -76,6 +82,7 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
         val live = entries.values.mapTo(hashSetOf()) { it.file }
         files.filter { it.extension == "tmp" || it.extension == "blob" && it !in live }.forEach { Files.deleteIfExists(it.toPath()) }
         refresh()
+        committedPlaylists.value = playlists.committedIds()
     }
 
     private fun refresh() {
@@ -178,6 +185,7 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
         // Commit has succeeded. A failure trimming AUTO is not a failed playlist replacement.
         try { trim(owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
         refresh()
+        committedPlaylists.value = playlists.committedIds()
     }
     internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
         val keys = trackKeys(owner, manifest)
