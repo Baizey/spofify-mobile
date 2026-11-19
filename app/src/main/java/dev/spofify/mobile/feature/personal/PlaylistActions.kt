@@ -2,8 +2,14 @@ package dev.spofify.mobile.feature.personal
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
@@ -16,8 +22,9 @@ import dev.spofify.mobile.core.personal.PersonalPlaylistSummary
 import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.playback.AccountMusic
+import dev.spofify.mobile.playback.DevicePersonalLibrary
 
-/** FINAL collection menu: Play and Queue; shuffle belongs to the player, not this sheet. */
+/** Shared playlist menu for the list and detail screens. */
 @Composable
 internal fun PlaylistCollectionSheet(
     state: PlaylistDetailState,
@@ -28,11 +35,18 @@ internal fun PlaylistCollectionSheet(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
+    onOfflineRemoved: (() -> Unit)? = null,
 ) {
     val summary = state.summary
-    val saved = music?.saved?.collectAsStateWithLifecycle()?.value?.any { it.collection.reference.id == summary?.id } == true
-    val saving = music?.saving?.collectAsStateWithLifecycle()?.value?.contains(summary?.id) == true
-    val failed = music?.failed?.collectAsStateWithLifecycle()?.value?.contains(summary?.id) == true
+    val offline = music?.offlinePlaylists
+    val wanted = offline?.wanted?.collectAsStateWithLifecycle()?.value
+    val pending = offline?.pending?.collectAsStateWithLifecycle()?.value.orEmpty()
+    val checked = summary?.id in wanted.orEmpty()
+    val removed by rememberUpdatedState(onOfflineRemoved)
+    LaunchedEffect(summary?.id, checked) {
+        // Offline screens show complete downloads only; after removing one, leave/refresh it.
+        if (wanted != null && !checked) removed?.invoke()
+    }
     SpofifySheet(onDismiss) {
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") {
@@ -45,13 +59,17 @@ internal fun PlaylistCollectionSheet(
             }
             if (summary != null) {
                 item("library") { SheetGroup("Library") }
-                if (music != null && (saved || summary.capabilities.play && state.completeCollection && state.rows.isNotEmpty() && state.rows.all { it.track.hasAudio })) {
-                    item("save-offline") { SheetAction(when {
-                        saved -> "Saved for offline"
-                        saving -> "Saving for offline…"
-                        failed -> "Retry saving for offline"
-                        else -> "Save for offline"
-                    }, if (saved) SpofifyGlyph.Check else SpofifyGlyph.Down, !saved && !saving) { music.save(summary.id) } }
+                if (offline != null) item("save-offline") {
+                    val enabled = wanted != null && summary.id !in pending
+                    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp)
+                        .toggleable(checked, enabled = enabled, role = Role.Switch) { offline.set(summary.id, it) }
+                        .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                        SpofifyIcon(SpofifyGlyph.Down, null, Modifier.size(22.dp))
+                        Text("Save for offline", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+                        SpofifySwitchIndicator(checked, enabled)
+                    }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 }
                 if (summary.kind == PersonalPlaylistKind.MANUAL && summary.capabilities.editMetadata) {
                     item("edit") { SheetAction("Edit details", SpofifyGlyph.Edit, state.canEdit, onEdit) }
@@ -111,6 +129,7 @@ internal fun PlaylistSummaryActions(
                 if (context != null && playback?.queueCollection(context) == true) onDismiss()
             },
             onEdit = { editing = state.summary }, onDelete = { deleting = state.summary },
-            onDismiss = onDismiss)
+            onDismiss = onDismiss,
+            onOfflineRemoved = if (api is DevicePersonalLibrary) ({ onDismiss(); onMutationAcknowledged() }) else null)
     }
 }

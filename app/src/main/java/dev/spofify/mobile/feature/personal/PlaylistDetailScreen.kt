@@ -141,7 +141,8 @@ internal fun PlaylistDetailScreen(
             menu = false
             deleting = summary
         },
-        onDismiss = { menu = false })
+        onDismiss = { menu = false },
+        onOfflineRemoved = if (api is dev.spofify.mobile.playback.DevicePersonalLibrary) ({ menu = false; onBack() }) else null)
     songMenu?.let { row ->
         PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null,
             onPlay = { playRow(row) }, onQueue = { queueRow(row) }, onNavigate = onNavigate,

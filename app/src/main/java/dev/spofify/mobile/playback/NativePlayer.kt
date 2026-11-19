@@ -25,7 +25,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
     private val detachService: () -> Unit) {
     val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]))
     val cache = AutomaticMusicCache(app, sessions, identity, storage, scope)
-    val music = AccountMusic(app.noBackupFilesDir, identity, sessions, storage, cache, scope)
+    val music = AccountMusic(app, identity, sessions, storage, cache, scope)
     private val mutable = MutableStateFlow<AppPlayback?>(null)
     val target = mutable.asStateFlow()
     val audio = Media3AudioExecutor(app, sessions, identity, cache, ::systemPause, requestPlaybackStart)

@@ -66,7 +66,7 @@ class OfflinePlaylistRepository(
     }
 
     /** Only retry classified transient metadata reads once. No retry of auth, stale membership,
-     * storage, or an interrupted body; a later explicit refresh can start another attempt.
+     * storage, or an interrupted body within this attempt. The caller owns retry policy.
      */
     private suspend fun <T> transient(checkCurrent: () -> Unit, read: suspend () -> T): T {
         checkCurrent()
