@@ -28,6 +28,7 @@ import dev.spofify.mobile.core.personal.PersonalLibraryApi
 import dev.spofify.mobile.playback.DevicePersonalLibrary
 import dev.spofify.mobile.core.personal.PersonalPlaylistSummary
 import dev.spofify.mobile.playback.AppPlayback
+import dev.spofify.mobile.playback.PlaylistOfflineStatus
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicRowGeometry
 import kotlinx.coroutines.CancellationException
@@ -48,6 +49,7 @@ internal fun PlaylistsScreen(
     val model: PlaylistsViewModel = viewModel(owner, key = "playlists-${System.identityHashCode(api)}",
         factory = viewModelFactory { initializer { PlaylistsViewModel(api) } })
     val state by model.state.collectAsStateWithLifecycle()
+    val offlineStatuses = music?.offlinePlaylistStatuses?.collectAsStateWithLifecycle()?.value.orEmpty()
     val player = playback?.observe()
     val ready = player?.ready == true
     val scope = rememberCoroutineScope()
@@ -102,6 +104,7 @@ internal fun PlaylistsScreen(
                 // Ascending state is used directly. reverseLayout puts A at the bottom, Z at the top.
                 items(state.items, key = { it.id }) { summary ->
                     PlaylistSummaryRow(summary,
+                        offlineStatus = offlineStatuses[summary.id],
                         onQueue = if (ready && summary.capabilities.play && summary.trackCount?.let { it > 0 } == true) ({ queue(summary) }) else null,
                         onMore = { more = summary }, gestureBinding = playback to personalGestureBinding(summary, null, player?.online)) { onOpenPlaylist(summary.id) }
                 }
@@ -120,6 +123,7 @@ internal fun PlaylistsScreen(
 @Composable
 internal fun PlaylistSummaryRow(
     summary: PersonalPlaylistSummary,
+    offlineStatus: PlaylistOfflineStatus? = null,
     enabled: Boolean = true,
     onQueue: (() -> Unit)? = null,
     onMore: (() -> Unit)? = null,
@@ -132,7 +136,7 @@ internal fun PlaylistSummaryRow(
         Column(Modifier.fillMaxWidth().clickable(enabled = enabled, role = Role.Button, onClick = onClick)) {
             Row(Modifier.fillMaxWidth().heightIn(min = MusicRowGeometry.MIN_HEIGHT.dp)
                 .padding(horizontal = geometry.gutter.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                PlaylistArtwork(Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp))
+                PlaylistOfflineIndicator(offlineStatus, Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), tile = true)
                 Spacer(Modifier.width(geometry.identityGap.dp))
                 Column(Modifier.weight(1f)) {
                     Text(summary.name, maxLines = 1, overflow = TextOverflow.Ellipsis,

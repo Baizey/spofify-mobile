@@ -28,6 +28,7 @@ enum class SpofifyGlyph(private val path: String, private val filled: Boolean = 
     Artist("M17 7a5 5 0 1 1-10 0 5 5 0 0 1 10 0M3 22a9 9 0 0 1 18 0"),
     Down("m6 9 6 6 6-6"),
     Downloaded("M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M12 7v9m-4-4 4 4 4-4"),
+    DownloadPending("M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M12 7v5l3 2"),
     Up("m6 15 6-6 6 6"),
     Next("m5 5 11 7-11 7ZM19 5v14"),
     Previous("m19 5-11 7 11 7ZM5 5v14"),

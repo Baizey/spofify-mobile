@@ -40,9 +40,9 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
     private val committedPlaylistIds: Flow<Set<String>> = flow {
         emitAll(repository.await()?.completeIds() ?: flowOf(emptySet()))
     }
-    val availableOfflinePlaylists = combine(offlinePlaylists.wanted, committedPlaylistIds) { wanted, committed ->
-        wanted.orEmpty().intersect(committed)
-    }.distinctUntilChanged()
+    private val playlistProgress = MutableStateFlow<Map<String, OfflinePlaylistProgress>>(emptyMap())
+    val offlinePlaylistStatuses = combine(offlinePlaylists.wanted, committedPlaylistIds, playlistProgress, ::playlistOfflineStatuses)
+        .stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
     // The KTX edit helper discards commit's result; don't publish an unpersisted choice.
     @SuppressLint("UseKtx")
@@ -124,8 +124,12 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
                         // Explicit downloads may use metered data; background updates to an
                         // already saved playlist still wait for an unmetered link.
                         if (!link.metered || repo.select(id) == null) {
-                            val manifest = repo.refresh(id, cache.options.value.cap) {
-                                wanted() && sessions.onlineGrant.value === grant && cache.link.value == link
+                            val manifest = try {
+                                repo.refresh(id, cache.options.value.cap, onProgress = { progress ->
+                                    playlistProgress.update { it + (id to progress) }
+                                }) { wanted() && sessions.onlineGrant.value === grant && cache.link.value == link }
+                            } finally {
+                                playlistProgress.update { it - id }
                             }
                             remember(manifest)
                             metadataVersion.value++

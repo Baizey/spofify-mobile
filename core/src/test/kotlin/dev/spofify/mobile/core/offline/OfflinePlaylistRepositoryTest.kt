@@ -83,6 +83,27 @@ class OfflinePlaylistRepositoryTest {
         }
     }
 
+    @Test fun progressCountsVerifiedOccurrencesButNeverPublishesAPartialPlaylist() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val manifest = playlist("p", 1, "a", "b", "a")
+        val updates = mutableListOf<OfflinePlaylistProgress>()
+        val touched = mutableListOf<String>()
+        var fail = true
+        val repository = repo(store, manifest = { manifest }, open = {
+            touched += it.trackId
+            audio(if (fail && it.trackId == "b") bytes.reversedArray() else bytes)
+        })
+        assertTrue(runCatching { repository.refresh("p", 3, onProgress = { updates += it }) { true } }.isFailure)
+        assertEquals(listOf(OfflinePlaylistProgress(0, 3), OfflinePlaylistProgress(2, 3)), updates)
+        assertEquals(listOf("a", "b"), touched)
+        assertTrue(repository.completeIds().first().isEmpty())
+        fail = false
+        updates.clear()
+        repository.refresh("p", 3, onProgress = { updates += it }) { true }
+        assertEquals(listOf(OfflinePlaylistProgress(0, 3), OfflinePlaylistProgress(2, 3), OfflinePlaylistProgress(3, 3)), updates)
+        assertEquals(setOf("p"), repository.completeIds().first())
+    }
+
     @Test fun completedIdsFollowDurableMembershipEvenWhenNoAudioBlobsChange() = runBlocking {
         val store = MusicBlobStore(root.root)
         val first = repo(store, manifest = { playlist(it.id, 1, "shared") })
@@ -166,7 +187,7 @@ class OfflinePlaylistRepositoryTest {
         var calls = 0
         val r = repo(store, manifest = { m }, prepare = { calls++; live.set(false); descriptor(it) },
             open = { error("retired body opened") })
-        assertTrue(runCatching { r.refresh("p", 3, live::get) }.exceptionOrNull() is CancellationException)
+        assertTrue(runCatching { r.refresh("p", 3, current = live::get) }.exceptionOrNull() is CancellationException)
         assertEquals(1, calls); assertNull(r.select("p"))
         calls = 0
         val busy = repo(store, manifest = { calls++; throw OfflineException(OfflineFailure.BUSY) })

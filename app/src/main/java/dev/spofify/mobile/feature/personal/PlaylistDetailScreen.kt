@@ -48,7 +48,7 @@ internal fun PlaylistDetailScreen(
     val summary = state.summary
     val playable = ready && context != null && !state.loading && !state.writing && !state.needsRefresh &&
         summary?.capabilities?.play == true && state.rows.isNotEmpty()
-    val saved = music?.availableOfflinePlaylists?.collectAsStateWithLifecycle(initialValue = emptySet())?.value?.contains(id) == true
+    val offlineStatus = music?.offlinePlaylistStatuses?.collectAsStateWithLifecycle()?.value?.get(id)
     var menu by remember(model) { mutableStateOf(false) }
     var songMenu by remember(model) { mutableStateOf<PlaylistSong?>(null) }
     var renaming by remember(model) { mutableStateOf<PersonalPlaylistSummary?>(null) }
@@ -80,8 +80,7 @@ internal fun PlaylistDetailScreen(
                 summary?.let { Text(playlistCount(it), Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
-            if (saved) SpofifyIcon(SpofifyGlyph.Downloaded, "Saved for offline", Modifier.size(20.dp),
-                tint = MaterialTheme.colorScheme.primary)
+            if (offlineStatus != null) PlaylistOfflineIndicator(offlineStatus, Modifier.widthIn(max = 96.dp))
             IconButton({ menu = true }, Modifier.size(MusicRowGeometry.ACTION_SLOT.dp)) {
                 SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary?.name ?: "playlist"}", Modifier.size(24.dp))
             }

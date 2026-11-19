@@ -9,6 +9,9 @@ import java.io.InputStream
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.withLock
 
+/** Counts playlist entries, including each occurrence of a verified shared track. */
+data class OfflinePlaylistProgress(val verified: Int, val total: Int)
+
 /** One account+origin facade over the app's existing store, not a service or queue. The caller
  * owns the Job (cancel on retirement/policy change) and a nonblocking generation/policy check.
  * Reads have no network dependency. Pending work is never a selectable playlist.
@@ -24,7 +27,8 @@ class OfflinePlaylistRepository(
     suspend fun select(id: String): OfflineManifest? = withContext(Dispatchers.IO) { store.select(owner, id) }
     fun completeIds() = store.completePlaylistIds(owner)
 
-    suspend fun refresh(id: String, cap: Int, current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
+    suspend fun refresh(id: String, cap: Int, onProgress: (OfflinePlaylistProgress) -> Unit = {},
+        current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
         val ref = OfflineCollectionRef(OfflineCollectionKind.PLAYLIST, id)
         require(cap in CacheOptions.caps && OfflineParser.validReference(ref))
         val job = currentCoroutineContext().job
@@ -36,14 +40,22 @@ class OfflinePlaylistRepository(
                 val result = transient(::checkCurrent) { manifest(ref) }
                 checkCurrent()
                 validatePlaylist(id, result)
-                for (item in result.items.distinctBy { it.track.id }) {
+                val remaining = result.items.groupingBy { it.track.id }.eachCount().toMutableMap()
+                var verified = 0
+                checkCurrent()
+                onProgress(OfflinePlaylistProgress(verified, result.items.size))
+                for (item in result.items) {
                     val track = item.track
+                    val occurrences = remaining.remove(track.id) ?: continue
                     checkCurrent()
                     store.stage(SongKey(owner, track.id), track.name, cap, ::live,
                         { transient(::checkCurrent) { prepare(track.id) } }) { media, consume ->
                         checkCurrent()
                         open(media).consumeBody(::checkCurrent, consume)
                     }
+                    checkCurrent()
+                    verified += occurrences
+                    onProgress(OfflinePlaylistProgress(verified, result.items.size))
                 }
                 checkCurrent()
                 store.commit(owner, result, cap, ::checkCurrent)
