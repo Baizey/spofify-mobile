@@ -11,7 +11,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.style.TextOverflow
@@ -34,9 +33,7 @@ internal fun PlaylistOfflineIndicator(status: PlaylistOfflineStatus?, modifier: 
             PlaylistOfflineStatus.Pending -> SpofifyIcon(SpofifyGlyph.DownloadPending, "Offline download pending", Modifier.size(20.dp), colors.onSurfaceVariant)
             is PlaylistOfflineStatus.Downloading -> {
                 val (verified, total) = status.progress
-                val count = "$verified/$total"
-                val maxChars = (7 / LocalDensity.current.fontScale.coerceAtLeast(1f)).toInt().coerceAtLeast(3)
-                val label = if (tile && count.length > maxChars) "${if (total == 0) 100 else verified * 100 / total}%" else count
+                val label = if (tile) "${if (total == 0) 100 else verified * 100 / total}%" else "$verified/$total"
                 Text(label, Modifier.padding(horizontal = 2.dp).clearAndSetSemantics {
                     contentDescription = "Saving for offline: $verified of $total songs verified"
                 }, style = MaterialTheme.typography.labelSmall, color = colors.primary, maxLines = 1, overflow = TextOverflow.Ellipsis)
