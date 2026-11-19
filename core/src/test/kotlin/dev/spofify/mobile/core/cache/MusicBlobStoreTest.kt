@@ -137,6 +137,23 @@ class MusicBlobStoreTest {
         assertNull(store.open(other, 0) { true }); assertTrue(store.hasOfflineReference(key))
     }
 
+    @Test fun truncatedPinnedFileFailsLocallyAndNeverBecomesANetworkMiss() {
+        val file = root.newFile().apply { writeBytes(bytes) }
+        var pins = 0
+        var releases = 0
+        MusicSourceChoice({ pins++; PinnedSong(file, bytes.size.toLong(), { true }) { releases++ } }).use { choice ->
+            choice.openLocal("a", 0)!!.use { local ->
+                file.writeBytes(byteArrayOf())
+                // Local EOF is terminal, not an HTTP interruption that Media3 could retry.
+                assertThrows(java.io.EOFException::class.java) { local.input.read() }
+            }
+            assertTrue(file.delete())
+            assertThrows(IOException::class.java) { choice.openLocal("a", 0) }
+            assertEquals(1, pins)
+        }
+        assertEquals(1, releases)
+    }
+
     @Test fun freshSourceHitsAtOffsetButAnExistingMissDoesNotSwitchRepresentation() = runBlocking {
         val store = MusicBlobStore(root.root)
         fun source() = MusicSourceChoice({ id -> store.pin(key.copy(id = id)) { true } })

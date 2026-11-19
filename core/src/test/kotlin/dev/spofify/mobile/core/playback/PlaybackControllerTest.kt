@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.double
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
@@ -224,17 +225,223 @@ class PlaybackControllerTest {
     @Test fun pauseExecuteConfirmsPhysicalStopInsteadOfRewindingToReportBasis() = runTest {
         for (remote in listOf(false, true)) Harness(this).use { h ->
             h.start()
-            h.observe(h.audio.actual.copy(elapsed = 30.0), seekCompleted = true)
-            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            h.observe(h.audio.actual.copy(elapsed = 30.0, duration = 180.0), seekCompleted = true)
             h.audio.actual = h.audio.actual.copy(elapsed = 30.4) // not reported yet
-            val id = if (remote) "remote-id" else requireNotNull(h.controller.pause())
-            h.instruction(PlaybackInstruction("stop", "execute", 1, "event", 30.0, false,
-                commandId = id, track = track(), lease = LeaseTiming(basis, 8_000)))
+            val id = if (remote) "remote-id" else requireNotNull(h.controller.toggle())
+            assertEquals(remote, h.audio.actual.isPlaying) // no round trip for a local explicit stop
+            val sample = h.frames("report").last()
+            if (!remote) {
+                assertEquals(listOf("report", "command"), h.socket.sent.takeLast(2).map { it["type"]!!.jsonPrimitive.content })
+                assertEquals("execution", sample["instructionId"]!!.jsonPrimitive.content)
+                assertEquals("event", sample["eventId"]!!.jsonPrimitive.content)
+                assertEquals(1L, sample["outputVersion"]!!.jsonPrimitive.long)
+                assertFalse(sample["ended"]!!.jsonPrimitive.boolean)
+                assertFalse(sample["isPlaying"]!!.jsonPrimitive.boolean)
+                assertEquals(30.4, sample["elapsed"]!!.jsonPrimitive.double, 0.0)
+            }
+            h.instruction(PlaybackInstruction("stop", "execute", 1, "event", sample["elapsed"]!!.jsonPrimitive.double, false,
+                commandId = id, track = track(), lease = LeaseTiming(sample["clientSequence"]!!.jsonPrimitive.long, 8_000)))
             val frames = h.socket.sent.filter { it["instructionId"]?.jsonPrimitive?.content == "stop" }
             assertEquals(listOf("ack", "report"), frames.map { it["type"]!!.jsonPrimitive.content })
             assertEquals("ok", frames.first()["status"]!!.jsonPrimitive.content)
             assertEquals("30.4", frames.last()["elapsed"]!!.jsonPrimitive.content)
             assertFalse(frames.last()["isPlaying"]!!.jsonPrimitive.boolean)
+        }
+    }
+
+    @Test fun crossedStartAndUnsuccessfulPauseResultNeverReplayAudio() = runTest {
+        for (rejected in listOf(true, false)) Harness(this).use { h ->
+            h.start()
+            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            val id = requireNotNull(h.controller.pause())
+            // Already sent by server when the local user stopped its old execution.
+            h.instruction(PlaybackInstruction("crossed", "execute", 1, "next-event", 0.0, true,
+                track = track("next", 2), lease = LeaseTiming(basis, 8_000)))
+            h.message(PlaybackServerMessage("result", "session", result = PlaybackCommandResult(id,
+                if (rejected) "rejected" else "accepted", if (rejected) "capacity" else "", 2, 0, "none",
+                if (rejected) "unchanged" else "uncertain", true)))
+            assertNotNull(h.controller.state.value.commandFailure)
+            assertEquals(1, h.audio.executions.size)
+            assertFalse(h.audio.actual.isPlaying)
+            assertTrue(h.frames("ack").none { it["instructionId"]!!.jsonPrimitive.content == "crossed" })
+            assertEquals(1, h.frames("command").size)
+            // A late instruction on the old basis is still ambiguous, even after the result.
+            h.instruction(PlaybackInstruction("late", "execute", 1, "next-event", 0.0, true,
+                track = track("next", 2), lease = LeaseTiming(basis, 8_000)))
+            assertEquals(1, h.audio.executions.size)
+            assertFalse(h.audio.actual.isPlaying)
+            // A distinct grant based on the stop observation is causally newer.
+            val stopBasis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            h.instruction(PlaybackInstruction("later", "execute", 1, "next-event", 0.0, true,
+                track = track("next", 2), lease = LeaseTiming(stopBasis, 8_000)))
+            assertTrue(h.audio.actual.isPlaying)
+        }
+    }
+
+    @Test fun pendingTimeoutIsNotAnOrderingBoundaryForCrossedPlay() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            val id = requireNotNull(h.controller.pause())
+            // Keep genuine stopped reports/leases flowing while the Pause result is missing.
+            repeat(4) {
+                advanceTimeBy(4_000)
+                runCurrent()
+                h.lease("event", h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long)
+            }
+            assertEquals(0, h.controller.state.value.pendingCommands)
+            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            val start = PlaybackInstruction("crossed", "execute", 1, "event", 0.0, true,
+                track = track(), lease = LeaseTiming(basis, 8_000))
+            h.instruction(start)
+            assertFalse(h.audio.actual.isPlaying)
+            assertEquals(1, h.audio.executions.size)
+            h.result(id) // late receipt isn't a replay or UI success
+            assertNull(h.controller.state.value.latestResult)
+            assertFalse(h.audio.actual.isPlaying)
+            h.instruction(start.copy(id = "new-grant"))
+            assertTrue(h.audio.actual.isPlaying)
+        }
+    }
+
+    @Test fun fullCommandBookCannotPreventStopOrLetAnOlderExecutionStart() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            h.stage("discard-me")
+            repeat(32) { assertNotNull(h.controller.renameDevice("Phone")) }
+            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            val old = h.audio.actual
+            val sent = h.socket.sent.size
+            assertNull(h.controller.toggle())
+            assertFalse(h.audio.actual.isPlaying)
+            assertFalse(h.audio.executions.single().authorized())
+            val stop = h.socket.sent.drop(sent).single()
+            assertEquals("report", stop["type"]!!.jsonPrimitive.content)
+            assertFalse(stop["isPlaying"]!!.jsonPrimitive.boolean)
+            h.audio.events.send(AudioObservation(old.binding!!, old)) // delayed before-stop callback
+            runCurrent()
+            assertEquals(stop, h.socket.sent.last())
+            h.result("1") // room again; never replay the unsent Pause
+            h.instruction(PlaybackInstruction("older", "execute", 1, "event", 1.0, true,
+                track = track(), lease = LeaseTiming(basis, 8_000)))
+            assertTrue(h.socket.isOpen)
+            assertEquals(1, h.audio.executions.size)
+            assertFalse(h.audio.actual.isPlaying)
+            assertEquals(32, h.frames("command").size)
+            assertTrue(h.frames("ack").none { it["instructionId"]!!.jsonPrimitive.content == "older" })
+        }
+    }
+
+    @Test fun closedSocketBeforeDisconnectCallbackCannotDelayLocalStop() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            val sent = h.socket.sent.size
+            h.socket.finish() // collector and sampler have not run yet
+            assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
+            assertTrue(h.audio.actual.isPlaying)
+            assertNull(h.controller.pause())
+            assertFalse(h.audio.actual.isPlaying)
+            assertEquals(sent, h.socket.sent.size)
+            runCurrent()
+            assertEquals(PlaybackConnectionState.DISCONNECTED, h.controller.state.value.connection)
+        }
+    }
+
+    @Test fun sendFailureDoesNotUndoLocalStopOrReplayAnythingOnFreshConnection() = runTest {
+        for (failure in listOf("report", "command")) Harness(this).use { h ->
+            h.start()
+            val oldAttempt = h.audio.executions.single()
+            h.socket.failSend = failure
+            val sent = h.socket.sent.size
+            assertNull(h.controller.pause())
+            assertFalse(h.audio.actual.isPlaying)
+            assertFalse(oldAttempt.authorized())
+            assertEquals(if (failure == "report") emptyList() else listOf("report"),
+                h.socket.sent.drop(sent).map { it["type"]!!.jsonPrimitive.content })
+            assertEquals(PlaybackConnectionState.DISCONNECTED, h.controller.state.value.connection)
+            h.transport.socket = FakeConnection()
+            h.controller.connect("Phone", "device")
+            runCurrent()
+            h.snapshot()
+            assertTrue(h.socket.sent.isEmpty())
+            assertFalse(h.audio.actual.isPlaying)
+            h.prepare()
+            h.activate() // same numeric epoch/sequence and event on fresh socket
+            assertTrue(h.audio.actual.isPlaying)
+            assertFalse(oldAttempt.authorized())
+            assertTrue(h.frames("command").isEmpty())
+        }
+    }
+
+    @Test fun pauseIssuedWhileAnotherConnectionIsSelectedDoesNotSilenceTransferTarget() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            h.message(PlaybackServerMessage("state", "session", snapshot = snapshotValue(2).copy(outputVersion = 1,
+                selectedConnectionId = "other", transfer = PlaybackTransfer("other-device", "device", "other", "connection", "activating"))))
+            val reports = h.frames("report").size
+            assertNotNull(h.controller.pause())
+            assertTrue(h.audio.actual.isPlaying)
+            assertTrue(h.audio.executions.single().authorized())
+            assertEquals(reports, h.frames("report").size)
+        }
+    }
+
+    @Test fun localPauseNeverRelabelsAStaleStopSample() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            val actual = h.audio.actual
+            h.audio.actual = actual.copy(binding = actual.binding!!.copy(instructionId = "retired"), elapsed = 30.4)
+            val frames = h.socket.sent.size
+            assertNotNull(h.controller.pause())
+            assertFalse(h.audio.actual.isPlaying)
+            assertEquals(listOf("command"), h.socket.sent.drop(frames).map { it["type"]!!.jsonPrimitive.content })
+        }
+    }
+
+    @Test fun localPauseFencesPendingStartBeforeAnyServerResponse() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            val gate = CompletableDeferred<AudioResult>()
+            h.audio.gate = gate
+            h.instruction(PlaybackInstruction("loading", "execute", 1, "event", 4.0, true,
+                track = track(), lease = LeaseTiming(basis, 8_000)))
+            val attempt = h.audio.executions.last()
+            assertTrue(attempt.authorized())
+            val receipts = h.frames("ack").size
+            val reports = h.frames("report").size
+            assertNotNull(h.controller.pause())
+            assertEquals(reports, h.frames("report").size) // no position invented from pending setup
+            assertFalse(attempt.authorized())
+            gate.complete(AudioResult.OK)
+            runCurrent()
+            assertFalse(h.audio.actual.isPlaying)
+            assertEquals(receipts, h.frames("ack").size)
+            advanceTimeBy(2_001)
+            runCurrent()
+            assertEquals(reports, h.frames("report").size) // sampler cannot turn cancelled setup into history
+            assertNull(h.controller.state.value.latestResult)
+        }
+    }
+
+    @Test fun stoppedSpeculativeStartCannotConfirmOrEmitHistoryAfterPause() = runTest {
+        Harness(this).use { h ->
+            h.start()
+            h.stage("plan")
+            val gate = CompletableDeferred<AudioResult>()
+            h.audio.gate = gate
+            h.observe(h.audio.actual.copy(ended = true, isPlaying = false))
+            val basis = h.frames("report").last()["clientSequence"]!!.jsonPrimitive.long
+            val attempt = h.audio.executions.last()
+            assertEquals("next-event", attempt.binding.eventId)
+            assertNotNull(h.controller.pause())
+            h.confirmNext("plan", basis)
+            gate.complete(AudioResult.OK)
+            runCurrent()
+            advanceTimeBy(2_001)
+            runCurrent()
+            assertFalse(attempt.authorized())
+            assertFalse(h.audio.actual.isPlaying)
+            assertTrue(h.socket.sent.none { it["instructionId"]?.jsonPrimitive?.content == "next-execution" })
         }
     }
 
@@ -633,8 +840,8 @@ class PlaybackControllerTest {
     }
 
     private class Harness(private val scope: TestScope, name: String = "Phone") : AutoCloseable {
-        val socket = FakeConnection()
-        val transport = FakeTransport(socket)
+        val transport = FakeTransport(FakeConnection())
+        val socket get() = transport.socket
         val audio = FakeAudio()
         val wall get() = 1_700_000_000_000L + scope.testScheduler.currentTime
         val controller = PlaybackController(transport, audio, scope.backgroundScope, object : PlaybackClock {
@@ -704,9 +911,11 @@ class PlaybackControllerTest {
         val sent = mutableListOf<JsonObject>()
         override val messages = incoming.receiveAsFlow()
         override var isOpen = true
+        var failSend: String? = null
         override fun send(text: String): Boolean {
-            if (!isOpen) return false
-            sent.add(playbackJson.parseToJsonElement(text).jsonObject)
+            val frame = playbackJson.parseToJsonElement(text).jsonObject
+            if (!isOpen || frame["type"]!!.jsonPrimitive.content == failSend) return false
+            sent.add(frame)
             return true
         }
         fun finish() {

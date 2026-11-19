@@ -42,7 +42,7 @@ internal class OkHttpAuthApi(
 
     // Ordinary GET connection recovery is safe; HTTP status responses are never replayed.
     private enum class UnavailableBodyPolicy { DISCARD, BOUNDED_JSON }
-    private class ReadStatus(val response: FeatureResponse) : java.net.ProtocolException("Read status received")
+    internal class ReadStatus(val response: FeatureResponse) : java.net.ProtocolException("Read status received")
     private val readClient = client.newBuilder()
         .retryOnConnectionFailure(true)
         .addNetworkInterceptor { chain ->

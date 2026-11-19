@@ -16,7 +16,7 @@ class PinnedSong internal constructor(private val file: File, private val size: 
         val input = file.inputStream()
         try { input.channel.position(position) } catch (e: Exception) { input.close(); throw e }
         ranges++
-        return AudioStream(input, size - position, null, current) {
+        return AudioStream(input, size - position, permitted = current) {
             try { input.close() } finally { synchronized(this) { if (--ranges == 0 && retired) release() } }
         }
     }

@@ -26,8 +26,11 @@ internal class Media3AudioExecutor(
     private val onSystemPause: () -> Unit,
     private val requestPlaybackStart: () -> Boolean,
 ) : AudioExecutor, Closeable {
+    private var audioLoadScope: AudioLoadScope? = null
+    @Volatile private var source: AudioSourceOwner? = null
     val player: ExoPlayer = ExoPlayer.Builder(context)
-        .setMediaSourceFactory(SessionMusicSourceFactory(sessions, identity, cache))
+        .setMediaSourceFactory(SessionMusicSourceFactory(sessions, identity, cache) { source }
+            .setLoadErrorHandlingPolicy(AudioLoadRecovery()))
         .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(), true)
         .setHandleAudioBecomingNoisy(true)
         .setWakeMode(C.WAKE_MODE_LOCAL)
@@ -81,7 +84,7 @@ internal class Media3AudioExecutor(
     ): AudioResult {
         checkThread()
         if (!isAuthorized()) { pause(); return AudioResult.REJECTED }
-        val result = load(binding, track, elapsed, playRequested = desiredPlaying)
+        val result = load(binding, track, elapsed, playRequested = desiredPlaying, isAuthorized = isAuthorized)
         if (result != AudioResult.OK) return result
         if (this.binding != binding || !isAuthorized()) { pause(); return AudioResult.REJECTED }
         // A known terminal position cannot start sound or justify a new foreground-service deadline.
@@ -95,6 +98,7 @@ internal class Media3AudioExecutor(
                 blocked = true
                 return AudioResult.BLOCKED
             }
+            audioLoadScope?.playing = true
             player.play()
             if (!player.playWhenReady) {
                 pause()
@@ -106,7 +110,10 @@ internal class Media3AudioExecutor(
         return AudioResult.OK
     }
 
-    private suspend fun load(next: AudioBinding, track: PlaybackTrack?, elapsed: Double, playRequested: Boolean = false): AudioResult {
+    private suspend fun load(
+        next: AudioBinding, track: PlaybackTrack?, elapsed: Double,
+        playRequested: Boolean = false, isAuthorized: () -> Boolean = { true },
+    ): AudioResult {
         checkThread()
         pause()
         binding = next
@@ -116,21 +123,28 @@ internal class Media3AudioExecutor(
         val token = generation
         try {
             if (track == null) {
+                retireSource()
                 player.stop()
                 player.clearMediaItems()
                 return AudioResult.OK
             }
             require(elapsed.isFinite() && elapsed >= 0)
+            val owner = AudioLoadScope(track.id, authorized = isAuthorized)
+            audioLoadScope = owner
             val position = (elapsed * 1000).toLong()
             val wait = NativePreparation(token, next, track.id, position, playRequested)
             preparation = wait
             if (player.currentMediaItem?.mediaId != track.id || player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED)
-                || player.playerError != null) {
+                || player.playerError != null || source?.bind(owner) != true) {
+                retireSource()
+                val installed = AudioSourceOwner(token.toString(), track.id)
+                check(installed.bind(owner))
+                source = installed
                 val metadata = MediaMetadata.Builder().setTitle(track.name)
                     .setArtist(track.artists.joinToString(", ") { it.name }).setAlbumTitle(track.albumName).build()
                 val uri = Uri.Builder().scheme("spofify").authority("audio").appendPath(track.id).build()
                 // IDs are opaque: a suffix such as .mpd must not select a manifest media source.
-                player.setMediaItem(MediaItem.Builder().setMediaId(track.id).setUri(uri)
+                player.setMediaItem(MediaItem.Builder().setMediaId(track.id).setUri(uri).setCustomCacheKey(installed.key)
                     .setMimeType("application/octet-stream").setMediaMetadata(metadata).build(), position)
                 player.prepare()
             } else if (playRequested || elapsed != player.currentPosition / 1000.0) {
@@ -139,24 +153,33 @@ internal class Media3AudioExecutor(
             }
             if (!wait.matches(generation, binding, player.currentMediaItem?.mediaId)) return AudioResult.REJECTED
             wait.outcome(player.playbackState, player.playerError != null, player.duration)?.let(wait.result::complete)
-            val outcome = wait.result.await()
+            val outcome = owner.awaitPreparation(wait.result)
             if (token != generation || binding != next) return AudioResult.REJECTED
             if (outcome != AudioResult.OK) pause()
             return outcome
         } catch (cancelled: CancellationException) {
-            if (binding == next) pause()
+            if (!released && token == generation) pause()
             throw cancelled
         } catch (_: Exception) {
-            if (binding == next) pause()
+            if (!released && token == generation) pause()
             return AudioResult.MEDIA
         } finally {
             if (token == generation) preparation = null
         }
     }
 
+    private fun retireSource() {
+        val old = source
+        source = null
+        old?.job?.cancel()
+    }
+
     override fun pause() {
         checkThread()
         generation++
+        source?.unbind()
+        audioLoadScope?.job?.cancel()
+        audioLoadScope = null
         playbackAuthority = null
         traversalBinding = null
         val pending = preparation
@@ -193,6 +216,7 @@ internal class Media3AudioExecutor(
         if (released) return
         pause()
         released = true
+        retireSource()
         player.removeListener(listener)
         player.release()
     }

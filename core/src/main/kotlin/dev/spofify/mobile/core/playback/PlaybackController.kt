@@ -58,6 +58,11 @@ class PlaybackController(
 
     private data class Prepared(val instruction: PlaybackInstruction, val basis: Long)
     private data class PendingCommand(val command: JsonObject, val sentAt: Long, val removeKey: Long?)
+    // A full command book or timed-out receipt does not undo a physical stop.
+    // A fresh same-output start needs a grant based on a send AFTER the stop,
+    // and (if Pause was sent) the server must have processed that command.
+    private data class PauseFence(val output: Long, val throughSequence: Long, var awaitingResult: String? = null)
+    private var pauseFence: PauseFence? = null
     private data class UndoState(val token: String, val key: Long, val deadline: Long)
     private class Execution(
         val instruction: PlaybackInstruction,
@@ -68,6 +73,8 @@ class PlaybackController(
         var confirmed = source == null
         var speculationDisabled = false
         var parked = false
+        // Local safety stop, not an execution receipt or a change of lease.
+        var localPauseRequested = false
         var revoked = false
         var endedReported = false
         var outcome: AudioResult? = null
@@ -234,10 +241,29 @@ class PlaybackController(
 
     private fun simple(type: String): String? = issue(fields("type" to type))
 
+    private fun pauseSelectedLocally(): PauseFence? {
+        val current = execution ?: return null
+        if (!current.instruction.desiredPlaying || current.revoked || current.parked) return null
+        val fence = PauseFence(current.binding.outputVersion, clientSequence)
+        pauseFence = fence
+        current.localPauseRequested = true
+        discardStage()
+        mediaJob?.cancel()
+        audio.pause()
+        // Preserve the physical stop position in socket order BEFORE the command.
+        // This is an observation of the old execution, never a receipt for the next one.
+        if (authorized(current)) report(current, audio.facts())
+        return fence
+    }
+
     /** Returns a sent command ID, not a success receipt. Results are server-only. */
     private fun issue(command: JsonObject, guarded: Boolean = false, removeKey: Long? = null): String? = synchronized(lock) {
         val view = state.value
-        if (view.connection != PlaybackConnectionState.READY || connection?.isOpen != true) return@synchronized null
+        if (view.connection != PlaybackConnectionState.READY) return@synchronized null
+        // Socket close can be visible before collection/sampling has retired native audio.
+        val fence = if (command["type"]?.jsonPrimitive?.content == "pause" &&
+            view.snapshot?.selectedConnectionId == view.connectionId) pauseSelectedLocally() else null
+        if (connection?.isOpen != true) return@synchronized null
         if (pending.size >= 32 || commandId >= MAX_SAFE_INTEGER) {
             mutableState.value = view.copy(error = "Too many pending playback actions.")
             return@synchronized null
@@ -250,6 +276,7 @@ class PlaybackController(
         }
         val id = (++commandId).toString()
         if (removeKey != null) lastUndoRequest = id
+        fence?.awaitingResult = id
         pending[id] = PendingCommand(command, clock.monotonicMs(), removeKey)
         val envelope = JsonObject(fields("type" to "command", "id" to id, "command" to command) +
             if (guarded) fields("expectedStateVersion" to view.snapshot!!.stateVersion) else emptyMap())
@@ -332,6 +359,8 @@ class PlaybackController(
         require(safeCounter(result.stateVersion) && result.acceptedCount >= 0)
         require(result.placement in setOf("none", "low", "high", "next", "replace", "existing"))
         require(result.execution in setOf("unchanged", "pending", "confirmed", "blocked", "media", "uncertain", "superseded"))
+        // Even a late result is a wire-order boundary, never permission to restart audio.
+        pauseFence?.takeIf { it.awaitingResult == result.id }?.awaitingResult = null
         val request = pending[result.id] ?: return
         val safeCode = result.code.takeIf { it in setOf("", "stale_state_version", "stale_revision", "conflict",
             "expired", "invalid", "unavailable", "capacity", "superseded") } ?: "unknown"
@@ -395,6 +424,7 @@ class PlaybackController(
                 ack(instruction, AudioResult.REJECTED)
                 return
             }
+            if (current.localPauseRequested) return // A stopped speculative start cannot confirm play.
             current.confirmed = true
             val outcome = current.outcome
             if (outcome == null) current.receipts.add(instruction) else {
@@ -471,17 +501,23 @@ class PlaybackController(
         nextPlan = null
         execution?.revoked = true
         val current = Execution(instruction, operation, source)
+        // An older playing execute can cross the outgoing Pause on the wire. Never
+        // start or confirm it. A new epoch or later authoritative command is distinct.
+        val fence = pauseFence
+        current.localPauseRequested = instruction.desiredPlaying && fence?.output == instruction.outputVersion &&
+            (fence.awaitingResult != null || (instruction.lease?.clientSequence ?: 0) <= fence.throughSequence)
+        if (instruction.desiredPlaying && !current.localPauseRequested) pauseFence = null
         execution = current // Admission, not completion, is the deduplication point.
         val life = lifecycle
         mediaJob = scope.launch {
-            if (!synchronized(lock) { life == lifecycle && authorized(current) }) return@launch
+            if (!synchronized(lock) { life == lifecycle && mayExecute(current) }) return@launch
             val outcome = try {
                 audio.execute(current.binding, instruction.track, elapsed, instruction.desiredPlaying) {
-                    synchronized(lock) { authorized(current) }
+                    synchronized(lock) { mayExecute(current) }
                 }
             } catch (_: Exception) { AudioResult.MEDIA }
             synchronized(lock) {
-                if (life != lifecycle || execution !== current || current.generation != operation || current.revoked) return@synchronized
+                if (life != lifecycle || execution !== current || current.generation != operation || current.revoked || current.localPauseRequested) return@synchronized
                 current.outcome = outcome
                 if (outcome != AudioResult.OK) audio.pause()
                 if (current.confirmed) parkIfStopped(current, outcome)
@@ -522,7 +558,7 @@ class PlaybackController(
             }
             return
         }
-        if (current.speculationDisabled || !sameSource(instruction, current) || !authorized(current) || !current.instruction.desiredPlaying ||
+        if (current.localPauseRequested || current.speculationDisabled || !sameSource(instruction, current) || !authorized(current) || !current.instruction.desiredPlaying ||
             current.endedReported || !targetOutput() || instruction.planId in current.retiredPlans ||
             pending.values.any { it.command["type"]?.jsonPrimitive?.content != "rename" }) return
         if (nextPlan?.planId == instruction.planId) return
@@ -594,6 +630,8 @@ class PlaybackController(
         execution === current && current.generation == operation && !current.revoked && !current.parked &&
         clock.monotonicMs() < leaseDeadline
 
+    private fun mayExecute(current: Execution) = !current.localPauseRequested && authorized(current)
+
     private fun observable(current: Execution): Boolean = authorized(current) ||
         current.parked && !current.revoked && execution === current && connection?.isOpen == true
 
@@ -633,7 +671,8 @@ class PlaybackController(
         audio.observations.collect { observation ->
             synchronized(lock) {
                 val current = execution ?: return@synchronized
-                if (observation.binding != current.binding || observation.facts.binding != current.binding) return@synchronized
+                // A queued pre-Pause callback must not reopen the stopped history interval.
+                if (current.localPauseRequested || observation.binding != current.binding || observation.facts.binding != current.binding) return@synchronized
                 val previous = current.lastFacts
                 val facts = observation.facts
                 // Ordinary native timeupdate must not become a second progress sampler.
@@ -648,6 +687,10 @@ class PlaybackController(
 
     private fun report(current: Execution, facts: AudioFacts, endedEvent: Boolean = false, allowFinal: Boolean = false) {
         if (facts.binding != current.binding || execution !== current || current.revoked) return
+        // Only actual stopped samples of a healthy, confirmed execution can close its
+        // listening interval. Never pass off cancelled setup or crossed work as a stop fact.
+        if (current.localPauseRequested && (!authorized(current) || !current.confirmed || current.outcome != AudioResult.OK ||
+            current.binding.trackId == null || facts.isPlaying || facts.ended || facts.error.isNotEmpty())) return
         if (!allowFinal && !observable(current)) return
         if (!safeSeconds(facts.elapsed) || !safeSeconds(facts.duration) || !validMediaError(facts.error)) return
         if (current.parked && (facts.isPlaying || facts.ended)) {
@@ -736,6 +779,7 @@ class PlaybackController(
         samplerJob = null
         old?.close()
         pending.clear()
+        pauseFence = null
         sendBases.clear()
         seenInstructions.clear()
         futurePlayback = null

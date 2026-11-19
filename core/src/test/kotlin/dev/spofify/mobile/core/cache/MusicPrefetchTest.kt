@@ -83,7 +83,7 @@ class MusicPrefetchTest {
                         throw IOException("closed")
                     }
                 } else bytes.inputStream()
-                AudioStream(source, bytes.size.toLong(), null, { true }) {
+                AudioStream(source, bytes.size.toLong(), permitted = { true }) {
                     opened.decrementAndGet(); release.countDown(); closed.complete(Unit); source.close()
                 }
             }

@@ -17,7 +17,7 @@ import dev.spofify.mobile.core.auth.SessionRepository
  */
 @UnstableApi
 internal class SessionMusicSourceFactory(private val sessions: SessionRepository, private val identity: AccountIdentity,
-    private val cache: AutomaticMusicCache) : MediaSource.Factory {
+    private val cache: AutomaticMusicCache, private val currentSource: () -> AudioSourceOwner?) : MediaSource.Factory {
     private var drm: DrmSessionManagerProvider? = null
     private var loadPolicy: LoadErrorHandlingPolicy? = null
     override fun getSupportedTypes() = intArrayOf(C.CONTENT_TYPE_OTHER)
@@ -26,7 +26,7 @@ internal class SessionMusicSourceFactory(private val sessions: SessionRepository
 
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
         var choice = cache.sourceChoice()
-        val factory = ProgressiveMediaSource.Factory(DataSource.Factory { SessionAudioDataSource(sessions, identity, choice) })
+        val factory = ProgressiveMediaSource.Factory(DataSource.Factory { SessionAudioDataSource(sessions, identity, choice, currentSource) })
         drm?.let(factory::setDrmSessionManagerProvider)
         loadPolicy?.let(factory::setLoadErrorHandlingPolicy)
         return object : WrappingMediaSource(factory.createMediaSource(mediaItem)) {

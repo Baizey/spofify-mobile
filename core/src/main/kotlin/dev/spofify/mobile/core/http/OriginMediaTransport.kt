@@ -20,7 +20,9 @@ internal class OriginMediaTransport(
     private val renewedCookie: (Response) -> String?,
 ) {
     private val socketClient = client
-    private val audioClient = client.newBuilder().callTimeout(0, TimeUnit.MILLISECONDS).build()
+    // Media3 owns the bounded retry budget; don't replay a failed audio GET underneath it.
+    private val fillClient = client.newBuilder().callTimeout(0, TimeUnit.MILLISECONDS).build()
+    private val audioClient = fillClient.newBuilder().retryOnConnectionFailure(false).build()
     private val audioCalls = ConcurrentHashMap.newKeySet<Call>()
     private val sockets = ConcurrentHashMap.newKeySet<SessionSocket>()
 
@@ -103,14 +105,21 @@ internal class OriginMediaTransport(
             .header("Accept-Encoding", "identity").apply {
             if (ranged) header("Range", "bytes=$position-${end ?: ""}")
         }.build()
-        val call = audioClient.newCall(request)
+        val call = (if (media == null) audioClient else fillClient).newCall(request)
         audioCalls.add(call)
         return suspendCancellableCoroutine { continuation ->
             continuation.invokeOnCancellation { call.cancel(); audioCalls.remove(call) }
             val callback = object : Callback {
-                override fun onFailure(call: Call, error: IOException) {
+                override fun onFailure(call: Call, e: IOException) {
                     audioCalls.remove(call)
-                    if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
+                    if (!continuation.isActive) return
+                    val interrupted = when (e) {
+                        is OkHttpAuthApi.ReadStatus -> e.response.status.isTransientAudioStatus()
+                        else -> e.isAudioInterruption()
+                    }
+                    val retryable = media == null && interrupted && !call.isCanceled() && authority.isCurrent
+                    continuation.resumeWithException(if (retryable) TransientAudioLoadFailure(e)
+                        else AuthFailure(AuthFailure.Kind.UNAVAILABLE))
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -121,6 +130,9 @@ internal class OriginMediaTransport(
                     }
                     try {
                         onHeaders(response.code, renewedCookie(response))
+                        if (media == null && response.code.isTransientAudioStatus() && authority.isCurrent && !call.isCanceled()) {
+                            throw TransientAudioLoadFailure()
+                        }
                         require(response.code == if (ranged) 206 else 200)
                         val body = response.body
                         require(response.header("Content-Encoding").let { it == null || it.equals("identity", true) })
@@ -128,24 +140,32 @@ internal class OriginMediaTransport(
                         if (media != null) {
                             require(!ranged && bytes == media.byteLength && response.headers.values("ETag") == listOf("\"${media.mediaVersion}\""))
                         }
+                        var totalLength = bytes.takeIf { it >= 0 }
                         if (ranged) {
                             val range = RANGE.matchEntire(response.header("Content-Range").orEmpty())
                                 ?: throw IOException("Invalid audio range")
                             val first = range.groupValues[1].toLong()
                             val last = range.groupValues[2].toLong()
                             require(first == position && last >= first && (end == null || last <= end))
-                            val total = range.groupValues[3]
-                            require(total == "*" || total.toLong() > last)
+                            totalLength = range.groupValues[3].takeUnless { it == "*" }?.toLong()
+                            require(totalLength == null || totalLength > last)
                             val rangeLength = Math.addExact(last - first, 1)
                             require(bytes < 0 || bytes == rangeLength)
                             bytes = rangeLength
                         }
-                        val stream = AudioStream(body.byteStream(), bytes, body.contentType()?.toString(),
-                            { authority.isCurrent }, { closeAudio(call, response) })
+                        val etag = response.header("ETag")
+                        val representation = AudioRepresentation(totalLength, etag,
+                            response.header("Last-Modified"), body.contentType()?.toString(),
+                            EVIDENCE_HEADERS.none { response.headers.values(it).size > 1 },
+                            etag?.matches(STRONG_ETAG) == true || response.headers.getDate("Last-Modified") != null)
+                        val stream = AudioStream(body.byteStream(), bytes, representation,
+                            { !call.isCanceled() && authority.isCurrent }, recoverable = media == null,
+                            cancelCall = call::cancel) { closeAudio(call, response) }
                         continuation.resume(stream, onCancellation = { _, value, _ -> value.close() })
-                    } catch (_: Exception) {
+                    } catch (failure: Exception) {
                         closeAudio(call, response)
-                        if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
+                        if (continuation.isActive) continuation.resumeWithException(
+                            if (failure is TransientAudioLoadFailure) failure else AuthFailure(AuthFailure.Kind.UNAVAILABLE))
                     }
                 }
             }
@@ -178,6 +198,8 @@ internal class OriginMediaTransport(
     private companion object {
         const val PROTOCOL = "spofify.library-playback.v2"
         val SHA = Regex("[0-9a-f]{64}")
+        val EVIDENCE_HEADERS = listOf("Content-Range", "Content-Length", "Content-Type", "Content-Encoding", "ETag", "Last-Modified")
+        val STRONG_ETAG = Regex("\"[!#-~\\x80-\\xff]*\"")
         val RANGE = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+|\\*)")
     }
 }
