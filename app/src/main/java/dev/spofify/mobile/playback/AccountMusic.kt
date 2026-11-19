@@ -29,8 +29,9 @@ internal class AccountMusic(root: File, private val identity: AccountIdentity, p
         .stateIn(scope, SharingStarted.Eagerly, sessions.isCurrent(identity))
     private fun localSources() = MusicSources(catalog, catalog,
         DevicePersonalLibrary(catalog) { repository.await()?.complete().orEmpty() }, catalog.trackContent(ownerActive), true)
+    val personal = AccountPersonalSource()
     private var dataGrant = sessions.onlineGrant.value?.takeIf { it.identity == identity }
-    private fun dataFor(grant: OnlineGrant?) = grant?.let { onlineMusicSources(sessions, it, catalog) } ?: localSources()
+    private fun dataFor(grant: OnlineGrant?) = grant?.let { onlineMusicSources(sessions, it, catalog, personal) } ?: localSources()
     private val mutableSources = MutableStateFlow(dataFor(dataGrant))
     val sources = mutableSources.asStateFlow()
     private val mutableSaved = MutableStateFlow<List<OfflineManifest>>(emptyList())
@@ -50,6 +51,13 @@ internal class AccountMusic(root: File, private val identity: AccountIdentity, p
     fun observeQueue(view: PlaybackView) { queue.value = view.snapshot?.state?.queue.orEmpty() }
 
     init {
+        scope.launch {
+            personal.replica.view.filter { it.connected }.map { it.recent }.distinctUntilChanged().collectLatest { rows ->
+                try { catalog.rememberHistory(rows) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { /* Keep the previous complete on-device snapshot. */ }
+            }
+        }
         scope.launch {
             sessions.onlineGrant.collect { current ->
                 val newGrant = current?.takeIf { it.identity == identity }

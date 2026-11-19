@@ -20,8 +20,15 @@ internal class RecentViewModel(private val api: PersonalLibraryApi) : ViewModel(
     private val mutable = MutableStateFlow(RecentState())
     val state = mutable.asStateFlow()
 
+    private val live = api as? dev.spofify.mobile.playback.LivePersonal
+    init {
+        live?.let { source -> viewModelScope.launch {
+            source.replica.view.collect { mutable.value = RecentState(items = it.recent) }
+        } }
+    }
+
     fun refresh() {
-        if (mutable.value.loading) return
+        if (live != null || mutable.value.loading) return
         mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null)
         viewModelScope.launch {
             try {

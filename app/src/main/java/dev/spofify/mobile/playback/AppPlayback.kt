@@ -6,7 +6,7 @@ import dev.spofify.mobile.core.playback.*
 
 /** One controller lifetime, never a lookup of the *next* controller. An old gesture cannot migrate. */
 internal sealed class AppPlayback(private val current: () -> Boolean) {
-    class Online(val controller: PlaybackController, current: () -> Boolean) : AppPlayback(current)
+    class Online(val controller: AccountChannel, current: () -> Boolean) : AppPlayback(current)
     class Local(val controller: LocalPlaybackController, current: () -> Boolean) : AppPlayback(current)
 
     val presentation: PlayerPresentation get() = when (this) {
@@ -19,7 +19,7 @@ internal sealed class AppPlayback(private val current: () -> Boolean) {
         is Local -> PlayerPresentation.Local(controller.state.collectAsStateWithLifecycle().value)
     }
 
-    private inline fun <R> dispatch(online: PlaybackController.() -> R, local: LocalPlaybackController.() -> R): R? =
+    private inline fun <R> dispatch(online: AccountChannel.() -> R, local: LocalPlaybackController.() -> R): R? =
         if (!current()) null else when (this) {
             is Online -> controller.online()
             is Local -> controller.local()
@@ -28,22 +28,20 @@ internal sealed class AppPlayback(private val current: () -> Boolean) {
     fun pause() { dispatch({ pause() }, { pause() }) }
     fun resume() { dispatch({ resume() }, { resume() }) }
     fun toggle() { dispatch({ toggle() }, { toggle() }) }
-    // Only a real submitted online command has an ID for the mini-player handoff.
-    fun next(): String? = dispatch({ next() }, { next(); null })
-    fun previous(): String? = dispatch({ previous() }, { previous(); null })
+    fun next() { dispatch({ next() }, { next() }) }
+    fun previous() { dispatch({ previous() }, { previous() }) }
     fun seek(seconds: Double) { dispatch({ seek(seconds) }, { seek(seconds) }) }
     fun jump(key: Long) { dispatch({ jump(key) }, { jump(key) }) }
     fun remove(key: Long) { dispatch({ remove(key) }, { remove(key) }) }
     fun moveUpcoming(key: Long, after: Long?) { dispatch({ moveUpcoming(key, after) }, { moveUpcoming(key, after) }) }
     fun playTrack(track: PlaybackTrackReference, context: PlaybackContext? = null): Boolean =
-        dispatch({ playTrack(track, context) != null }, { playTrack(track, context) }) == true
+        dispatch({ playTrack(track, context) }, { playTrack(track, context) }) == true
     fun playCollection(context: PlaybackContext): Boolean =
-        dispatch({ playCollection(context) != null }, { playCollection(context) }) == true
+        dispatch({ playCollection(context) }, { playCollection(context) }) == true
     fun queueCollection(context: PlaybackContext, next: Boolean = false): Boolean =
-        dispatch({ queueCollection(context, next) != null }, { queueCollection(context, next) }) == true
+        dispatch({ queueCollection(context, next) }, { queueCollection(context, next) }) == true
     fun queueTrack(track: PlaybackTrackReference, context: PlaybackContext? = null, next: Boolean = false): Boolean =
-        dispatch({ queueTrack(track, context, next) != null }, { queueTrack(track, context, next) }) == true
-    fun undoRemove() { if (this is Online && current()) controller.undoRemove() }
+        dispatch({ queueTrack(track, context, next) }, { queueTrack(track, context, next) }) == true
     fun toggleShuffle() { dispatch({ toggleShuffle() }, { toggleShuffle() }) }
     fun cycleRepeat() { dispatch({ cycleRepeat() }, { cycleRepeat() }) }
     fun setShuffle(enabled: Boolean) { dispatch({ setShuffle(enabled) }, { setShuffle(enabled) }) }

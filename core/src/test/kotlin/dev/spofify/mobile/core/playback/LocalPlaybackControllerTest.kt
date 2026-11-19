@@ -265,6 +265,59 @@ class LocalPlaybackControllerTest {
         assertEquals(PlaybackQueueState(), h.state)
     }
 
+    @Test fun accountOwnerTraversesDuplicateBeforeAnyResponseAndReconciliationDoesNotExecuteAgain() = runTest {
+        val audio = FakeAudio()
+        val facts = mutableListOf<AccountFact>()
+        val views = mutableListOf<AccountState>()
+        val owner = AccountPlayer(audio, backgroundScope, { true }, views::add, facts::add)
+        val rows = listOf(track("same").copy(key = 7), track("same").copy(key = 8))
+        val before = AccountCursor(7, "source", desired = true)
+        owner.snapshot(AccountState(rows, before, "off", false), true)
+        runCurrent()
+        val source = audio.starts.single()
+        audio.end(source)
+        runCurrent()
+        assertEquals(2, audio.starts.size)
+        assertEquals(8L, views.last().cursor.key)
+        assertEquals(8L, facts.single { it.ended }.landed)
+        assertEquals(7L, facts.single { it.ended }.key)
+        owner.update(AccountDelta(cursor = before.copy(elapsed = 29.0), observed = true))
+        owner.update(AccountDelta(cursor = views.last().cursor, observed = true))
+        runCurrent()
+        assertEquals(2, audio.attempts.size)
+        owner.output(false)
+        val count = facts.size
+        audio.end(audio.starts.last()); runCurrent()
+        assertEquals(count, facts.size)
+        owner.close()
+    }
+
+    @Test fun accountOwnerEditsCachedTraversalAndPromotesExactNativeBinding() = runTest {
+        val audio=FakeAudio(); val facts=mutableListOf<AccountFact>(); val views=mutableListOf<AccountState>()
+        val owner=AccountPlayer(audio,backgroundScope,{true},views::add,facts::add)
+        val rows=(1..4).map { track("t$it","e$it").copy(playbackContext=playlist,key=it.toLong(),order=it.toLong(),intent="low") }
+        val start=AccountState(rows,AccountCursor(1,"source",desired=true),"off",false)
+        fun local(type:String,vararg v:Pair<String,Any?>)=owner.local(fields("type" to type,*v))
+        val ctx=fields("kind" to "playlist","id" to "p","name" to "Playlist")
+        val collection=fields("kind" to "collection","context" to ctx)
+        val selection=fields("kind" to "track","track" to fields("id" to "t3","entryId" to "e3"),"context" to ctx)
+        fun keys()=views.last().queue.map { it.key }
+        owner.snapshot(start,true); runCurrent()
+        local("play","selection" to collection);runCurrent();assertEquals(1,audio.attempts.size) // rows alone do not prove completeness
+        owner.snapshot(start.copy(collectionFirst=1),true)
+        local("shuffle","shuffle" to true,"seed" to 0);assertEquals(listOf(1L,3L,4L,2L),keys());local("shuffle","shuffle" to false);assertEquals(rows.map { it.key },keys())
+        local("move","key" to 4,"after" to 0);assertEquals(listOf(1L,4L,2L,3L),keys());local("remove","key" to 2);assertEquals(listOf(1L,4L,3L),keys());local("clear");assertEquals(listOf(1L),keys())
+        local("add","selection" to collection,"placement" to "next");local("add","selection" to selection,"placement" to "low");assertEquals(listOf("t1","t1","t2","t3","t4","t3"),views.last().queue.map { it.id });assertEquals(6,keys().distinct().size)
+        owner.update(AccountDelta(cursor=start.cursor,observed=true));assertEquals(6,keys().size);runCurrent();assertEquals(1,audio.attempts.size)
+        local("play","selection" to selection);runCurrent();val binding=audio.starts.last();assertEquals(listOf("e3","e4","e1","e2"),views.last().queue.map { it.entryId });assertEquals(2,audio.attempts.size)
+        val actual=audio.actual.copy(elapsed=2.0);audio.actual=actual;audio.observations.tryEmit(AudioObservation(binding,actual));runCurrent();assertFalse(facts.any { it.chain.startsWith("local:") })
+        val canonical=views.last().queue.mapIndexed { i,r->r.copy(key=i+20L,order=i+20L) }
+        owner.update(AccountDelta(queue=AccountQueueEdit("replace",rows=canonical,collectionFirst=22),cursor=AccountCursor(20,"confirmed",desired=true)),ownSelection=true);runCurrent()
+        assertEquals(2,audio.attempts.size);assertEquals(2.0,views.last().cursor.elapsed,0.0);assertTrue(views.last().cursor.playing)
+        audio.observations.tryEmit(AudioObservation(binding,actual));runCurrent();assertEquals("confirmed",facts.last().chain);assertEquals(20L,facts.last().key)
+        local("close");assertTrue(views.last().queue.isEmpty());assertFalse(audio.actual.isPlaying);assertFalse(audio.attempts.last().authorized());owner.close()
+    }
+
     private class Harness(scope: TestScope) {
         var allowed = true
         val audio = FakeAudio()

@@ -54,11 +54,10 @@ internal fun PersonalSongRow(
 
 /** No permanent refresh control or healthy-state helper prose. */
 @Composable
-internal fun PersonalStatus(loading: Boolean, error: String?, onRefresh: () -> Unit) {
+internal fun PersonalStatus(loading: Boolean, error: String?) {
     if (loading) LinearProgressIndicator(Modifier.fillMaxWidth().height(3.dp))
     if (error != null) Column(Modifier.padding(vertical = 12.dp)) {
         Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        TextButton(onRefresh, enabled = !loading, contentPadding = PaddingValues(0.dp)) { Text("Retry") }
     }
 }
 

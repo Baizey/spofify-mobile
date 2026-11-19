@@ -6,7 +6,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,12 +61,11 @@ internal fun PlaylistsScreen(
             val captured = personalGestureBinding(summary, null, playback?.presentation?.online)
             queueJob = scope.launch {
                 try {
-                    val context = freshPlaylistContext(api, summary.id)
+                    val context = if (api is dev.spofify.mobile.playback.LivePersonal) playlistContext(summary)
+                        else freshPlaylistContext(api, summary.id)
                     val current = playback?.presentation
-                    if (current?.ready != true || captured != personalGestureBinding(summary, null, current.online) ||
-                        summary !in model.state.value.items || playback?.queueCollection(context) != true) {
-                        queueError = "Playback action wasn't sent."
-                    }
+                    if (current?.ready == true && captured == personalGestureBinding(summary, null, current.online) &&
+                        model.state.value.items.any { it.id == summary.id }) playback.queueCollection(context)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) { queueError = personalError(failure) }
@@ -92,12 +90,9 @@ internal fun PlaylistsScreen(
         if (state.writing) LinearProgressIndicator(Modifier.fillMaxWidth().height(3.dp))
         val failure = state.error ?: state.message ?: queueError
         if (failure != null) Box(Modifier.padding(horizontal = 20.dp)) {
-            PersonalStatus(false, failure) {
-                queueError = null
-                model.refresh()
-            }
+            PersonalStatus(false, failure)
         }
-        PullToRefreshBox(state.loading, onRefresh = { if (!state.writing) model.refresh() }, modifier = Modifier.weight(1f).fillMaxWidth()) {
+        Box(Modifier.weight(1f).fillMaxWidth()) {
             if (state.loaded && state.items.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("No playlists", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -172,6 +167,8 @@ fun AddTrackToPlaylistSheet(
     val scroll = rememberLazyListState()
     var creating by remember { mutableStateOf(false) }
     val priorAddition = remember(model) { model.state.value.added }
+    val priorSent = remember(model) { model.state.value.addSent }
+    LaunchedEffect(state.addSent) { if (state.addSent != priorSent) onDismiss() }
     LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
     LaunchedEffect(state.created) { if (state.created != null) model.consumeCreated() }
     LaunchedEffect(state.added) {
@@ -187,12 +184,12 @@ fun AddTrackToPlaylistSheet(
         creating = false
         model.create(name, description)
     } else SpofifySheet(onDismiss) {
-        PullToRefreshBox(state.loading, onRefresh = { if (!state.writing) model.refresh() }) {
+        Box {
             LazyColumn(Modifier.fillMaxWidth(), state = scroll,
                 contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
                 item("heading") {
                     SheetHeading("Add to playlist")
-                    PersonalStatus(state.writing, state.error ?: state.message, model::refresh)
+                    PersonalStatus(state.writing, state.error ?: state.message)
                     SheetAction("New playlist", SpofifyGlyph.Plus, !state.writing && !state.needsReview) { creating = true }
                 }
                 items(state.items.filter { it.capabilities.addTracks }, key = { it.id }) { summary ->

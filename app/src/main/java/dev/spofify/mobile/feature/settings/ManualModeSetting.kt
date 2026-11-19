@@ -18,8 +18,6 @@ import kotlinx.coroutines.launch
 @Composable
 internal fun ManualModeSetting(identity: AccountIdentity, sessions: SessionRepository, owner: PlaybackOwner) {
     val offline by sessions.manualOffline.collectAsStateWithLifecycle()
-    val grant by sessions.onlineGrant.collectAsStateWithLifecycle()
-    val auth by sessions.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     var writing by remember(identity) { mutableStateOf(false) }
     var failed by remember(identity) { mutableStateOf(false) }
@@ -37,7 +35,4 @@ internal fun ManualModeSetting(identity: AccountIdentity, sessions: SessionRepos
         SpofifySwitchIndicator(offline, !writing)
     }
     if (failed) Text("Couldn’t save offline mode.", style = MaterialTheme.typography.bodySmall)
-    if (!offline && grant == null && (auth as? AuthState.Authenticated)?.notice == AuthNotice.CONNECTION_FAILED) {
-        TextButton({ sessions.retry() }, enabled = !writing) { Text("Retry going online") }
-    }
 }

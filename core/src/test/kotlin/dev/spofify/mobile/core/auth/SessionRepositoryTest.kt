@@ -130,10 +130,11 @@ class SessionRepositoryTest {
         val policy = Policy(true)
         val repo = repository(sessions, Logins(), unavailable, revoked, policy = policy)
         repo.start(); advanceUntilIdle(); val id = (repo.state.value as AuthState.Authenticated).identity
-        repo.setManualOffline(false); advanceUntilIdle()
+        repo.setManualOffline(false); runCurrent()
         assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
-        assertEquals(AuthNotice.CONNECTION_FAILED, (repo.state.value as AuthState.Authenticated).notice)
-        repo.retry(); runCurrent(); assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
+        assertNull((repo.state.value as AuthState.Authenticated).notice)
+        advanceTimeBy(1_000); runCurrent() // Quiet automatic validation; no retry gesture.
+        assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
         revoked.sessionGate!!.complete(Unit); advanceUntilIdle()
         assertFalse(repo.isCurrent(id)); assertNull(sessions.record)
         assertEquals(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED), repo.state.value)

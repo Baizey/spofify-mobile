@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -40,7 +39,7 @@ internal fun RecentScreen(
     val ready = player?.ready == true
     var menu by remember(model) { mutableStateOf<PersonalHistoryEntry?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
-    val send: (() -> Boolean?) -> Unit = { action -> actionError = if (action() != true) "Playback action wasn't sent." else null }
+    val send: (() -> Boolean?) -> Unit = { action -> action(); actionError = null }
     val play: (PersonalHistoryEntry) -> Unit = { entry ->
         activateTrackRow(entry.track.id, entry.track.hasAudio,
             play = { playback?.playTrack(it) },
@@ -56,12 +55,9 @@ internal fun RecentScreen(
         Column(Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp)) {
             PageTitle("History")
             val error = state.error ?: actionError ?: player?.error
-            if (error != null) PersonalStatus(false, error) {
-                actionError = null
-                model.refresh()
-            }
+            if (error != null) PersonalStatus(false, error)
         }
-        PullToRefreshBox(state.loading, onRefresh = model::refresh, modifier = Modifier.weight(1f).fillMaxWidth()) {
+        Box(Modifier.weight(1f).fillMaxWidth()) {
             if (state.items?.isEmpty() == true && !state.loading && state.error == null) {
                 Text("Nothing played yet", Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp, vertical = 16.dp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant)

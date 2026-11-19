@@ -135,7 +135,7 @@ class RoutingPlayerTest {
             override fun pause() = Unit
             override fun facts() = AudioFacts()
         }
-        val controller = PlaybackController(PlaybackTransport { _, _ -> connection }, audio, scope.backgroundScope)
+        val controller = AccountChannel(PlaybackTransport { _, _ -> connection }, audio, scope.backgroundScope)
         val native = Proxy.newProxyInstance(Player::class.java.classLoader, arrayOf(Player::class.java)) { _, method, _ ->
             nativeCalls.add(method.name)
             when (method.returnType) {
@@ -149,20 +149,12 @@ class RoutingPlayerTest {
         var current = true
         val player = RoutingPlayer(native, AppPlayback.Online(controller) { current }) { controllerRequest }
         val commands: List<String> get() = sent.map { Json.parseToJsonElement(it).jsonObject }
-            .filter { it["type"]?.jsonPrimitive?.content == "command" }
-            .map { it["command"]!!.jsonObject["type"]!!.jsonPrimitive.content }
+            .map { it.getValue("type").jsonPrimitive.content }.filterNot { it == "presence" }
 
         suspend fun remotePlaying() {
             controller.connect("Phone", "phone")
             scope.runCurrent()
-            val track = PlaybackTrack("song", "Song", emptyList(), "Album", "album", 120.0, 1, 1, "now")
-            val snapshot = PlaybackSnapshot("room", 1, 1,
-                PlaybackQueueState(queue = listOf(track), position = 0, desiredPlaying = true,
-                    occurrence = PlaybackOccurrence(1, "song", "event", 0.0, true)),
-                PlaybackStatus(1, 1, 1, "event", true, 0.0, 120.0, true, false, false, ""),
-                listOf(PlaybackDevice("phone", "Phone", true, true), PlaybackDevice("remote", "Remote", true, true)),
-                "remote", "remote-connection", null, 0)
-            incoming.send("""{"type":"snapshot","sessionId":"room","connectionId":"phone-connection","deviceId":"phone","snapshot":${Json.encodeToString(snapshot)}}""")
+            incoming.send(accountSnapshot("phone-connection", local = false))
             scope.runCurrent()
             assertEquals(PlaybackConnectionState.READY, controller.state.value.connection)
         }

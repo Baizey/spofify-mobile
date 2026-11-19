@@ -344,7 +344,7 @@ class LibraryClientTest {
                 hello.complete(text)
                 socket.send("""{"type":"snapshot"}""")
             }
-        }).setHeader("Sec-WebSocket-Protocol", "spofify.library-playback.v2"))
+        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v1"))
         val deviceName = "😀".repeat(64)
         val connection = sessions.playbackTransport(identity).connect(deviceName, "fixture-device")
         try {
@@ -364,7 +364,7 @@ class LibraryClientTest {
             val upgrade = server.takeRequest(2, TimeUnit.SECONDS)!!
             assertEquals("/api/me/player/socket", upgrade.path)
             assertNull(upgrade.requestUrl!!.query)
-            assertEquals("spofify.library-playback.v2", upgrade.getHeader("Sec-WebSocket-Protocol"))
+            assertEquals("spofify.account-state.v1", upgrade.getHeader("Sec-WebSocket-Protocol"))
             assertEquals(identity.origin, upgrade.getHeader("Origin"))
             assertFalse(upgrade.path!!.contains("fixture-ticket"))
         } finally { connection.close() }

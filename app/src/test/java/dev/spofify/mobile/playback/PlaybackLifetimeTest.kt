@@ -23,11 +23,11 @@ class PlaybackLifetimeTest {
         Harness(this).use { h ->
             h.start()
             h.snapshot()
-            assertNotNull(h.controller.selectDevice("remote"))
-            assertNotNull(h.controller.pause())
-            assertNotNull(h.controller.resume())
-            assertNotNull(h.controller.playTrack(PlaybackTrackReference("track")))
-            assertEquals(4, h.controller.state.value.pendingCommands)
+            assertTrue(h.controller.selectDevice("remote"))
+            assertTrue(h.controller.pause())
+            assertTrue(h.controller.resume())
+            assertTrue(h.controller.playTrack(PlaybackTrackReference("track")))
+            assertEquals(4, h.transport.sockets.single().commands().size)
             val old = h.transport.sockets.single()
             old.finish()
             runCurrent()
@@ -39,20 +39,19 @@ class PlaybackLifetimeTest {
             runCurrent()
             assertEquals(2, h.transport.sockets.size)
             assertEquals(PlaybackConnectionState.CONNECTING, h.controller.state.value.connection)
-            assertNull(h.controller.state.value.snapshot)
-            assertEquals(0, h.controller.state.value.pendingCommands)
+            assertNotNull(h.controller.state.value.snapshot) // Keep the last projection on screen.
             val fresh = h.transport.sockets.last()
             assertTrue(fresh.sent.isEmpty())
-            assertNull(h.controller.pause()) // No musical admission before its first snapshot.
+            assertFalse(h.controller.pause()) // No musical admission before its first snapshot.
             h.snapshot()
             assertEquals("connection-2", h.controller.state.value.connectionId)
             assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
             repeat(10) { h.reconnect.expedite() }
             runCurrent()
             assertEquals(2, h.transport.sockets.size)
-            assertTrue(fresh.sent.isEmpty())
+            assertTrue(fresh.commands().isEmpty())
             assertEquals(0, h.audio.executions)
-            assertEquals("1", h.controller.queueTrack(PlaybackTrackReference("track")))
+            assertTrue(h.controller.queueTrack(PlaybackTrackReference("track")))
             assertEquals(1, fresh.commands().size) // A new explicit action, never a replay.
         }
     }
@@ -157,7 +156,7 @@ class PlaybackLifetimeTest {
                 assertEquals(1, failures)
                 assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
                 assertTrue(h.transport.sockets.single().isOpen)
-                assertTrue(h.transport.sockets.single().sent.isEmpty())
+                assertTrue(h.transport.sockets.single().commands().isEmpty())
                 maintenance.refreshNow()
                 h.reconnect.expedite()
                 runCurrent()
@@ -213,7 +212,7 @@ class PlaybackLifetimeTest {
                 reportLocalBlocked = { error("An unrelated service callback must be ignored") })
             h.reconnect.expedite()
             runCurrent()
-            assertTrue(h.transport.sockets.single().sent.isEmpty())
+            assertTrue(h.transport.sockets.single().commands().isEmpty())
             assertTrue(h.transport.sockets.single().isOpen)
             assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
             assertEquals(1, h.transport.sockets.size)
@@ -247,6 +246,8 @@ class PlaybackLifetimeTest {
             h.snapshot(local = true)
             h.activateLocal()
             val paused = h.audio.pauses
+            val socket = h.transport.sockets.single()
+            val beforeRefusal = socket.sent.size
             var starts = 0
             handlePlaybackServiceLoss(h.controller.state.value, h.audio.facts(), true, h.audio.hasAuthority,
                 restartLocalService = { starts++; promotionRefused }, pauseNative = h.audio::pause, reportLocalBlocked = h.audio::blocked)
@@ -261,11 +262,21 @@ class PlaybackLifetimeTest {
             assertFalse(h.audio.actual.isPlaying)
             assertEquals(1, h.audio.blockedCount)
             assertEquals(1, h.audio.executions)
-            val socket = h.transport.sockets.single()
             assertTrue(socket.commands().isEmpty())
-            val facts = socket.sent.last { it["type"]!!.jsonPrimitive.content == "report" }
-            assertEquals("blocked", facts["error"]!!.jsonPrimitive.content)
-            assertFalse(facts["isPlaying"]!!.jsonPrimitive.boolean)
+            val fact = socket.sent.drop(beforeRefusal).single()
+            assertEquals("fact", fact.getValue("type").jsonPrimitive.content)
+            assertEquals("blocked", fact.getValue("error").jsonPrimitive.content)
+            assertFalse(fact.getValue("playing").jsonPrimitive.boolean)
+            assertFalse(fact.getValue("ended").jsonPrimitive.boolean)
+            assertEquals(1L, fact.getValue("key").jsonPrimitive.long)
+            assertEquals("visit", fact.getValue("chain").jsonPrimitive.content)
+            assertEquals(0L, fact.getValue("visit").jsonPrimitive.long)
+            assertEquals(0L, fact.getValue("run").jsonPrimitive.long)
+            assertFalse(h.controller.state.value.isPlaying)
+            advanceTimeBy(250); runCurrent() // Retired binding must not re-report on a sampler tick.
+            assertEquals(beforeRefusal + 1, socket.sent.size)
+            assertFalse(h.audio.hasAuthority)
+            assertFalse(h.audio.facts().isPlaying)
             assertEquals(PlaybackConnectionState.READY, h.controller.state.value.connection)
         }
     }
@@ -417,7 +428,7 @@ class PlaybackLifetimeTest {
         var current = true
         val transport = FakeTransport()
         val audio = FakeAudio()
-        val controller = PlaybackController(transport, audio, test.backgroundScope, object : PlaybackClock {
+        val controller = AccountChannel(transport, audio, test.backgroundScope, object : PlaybackClock {
             override fun monotonicMs() = test.testScheduler.currentTime
             override fun wallTimeMs() = 1_700_000_000_000L + test.testScheduler.currentTime
         })
@@ -425,41 +436,13 @@ class PlaybackLifetimeTest {
             connectFresh = { controller.connect("Phone", "phone") }, nowMs = { test.testScheduler.currentTime }, jitter = { it })
         fun start() { reconnect.start(); test.runCurrent() }
         suspend fun snapshot(local: Boolean = false) {
-            val index = transport.sockets.size
-            val snapshot = snapshotValue(local, "connection-$index")
-            transport.sockets.last().incoming.send(json.encodeToString(JsonObject.serializer(), buildJsonObject {
-                put("type", "snapshot")
-                put("sessionId", "session")
-                put("connectionId", "connection-$index")
-                put("deviceId", "phone")
-                put("snapshot", json.encodeToJsonElement(snapshot))
-            }))
+            transport.sockets.last().incoming.send(accountSnapshot("connection-${transport.sockets.size}", local))
             test.runCurrent()
         }
         suspend fun activateLocal() {
-            instruction("prepare", "prepare", 0)
-            instruction("activate", "activate", 1)
-            assertTrue(audio.actual.isPlaying)
-        }
-        private suspend fun instruction(type: String, id: String, output: Long) {
-            transport.sockets.last().incoming.send(buildJsonObject {
-                put("type", "instruction")
-                put("sessionId", "session")
-                put("instruction", buildJsonObject {
-                    put("id", id)
-                    put("type", type)
-                    put("outputVersion", output)
-                    put("eventId", "event")
-                    put("elapsed", 0.0)
-                    put("desiredPlaying", true)
-                    put("track", json.encodeToJsonElement(track))
-                    if (type == "activate") put("lease", buildJsonObject {
-                        put("clientSequence", 1)
-                        put("durationMs", 8_000)
-                    })
-                })
-            }.toString())
+            transport.sockets.last().incoming.send("""{"type":"grant","handle":"phone-output","basis":${test.testScheduler.currentTime},"ms":8000}""")
             test.runCurrent()
+            assertTrue(audio.actual.isPlaying)
         }
         override fun close() { reconnect.close(); controller.close() }
     }
@@ -479,8 +462,8 @@ class PlaybackLifetimeTest {
             sent.add(json.parseToJsonElement(text).jsonObject)
             return true
         }
-        fun commands() = sent.filter { it["type"]!!.jsonPrimitive.content == "command" }
-        fun finish() { isOpen = false; incoming.close() }
+        fun commands() = sent.filterNot { it.getValue("type").jsonPrimitive.content in setOf("presence", "fact", "release") }
+        override fun finish() { isOpen = false; incoming.close() }
         override fun close() = finish()
     }
 
@@ -511,7 +494,7 @@ class PlaybackLifetimeTest {
         fun blocked() {
             pause()
             blockedCount++
-            actual = actual.copy(error = "blocked")
+            actual = actual.copy(error = "blocked", stoppedByRefusal = true)
             actual.binding?.let { events.trySend(AudioObservation(it, actual)) }
         }
     }

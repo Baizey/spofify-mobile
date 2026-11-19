@@ -19,6 +19,8 @@ internal data class PlaylistsState(
     val message: String? = null,
     val created: PersonalPlaylistSummary? = null,
     val added: PersonalPlaylistSummary? = null,
+    val createSent: Long = 0,
+    val addSent: Long = 0,
 )
 
 internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private val manualOnly: Boolean = false) : ViewModel() {
@@ -27,9 +29,18 @@ internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private v
     private var generation = 0L
     private var reading: Job? = null
 
-    init { refresh() }
+    private val live = api as? dev.spofify.mobile.playback.LivePersonal
+    init {
+        if (live == null) refresh() else viewModelScope.launch {
+            live.replica.view.collect { snapshot ->
+                val rows = snapshot.playlists.filter { !manualOnly || it.kind == PersonalPlaylistKind.MANUAL }
+                mutable.value = mutable.value.copy(items = naturalPlaylistOrder(rows), loaded = true)
+            }
+        }
+    }
 
     fun refresh() {
+        if (live != null) return
         reading?.cancel()
         val token = ++generation
         mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null)
@@ -65,6 +76,12 @@ internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private v
     }
 
     fun create(name: String, description: String) {
+        live?.let {
+            if (it.command(PersonalIntent("createPlaylist", name = name, description = description))) {
+                mutable.value = mutable.value.copy(createSent = mutable.value.createSent + 1)
+            }
+            return
+        }
         if (mutable.value.writing || mutable.value.needsReview) return
         mutable.value = mutable.value.copy(writing = true, message = null, created = null)
         viewModelScope.launch {
@@ -81,6 +98,12 @@ internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private v
     }
 
     fun add(trackId: String, summary: PersonalPlaylistSummary) {
+        live?.let {
+            if (summary.capabilities.addTracks && it.command(PersonalIntent("addEntry", playlistId = summary.id, trackId = trackId))) {
+                mutable.value = mutable.value.copy(addSent = mutable.value.addSent + 1)
+            }
+            return
+        }
         if (mutable.value.writing || mutable.value.needsReview || summary.kind != PersonalPlaylistKind.MANUAL || !summary.capabilities.addTracks) return
         mutable.value = mutable.value.copy(writing = true, message = null, added = null)
         viewModelScope.launch {

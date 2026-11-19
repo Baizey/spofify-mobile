@@ -203,7 +203,7 @@ internal class OriginMediaTransport(
     }
 
     private companion object {
-        const val PROTOCOL = "spofify.library-playback.v2"
+        const val PROTOCOL = "spofify.account-state.v1"
         val SHA = Regex("[0-9a-f]{64}")
         val EVIDENCE_HEADERS = listOf("Content-Range", "Content-Length", "Content-Type", "Content-Encoding", "ETag", "Last-Modified")
         val STRONG_ETAG = Regex("\"[!#-~\\x80-\\xff]*\"")

@@ -39,40 +39,8 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
     val position = queue?.position ?: -1
     val previous = queue?.queue?.getOrNull(position - 1)
     val next = queue?.queue?.getOrNull(position + 1)
-    var handoff by remember(controller) { mutableStateOf<MiniHandoff?>(null) }
-    val observedHandoff = handoff
-    val nowMs = SystemClock.elapsedRealtime()
-    val activeHandoff = online?.let { retainedMiniHandoff(observedHandoff, it, nowMs) }
-    val presented = online?.let { miniPresentedTrack(it, observedHandoff, nowMs) } ?: track
-    SideEffect {
-        // Do not let an old composition retire a handoff installed by a newer callback.
-        if (handoff === observedHandoff && activeHandoff !== observedHandoff) handoff = activeHandoff
-    }
-    LifecycleEventEffect(Lifecycle.Event.ON_START) {
-        // A sleeping UI's delay may resume late; expired presentation must not return with the app.
-        handoff = controller.presentation.online?.let { retainedMiniHandoff(handoff, it, SystemClock.elapsedRealtime()) }
-    }
-    LaunchedEffect(observedHandoff) {
-        if (observedHandoff != null) {
-            delay((MINI_HANDOFF_TIMEOUT_MS - (SystemClock.elapsedRealtime() - observedHandoff.startedAtMs)).coerceAtLeast(0L))
-            if (handoff === observedHandoff) handoff = null
-        }
-    }
-    val previousSelection = online?.let { miniSwipeSelection(it, -1) }
-    val nextSelection = online?.let { miniSwipeSelection(it, 1) }
-    val requestStep: (MiniSwipeSelection, Int) -> Unit = { captured, step ->
-        // Recheck the captured queue version even if a newer WS snapshot has not recomposed us yet.
-        if (controller.presentation.online?.let(captured::isCurrent) == true) {
-            val startedAt = SystemClock.elapsedRealtime()
-            val commandId = if (step < 0) controller.previous() else controller.next()
-            if (commandId != null) {
-                // Installed before SwipeActionSurface returns its translated face to zero.
-                handoff = MiniHandoff(captured.source, captured.incoming, commandId, startedAt)
-            }
-        }
-    }
-    fun localSwipe(neighbour: PlaybackTrack?, step: Int): (() -> Unit)? {
-        if (controller !is AppPlayback.Local || neighbour == null) return null
+    fun swipe(neighbour: PlaybackTrack?, step: Int): (() -> Unit)? {
+        if (!ready || neighbour == null) return null
         return {
             val latest = controller.presentation.queue
             if (latest?.current?.key == track?.key && latest?.queue?.getOrNull(position + step)?.key == neighbour.key) {
@@ -80,12 +48,9 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
             }
         }
     }
-    val previousSwipe: (() -> Unit)? = if (activeHandoff == null && previousSelection != null)
-        ({ requestStep(previousSelection, -1) }) else localSwipe(previous, -1)
-    val nextSwipe: (() -> Unit)? = if (activeHandoff == null && nextSelection != null)
-        ({ requestStep(nextSelection, 1) }) else localSwipe(next, 1)
-    val binding = listOf(controller, online?.let(::miniHandoffSource), online?.connection, online?.snapshot?.stateVersion,
-        activeHandoff?.commandId, track?.key, previous?.key, next?.key)
+    val previousSwipe = swipe(previous, -1)
+    val nextSwipe = swipe(next, 1)
+    val binding = listOf(controller, online?.connectionId, track?.key, previous?.key, next?.key)
     var actions by remember(controller) { mutableStateOf(false) }
     LaunchedEffect(binding) { actions = false }
     Surface(color = MaterialTheme.colorScheme.surface) {
@@ -103,14 +68,13 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
                         modifier = Modifier.weight(1f), excludeEnd = 0.dp, slideOutOnCommit = true,
                         background = { offset, width ->
                             val neighbour = if (offset > 0) previous else next
-                            if (activeHandoff == null && neighbour != null) Box(Modifier.matchParentSize().graphicsLayer {
+                            if (neighbour != null) Box(Modifier.matchParentSize().graphicsLayer {
                                 translationX = if (offset > 0) -width + offset else width + offset
                             }) { MiniIdentity(neighbour, loader, Modifier.fillMaxSize()) }
                         }) {
-                        MiniIdentity(presented ?: track, loader, Modifier.fillMaxWidth().heightIn(min = 64.dp)
+                        MiniIdentity(track, loader, Modifier.fillMaxWidth().heightIn(min = 64.dp)
                             .semantics {
-                                contentDescription = if (activeHandoff != null) "Switching to ${activeHandoff.incoming.name}. Open player"
-                                    else "Open player for ${track.name}"
+                                contentDescription = "Open player for ${track.name}"
                             }
                             .onPreviewKeyEvent {
                                 if (it.type != KeyEventType.KeyDown) false

@@ -56,7 +56,7 @@ internal fun DetailScreen(
     val item = state.item
     val context = item?.collectionContext(state.revision)
     val send: (() -> Boolean?) -> Unit = { action ->
-        actionError = if (action() != true) "Playback action wasn't sent. Check the playback connection." else null
+        action(); actionError = null
     }
     val playRow: (MusicItem) -> Unit = { row ->
         when {

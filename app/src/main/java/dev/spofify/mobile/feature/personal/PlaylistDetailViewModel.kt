@@ -44,12 +44,37 @@ internal class PlaylistDetailViewModel(
     private var generation = 0L
     private var reading: Job? = null
 
-    init { refresh() }
+    private val live = api as? dev.spofify.mobile.playback.LivePersonal
+    private val watch = live?.watch(id)
+    private var seen = false
+    init {
+        if (live == null) refresh() else viewModelScope.launch {
+            live.replica.view.collect { snapshot ->
+                val summary = snapshot.playlists.firstOrNull { it.id == id }
+                if (summary == null) {
+                    if (seen && snapshot.connected) mutable.value = mutable.value.copy(deleted = true)
+                    return@collect
+                }
+                seen = true
+                val detail = snapshot.details[id]
+                val derived = summary.kind == PersonalPlaylistKind.DERIVED
+                val rows = detail?.rows.orEmpty().mapIndexed { index, row ->
+                    PlaylistSong(row.id, index.toLong(), row.track, entryId = row.id.takeUnless { derived },
+                        occurrenceId = row.id.takeIf { derived })
+                }
+                mutable.value = mutable.value.copy(summary = summary, rows = rows,
+                    loaded = detail != null, completeCollection = detail != null,
+                    context = if (detail == null) null else PlaybackContext(if (derived) "derived" else "playlist", id, summary.name))
+            }
+        }
+    }
+
+    override fun onCleared() { watch?.close() }
 
     fun filter(value: String) { mutable.value = mutable.value.copy(filter = value) }
 
     fun refresh() {
-        if (mutable.value.deleted) return
+        if (live != null || mutable.value.deleted) return
         reading?.cancel()
         val token = ++generation
         mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null, context = null)
@@ -137,17 +162,20 @@ internal class PlaylistDetailViewModel(
         return Loaded(confirmed, rows, context, complete = true)
     }
 
-    fun rename(name: String, description: String, expectedRevision: Long) = change(expectedRevision) {
-        api.renamePlaylist(id, name, description, expectedRevision)
+    fun rename(name: String, description: String, expectedRevision: Long) {
+        live?.let { it.command(PersonalIntent("renamePlaylist", playlistId = id, name = name, description = description)); return }
+        change(expectedRevision) { api.renamePlaylist(id, name, description, expectedRevision) }
     }
 
     fun remove(row: PlaylistSong, expectedRevision: Long) {
         val entryId = row.entryId ?: return
         if (mutable.value.summary?.kind != PersonalPlaylistKind.MANUAL || mutable.value.summary?.capabilities?.editEntries != true) return
+        live?.let { it.command(PersonalIntent("removeEntry", playlistId = id, entryId = entryId)); return }
         change(expectedRevision) { api.removeEntry(id, entryId, expectedRevision) }
     }
 
     fun delete(expectedRevision: Long) {
+        live?.let { it.command(PersonalIntent("deletePlaylist", playlistId = id)); return }
         if (!beginChange(expectedRevision)) return
         viewModelScope.launch {
             try {

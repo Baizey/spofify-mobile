@@ -40,6 +40,8 @@ class LocalPlaybackController(
     private val scope: CoroutineScope,
     private val isOutputAllowed: () -> Boolean,
     private val random: Random = Random.Default,
+    private val onNaturalEnd: ((PlaybackQueueState, AudioFacts) -> Unit)? = null,
+    private val onObserved: ((AudioFacts) -> Unit)? = null,
 ) {
     private val mutableState = MutableStateFlow(PlaybackQueueState())
     val state: StateFlow<PlaybackQueueState> = mutableState.asStateFlow()
@@ -59,7 +61,9 @@ class LocalPlaybackController(
         audio.observations.collect { observation ->
             val op = active ?: return@collect
             if (observation.binding != op.binding || observation.facts.binding != op.binding || !keep(op)) return@collect
-            if (observation.facts.ended) {
+            if (observation.facts.error == "blocked") {
+                fail(op, "blocked", observation.facts)
+            } else if (observation.facts.ended) {
                 if (op.ready) ended(op, observation.facts) else op.earlyEnd = observation.facts
             } else if (op.ready) {
                 sample(op, audio.facts())
@@ -135,14 +139,10 @@ class LocalPlaybackController(
     fun toggleShuffle() = setShuffle(!state.value.shuffle)
 
     fun setRepeat(repeat: String) {
-        if (repeat == "off" || repeat == "all" || repeat == "one") edit { it.copy(repeat = repeat) }
+        if (repeat == "off" || repeat == "all" || repeat == "one") edit { LocalPlaybackQueue.withRepeat(it, repeat) }
     }
 
-    fun cycleRepeat() = setRepeat(when (state.value.repeat) {
-        "off" -> "all"
-        "all" -> "one"
-        else -> "off"
-    })
+    fun cycleRepeat() = setRepeat(LocalPlaybackQueue.nextRepeat(state.value.repeat))
 
     fun clearUpcoming() = edit(LocalPlaybackQueue::clearUpcoming)
     fun remove(key: Long) = edit { LocalPlaybackQueue.remove(it, key) }
@@ -198,15 +198,26 @@ class LocalPlaybackController(
         if (allowed()) mutableState.value = change(state.value)
     }
 
+    // The online owner adopts an already-resolved traversal. A queue-only edit or
+    // reconciliation of its current native binding must not restart that binding.
+    internal fun adopt(next: PlaybackQueueState, execute: Boolean) {
+        if (!allowed()) return
+        if (execute && next.current != null) start(next)
+        else {
+            if (execute) invalidate()
+            mutableState.value = next
+        }
+    }
+
     private fun select(position: Int) = start(LocalPlaybackQueue.select(state.value, position))
 
     private fun allowed(): Boolean = !retired && scope.isActive && isOutputAllowed()
     private fun authorized(op: Operation): Boolean = active === op && allowed()
 
-    private fun invalidate() {
+    private fun invalidate(pauseNative: Boolean = true) {
         val op = active ?: return
         active = null // Revoke the callback before any synchronous native or cancellation callback.
-        audio.pause()
+        if (pauseNative) audio.pause()
         op.job?.cancel()
     }
 
@@ -255,6 +266,12 @@ class LocalPlaybackController(
         op.job?.start()
     }
 
+    internal fun sampleBeforePause(): AudioFacts? {
+        val op = active?.takeIf { it.ready && authorized(it) } ?: return null
+        return audio.facts().takeIf { it.binding == op.binding && (it.isPlaying || state.value.isPlaying) && !it.isBuffering &&
+            !it.ended && it.error.isEmpty() && safeSeconds(it.elapsed) }
+    }
+
     private fun currentElapsed(): Double {
         val previous = state.value
         val op = active?.takeIf { it.ready } ?: return previous.elapsed
@@ -270,19 +287,23 @@ class LocalPlaybackController(
         // Local IO may have native buffering but we do not publish request/spinner state.
         mutableState.value = previous.copy(elapsed = boundedElapsed(elapsed, duration), duration = duration,
             isPlaying = facts.isPlaying && facts.error.isEmpty())
-        if (facts.error.isNotEmpty()) fail(op, facts.error)
+        if (facts.error.isNotEmpty()) fail(op, facts.error, facts)
+        else if (!facts.ended) onObserved?.invoke(facts)
     }
 
     private fun ended(op: Operation, facts: AudioFacts) {
         sample(op, facts)
         val previous = state.value
         if (!keep(op) || !previous.desiredPlaying || facts.error.isNotEmpty()) return
-        LocalPlaybackQueue.successor(previous, naturalEnd = true)?.let(::select) ?: pause()
+        if (onNaturalEnd != null) onNaturalEnd.invoke(previous, facts)
+        else LocalPlaybackQueue.successor(previous, naturalEnd = true)?.let(::select) ?: pause()
     }
 
-    private fun fail(op: Operation, error: String) {
+    private fun fail(op: Operation, error: String, native: AudioFacts = audio.facts()) {
         if (active !== op) return
-        invalidate()
+        val refusal = native.takeIf { error == "blocked" && it.binding == op.binding && it.error == "blocked" && !it.isPlaying }
+        invalidate(pauseNative = refusal?.stoppedByRefusal != true)
+        refusal?.let { onObserved?.invoke(it) }
         mutableState.value = state.value.copy(desiredPlaying = false, isPlaying = false, error = when (error) {
             "unavailable", "blocked" -> error
             else -> "media"

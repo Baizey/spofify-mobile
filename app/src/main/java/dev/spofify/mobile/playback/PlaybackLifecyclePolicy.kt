@@ -2,7 +2,7 @@ package dev.spofify.mobile.playback
 
 import dev.spofify.mobile.core.playback.AudioFacts
 import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackController
+import dev.spofify.mobile.core.playback.AccountChannel
 import dev.spofify.mobile.core.playback.PlaybackView
 
 /** Logical device grouping is not executor identity; only this exact live socket may own local sound. */
@@ -10,7 +10,7 @@ internal fun PlaybackView.isLocalSelectedConnection(): Boolean =
     connection == PlaybackConnectionState.READY && connectionId.isNotEmpty() &&
         snapshot?.selectedConnectionId == connectionId
 
-internal fun PlaybackController.isLocalSelectedConnection(): Boolean = state.value.isLocalSelectedConnection()
+internal fun AccountChannel.isLocalSelectedConnection(): Boolean = state.value.isLocalSelectedConnection()
 
 internal fun PlaybackView.isLocalTransferTarget(): Boolean =
     connection == PlaybackConnectionState.READY && connectionId.isNotEmpty() &&

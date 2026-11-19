@@ -13,6 +13,8 @@ interface PlaybackConnection : Closeable {
     val messages: Flow<String>
     val isOpen: Boolean
     fun send(text: String): Boolean
+    /** Flush a final exact-output relinquish before normal close. Never wait for a receipt. */
+    fun finish() = close()
 }
 
 /** Every callback and sampled fact must identify the native operation it observes. */
@@ -32,6 +34,8 @@ data class AudioFacts(
     val isLoading: Boolean = false,
     val error: String = "",
     val ended: Boolean = false,
+    /** The executor has already revoked pending starts and synchronously paused this binding. */
+    val stoppedByRefusal: Boolean = false,
 )
 
 /** ended=true is emitted only for an actual native media-ended callback, not a timer. */

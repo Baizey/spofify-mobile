@@ -4,6 +4,17 @@ import kotlin.random.Random
 
 /** Order and identity belong to queue occurrences, not to the underlying audio blobs. */
 internal object LocalPlaybackQueue {
+    fun nextRepeat(mode: String?) = when (mode) {
+        "off" -> "all"
+        "all" -> "one"
+        else -> "off"
+    }
+
+    fun withRepeat(state: PlaybackQueueState, mode: String): PlaybackQueueState {
+        require(mode in setOf("off", "one", "all"))
+        return state.copy(repeat = mode)
+    }
+
     fun select(state: PlaybackQueueState, position: Int): PlaybackQueueState {
         val upcomingKeys = state.queue.drop(position + 1).mapTo(HashSet()) { it.key }
         return state.copy(

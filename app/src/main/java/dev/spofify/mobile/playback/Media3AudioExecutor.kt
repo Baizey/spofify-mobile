@@ -237,7 +237,8 @@ internal class Media3AudioExecutor(
             duration = duration, isPlaying = player.isPlaying,
             isBuffering = player.playbackState == Player.STATE_BUFFERING, isLoading = player.isLoading,
             error = if (blocked) "blocked" else if (player.playerError != null) "media" else "",
-            ended = binding != null && endedBinding == binding)
+            ended = binding != null && endedBinding == binding,
+            stoppedByRefusal = blocked && playbackAuthority == null && !player.playWhenReady && !player.isPlaying)
     }
 
     /** The service calls this only after an actual platform background-start refusal. */

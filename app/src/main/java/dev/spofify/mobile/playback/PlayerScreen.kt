@@ -154,7 +154,7 @@ internal fun FullPlayer(
                                 IconButton({ queue = true }, Modifier.size(48.dp)) { SpofifyIcon(SpofifyGlyph.Queue, "See queue") }
                             }
                         }
-                        (online?.let(::playbackNotice) ?: state.queue?.error?.takeIf { it.isNotEmpty() && online == null })?.let { notice ->
+                        state.queue?.error?.takeIf { it.isNotEmpty() && online == null }?.let { notice ->
                             SelectionContainer {
                                 Text(notice, Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.error,
                                     style = MaterialTheme.typography.bodySmall)

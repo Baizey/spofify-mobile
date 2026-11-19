@@ -29,6 +29,19 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         if (started) return
         started = true
         scope.launch {
+            combine(sessions.manualOffline, sessions.onlineGrant, sessions.state) { offline, grant, auth ->
+                (auth as? AuthState.Authenticated)?.identity?.takeIf { !offline && grant == null && auth.notice == AuthNotice.CONNECTION_FAILED }
+            }.distinctUntilChanged().collectLatest { account ->
+                if (account == null) return@collectLatest
+                var backoff = 1_000L
+                while (sessions.isCurrent(account) && !sessions.manualOffline.value && sessions.onlineGrant.value == null) {
+                    delay(kotlin.random.Random.nextLong(backoff / 2, backoff + 1))
+                    if (!sessions.manualOffline.value && sessions.onlineGrant.value == null) sessions.refresh()
+                    backoff = (backoff * 2).coerceAtMost(20_000L)
+                }
+            }
+        }
+        scope.launch {
             sessions.state.collect { auth ->
                 val identity = (auth as? AuthState.Authenticated)?.identity
                 if (mutable.value?.identity == identity) return@collect

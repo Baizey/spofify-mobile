@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,7 +56,7 @@ internal fun PlaylistDetailScreen(
     var deleting by remember(model) { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var removing by remember(model) { mutableStateOf<Pair<PlaylistSong, Long>?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
-    val send: (() -> Boolean?) -> Unit = { action -> actionError = if (action() != true) "Playback action wasn't sent." else null }
+    val send: (() -> Boolean?) -> Unit = { action -> action(); actionError = null }
     val playRow: (PlaylistSong) -> Unit = { row ->
         val reference = row.takeIf { it in state.rows }?.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)
         if (playable && reference != null) send { playback?.playTrack(reference, context) }
@@ -102,14 +101,11 @@ internal fun PlaylistDetailScreen(
             if (state.loaded && !state.completeCollection) "Rules result unavailable." else null
         if (failure != null || state.writing) {
             Box(Modifier.padding(horizontal = 20.dp)) {
-                PersonalStatus(state.writing, failure) {
-                    actionError = null
-                    model.refresh()
-                }
+                PersonalStatus(state.writing, failure)
             }
         }
         if (state.rows.isNotEmpty() || state.filter.isNotBlank()) PersonalSongFilter(state.filter, model::filter)
-        PullToRefreshBox(state.loading, onRefresh = { if (!state.writing) model.refresh() }, modifier = Modifier.weight(1f).fillMaxWidth()) {
+        Box(Modifier.weight(1f).fillMaxWidth()) {
             val emptyMessage = when {
                 state.noMatches -> "No matches"
                 state.loaded && state.completeCollection && state.rows.isEmpty() -> "No songs yet"
@@ -145,7 +141,7 @@ internal fun PlaylistDetailScreen(
             menu = false
             deleting = summary
         },
-        onDismiss = { menu = false }, onRetry = model::refresh)
+        onDismiss = { menu = false })
     songMenu?.let { row ->
         PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null,
             onPlay = { playRow(row) }, onQueue = { queueRow(row) }, onNavigate = onNavigate,

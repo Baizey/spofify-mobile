@@ -28,7 +28,6 @@ internal fun PlaylistCollectionSheet(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
-    onRetry: () -> Unit,
 ) {
     val summary = state.summary
     val saved = music?.saved?.collectAsStateWithLifecycle()?.value?.any { it.collection.reference.id == summary?.id } == true
@@ -38,7 +37,7 @@ internal fun PlaylistCollectionSheet(
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") {
                 SheetHeading(summary?.name ?: "Playlist")
-                PersonalStatus(state.loading || state.writing, state.error ?: state.message, onRetry)
+                PersonalStatus(state.loading || state.writing, state.error ?: state.message)
             }
             if (state.rows.isNotEmpty() || summary?.trackCount?.let { it > 0 } == true) {
                 item("play") { SheetAction("Play now", SpofifyGlyph.Play, playable, onPlay) }
@@ -112,6 +111,6 @@ internal fun PlaylistSummaryActions(
                 if (context != null && playback?.queueCollection(context) == true) onDismiss()
             },
             onEdit = { editing = state.summary }, onDelete = { deleting = state.summary },
-            onDismiss = onDismiss, onRetry = model::refresh)
+            onDismiss = onDismiss)
     }
 }

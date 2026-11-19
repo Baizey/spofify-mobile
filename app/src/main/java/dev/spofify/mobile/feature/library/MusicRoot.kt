@@ -231,10 +231,8 @@ internal fun MusicRoot(
 @Composable
 private fun PlayerConnectionStatus(player: AppPlayback?, rowNotice: String?) {
     if (player !is AppPlayback.Online) return
-    val state = player.observe().online
-    val notice = listOfNotNull(state?.let(::playbackNotice), rowNotice).joinToString(" · ")
-    if (rowNotice == null && state?.connection == PlaybackConnectionState.CONNECTING) LinearProgressIndicator(Modifier.fillMaxWidth())
-    else if (notice.isNotEmpty()) {
+    val notice = rowNotice.orEmpty()
+    if (notice.isNotEmpty()) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             SelectionContainer(Modifier.weight(1f)) {
                 Text(notice, style = MaterialTheme.typography.bodySmall,

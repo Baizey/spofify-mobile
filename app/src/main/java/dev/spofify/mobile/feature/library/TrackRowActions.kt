@@ -11,7 +11,7 @@ internal fun activateTrackRow(
     notice: (String?) -> Unit,
 ) {
     when {
-        hasAudio -> notice(if (play(PlaybackTrackReference(id)) != true) "Playback action wasn't sent." else null)
+        hasAudio -> { play(PlaybackTrackReference(id)); notice(null) }
         openDetails != null -> openDetails()
         else -> notice("Track unavailable.")
     }

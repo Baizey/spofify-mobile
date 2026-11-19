@@ -58,6 +58,14 @@ internal class SessionSocket(
         return sent
     }
 
+    override fun finish() {
+        if (!retired.compareAndSet(false, true)) return
+        opened = false
+        incoming.cancel(CancellationException("Output relinquished"))
+        if (socket?.close(1000, null) != true) socket?.cancel()
+        onRetired(this)
+    }
+
     override fun close() {
         if (!retired.compareAndSet(false, true)) return
         opened = false

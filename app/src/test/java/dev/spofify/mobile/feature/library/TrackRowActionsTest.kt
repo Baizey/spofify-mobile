@@ -17,7 +17,7 @@ class TrackRowActionsTest {
         }
         tap()
         assertEquals(listOf(PlaybackTrackReference("track")), attempts)
-        assertEquals(listOf("Playback action wasn't sent."), notices)
+        assertEquals(listOf<String?>(null), notices)
         ready = true
         assertEquals(1, attempts.size)
         tap() // Only another explicit tap attempts the command again.

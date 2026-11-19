@@ -73,20 +73,18 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
             AppPlayback.Local(controller, current)
         } else {
             val transport = sessions.playbackTransport(identity)
-            val controller = PlaybackController(PlaybackTransport { name, device -> sessions.withOnlineGrant(online) {
+            val controller = AccountChannel(PlaybackTransport { name, device -> sessions.withOnlineGrant(online) {
                 transport.connect(name, device)
             } }, port, mode, object : PlaybackClock {
                 override fun monotonicMs() = SystemClock.elapsedRealtime()
                 override fun wallTimeMs() = System.currentTimeMillis()
-            })
+            }, current)
+            music.personal.attach(controller)
             reconnect = PlaybackReconnect(mode, controller.state, current, { controller.connect("Phone", deviceId) }, SystemClock::elapsedRealtime)
             maintenance = PlaybackSessionMaintenance(mode, current,
                 { controller.state.value.connection == PlaybackConnectionState.READY }, { sessions.withOnlineGrant(online) { sessions.renew(identity) } },
                 { Log.w("SpofifyPlayer", "Session maintenance check failed") })
             mode.launch { controller.state.collect { reconcile() } }
-            mode.launch { controller.state.map { it.commandFailure }.distinctUntilChanged().filterNotNull().collect {
-                Log.w("SpofifyPlayer", it.diagnosticText())
-            } }
             AppPlayback.Online(controller, current)
         }
         mediaSession = MediaSession.Builder(app, RoutingPlayer(audio.player, selected) {
@@ -114,11 +112,12 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         mutable.value = null
         reconnect?.close(); reconnect = null
         maintenance?.close(); maintenance = null
-        life?.cancel(); life = null
+        music.personal.attach(null)
         when (old) {
             is AppPlayback.Online -> old.controller.close()
             is AppPlayback.Local -> old.controller.retire()
         }
+        life?.cancel(); life = null
         audio.releaseOutput()
         mediaSession?.release(); mediaSession = null
         grant = null

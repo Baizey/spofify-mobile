@@ -81,7 +81,10 @@ internal fun naturalPlaylistOrder(items: List<PersonalPlaylistSummary>): List<Pe
     }
 }
 
-/** Collection-only admission needs the freshly returned rules fence, never guessed row identities. */
+internal fun playlistContext(summary: PersonalPlaylistSummary): PlaybackContext =
+    PlaybackContext(if (summary.kind == PersonalPlaylistKind.DERIVED) "derived" else "playlist", summary.id, summary.name)
+
+/** Local saved manifests retain their original materialized collection context. */
 internal suspend fun freshPlaylistContext(api: PersonalLibraryApi, id: String): PlaybackContext {
     val summary = api.playlist(id)
     if (summary.kind == PersonalPlaylistKind.MANUAL) return PlaybackContext("playlist", summary.id, summary.name)

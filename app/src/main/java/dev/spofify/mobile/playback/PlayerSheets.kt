@@ -32,7 +32,7 @@ import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
 
 @Composable
-internal fun DevicesSheet(controller: PlaybackController, onDismiss: () -> Unit) {
+internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
     val state by controller.state.collectAsStateWithLifecycle()
     val ready = state.connection == PlaybackConnectionState.READY
     var renaming by remember { mutableStateOf<PlaybackDevice?>(null) }
@@ -45,7 +45,7 @@ internal fun DevicesSheet(controller: PlaybackController, onDismiss: () -> Unit)
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(Modifier.weight(1f).heightIn(min = 80.dp).clickable(enabled = available, role = Role.Button) {
-                        if (controller.selectDevice(device.deviceId) != null) onDismiss()
+                        controller.selectDevice(device.deviceId); onDismiss()
                     }.semantics { selected = active }.padding(vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         SpofifyIcon(SpofifyGlyph.Devices, null)
@@ -77,49 +77,27 @@ internal fun DevicesSheet(controller: PlaybackController, onDismiss: () -> Unit)
 }
 
 @Composable
-private fun DeviceNameSheet(controller: PlaybackController, device: PlaybackDevice, onDismiss: () -> Unit) {
+private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, onDismiss: () -> Unit) {
     val state by controller.state.collectAsStateWithLifecycle()
     var name by remember(device.deviceId) { mutableStateOf(device.name) }
-    var pending by remember { mutableStateOf<String?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
     val valid = isValidDeviceName(name)
     val currentName = state.devices.firstOrNull { it.deviceId == device.deviceId }?.name
-    LaunchedEffect(currentName, pending) {
-        if (pending != null && currentName == name.trim()) onDismiss()
-    }
-    LaunchedEffect(state.latestResult) {
-        val result = state.latestResult
-        if (result != null && result.id == pending && result.final) {
-            pending = null
-            if (result.outcome == "accepted") onDismiss() else error = "Couldn’t rename device"
-        }
-    }
-    LaunchedEffect(state.connection) {
-        if (state.connection != PlaybackConnectionState.READY && pending != null) {
-            pending = null
-            error = "Rename not confirmed. Reconnect to check the device name."
-        }
-    }
     SpofifySheet(onDismiss) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 22.dp)) {
             Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading("Rename device") }
             Text("Device name", Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 9.dp), style = MaterialTheme.typography.bodySmall)
             BasicTextField(name, { name = it }, Modifier.fillMaxWidth().heightIn(min = 56.dp)
                 .semantics { contentDescription = "Device name" }.padding(horizontal = 20.dp, vertical = 14.dp),
-                singleLine = true, enabled = pending == null, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
                 cursorBrush = SolidColor(MaterialTheme.colorScheme.secondary))
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-            error?.let { Text(it, Modifier.padding(horizontal = 20.dp, vertical = 12.dp), style = MaterialTheme.typography.bodySmall) }
             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(onDismiss, Modifier.weight(1f)) { Text("Cancel") }
                 Button({
-                    if (currentName == name.trim()) onDismiss()
-                    else {
-                        pending = controller.renameDevice(name.trim(), device.deviceId)
-                        if (pending == null) error = "Rename wasn’t sent. Check the playback connection."
-                    }
+                    if (currentName != name.trim()) controller.renameDevice(name.trim(), device.deviceId)
+                    onDismiss()
                 }, Modifier.weight(1f), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
-                    enabled = valid && pending == null && state.connection == PlaybackConnectionState.READY) { Text("Save") }
+                    enabled = valid && state.connection == PlaybackConnectionState.READY) { Text("Save") }
             }
         }
     }
@@ -134,16 +112,9 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
     val upcoming = state.queue?.queue.orEmpty().drop((position + 1).coerceAtLeast(0))
     val list = rememberLazyListState()
     var actions by remember(controller) { mutableStateOf<Long?>(null) }
-    val selected = upcoming.firstOrNull { it.key == actions }
+    fun editable(key: Long) = online == null || isPublishedQueueKey(key)
+    val selected = upcoming.firstOrNull { it.key == actions && editable(it.key) }
     SpofifySheet(onDismiss) {
-        online?.undo?.let {
-            Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 16.dp),
-                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Removed from queue", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                TextButton({ controller.undoRemove() }) { Text("Undo", color = MaterialTheme.colorScheme.secondary) }
-            }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        }
         LazyColumn(Modifier.weight(1f, fill = false).fillMaxWidth(), state = list,
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") { SheetHeading("Queue") }
@@ -155,9 +126,11 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
             itemsIndexed(upcoming, key = { _, track -> track.key }) { _, track ->
                 SwipeActionSurface(binding = listOf(controller, online?.sessionId, online?.snapshot?.stateVersion ?: upcoming, track.key),
                     onRight = if (ready) ({ controller.queueTrack(PlaybackTrackReference(track.id)) }) else null,
-                    onLeft = if (ready) ({ controller.remove(track.key) }) else null,
+                    onLeft = if (ready && editable(track.key)) ({ controller.remove(track.key) }) else null,
                     slideOutOnLeft = true) {
-                    QueueTrack(track, loader, onOpen = { if (ready) controller.jump(track.key) }, onMore = { actions = track.key })
+                    QueueTrack(track, loader,
+                        onOpen = if (ready && editable(track.key)) ({ controller.jump(track.key) }) else null,
+                        onMore = if (editable(track.key)) ({ actions = track.key }) else null)
                 }
             }
             if (upcoming.isEmpty()) item("empty") { Text("Nothing up next", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -167,11 +140,11 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
         val index = upcoming.indexOfFirst { it.key == selected.key }
         Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             SheetHeading(selected.name)
-            SheetAction("Move up", SpofifyGlyph.Up, ready && index > 0) {
+            SheetAction("Move up", SpofifyGlyph.Up, ready && index > 0 && upcoming.getOrNull(index - 2)?.let { editable(it.key) } != false) {
                 actions = null
                 controller.moveUpcoming(selected.key, upcoming.getOrNull(index - 2)?.key)
             }
-            SheetAction("Move down", SpofifyGlyph.Down, ready && index >= 0 && index < upcoming.lastIndex) {
+            SheetAction("Move down", SpofifyGlyph.Down, ready && index >= 0 && upcoming.getOrNull(index + 1)?.let { editable(it.key) } == true) {
                 actions = null
                 controller.moveUpcoming(selected.key, upcoming[index + 1].key)
             }

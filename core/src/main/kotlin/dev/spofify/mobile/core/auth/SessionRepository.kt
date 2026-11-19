@@ -337,6 +337,16 @@ class SessionRepository(
         val previous = identity
         val next = when {
             enabled && current is AuthState.Authenticated -> null // retain exact identity and verified record
+            !enabled && record != null && current is AuthState.Authenticated -> operationLocked {
+                var backoff = 1_000L
+                do {
+                    restore(token, record, previous, quiet = true)
+                    val waiting = synchronized(lock) { token == generation && bootstrapAllowed && mutableGrant.value == null && state.value is AuthState.Authenticated }
+                    if (!waiting) break
+                    delay(backoff)
+                    backoff = (backoff * 2).coerceAtMost(30_000L)
+                } while (isActive)
+            }
             record != null && (current is AuthState.Authenticated || recovering) -> operationLocked { restore(token, record, previous) }
             recovering -> operationLocked { restoreStored(token) }
             else -> null
@@ -459,7 +469,7 @@ class SessionRepository(
         job.start()
     }
 
-    private suspend fun restore(token: Long, record: StoredSession, previous: AccountIdentity?) {
+    private suspend fun restore(token: Long, record: StoredSession, previous: AccountIdentity?, quiet: Boolean = false) {
         try {
             val origin = ServerOrigin.parse(record.server)
             record.session.validated()
@@ -507,7 +517,7 @@ class SessionRepository(
                     val active = (state.value as? AuthState.Authenticated)?.takeIf {
                         error is AuthFailure && error.kind == AuthFailure.Kind.UNAVAILABLE
                     }
-                    mutableState.value = active?.copy(notice = AuthNotice.CONNECTION_FAILED)
+                    mutableState.value = active?.copy(notice = if (quiet) null else AuthNotice.CONNECTION_FAILED)
                         ?: AuthState.Unavailable(AuthNotice.CONNECTION_FAILED)
                     null
                 }
