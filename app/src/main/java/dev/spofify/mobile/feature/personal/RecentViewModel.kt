@@ -22,7 +22,7 @@ internal class RecentViewModel(private val api: PersonalLibraryApi) : ViewModel(
 
     fun refresh() {
         if (mutable.value.loading) return
-        mutable.value = mutable.value.copy(loading = true, error = null)
+        mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null)
         viewModelScope.launch {
             try {
                 // Use the occurrence endpoint's default limit and latest offset, not the deduplicated recent feed.

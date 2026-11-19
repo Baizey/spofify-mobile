@@ -43,27 +43,27 @@ import kotlin.math.max
 
 @Composable
 internal fun FullPlayer(
-    controller: PlaybackController,
+    controller: AppPlayback,
     loader: ImageLoader,
     contentApi: TrackContentApi,
     onNavigate: ((MusicKind, String) -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
-    val state by controller.state.collectAsStateWithLifecycle()
-    val track = state.current ?: return
+    val state = controller.observe()
+    val track = state.queue?.current ?: return
+    val online = (state as? PlayerPresentation.Online)?.view
     val contentModel: TrackContentViewModel = viewModel(key = "track-content-${System.identityHashCode(contentApi)}",
-        factory = viewModelFactory { initializer { TrackContentViewModel(contentApi) } })
+        factory = viewModelFactory { initializer { TrackContentViewModel(contentApi, local = controller is AppPlayback.Local) } })
     val content by contentModel.state.collectAsStateWithLifecycle()
-    val binding = "${state.sessionId}:${state.snapshot?.outputVersion}:${state.snapshot?.selectedDeviceId}:${state.snapshot?.state?.occurrence?.eventId}:${track.key}"
+    val binding = "${online?.sessionId}:${online?.snapshot?.outputVersion}:${online?.snapshot?.selectedDeviceId}:${online?.snapshot?.state?.occurrence?.eventId}:${track.key}"
     LaunchedEffect(binding, track.id) { contentModel.select(track.id, binding) }
     DisposableEffect(contentModel) { onDispose { contentModel.select(null, "") } }
     val currentContent = content.takeIf { it.trackId == track.id && it.binding == binding } ?: TrackContentState()
-    val actual = state.playback?.takeIf { it.hasReportedPlayback }
-    val elapsedMs = ((actual?.elapsed ?: 0.0) * 1000).toLong()
-    val durationMs = ((actual?.duration ?: 0.0) * 1000).toLong()
+    val elapsedMs = (state.elapsed * 1000).toLong()
+    val durationMs = (state.duration * 1000).toLong()
     val inlineLine = lyricViewportKey(currentContent, elapsedMs, durationMs)
-    val lyricsEntryLabel = lyricSheetEntryLabel(currentContent)
-    val ready = state.connection == PlaybackConnectionState.READY
+    val lyricsEntryLabel = lyricSheetEntryLabel(currentContent).takeUnless { controller is AppPlayback.Local && inlineLine == null && currentContent.lyrics?.state != LyricsState.PLAIN }
+    val ready = state.ready
     var queue by remember { mutableStateOf(false) }
     var devices by remember { mutableStateOf(false) }
     var lyrics by remember { mutableStateOf(false) }
@@ -129,19 +129,20 @@ internal fun FullPlayer(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle))
                         }
-                        PlaybackSeek(state, currentContent) { controller.seek(it) }
+                        PlaybackSeek(state, binding, currentContent) { controller.seek(it) }
                         Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                             TransportSlot(Modifier.weight(1f), "Shuffle", SpofifyGlyph.Shuffle, ready,
-                                active = state.snapshot?.state?.shuffle == true) { controller.toggleShuffle() }
+                                active = state.queue?.shuffle == true) { controller.toggleShuffle() }
                             TransportSlot(Modifier.weight(1f), "Previous song", SpofifyGlyph.Previous, ready) { controller.previous() }
                             Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
                                 FilledIconButton({ controller.toggle() }, Modifier.size(64.dp), enabled = ready, shape = CircleShape) {
-                                    SpofifyIcon(if (state.desiredPlaying) SpofifyGlyph.Pause else SpofifyGlyph.Play,
-                                        if (state.desiredPlaying) "Pause" else "Play")
+                                    val wantsPlay = state.queue?.desiredPlaying == true
+                                    SpofifyIcon(if (wantsPlay) SpofifyGlyph.Pause else SpofifyGlyph.Play,
+                                        if (wantsPlay) "Pause" else "Play")
                                 }
                             }
                             TransportSlot(Modifier.weight(1f), "Next song", SpofifyGlyph.Next, ready) { controller.next() }
-                            val repeat = state.snapshot?.state?.repeat ?: "off"
+                            val repeat = state.queue?.repeat ?: "off"
                             TransportSlot(Modifier.weight(1f), "Repeat ${if (repeat == "all") "queue" else repeat}",
                                 if (repeat == "one") SpofifyGlyph.RepeatOne else SpofifyGlyph.Repeat, ready,
                                 active = repeat != "off") { controller.cycleRepeat() }
@@ -153,7 +154,7 @@ internal fun FullPlayer(
                                 IconButton({ queue = true }, Modifier.size(48.dp)) { SpofifyIcon(SpofifyGlyph.Queue, "See queue") }
                             }
                         }
-                        playbackNotice(state)?.let { notice ->
+                        (online?.let(::playbackNotice) ?: state.queue?.error?.takeIf { it.isNotEmpty() && online == null })?.let { notice ->
                             SelectionContainer {
                                 Text(notice, Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.error,
                                     style = MaterialTheme.typography.bodySmall)
@@ -164,7 +165,7 @@ internal fun FullPlayer(
             }
         }
         if (queue) QueueSheet(controller, loader) { queue = false }
-        if (devices) DevicesSheet(controller) { devices = false }
+        if (devices && controller is AppPlayback.Online) DevicesSheet(controller.controller) { devices = false }
         if (lyrics) PlayerLyricsSheet(track, currentContent, elapsedMs, durationMs, contentModel::refresh) { lyrics = false }
     }
 }

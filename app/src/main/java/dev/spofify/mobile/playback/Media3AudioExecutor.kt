@@ -22,7 +22,7 @@ internal class Media3AudioExecutor(
     context: Context,
     sessions: SessionRepository,
     identity: AccountIdentity,
-    cache: AutomaticMusicCache,
+    private val cache: AutomaticMusicCache,
     private val onSystemPause: () -> Unit,
     private val requestPlaybackStart: () -> Boolean,
 ) : AudioExecutor, Closeable {
@@ -67,7 +67,7 @@ internal class Media3AudioExecutor(
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-            if (released || binding == null) return
+            if (released || binding == null || !hasPlaybackAuthority() || player.playWhenReady) return
             if (!playWhenReady && reason in setOf(Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY,
                     Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS)) onSystemPause()
         }
@@ -82,11 +82,29 @@ internal class Media3AudioExecutor(
         binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
         desiredPlaying: Boolean, isAuthorized: () -> Boolean,
     ): AudioResult {
+        return executeOn(binding, track, elapsed, desiredPlaying, false, isAuthorized)
+    }
+
+    /** Both ports share this output; local callers cannot request HTTP-capable installations. */
+    fun port(localOnly: Boolean, current: () -> Boolean): AudioExecutor = object : AudioExecutor {
+        override val observations get() = this@Media3AudioExecutor.observations
+        override fun facts() = this@Media3AudioExecutor.facts()
+        override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double) =
+            if (localOnly || !current()) AudioResult.REJECTED else load(binding, track, elapsed, isAuthorized = current)
+        override suspend fun execute(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
+            desiredPlaying: Boolean, isAuthorized: () -> Boolean) =
+            executeOn(binding, track, elapsed, desiredPlaying, localOnly) { current() && isAuthorized() }
+        override fun pause() { if (current()) this@Media3AudioExecutor.pause() }
+    }
+
+    private suspend fun executeOn(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
+        desiredPlaying: Boolean, localOnly: Boolean, isAuthorized: () -> Boolean): AudioResult {
         checkThread()
-        if (!isAuthorized()) { pause(); return AudioResult.REJECTED }
-        val result = load(binding, track, elapsed, playRequested = desiredPlaying, isAuthorized = isAuthorized)
+        if (!isAuthorized()) return AudioResult.REJECTED
+        val result = load(binding, track, elapsed, playRequested = desiredPlaying, localOnly = localOnly, isAuthorized = isAuthorized)
         if (result != AudioResult.OK) return result
-        if (this.binding != binding || !isAuthorized()) { pause(); return AudioResult.REJECTED }
+        if (this.binding != binding) return AudioResult.REJECTED
+        if (!isAuthorized()) { pause(); return AudioResult.REJECTED }
         // A known terminal position cannot start sound or justify a new foreground-service deadline.
         if (track != null && desiredPlaying && player.playbackState != Player.STATE_ENDED) {
             val nativeGeneration = generation
@@ -98,6 +116,8 @@ internal class Media3AudioExecutor(
                 blocked = true
                 return AudioResult.BLOCKED
             }
+            if (this.binding != binding) return AudioResult.REJECTED
+            if (!hasPlaybackAuthority()) { pause(); return AudioResult.REJECTED }
             audioLoadScope?.playing = true
             player.play()
             if (!player.playWhenReady) {
@@ -112,7 +132,7 @@ internal class Media3AudioExecutor(
 
     private suspend fun load(
         next: AudioBinding, track: PlaybackTrack?, elapsed: Double,
-        playRequested: Boolean = false, isAuthorized: () -> Boolean = { true },
+        playRequested: Boolean = false, localOnly: Boolean = false, isAuthorized: () -> Boolean = { true },
     ): AudioResult {
         checkThread()
         pause()
@@ -134,7 +154,7 @@ internal class Media3AudioExecutor(
             val position = (elapsed * 1000).toLong()
             val wait = NativePreparation(token, next, track.id, position, playRequested)
             preparation = wait
-            if (player.currentMediaItem?.mediaId != track.id || player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED)
+            if (localOnly || player.currentMediaItem?.mediaId != track.id || player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED)
                 || player.playerError != null || source?.bind(owner) != true) {
                 retireSource()
                 val installed = AudioSourceOwner(token.toString(), track.id)
@@ -144,8 +164,11 @@ internal class Media3AudioExecutor(
                     .setArtist(track.artists.joinToString(", ") { it.name }).setAlbumTitle(track.albumName).build()
                 val uri = Uri.Builder().scheme("spofify").authority("audio").appendPath(track.id).build()
                 // IDs are opaque: a suffix such as .mpd must not select a manifest media source.
-                player.setMediaItem(MediaItem.Builder().setMediaId(track.id).setUri(uri).setCustomCacheKey(installed.key)
-                    .setMimeType("application/octet-stream").setMediaMetadata(metadata).build(), position)
+                val item = MediaItem.Builder().setMediaId(track.id).setUri(uri).setCustomCacheKey(installed.key)
+                    .setMimeType("application/octet-stream").setMediaMetadata(metadata).build()
+                if (localOnly) player.setMediaSource(localMusicSource(item,
+                    LocalMusicRanges(installed, owner::isCurrent, cache::sourceChoice)), position)
+                else player.setMediaItem(item, position)
                 player.prepare()
             } else if (playRequested || elapsed != player.currentPosition / 1000.0) {
                 // In-place stop: don't round-trip an already exact native millisecond through a seek.
@@ -186,6 +209,18 @@ internal class Media3AudioExecutor(
         preparation = null
         pending?.result?.cancel()
         player.pause()
+    }
+
+    /** Source handoff on the player looper; even an in-buffer seek cannot inherit retired bytes. */
+    fun releaseOutput() {
+        if (binding == null && source == null) return
+        pause()
+        binding = null
+        endedBinding = null
+        blocked = false
+        retireSource()
+        player.stop()
+        player.clearMediaItems()
     }
 
     /** Service reattachment cannot renew or manufacture the Core-owned execution lease. */

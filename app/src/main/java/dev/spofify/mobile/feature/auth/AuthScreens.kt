@@ -31,9 +31,10 @@ internal fun LoginScreen(
     onPassword: (String) -> Unit,
     onReveal: () -> Unit,
     onSignIn: () -> Unit,
+    goOnline: (() -> Unit)? = null,
 ) {
     val focus = LocalFocusManager.current
-    val submit = { if (!busy && inputs.server.isNotEmpty() && inputs.username.isNotEmpty() && inputs.password.isNotEmpty()) {
+    val submit = { if (goOnline == null && !busy && inputs.server.isNotEmpty() && inputs.username.isNotEmpty() && inputs.password.isNotEmpty()) {
         focus.clearFocus(); onSignIn()
     } }
     Column(Modifier.fillMaxSize()) {
@@ -41,7 +42,11 @@ internal fun LoginScreen(
             LoginHeading()
             LoginFields(inputs, busy, onServer, onUsername, onPassword, onReveal, submit)
         }
-        LoginActions(busy, notice, inputs, submit)
+        if (goOnline == null) LoginActions(busy, notice, inputs, submit)
+        else Column(Modifier.fillMaxWidth().padding(Spacing.page)) {
+            Notice(notice)
+            Button(goOnline, Modifier.fillMaxWidth().heightIn(min = Spacing.action)) { Text("Go online") }
+        }
     }
 }
 

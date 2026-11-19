@@ -37,12 +37,12 @@ import okio.Buffer
 private data class Cover(val kind: MusicKind, val id: String)
 
 /** A loader belongs to one account graph. No cookie headers or disk cache in presentation. */
-internal fun artworkLoader(context: android.content.Context, api: LibraryApi): ImageLoader =
+internal fun artworkLoader(context: android.content.Context, api: LibraryApi, local: Boolean = false): ImageLoader =
     ImageLoader.Builder(context).diskCache(null).components {
         add(object : Fetcher.Factory<Cover> {
             override fun create(data: Cover, options: Options, imageLoader: ImageLoader): Fetcher = Fetcher {
                 val bytes = api.artwork(data.kind, data.id) ?: throw IOException("Artwork unavailable")
-                SourceFetchResult(ImageSource(Buffer().write(bytes), options.fileSystem), null, DataSource.NETWORK)
+                SourceFetchResult(ImageSource(Buffer().write(bytes), options.fileSystem), null, if (local) DataSource.DISK else DataSource.NETWORK)
             }
         })
     }.build()

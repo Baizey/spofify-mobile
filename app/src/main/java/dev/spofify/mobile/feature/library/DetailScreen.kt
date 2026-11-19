@@ -29,8 +29,7 @@ import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.playback.PlaybackContext
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackController
+import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.core.playback.PlaybackTrackReference
 import dev.spofify.mobile.designsystem.SheetAction
 import dev.spofify.mobile.designsystem.SheetGroup
@@ -46,19 +45,18 @@ internal fun DetailScreen(
     loader: ImageLoader,
     onBack: () -> Unit,
     onOpen: (MusicItem) -> Unit,
-    playback: PlaybackController? = null,
+    playback: AppPlayback? = null,
     onNavigate: ((MusicKind, String) -> Unit)? = null,
     onMore: ((MusicItem, PlaybackContext?) -> Unit)? = null,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
-    val playbackView = playback?.state?.collectAsStateWithLifecycle()?.value
-    val ready = playbackView?.connection == PlaybackConnectionState.READY
+    val ready = playback?.observe()?.ready == true
     var menuItem by remember(model) { mutableStateOf<MusicItem?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
     val item = state.item
     val context = item?.collectionContext(state.revision)
-    val send: (() -> String?) -> Unit = { action ->
-        actionError = if (action() == null) "Playback action wasn't sent. Check the playback connection." else null
+    val send: (() -> Boolean?) -> Unit = { action ->
+        actionError = if (action() != true) "Playback action wasn't sent. Check the playback connection." else null
     }
     val playRow: (MusicItem) -> Unit = { row ->
         when {

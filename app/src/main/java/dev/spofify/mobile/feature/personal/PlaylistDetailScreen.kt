@@ -23,8 +23,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.*
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackController
+import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.feature.library.MusicCollectionControls
 import dev.spofify.mobile.feature.library.MusicRowGeometry
 import dev.spofify.mobile.designsystem.SpofifyGlyph
@@ -32,11 +31,12 @@ import dev.spofify.mobile.designsystem.SpofifyIcon
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PlaylistDetailScreen(
-    api: PersonalLibraryClient,
+internal fun PlaylistDetailScreen(
+    api: PersonalLibraryApi,
     id: String,
     loader: ImageLoader,
-    playback: PlaybackController?,
+    playback: AppPlayback?,
+    music: dev.spofify.mobile.playback.AccountMusic?,
     onBack: () -> Unit,
     onNavigate: (MusicKind, String) -> Unit,
 ) {
@@ -44,8 +44,8 @@ fun PlaylistDetailScreen(
     val model: PlaylistDetailViewModel = viewModel(owner, key = "playlist-${System.identityHashCode(api)}-$id",
         factory = viewModelFactory { initializer { PlaylistDetailViewModel(api, id) } })
     val state by model.state.collectAsStateWithLifecycle()
-    val player = playback?.state?.collectAsStateWithLifecycle()?.value
-    val ready = player?.connection == PlaybackConnectionState.READY
+    val player = playback?.observe()
+    val ready = player?.ready == true
     val context = state.context
     val summary = state.summary
     val playable = ready && context != null && !state.loading && !state.writing && !state.needsRefresh &&
@@ -57,14 +57,14 @@ fun PlaylistDetailScreen(
     var deleting by remember(model) { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var removing by remember(model) { mutableStateOf<Pair<PlaylistSong, Long>?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
-    val send: (() -> String?) -> Unit = { action -> actionError = if (action() == null) "Playback action wasn't sent." else null }
+    val send: (() -> Boolean?) -> Unit = { action -> actionError = if (action() != true) "Playback action wasn't sent." else null }
     val playRow: (PlaylistSong) -> Unit = { row ->
-        val reference = row.takeIf { it in state.rows }?.reference(context)
+        val reference = row.takeIf { it in state.rows }?.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)
         if (playable && reference != null) send { playback?.playTrack(reference, context) }
         else actionError = "This song isn't available to play."
     }
     val queueRow: (PlaylistSong) -> Unit = { row ->
-        if (playable && row in state.rows) row.reference(context)?.let { reference -> send { playback?.queueTrack(reference, context) } }
+        if (playable && row in state.rows) row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)?.let { reference -> send { playback?.queueTrack(reference, context) } }
     }
     LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
     LaunchedEffect(state.context, state.rows) { songMenu = null }
@@ -121,14 +121,14 @@ fun PlaylistDetailScreen(
             LazyColumn(Modifier.fillMaxSize(), reverseLayout = true, contentPadding = PaddingValues(bottom = 8.dp)) {
                 items(visibleRows.asReversed(), key = { it.identity }) { row ->
                     PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
-                        onQueue = if (playable && row.reference(context) != null) ({ queueRow(row) }) else null,
-                        gestureBinding = personalGestureBinding(row, context, player))
+                        onQueue = if (playable && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null) ({ queueRow(row) }) else null,
+                        gestureBinding = playback to personalGestureBinding(row, context, player?.online))
                 }
             }
         }
     }
 
-    if (menu) PlaylistCollectionSheet(state, playable,
+    if (menu) PlaylistCollectionSheet(state, playable, music,
         onPlay = {
             menu = false
             context?.let { send { playback?.playCollection(it) } }
@@ -147,7 +147,7 @@ fun PlaylistDetailScreen(
         },
         onDismiss = { menu = false }, onRetry = model::refresh)
     songMenu?.let { row ->
-        PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context) != null,
+        PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null,
             onPlay = { playRow(row) }, onQueue = { queueRow(row) }, onNavigate = onNavigate,
             onRemove = if (state.canEdit && summary?.capabilities?.editEntries == true && row.entryId != null) ({
                 removing = row to requireNotNull(summary).revision

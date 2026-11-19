@@ -10,6 +10,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
@@ -19,15 +21,11 @@ class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
     val inputNotice = mutableInputNotice.asStateFlow()
 
     init {
-        loadRemembered()
         viewModelScope.launch {
-            var wasAuthenticated = false
-            state.collect { state ->
-                if (state is AuthState.Authenticated) inputs.clearSecret()
-                if (wasAuthenticated && state is AuthState.SignedOut) loadRemembered()
-                // Preserve true through a transient validation state.
-                if (state is AuthState.Authenticated) wasAuthenticated = true
-                if (state is AuthState.SignedOut) wasAuthenticated = false
+            var needsAutofill = true
+            combine(state, sessions.manualOffline) { auth, offline -> auth to offline }.collect { (auth, offline) ->
+                if (auth is AuthState.Authenticated || offline) { inputs.clearSecret(); needsAutofill = true }
+                else if (auth is AuthState.SignedOut && needsAutofill) { needsAutofill = false; loadRemembered() }
             }
         }
     }
@@ -35,7 +33,9 @@ class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
     private fun loadRemembered() {
         val revision = inputs.revision
         viewModelScope.launch {
-            try { sessions.rememberedLogin()?.let { inputs.autofill(it, revision) } }
+            try { sessions.rememberedLogin()?.let {
+                if (state.value is AuthState.SignedOut && !sessions.manualOffline.value) inputs.autofill(it, revision)
+            } }
             catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { mutableInputNotice.value = AuthNotice.STORAGE_UNAVAILABLE }
         }
@@ -48,6 +48,13 @@ class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
     fun signIn() {
         mutableInputNotice.value = null
         sessions.signIn(inputs.server, inputs.username, inputs.password.trim())
+    }
+    fun goOnline() {
+        if (state.value !is AuthState.SignedOut || !sessions.manualOffline.value) return
+        viewModelScope.launch {
+            try { sessions.setManualOffline(false) }
+            catch (e: CancellationException) { throw e } catch (_: Exception) { mutableInputNotice.value = AuthNotice.SAVE_FAILED }
+        }
     }
     fun signOut() = sessions.signOut()
     fun retry() = sessions.retry()

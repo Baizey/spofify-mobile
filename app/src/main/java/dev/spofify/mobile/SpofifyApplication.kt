@@ -26,9 +26,18 @@ class SpofifyApplication : Application() {
         super.onCreate()
         val stores = EncryptedAuthStores(this)
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        sessions = SessionRepository(stores.sessions, stores.logins, OkHttpAuthApiFactory(), scope)
+        sessions = SessionRepository(stores.sessions, stores.logins, OkHttpAuthApiFactory(), scope,
+            manualOfflineStore = dev.spofify.mobile.storage.PreferenceManualOfflineStore(this))
         val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        palettes = AccountPaletteController(sessions.state, { identity -> PaletteClient(sessions, identity) }, mainScope)
+        palettes = AccountPaletteController(sessions.state, { identity ->
+            val grant = requireNotNull(sessions.onlineGrant.value?.takeIf { it.identity == identity })
+            val client = PaletteClient(sessions, identity)
+            object : dev.spofify.mobile.core.palette.PaletteApi {
+                override suspend fun read() = sessions.withOnlineGrant(grant) { client.read() }
+                override suspend fun choose(id: dev.spofify.mobile.core.palette.PaletteId, expectedRevision: Long) =
+                    sessions.withOnlineGrant(grant) { client.choose(id, expectedRevision) }
+            }
+        }, mainScope, sessions.onlineGrant)
         playback = PlaybackOwner(this, sessions, mainScope)
         palettes.start()
         playback.start()

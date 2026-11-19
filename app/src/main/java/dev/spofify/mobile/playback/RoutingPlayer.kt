@@ -3,16 +3,15 @@ package dev.spofify.mobile.playback
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import dev.spofify.mobile.core.playback.PlaybackController
 
 /** Only a MediaSession controller request is a musical intent; framework cleanup is not. */
 @UnstableApi
 internal class RoutingPlayer(
     player: Player,
-    private val controller: PlaybackController,
+    private val controller: AppPlayback,
     private val isControllerRequest: () -> Boolean,
 ) : ForwardingPlayer(player) {
-    private fun dispatch(command: () -> String?) {
+    private fun dispatch(command: () -> Unit) {
         if (!isControllerRequest()) return
         command()
     }
@@ -32,10 +31,10 @@ internal class RoutingPlayer(
     override fun seekToPrevious() { dispatch { controller.previous() } }
     override fun seekToPreviousMediaItem() { seekToPrevious() }
     override fun seekBack() {
-        dispatch { controller.seek(((controller.state.value.playback?.elapsed ?: 0.0) - 10).coerceAtLeast(0.0)) }
+        dispatch { controller.seek((controller.presentation.elapsed - 10).coerceAtLeast(0.0)) }
     }
     override fun seekForward() {
-        dispatch { controller.seek((controller.state.value.playback?.elapsed ?: 0.0) + 10) }
+        dispatch { controller.seek(controller.presentation.elapsed + 10) }
     }
     override fun setShuffleModeEnabled(shuffleModeEnabled: Boolean) { dispatch { controller.setShuffle(shuffleModeEnabled) } }
     override fun setRepeatMode(repeatMode: Int) {

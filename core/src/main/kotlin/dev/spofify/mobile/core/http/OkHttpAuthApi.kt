@@ -31,7 +31,7 @@ internal class OkHttpAuthApi(
 ) : AuthApi, FeatureTransport {
     private val json = Json { ignoreUnknownKeys = true }
     private val calls = ConcurrentHashMap.newKeySet<Call>()
-    private val cookieName = if (origin.url.isHttps) "__Host-spofify_session" else "spofify_session"
+    private val cookieName = cookieName(origin)
 
     init {
         require(!client.followRedirects && !client.followSslRedirects && !client.retryOnConnectionFailure)
@@ -180,6 +180,8 @@ internal class OkHttpAuthApi(
 
     override fun validateCookie(cookie: String) { parseCookie(cookie) }
 
+    override fun closeRetiredStreams() = media.closeRetiredStreams()
+
     override fun cancel() {
         media.cancel()
         calls.forEach(Call::cancel)
@@ -227,32 +229,8 @@ internal class OkHttpAuthApi(
             }
         }
 
-    private fun parseCookie(raw: String, requireAbsoluteExpiry: Boolean = false): Cookie {
-        // Cookie.parse gives Max-Age precedence and rebases it on the device clock.
-        // Strip ONLY that attribute; OkHttp still owns cookie/date/attribute parsing.
-        // Expires is the backend's durable deadline, even if the device clock is skewed.
-        val parts = raw.split(';')
-        val attributes = parts.drop(1)
-        fun String.named(name: String) = substringBefore('=').trim().equals(name, ignoreCase = true)
-        val expires = attributes.filter { it.named("Expires") }
-        val maxAge = attributes.filter { it.named("Max-Age") }
-        if (expires.size > 1 || maxAge.size > 1 ||
-            (maxAge.isNotEmpty() && (expires.isEmpty() ||
-                maxAge.single().substringAfter('=', "").trim().toLongOrNull()?.let { it > 0 } != true))) {
-            throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
-        }
-        val absolute = parts.filterIndexed { index, part -> index == 0 || !part.named("Max-Age") }.joinToString(";")
-        val cookie = Cookie.parse(origin.url, absolute) ?: throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
-        if ((requireAbsoluteExpiry || expires.isNotEmpty()) && (expires.size != 1 || !cookie.persistent)) {
-            throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
-        }
-        if (cookie.name != cookieName || cookie.value.isEmpty() || !cookie.hostOnly ||
-            cookie.domain != origin.url.host || cookie.path != "/" || !cookie.httpOnly ||
-            cookie.secure != origin.url.isHttps || cookie.expiresAt <= 0L) {
-            throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
-        }
-        return cookie
-    }
+    private fun parseCookie(raw: String, requireAbsoluteExpiry: Boolean = false): Cookie =
+        parseSessionCookie(origin, raw, requireAbsoluteExpiry)
 
     private fun cookieHeader(raw: String): String = parseCookie(raw).let { "${it.name}=${it.value}" }
 

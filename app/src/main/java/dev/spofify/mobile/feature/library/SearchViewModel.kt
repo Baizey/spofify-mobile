@@ -38,7 +38,19 @@ internal data class SearchState(
 }
 
 /** One ranked snapshot; cursor continuation never mixes it with a fresh search. */
-internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
+internal class SearchViewModel(private var api: SearchApi) : ViewModel() {
+    private var local = false
+
+    /** Invalidate the old cursor/jobs, not the destination, query or scroll anchor. */
+    fun bind(next: SearchApi, device: Boolean) {
+        if (api === next && local == device) return
+        cancelRequests()
+        api = next; local = device
+        snapshot = null; retryRequest = null; interruptedRequest = null
+        val old = mutable.value
+        mutable.value = SearchState(query = old.query, queryGeneration = old.queryGeneration, paused = old.paused)
+        if (!old.paused && old.query.isNotBlank()) load(Request.First)
+    }
     private sealed interface Request {
         data object First : Request
         data class Next(val cursor: String) : Request
@@ -79,9 +91,10 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
         interruptedRequest = null
         snapshot = null
         val paused = current.paused
-        mutable.value = SearchState(query = value, paused = paused, waiting = value.isNotBlank() && !paused,
+        mutable.value = SearchState(query = value, paused = paused, waiting = value.isNotBlank() && !paused && !local,
             queryGeneration = current.queryGeneration + 1)
         if (value.isBlank() || paused) return
+        if (local) { load(Request.First); return }
         val token = generation
         timer = viewModelScope.launch {
             delay(300)
@@ -124,7 +137,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
 
     private fun load(request: Request, resuming: Boolean = false) {
         val before = mutable.value
-        if (before.busy || before.query.isBlank() || before.paused && !resuming) return
+        if (requestJob?.isActive == true || before.busy || before.query.isBlank() || before.paused && !resuming) return
         val token = ++generation
         val query = before.query.trim()
         val base = snapshot
@@ -174,7 +187,7 @@ internal class SearchViewModel(private val api: SearchApi) : ViewModel() {
             }
         }
         requestJob = job
-        mutable.value = before.copy(loading = true, paused = false, error = null)
+        mutable.value = before.copy(loading = !local, paused = false, error = null)
         job.start()
     }
 

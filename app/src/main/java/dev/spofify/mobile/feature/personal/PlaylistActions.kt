@@ -10,18 +10,19 @@ import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
-import dev.spofify.mobile.core.personal.PersonalLibraryClient
+import dev.spofify.mobile.core.personal.PersonalLibraryApi
 import dev.spofify.mobile.core.personal.PersonalPlaylistKind
 import dev.spofify.mobile.core.personal.PersonalPlaylistSummary
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackController
+import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.designsystem.*
+import dev.spofify.mobile.playback.AccountMusic
 
 /** FINAL collection menu: Play and Queue; shuffle belongs to the player, not this sheet. */
 @Composable
 internal fun PlaylistCollectionSheet(
     state: PlaylistDetailState,
     playable: Boolean,
+    music: AccountMusic?,
     onPlay: () -> Unit,
     onQueue: () -> Unit,
     onEdit: () -> Unit,
@@ -30,6 +31,9 @@ internal fun PlaylistCollectionSheet(
     onRetry: () -> Unit,
 ) {
     val summary = state.summary
+    val saved = music?.saved?.collectAsStateWithLifecycle()?.value?.any { it.collection.reference.id == summary?.id } == true
+    val saving = music?.saving?.collectAsStateWithLifecycle()?.value?.contains(summary?.id) == true
+    val failed = music?.failed?.collectAsStateWithLifecycle()?.value?.contains(summary?.id) == true
     SpofifySheet(onDismiss) {
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") {
@@ -42,6 +46,14 @@ internal fun PlaylistCollectionSheet(
             }
             if (summary != null) {
                 item("library") { SheetGroup("Library") }
+                if (music != null && (saved || summary.capabilities.play && state.completeCollection && state.rows.isNotEmpty() && state.rows.all { it.track.hasAudio })) {
+                    item("save-offline") { SheetAction(when {
+                        saved -> "Saved for offline"
+                        saving -> "Saving for offline…"
+                        failed -> "Retry saving for offline"
+                        else -> "Save for offline"
+                    }, if (saved) SpofifyGlyph.Check else SpofifyGlyph.Down, !saved && !saving) { music.save(summary.id) } }
+                }
                 if (summary.kind == PersonalPlaylistKind.MANUAL && summary.capabilities.editMetadata) {
                     item("edit") { SheetAction("Edit details", SpofifyGlyph.Edit, state.canEdit, onEdit) }
                 }
@@ -56,9 +68,10 @@ internal fun PlaylistCollectionSheet(
 /** A summary's More sheet resolves fresh action authority before enabling musical actions. */
 @Composable
 internal fun PlaylistSummaryActions(
-    api: PersonalLibraryClient,
+    api: PersonalLibraryApi,
     summary: PersonalPlaylistSummary,
-    playback: PlaybackController?,
+    playback: AppPlayback?,
+    music: AccountMusic?,
     onMutationAcknowledged: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -67,9 +80,9 @@ internal fun PlaylistSummaryActions(
     val model: PlaylistDetailViewModel = viewModel(owner, key = "playlist-menu-${System.identityHashCode(api)}-$id",
         factory = viewModelFactory { initializer { PlaylistDetailViewModel(api, id, onMutationAcknowledged) } })
     val state by model.state.collectAsStateWithLifecycle()
-    val player = playback?.state?.collectAsStateWithLifecycle()?.value
+    val player = playback?.observe()
     val context = state.context
-    val playable = player?.connection == PlaybackConnectionState.READY && context != null &&
+    val playable = player?.ready == true && context != null &&
         !state.loading && !state.writing && !state.needsRefresh && state.rows.isNotEmpty() && state.summary?.capabilities?.play == true
     var editing by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var deleting by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
@@ -91,12 +104,12 @@ internal fun PlaylistSummaryActions(
                 model.delete(original.revision)
             }
         }
-        else -> PlaylistCollectionSheet(if (state.summary == null) state.copy(summary = summary) else state, playable,
+        else -> PlaylistCollectionSheet(if (state.summary == null) state.copy(summary = summary) else state, playable, music,
             onPlay = {
-                if (context != null && playback?.playCollection(context) != null) onDismiss()
+                if (context != null && playback?.playCollection(context) == true) onDismiss()
             },
             onQueue = {
-                if (context != null && playback?.queueCollection(context) != null) onDismiss()
+                if (context != null && playback?.queueCollection(context) == true) onDismiss()
             },
             onEdit = { editing = state.summary }, onDelete = { deleting = state.summary },
             onDismiss = onDismiss, onRetry = model::refresh)

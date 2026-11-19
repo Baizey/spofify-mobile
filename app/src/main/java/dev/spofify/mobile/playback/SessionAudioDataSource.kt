@@ -4,7 +4,7 @@ import android.net.Uri
 import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.*
-import dev.spofify.mobile.core.auth.AccountIdentity
+import dev.spofify.mobile.core.auth.OnlineGrant
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.cache.MusicSourceChoice
 import dev.spofify.mobile.core.http.AudioRepresentation
@@ -22,7 +22,7 @@ import kotlinx.coroutines.withTimeout
 @UnstableApi
 internal class SessionAudioDataSource(
     private val sessions: SessionRepository,
-    private val identity: AccountIdentity,
+    private val grant: OnlineGrant?,
     private val choice: MusicSourceChoice,
     private val currentSource: () -> AudioSourceOwner?,
 ) : DataSource {
@@ -53,11 +53,12 @@ internal class SessionAudioDataSource(
     }
 
     private fun openNetwork(dataSpec: DataSpec): AudioStream {
+        val grant = grant ?: throw InterruptedIOException("No online audio grant")
         val pending = retry.pending.get()
         val job = pending?.job ?: retry.source.job
         val length = dataSpec.length.takeIf { it != C.LENGTH_UNSET.toLong() }
         fun checkOwner() {
-            if (!retry.source.job.isActive || pending != null && (!pending.isCurrent() || !sessions.isCurrent(identity))) {
+            if (!retry.source.job.isActive || sessions.onlineGrant.value !== grant || pending != null && !pending.isCurrent()) {
                 throw InterruptedIOException("Audio load retired")
             }
         }
@@ -66,7 +67,9 @@ internal class SessionAudioDataSource(
             checkOwner()
             val opened = runBlocking(job) {
                 checkOwner()
-                suspend fun acquire() = sessions.audio(identity, retry.source.trackId, dataSpec.position, length).also { acquired = it }
+                suspend fun acquire() = sessions.withOnlineGrant(grant) {
+                    sessions.audio(grant.identity, retry.source.trackId, dataSpec.position, length)
+                }.also { acquired = it }
                 val budget = pending?.remainingPrepareRetryMs()
                 if (budget == null) acquire() else withTimeout(budget) { acquire() }
             }
@@ -87,7 +90,7 @@ internal class SessionAudioDataSource(
 
     private fun TransientAudioLoadFailure.forLoader(): IOException {
         val owner = retry.source.interrupted(retry)
-        return if (owner != null && sessions.isCurrent(identity) && representation?.canContinue != false) {
+        return if (owner != null && grant != null && sessions.onlineGrant.value === grant && representation?.canContinue != false) {
             RetryableAudioLoad(owner, retry, this)
         } else this
     }
@@ -108,7 +111,7 @@ internal class SessionAudioDataSource(
 }
 
 @UnstableApi
-private class RangeSource(network: Boolean, private val acquire: (DataSpec) -> AudioStream) : BaseDataSource(network) {
+internal class RangeSource(network: Boolean, private val acquire: (DataSpec) -> AudioStream) : BaseDataSource(network) {
     private var stream: AudioStream? = null
     private var uri: Uri? = null
     private var remaining = C.LENGTH_UNSET.toLong()

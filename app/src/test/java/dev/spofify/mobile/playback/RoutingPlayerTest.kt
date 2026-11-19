@@ -69,6 +69,53 @@ class RoutingPlayerTest {
         }
     }
 
+    @Test fun retiredOnlineTargetRejectsEvenTrustedRequests() = runTest {
+        Harness(this).use { h ->
+            h.remotePlaying()
+            h.controllerRequest = true
+            h.current = false
+            h.player.play()
+            h.player.pause()
+            h.player.seekForward()
+            assertTrue(h.commands.isEmpty())
+            assertTrue(h.nativeCalls.isEmpty())
+        }
+    }
+
+    @Test fun localRequestsControlOnlyRealLocalQueueAndCannotCrossRetirement() = runTest {
+        Harness(this).use { h ->
+            h.remotePlaying()
+            val song = h.controller.state.value.current!!
+            val library = object : LocalPlaybackLibrary {
+                override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = LocalPlaybackRows(listOf(song))
+                override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
+            }
+            val local = LocalPlaybackController(h.audio, library, backgroundScope, { h.current })
+            val target = AppPlayback.Local(local) { h.current }
+            val player = RoutingPlayer(h.native, target) { h.controllerRequest }
+            assertTrue(target.queueTrack(PlaybackTrackReference(song.id)))
+            runCurrent()
+            val view = target.presentation as PlayerPresentation.Local
+            assertSame(local.state.value, view.queue)
+            assertTrue(view.queue.desiredPlaying)
+            assertFalse(view.isPlaying) // no native observation of sound
+            player.pause() // not a controller request
+            assertTrue(local.state.value.desiredPlaying)
+            h.controllerRequest = true
+            player.pause()
+            assertFalse(local.state.value.desiredPlaying)
+            player.seekForward()
+            assertEquals(10.0, local.state.value.elapsed, 0.0)
+            local.retire()
+            h.current = false
+            player.play()
+            assertFalse(target.queueTrack(PlaybackTrackReference(song.id)))
+            assertNull(local.state.value.current)
+            assertTrue(h.commands.isEmpty())
+            assertTrue(h.nativeCalls.isEmpty())
+        }
+    }
+
     private class Harness(private val scope: TestScope) : AutoCloseable {
         private val incoming = Channel<String>(Channel.UNLIMITED)
         private val sent = mutableListOf<String>()
@@ -80,7 +127,7 @@ class RoutingPlayerTest {
             override fun send(text: String): Boolean { sent.add(text); return isOpen }
             override fun close() { isOpen = false; incoming.close() }
         }
-        private val audio = object : AudioExecutor {
+        val audio = object : AudioExecutor {
             override val observations = emptyFlow<AudioObservation>()
             override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double) = AudioResult.OK
             override suspend fun execute(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
@@ -89,7 +136,7 @@ class RoutingPlayerTest {
             override fun facts() = AudioFacts()
         }
         val controller = PlaybackController(PlaybackTransport { _, _ -> connection }, audio, scope.backgroundScope)
-        private val native = Proxy.newProxyInstance(Player::class.java.classLoader, arrayOf(Player::class.java)) { _, method, _ ->
+        val native = Proxy.newProxyInstance(Player::class.java.classLoader, arrayOf(Player::class.java)) { _, method, _ ->
             nativeCalls.add(method.name)
             when (method.returnType) {
                 java.lang.Boolean.TYPE -> false
@@ -99,7 +146,8 @@ class RoutingPlayerTest {
                 else -> null
             }
         } as Player
-        val player = RoutingPlayer(native, controller) { controllerRequest }
+        var current = true
+        val player = RoutingPlayer(native, AppPlayback.Online(controller) { current }) { controllerRequest }
         val commands: List<String> get() = sent.map { Json.parseToJsonElement(it).jsonObject }
             .filter { it["type"]?.jsonPrimitive?.content == "command" }
             .map { it["command"]!!.jsonObject["type"]!!.jsonPrimitive.content }

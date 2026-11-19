@@ -32,7 +32,7 @@ internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private v
     fun refresh() {
         reading?.cancel()
         val token = ++generation
-        mutable.value = mutable.value.copy(loading = true, error = null)
+        mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null)
         reading = viewModelScope.launch {
             try {
                 val result = mutableListOf<PersonalPlaylistSummary>()

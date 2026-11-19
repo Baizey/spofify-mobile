@@ -23,13 +23,17 @@ internal class OriginMediaTransport(
     // Media3 owns the bounded retry budget; don't replay a failed audio GET underneath it.
     private val fillClient = client.newBuilder().callTimeout(0, TimeUnit.MILLISECONDS).build()
     private val audioClient = fillClient.newBuilder().retryOnConnectionFailure(false).build()
-    private val audioCalls = ConcurrentHashMap.newKeySet<Call>()
+    // One owner from pending headers through transfer and final close. Before transfer
+    // Call.cancel() suffices; after transfer the entry can also finish the response body.
+    private val audioCalls = ConcurrentHashMap<Call, () -> Unit>()
     private val sockets = ConcurrentHashMap.newKeySet<SessionSocket>()
 
     fun cancel() {
-        sockets.toList().forEach { it.close() }
-        audioCalls.toList().forEach { it.cancel() }
+        sockets.forEach { it.close() }
+        audioCalls.keys.forEach { it.cancel() }
     }
+
+    fun closeRetiredStreams() = audioCalls.values.forEach { close -> close() }
 
     suspend fun socket(
         cookie: String, hello: String, authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
@@ -106,7 +110,7 @@ internal class OriginMediaTransport(
             if (ranged) header("Range", "bytes=$position-${end ?: ""}")
         }.build()
         val call = (if (media == null) audioClient else fillClient).newCall(request)
-        audioCalls.add(call)
+        audioCalls[call] = {}
         return suspendCancellableCoroutine { continuation ->
             continuation.invokeOnCancellation { call.cancel(); audioCalls.remove(call) }
             val callback = object : Callback {
@@ -161,6 +165,9 @@ internal class OriginMediaTransport(
                         val stream = AudioStream(body.byteStream(), bytes, representation,
                             { !call.isCanceled() && authority.isCurrent }, recoverable = media == null,
                             cancelCall = call::cancel) { closeAudio(call, response) }
+                        if (!authority.runIfCurrent { audioCalls.replace(call, stream::close) != null }) {
+                            throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
+                        }
                         continuation.resume(stream, onCancellation = { _, value, _ -> value.close() })
                     } catch (failure: Exception) {
                         closeAudio(call, response)

@@ -1,43 +1,25 @@
 package dev.spofify.mobile.playback
 
-import android.annotation.SuppressLint
 import android.app.Application
-import android.app.PendingIntent
 import android.content.Intent
-import android.os.SystemClock
-import android.provider.Settings
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaSession
-import dev.spofify.mobile.MainActivity
-import dev.spofify.mobile.core.auth.AccountIdentity
-import dev.spofify.mobile.core.auth.AuthFailure
-import dev.spofify.mobile.core.auth.AuthState
-import dev.spofify.mobile.core.auth.SessionRepository
-import dev.spofify.mobile.core.playback.PlaybackClock
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackController
-import java.security.MessageDigest
+import dev.spofify.mobile.core.auth.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
-/** The Application owns account/socket lifetime. The service owns only local output presentation. */
+/** Account/output lifetime stays stable across manual switching and return validation. */
 @androidx.annotation.OptIn(UnstableApi::class)
-class PlaybackOwner(
-    private val app: Application,
-    private val sessions: SessionRepository,
-    private val scope: CoroutineScope,
-) {
+class PlaybackOwner(private val app: Application, private val sessions: SessionRepository, private val scope: CoroutineScope) {
     private val mutable = MutableStateFlow<NativePlayer?>(null)
     internal val state = mutable.asStateFlow()
-    internal val current: NativePlayer? get() = mutable.value?.takeIf { sessions.isCurrent(it.identity) }
+    internal val current get() = mutable.value?.takeIf { sessions.isCurrent(it.identity) }
     private val storage = MusicStorage(app, scope)
+    private val modeChanges = Mutex()
     private var started = false
     private var serviceSession: MediaSession? = null
     private var startingSession: MediaSession? = null
@@ -52,184 +34,107 @@ class PlaybackOwner(
                 if (mutable.value?.identity == identity) return@collect
                 val retired = mutable.value
                 mutable.value = null
-                serviceSession = null
-                startingSession = null
-                stoppingSession = null
                 retired?.close()
+                serviceSession = null; startingSession = null; stoppingSession = null
                 app.stopService(Intent(app, PlaybackService::class.java))
                 if (identity != null && sessions.isCurrent(identity)) {
                     val player = NativePlayer(app, identity, sessions, scope, storage,
-                        requestPlaybackStart = { ensureService(identity) })
+                        requestPlaybackStart = { ensureService(identity) }, reconcile = { current?.let(::reconcileServiceFor) },
+                        detachService = { current?.let(::stopServiceFor) })
                     mutable.value = player
-                    player.scope.launch {
-                        player.controller.state.collect { reconcileServiceFor(player) }
-                    }
-                    player.scope.launch {
-                        // A failed native start must cancel its FGS deadline without
-                        // waiting for a server round trip. Sample current facts rather
-                        // than letting a queued observation retire a newer operation.
-                        player.audio.observations.collect { reconcileServiceFor(player) }
-                    }
-                    player.connect()
+                    player.start()
                 }
             }
         }
     }
 
-    /** Expedite admission/HTTP maintenance, without resetting READY or replaying an intent. */
+    /** The durable command is account-owned, not an online worker or destination coroutine. */
+    internal suspend fun switch(identity: AccountIdentity, enabled: Boolean) = withContext(Dispatchers.Main.immediate) {
+        modeChanges.withLock {
+            val player = current?.takeIf { it.identity == identity } ?: return@withLock
+            if (sessions.manualOffline.value == enabled) return@withLock
+            if (!enabled) player.retireSource() // no sound, prepared media or queue survives return validation
+            try {
+                sessions.setManualOffline(enabled) { old ->
+                    withContext(Dispatchers.Main.immediate) { if (current === player && old == identity) player.retireSource() }
+                }
+            } finally { if (current === player) player.synchronize() }
+        }
+    }
+
     fun foreground() { current?.foreground() }
 
     internal fun retainServiceAfterTaskRemoval(): Boolean {
-        val player = current ?: return false
-        return retainLocalPlaybackService(player.controller.state.value, player.audio.facts(), player.audio.player.playWhenReady)
+        val p = current ?: return false
+        val view = p.view ?: return false
+        return when (view) {
+            is PlayerPresentation.Online -> retainLocalPlaybackService(view.view, p.audio.facts(), p.audio.player.playWhenReady)
+            is PlayerPresentation.Local -> (p.target.value as? AppPlayback.Local)?.controller?.hasPendingStart == true ||
+                view.queue.desiredPlaying && p.audio.hasPlaybackAuthority() && !p.audio.facts().ended
+        }
     }
-
     internal fun onTaskRemoved() {
         if (retainServiceAfterTaskRemoval()) return
-        val player = current
-        if (player == null) app.stopService(Intent(app, PlaybackService::class.java))
-        else stopServiceFor(player)
+        val p = current
+        if (p == null) app.stopService(Intent(app, PlaybackService::class.java)) else stopServiceFor(p)
     }
 
     internal fun serviceStarted(session: MediaSession) {
-        val player = current?.takeIf { it.mediaSession === session } ?: return
-        serviceSession = session
-        startingSession = null
-        stoppingSession = null
-        reconcileServiceFor(player)
+        val p = current?.takeIf { it.mediaSession === session } ?: return
+        serviceSession = session; startingSession = null; stoppingSession = null
+        reconcileServiceFor(p)
     }
-
     internal fun serviceStopped(session: MediaSession?) {
         if (session == null) return
         if (serviceSession === session) serviceSession = null
         if (startingSession === session) startingSession = null
         if (stoppingSession === session) stoppingSession = null
-        val player = current?.takeIf { it.mediaSession === session } ?: return
-        Log.i("SpofifyPlayer", "Local media service stopped")
-        handlePlaybackServiceLoss(player.controller.state.value, player.audio.facts(), player.audio.player.playWhenReady,
-            hasPlaybackAuthority = player.audio.hasPlaybackAuthority(), restartLocalService = { ensureService(player.identity) },
-            pauseNative = player.audio::pause, reportLocalBlocked = player.audio::backgroundStartBlocked)
-        // Accepted reattachment leaves native playback untouched. Cleanup is neither
-        // a socket failure nor a reason to replay resume/select/execute.
-    }
-
-    internal fun backgroundStartBlocked(session: MediaSession?) {
-        val player = current?.takeIf { it.mediaSession === session } ?: return
-        handlePlaybackServiceStartRefusal(player.controller.state.value, player.audio.hasPlaybackAuthority(),
-            pauseNative = player.audio::pause, reportLocalBlocked = player.audio::backgroundStartBlocked)
-        reconcileServiceFor(player)
-    }
-
-    /** Called only by an authorized desired-playing native execution, immediately before play. */
-    private fun ensureService(identity: AccountIdentity): Boolean {
-        val player = current?.takeIf { it.identity == identity } ?: return false
-        if (!sessions.isCurrent(identity) || !player.controller.state.value.isLocalOutputConnection()) return false
-        val session = player.mediaSession
-        if (stoppingSession !== session && (serviceSession === session || startingSession === session)) return true
-        // Visibility is not authority, nor a reliable predictor of Android's actual
-        // foreground-start exemptions. Attempt the local start and handle real refusal.
-        return try {
-            ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))
-            startingSession = session
-            stoppingSession = null
-            true
-        } catch (_: IllegalStateException) {
-            Log.w("SpofifyPlayer", "Local playback service start refused")
-            false
-        } catch (_: SecurityException) {
-            Log.w("SpofifyPlayer", "Local playback service start denied")
-            false
+        val p = current?.takeIf { it.mediaSession === session } ?: return
+        val view = p.view ?: return
+        val facts = p.audio.facts()
+        if (view is PlayerPresentation.Online) handlePlaybackServiceLoss(view.view, facts, p.audio.player.playWhenReady,
+            p.audio.hasPlaybackAuthority(), { ensureService(p.identity) }, p.audio::pause, p.audio::backgroundStartBlocked)
+        else if (facts.isPlaying || p.audio.player.playWhenReady && !facts.ended) {
+            if (!p.audio.hasPlaybackAuthority()) p.audio.pause() else if (!ensureService(p.identity)) p.audio.backgroundStartBlocked()
         }
     }
-
-    private fun reconcileServiceFor(player: NativePlayer) {
-        if (current !== player) return
-        val view = player.controller.state.value
-        val facts = player.audio.facts()
-        player.cache.observe(view, facts, player.audio.hasPlaybackAuthority())
-        if (shouldStopPlaybackService(view, facts, player.audio.player.playWhenReady))
-            stopServiceFor(player)
+    internal fun backgroundStartBlocked(session: MediaSession?) {
+        val p = current?.takeIf { session != null && it.mediaSession === session } ?: return
+        val view = p.view ?: return
+        if (view is PlayerPresentation.Online) handlePlaybackServiceStartRefusal(view.view, p.audio.hasPlaybackAuthority(),
+            p.audio::pause, p.audio::backgroundStartBlocked)
+        else if (p.audio.hasPlaybackAuthority()) p.audio.backgroundStartBlocked() else p.audio.pause()
+        reconcileServiceFor(p)
     }
-
+    private fun ensureService(identity: AccountIdentity): Boolean {
+        val p = current?.takeIf { it.identity == identity } ?: return false
+        val session = p.mediaSession ?: return false
+        val view = p.view ?: return false
+        if (!p.audio.hasPlaybackAuthority() || view is PlayerPresentation.Online && !view.view.isLocalOutputConnection()) return false
+        if (stoppingSession !== session && (serviceSession === session || startingSession === session)) return true
+        return try {
+            ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))
+            startingSession = session; stoppingSession = null
+            true
+        } catch (_: IllegalStateException) {
+            Log.w("SpofifyPlayer", "Local playback service start refused"); false
+        } catch (_: SecurityException) {
+            Log.w("SpofifyPlayer", "Local playback service start denied"); false
+        }
+    }
+    private fun reconcileServiceFor(p: NativePlayer) {
+        val view = p.view ?: return
+        val facts = p.audio.facts()
+        if (view is PlayerPresentation.Online) {
+            p.cache.observe(view.view, facts, p.audio.hasPlaybackAuthority())
+            p.music.observeQueue(view.view)
+            if (shouldStopPlaybackService(view.view, facts, p.audio.player.playWhenReady)) stopServiceFor(p)
+        } else if (facts.error.isNotEmpty() && !facts.isPlaying && !p.audio.player.playWhenReady) stopServiceFor(p)
+    }
     private fun stopServiceFor(player: NativePlayer) {
-        if (current !== player) return
-        val session = player.mediaSession
+        val session = player.mediaSession ?: return
         if ((serviceSession !== session && startingSession !== session) || stoppingSession === session) return
         stoppingSession = session
         app.stopService(Intent(app, PlaybackService::class.java))
-    }
-}
-
-@androidx.annotation.OptIn(UnstableApi::class)
-internal class NativePlayer(
-    app: Application,
-    val identity: AccountIdentity,
-    private val sessions: SessionRepository,
-    parentScope: CoroutineScope,
-    storage: MusicStorage,
-    requestPlaybackStart: () -> Boolean,
-) {
-    val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]))
-    private var commandTarget: PlaybackController? = null
-    val cache = AutomaticMusicCache(app, sessions, identity, storage, scope)
-    val audio = Media3AudioExecutor(app, sessions, identity, cache, {
-        commandTarget?.let { if (it.isLocalSelectedConnection()) it.pause() }
-    }, requestPlaybackStart)
-    val controller = PlaybackController(sessions.playbackTransport(identity), audio, scope, object : PlaybackClock {
-        override fun monotonicMs(): Long = SystemClock.elapsedRealtime()
-        override fun wallTimeMs(): Long = System.currentTimeMillis()
-    }).also { commandTarget = it }
-    private var requestSession: MediaSession? = null
-    val mediaSession = MediaSession.Builder(app, RoutingPlayer(audio.player, controller) {
-        requestSession?.controllerForCurrentRequest != null
-    }).setSessionActivity(PendingIntent.getActivity(app, 0, Intent(app, MainActivity::class.java)
-        .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build().also { requestSession = it }
-
-    // Preserve the registered playback device and its chosen name. Android 8+ scopes
-    // ANDROID_ID to this signer/user/device; only the origin/account-scoped digest is sent.
-    @SuppressLint("HardwareIds")
-    private val deviceId: String = run {
-        val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID)
-            ?: "${android.os.Build.BRAND}:${android.os.Build.MODEL}"
-        val profile = "spofify-android-v1\n${identity.origin}\n${identity.accountId}\n$androidId"
-        "android-" + MessageDigest.getInstance("SHA-256").digest(profile.toByteArray())
-            .joinToString("") { "%02x".format(it.toInt() and 255) }
-    }
-    private val reconnect = PlaybackReconnect(scope, controller.state, { sessions.isCurrent(identity) },
-        connectFresh = { controller.connect("Phone", deviceId) }, nowMs = SystemClock::elapsedRealtime)
-    private val maintenance = PlaybackSessionMaintenance(scope, { sessions.isCurrent(identity) },
-        isConnected = { controller.state.value.connection == PlaybackConnectionState.READY },
-        renew = { sessions.renew(identity) }, onFailure = { failure ->
-            Log.w("SpofifyPlayer", "Session maintenance check failed: ${(failure as? AuthFailure)?.kind ?: "unexpected"}")
-        })
-
-    init {
-        scope.launch {
-            controller.state.map { it.commandFailure }.distinctUntilChanged().filterNotNull().collect { failure ->
-                Log.w("SpofifyPlayer", failure.diagnosticText())
-            }
-        }
-    }
-
-    fun connect() {
-        if (!scope.isActive || !sessions.isCurrent(identity)) return
-        maintenance.start()
-        reconnect.expedite()
-    }
-
-    fun foreground() {
-        connect()
-        maintenance.refreshNow()
-    }
-
-    suspend fun close() {
-        requestSession = null // Release/cleanup must never impersonate an external controller request.
-        reconnect.close()
-        maintenance.close()
-        controller.close()
-        scope.coroutineContext.job.cancelAndJoin()
-        mediaSession.release()
-        audio.close()
     }
 }

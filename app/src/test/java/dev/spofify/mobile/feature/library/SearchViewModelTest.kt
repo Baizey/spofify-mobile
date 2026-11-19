@@ -69,6 +69,30 @@ class SearchViewModelTest {
         assertFalse(model.state.value.busy)
     }
 
+    @Test fun sourceChangeKeepsQueryAndFocusAndDropsLateHttpFailureWithoutOfflineLoading() = runTest(dispatcher) {
+        val late = CompletableDeferred<Unit>()
+        val remote = Api().apply { first = {
+            withContext(NonCancellable) { late.await() }
+            throw SearchException(SearchErrorCode.CONNECTION_FAILED)
+        } }
+        val device = Api()
+        val model = model(remote)
+        assertTrue(model.consumeFocusIntent(1))
+        model.query("original"); advanceTimeBy(310); runCurrent()
+        val generation = model.state.value.queryGeneration
+        model.bind(device, true)
+        assertFalse(model.state.value.busy)
+        assertFalse(model.consumeFocusIntent(1))
+        runCurrent()
+        assertEquals(generation, model.state.value.queryGeneration)
+        model.query("latest"); runCurrent()
+        late.complete(Unit); advanceUntilIdle()
+        assertNull(model.state.value.error)
+        assertEquals("latest", model.state.value.items.single().id)
+        assertEquals(listOf("original", "latest"), device.firstRequests.map { it.first })
+        assertEquals(1, remote.firstRequests.size)
+    }
+
     @Test fun mixedServerRankingIsRetainedWithoutTypeBoostsOrNameResorting() = runTest(dispatcher) {
         val ranked = listOf(
             item(MusicKind.ARTIST, "fuzzy-artist", "A romanized match"),

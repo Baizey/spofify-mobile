@@ -30,25 +30,27 @@ import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun MiniPlayer(controller: PlaybackController, loader: ImageLoader, onExpand: () -> Unit, onDevices: () -> Unit) {
-    val state by controller.state.collectAsStateWithLifecycle()
-    val track = state.current
-    val ready = state.connection == PlaybackConnectionState.READY
-    val position = state.snapshot?.state?.position ?: -1
-    val previous = state.queue.getOrNull(position - 1)
-    val next = state.queue.getOrNull(position + 1)
+internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: () -> Unit, onDevices: () -> Unit) {
+    val state = controller.observe()
+    val online = state.online
+    val queue = state.queue
+    val track = queue?.current
+    val ready = state.ready
+    val position = queue?.position ?: -1
+    val previous = queue?.queue?.getOrNull(position - 1)
+    val next = queue?.queue?.getOrNull(position + 1)
     var handoff by remember(controller) { mutableStateOf<MiniHandoff?>(null) }
     val observedHandoff = handoff
     val nowMs = SystemClock.elapsedRealtime()
-    val activeHandoff = retainedMiniHandoff(observedHandoff, state, nowMs)
-    val presented = miniPresentedTrack(state, observedHandoff, nowMs)
+    val activeHandoff = online?.let { retainedMiniHandoff(observedHandoff, it, nowMs) }
+    val presented = online?.let { miniPresentedTrack(it, observedHandoff, nowMs) } ?: track
     SideEffect {
         // Do not let an old composition retire a handoff installed by a newer callback.
         if (handoff === observedHandoff && activeHandoff !== observedHandoff) handoff = activeHandoff
     }
     LifecycleEventEffect(Lifecycle.Event.ON_START) {
         // A sleeping UI's delay may resume late; expired presentation must not return with the app.
-        handoff = retainedMiniHandoff(handoff, controller.state.value, SystemClock.elapsedRealtime())
+        handoff = controller.presentation.online?.let { retainedMiniHandoff(handoff, it, SystemClock.elapsedRealtime()) }
     }
     LaunchedEffect(observedHandoff) {
         if (observedHandoff != null) {
@@ -56,11 +58,11 @@ internal fun MiniPlayer(controller: PlaybackController, loader: ImageLoader, onE
             if (handoff === observedHandoff) handoff = null
         }
     }
-    val previousSelection = miniSwipeSelection(state, -1)
-    val nextSelection = miniSwipeSelection(state, 1)
+    val previousSelection = online?.let { miniSwipeSelection(it, -1) }
+    val nextSelection = online?.let { miniSwipeSelection(it, 1) }
     val requestStep: (MiniSwipeSelection, Int) -> Unit = { captured, step ->
         // Recheck the captured queue version even if a newer WS snapshot has not recomposed us yet.
-        if (captured.isCurrent(controller.state.value)) {
+        if (controller.presentation.online?.let(captured::isCurrent) == true) {
             val startedAt = SystemClock.elapsedRealtime()
             val commandId = if (step < 0) controller.previous() else controller.next()
             if (commandId != null) {
@@ -69,12 +71,21 @@ internal fun MiniPlayer(controller: PlaybackController, loader: ImageLoader, onE
             }
         }
     }
+    fun localSwipe(neighbour: PlaybackTrack?, step: Int): (() -> Unit)? {
+        if (controller !is AppPlayback.Local || neighbour == null) return null
+        return {
+            val latest = controller.presentation.queue
+            if (latest?.current?.key == track?.key && latest?.queue?.getOrNull(position + step)?.key == neighbour.key) {
+                if (step < 0) controller.previous() else controller.next()
+            }
+        }
+    }
     val previousSwipe: (() -> Unit)? = if (activeHandoff == null && previousSelection != null)
-        ({ requestStep(previousSelection, -1) }) else null
+        ({ requestStep(previousSelection, -1) }) else localSwipe(previous, -1)
     val nextSwipe: (() -> Unit)? = if (activeHandoff == null && nextSelection != null)
-        ({ requestStep(nextSelection, 1) }) else null
-    val binding = listOf(controller, miniHandoffSource(state), state.connection, state.snapshot?.stateVersion,
-        activeHandoff?.commandId)
+        ({ requestStep(nextSelection, 1) }) else localSwipe(next, 1)
+    val binding = listOf(controller, online?.let(::miniHandoffSource), online?.connection, online?.snapshot?.stateVersion,
+        activeHandoff?.commandId, track?.key, previous?.key, next?.key)
     var actions by remember(controller) { mutableStateOf(false) }
     LaunchedEffect(binding) { actions = false }
     Surface(color = MaterialTheme.colorScheme.surface) {
@@ -113,8 +124,9 @@ internal fun MiniPlayer(controller: PlaybackController, loader: ImageLoader, onE
                 }
                 PlayerOutputButton(state, onDevices)
                 IconButton({ controller.toggle() }, enabled = ready && track != null, modifier = Modifier.size(48.dp)) {
-                    SpofifyIcon(if (state.desiredPlaying) SpofifyGlyph.Pause else SpofifyGlyph.Play,
-                        if (state.desiredPlaying) "Pause" else "Play")
+                    val wantsPlay = queue?.desiredPlaying == true
+                    SpofifyIcon(if (wantsPlay) SpofifyGlyph.Pause else SpofifyGlyph.Play,
+                        if (wantsPlay) "Pause" else "Play")
                 }
             }
         }
@@ -144,13 +156,15 @@ private fun MiniIdentity(track: PlaybackTrack, loader: ImageLoader, modifier: Mo
 }
 
 @Composable
-internal fun PlayerOutputButton(state: PlaybackView, onClick: () -> Unit) {
-    val selected = state.devices.firstOrNull { it.deviceId == state.snapshot?.selectedDeviceId }
-    val remote = state.isPlaying && selected != null && selected.deviceId != state.deviceId
-    IconButton(onClick, enabled = state.connection == PlaybackConnectionState.READY, modifier = Modifier.size(48.dp)) {
+internal fun PlayerOutputButton(state: PlayerPresentation, onClick: () -> Unit) {
+    val online = (state as? PlayerPresentation.Online)?.view
+    val selected = online?.devices?.firstOrNull { it.deviceId == online.snapshot?.selectedDeviceId }
+    val remote = state.isPlaying && selected != null && selected.deviceId != online.deviceId
+    val output = selected?.name ?: if (state is PlayerPresentation.Local) "this phone" else "no output"
+    IconButton(onClick, enabled = online != null && state.ready, modifier = Modifier.size(48.dp)) {
         Box(contentAlignment = Alignment.Center) {
             SpofifyIcon(SpofifyGlyph.Devices,
-                "Playback devices: ${if (state.isPlaying) "playing" else "paused"} on ${selected?.name ?: "no output"}",
+                "Playback devices: ${if (state.isPlaying) "playing" else "paused"} on $output",
                 tint = if (remote) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
             if (remote) Text("↗", Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp),
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)

@@ -36,6 +36,7 @@ internal fun SettingsScreen(
     identity: AccountIdentity,
     palettes: AccountPaletteController,
     cache: dev.spofify.mobile.playback.AutomaticMusicCache?,
+    modeSetting: @Composable () -> Unit,
     onCache: () -> Unit,
     onAccount: () -> Unit,
     onColours: () -> Unit,
@@ -48,6 +49,7 @@ internal fun SettingsScreen(
         SettingsLink("Account and server", identity.username, onAccount)
         SettingsLink("Account colours", palette?.selected?.name, onColours)
         SettingsGroup("Storage")
+        modeSetting()
         SettingsLink("Automatic music cache", cache?.let { cacheSummary(it.songs.collectAsStateWithLifecycle().value) }, onCache)
         SettingsGroup("About")
         SettingsLink("Credits", null, onCredits)
@@ -67,7 +69,7 @@ internal fun AccountColoursScreen(identity: AccountIdentity, palettes: AccountPa
         Text(identity.username, color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp, bottom = 24.dp))
         state?.notice?.let { SettingsNotice(it) }
-        if (confirmed == null) {
+        if (confirmed == null && state?.online != false) {
             SettingsNotice(if (state?.loading == true) "Loading account colours…"
                 else "Account colours are unavailable. Reload before choosing a palette.")
         }
@@ -117,7 +119,7 @@ internal fun AccountColoursScreen(identity: AccountIdentity, palettes: AccountPa
                 Text("Offline", color = MaterialTheme.colorScheme.tertiary)
             }
         }
-        if (state?.loading != true && state?.saving != true) {
+        if (state?.online == true && !state.loading && !state.saving) {
             if (confirmed == null || state.needsRefresh || state.notice != null) {
                 TextButton(palettes::refresh, contentPadding = PaddingValues(vertical = 12.dp)) { Text("Reload colours") }
             }

@@ -1,6 +1,11 @@
 package dev.spofify.mobile.core.cache
 
+import dev.spofify.mobile.core.offline.OfflineManifest
 import dev.spofify.mobile.core.offline.OfflineMediaDescriptor
+import dev.spofify.mobile.core.offline.PlaylistFiles
+import dev.spofify.mobile.core.offline.trackKeys
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.sync.Mutex
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -25,7 +30,8 @@ data class SongKey(val owner: MusicOwner, val id: String)
 data class StoredSong(val key: SongKey, val title: String, val bytes: Long, val auto: Boolean, val offline: Boolean)
 
 /** Single process owner. Construct on IO; playback falls through while recovery or mutation is busy.
- * The .meta rename commits a verified payload AND its durable references. Reader holds are process-local.
+ * .meta commits verified bytes, AUTO and independent refs. .playlist files alone commit
+ * playlist membership. Reader and download staging holds are process-local.
  */
 class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = { dir.usableSpace }) {
     @Serializable
@@ -34,8 +40,16 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
     private class Entry(val file: File, var row: Row, var last: Long, var readers: Int = 0)
     private val lock = ReentrantLock()
     private val entries = mutableMapOf<SongKey, Entry>()
-    private class Ticket { @Volatile var cleared = false }
+    internal val playlistWriter = Mutex()
+    private val playlists = PlaylistFiles(dir)
+    // Only the writer may stage. AUTO and readers remain independent of that writer.
+    private val staged = mutableSetOf<SongKey>()
+    private class Ticket(val auto: Boolean) {
+        @Volatile var cleared = false
+        val finished = CompletableDeferred<Unit>()
+    }
     private val pending = mutableMapOf<SongKey, Ticket>()
+    private val autoJoining = mutableMapOf<SongKey, Ticket>()
     private val mutable = MutableStateFlow<List<StoredSong>>(emptyList())
     val songs = mutable.asStateFlow()
     private var clock = 0L
@@ -43,42 +57,48 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
     init {
         check(dir.isDirectory || dir.mkdirs())
         val files = dir.listFiles() ?: throw IOException("Music store unavailable")
+        playlists.recover(files)
         files.filter { it.extension == "meta" }.forEach { meta ->
             val file = File(dir, meta.nameWithoutExtension + ".blob")
             // An unreadable store is unavailable, not permission to destroy another reference.
             val row = Json.decodeFromString<Row>(meta.readText())
             val valid = file.isFile && file.length() == row.size && file.inputStream().use { digest(it) == row.sha }
-            if (valid && (row.auto || row.refs.isNotEmpty())) {
+            if (valid && (row.auto || offline(row))) {
                 check(row.key !in entries)
                 entries[row.key] = Entry(file, row, file.lastModified())
                 clock = maxOf(clock, file.lastModified())
-            } else if (row.refs.isEmpty()) {
+            } else if (!offline(row)) {
+                playlists.beforeReclaim()
                 Files.deleteIfExists(meta.toPath()); Files.deleteIfExists(file.toPath())
             } else throw IOException("Referenced media unavailable")
         }
+        if (!entries.keys.containsAll(playlists.required)) throw IOException("Incomplete saved playlist")
         val live = entries.values.mapTo(hashSetOf()) { it.file }
         files.filter { it.extension == "tmp" || it.extension == "blob" && it !in live }.forEach { Files.deleteIfExists(it.toPath()) }
         refresh()
     }
 
     private fun refresh() {
-        mutable.value = entries.values.map { entry ->
+        mutable.value = entries.values.mapNotNull { entry ->
             val row = entry.row
-            StoredSong(row.key, row.title, row.size, row.auto, row.refs.isNotEmpty())
+            if (!row.auto && !offline(row) && entry.readers == 0) null
+            else StoredSong(row.key, row.title, row.size, row.auto, offline(row))
         }
     }
-    fun hasOfflineReference(key: SongKey) = lock.withLock { entries[key]?.row?.refs?.isNotEmpty() == true }
+    private fun offline(row: Row) = row.refs.isNotEmpty() || row.key in playlists.required
+    fun hasOfflineReference(key: SongKey) = lock.withLock { entries[key]?.row?.let(::offline) == true }
     private fun meta(file: File) = File(dir, file.nameWithoutExtension + ".meta")
     private fun save(entry: Entry, row: Row) {
         val tmp = File.createTempFile("ref", ".tmp", dir)
         try {
-            tmp.writeText(Json.encodeToString(row))
+            tmp.outputStream().use { it.write(Json.encodeToString(row).toByteArray()); it.fd.sync() }
             Files.move(tmp.toPath(), meta(entry.file).toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
             entry.row = row
         } finally { tmp.delete() }
     }
     private fun releaseUnused(entry: Entry) {
-        if (entry.readers != 0 || entry.row.auto || entry.row.refs.isNotEmpty()) return
+        if (entry.readers != 0 || entry.row.auto || offline(entry.row) || entry.row.key in staged) return
+        playlists.beforeReclaim()
         Files.deleteIfExists(entry.file.toPath()); Files.deleteIfExists(meta(entry.file).toPath())
         entries.remove(entry.row.key)
     }
@@ -93,14 +113,14 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
         if (!lock.tryLock()) return null
         try {
             val entry = entries[key] ?: return null
-            if (!current() || (!entry.row.auto && entry.row.refs.isEmpty()) ||
+            if (!current() || (!entry.row.auto && !offline(entry.row)) ||
                 entry.file.length() != entry.row.size) return null
             touch(entry)
             entry.readers++
             return PinnedSong(entry.file, entry.row.size, current) {
                 lock.withLock {
                     entry.readers--
-                    if (!entry.row.auto && entry.row.refs.isEmpty()) {
+                    if (!entry.row.auto && !offline(entry.row)) {
                         try { releaseUnused(entry) } catch (_: IOException) { /* Retry orphan cleanup at reopen. */ }
                         refresh()
                     }
@@ -113,13 +133,14 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
     fun clearAuto(owner: MusicOwner, id: String? = null) = lock.withLock {
         fun matches(key: SongKey) = key.owner == owner && (id == null || key.id == id)
         pending.forEach { (key, ticket) -> if (matches(key)) ticket.cleared = true }
+        autoJoining.forEach { (key, ticket) -> if (matches(key)) ticket.cleared = true }
         try { entries.values.filter { matches(it.row.key) && it.row.auto }.forEach(::removeAuto) } finally { refresh() }
     }
     private fun removeAuto(entry: Entry) {
         save(entry, entry.row.copy(auto = false)); releaseUnused(entry)
     }
 
-    /** Independent durable holders, e.g. two collections sharing a song. No offline producer here. */
+    /** Independent durable holders; saved playlists do not duplicate their membership here. */
     fun offlineReference(key: SongKey, reference: String, retain: Boolean, cap: Int) = lock.withLock {
         require(reference.isNotBlank() && cap in CacheOptions.caps)
         val entry = entries[key] ?: return@withLock false
@@ -133,25 +154,92 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
         trim(owner, cap, priority); refresh()
     }
     private fun trim(owner: MusicOwner, cap: Int, priority: List<String>) {
-        val budget = entries.values.filter { it.row.key.owner == owner && it.row.auto && it.row.refs.isEmpty() }
+        val budget = entries.values.filter { it.row.key.owner == owner && it.row.auto && !offline(it.row) }
         if (budget.size <= cap) return
         budget.sortedWith(compareBy<Entry> { priority.indexOf(it.row.key.id).let { i -> if (i < 0) Int.MIN_VALUE else -i } }
             .thenBy { it.last }).take(budget.size - cap).forEach(::removeAuto)
     }
 
+    internal fun complete(owner: MusicOwner) = lock.withLock { playlists.complete(owner) }
+    internal fun select(owner: MusicOwner, id: String) = lock.withLock { playlists.select(owner, id) }
+
+    private fun reclaim(keys: Set<SongKey>) {
+        for (key in keys) try { entries[key]?.let(::releaseUnused) }
+        catch (_: IOException) { /* No durable hold; reopen reaps garbage after failed unlink. */ }
+    }
+    internal fun finishStage() = lock.withLock {
+        val held = staged.toSet()
+        staged.clear()
+        reclaim(held)
+    }
+    private fun afterCommit(owner: MusicOwner, cap: Int, old: Set<SongKey>) {
+        try { playlists.beforeReclaim() } catch (_: IOException) { /* Retried before any actual unlink. */ }
+        reclaim(old)
+        // Commit has succeeded. A failure trimming AUTO is not a failed playlist replacement.
+        try { trim(owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
+        refresh()
+    }
+    internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
+        val keys = trackKeys(owner, manifest)
+        check(staged == keys && keys.all { entries.getValue(it).let { e -> e.file.length() == e.row.size } })
+        afterCommit(owner, cap, playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, checkCurrent))
+    }
+    internal fun remove(owner: MusicOwner, id: String, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
+        checkCurrent()
+        val old = playlists.remove(owner, id) ?: return@withLock false
+        afterCommit(owner, cap, old)
+        true
+    }
+
     /** Network and digest never hold the index lock. The ticket also fences clear during descriptor lookup. */
     suspend fun fill(key: SongKey, title: String, cap: Int, priority: List<String>, current: () -> Boolean,
-        prepare: suspend () -> OfflineMediaDescriptor, download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) {
+        prepare: suspend () -> OfflineMediaDescriptor, download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
+        fillShared(key, title, cap, priority, true, current, prepare, download)
+
+    internal suspend fun stage(key: SongKey, title: String, cap: Int, current: () -> Boolean,
+        prepare: suspend () -> OfflineMediaDescriptor, download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
+        fillShared(key, title, cap, emptyList(), false, current, prepare, download)
+
+    private suspend fun fillShared(key: SongKey, title: String, cap: Int, priority: List<String>, auto: Boolean,
+        current: () -> Boolean, prepare: suspend () -> OfflineMediaDescriptor,
+        download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) {
         require(cap in CacheOptions.caps)
-        val ticket = Ticket()
-        fun live() = !ticket.cleared && current()
-        lock.withLock {
-            if (!current() || key in pending) return
-            entries[key]?.let {
-                if (!it.row.auto) { save(it, it.row.copy(auto = true)); trim(key.owner, cap, priority); refresh() }
+        val ticket = Ticket(auto)
+        fun live() = (!auto || !ticket.cleared) && current()
+        var joined = false
+        while (true) {
+            val existing = lock.withLock {
+                if (!current()) return
+                entries[key]?.let {
+                    if (it.file.length() != it.row.size) throw IOException("Verified media unavailable")
+                    if (!auto) staged.add(key)
+                    else if (!it.row.auto) { save(it, it.row.copy(auto = true)); trim(key.owner, cap, priority); refresh() }
+                    return
+                }
+                pending[key].also {
+                    if (it == null) pending[key] = ticket
+                    else if (auto) {
+                        if (it.auto || key in autoJoining) return // Existing duplicate AUTO behavior.
+                        autoJoining[key] = ticket
+                    }
+                }
+            } ?: break
+            if (auto) {
+                // Hold our own clear fence until adoption, including after the network ticket retires.
+                try {
+                    existing.finished.await()
+                    lock.withLock {
+                        val entry = entries[key]
+                        if (live() && entry != null && !entry.row.auto) {
+                            save(entry, entry.row.copy(auto = true)); trim(key.owner, cap, priority); refresh()
+                        }
+                    }
+                } finally { lock.withLock { autoJoining.remove(key, ticket) } }
                 return
             }
-            pending[key] = ticket
+            if (joined) throw IOException("Concurrent fill superseded")
+            existing.finished.await()
+            joined = true
         }
         var stage: File? = null
         try {
@@ -181,7 +269,7 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
                 // Linearization point: session/window cancellation before admission cannot publish;
                 // clears after admission serialize here and release AUTO before returning.
                 if (!live()) return
-                val row = Row(key, title, media.byteLength, media.sha256)
+                val row = Row(key, title, media.byteLength, media.sha256, auto = auto)
                 val entry = Entry(File(dir, "${UUID.randomUUID()}.blob"), row, 0)
                 Files.move(tmp.toPath(), entry.file.toPath(), ATOMIC_MOVE)
                 try { save(entry, row) } catch (e: Exception) { entry.file.delete(); throw e }
@@ -190,9 +278,14 @@ class MusicBlobStore(private val dir: File, private val freeBytes: () -> Long = 
                     return
                 }
                 touch(entry); entries[key] = entry
-                try { trim(key.owner, cap, priority) } finally { refresh() }
+                if (!auto) staged.add(key)
+                else try { trim(key.owner, cap, priority) } finally { refresh() }
             }
-        } finally { stage?.delete(); lock.withLock { pending.remove(key, ticket) } }
+        } finally {
+            stage?.delete()
+            lock.withLock { pending.remove(key, ticket) }
+            ticket.finished.complete(Unit)
+        }
     }
 
     private companion object {

@@ -12,7 +12,7 @@ class TrackRowActionsTest {
         val tap = {
             activateTrackRow("track", true, play = {
                 attempts += it
-                if (ready) "sent-id" else null
+                ready
             }, openDetails = { fail("A playable track tap is not metadata navigation") }, notice = { notices += it })
         }
         tap()
@@ -28,7 +28,7 @@ class TrackRowActionsTest {
     @Test fun unavailableTrackOpensDetailsOnlyWhenMetadataExists() {
         var detailOpens = 0
         val notices = mutableListOf<String?>()
-        val play: (PlaybackTrackReference) -> String? = { error("Unavailable track must not be sent") }
+        val play: (PlaybackTrackReference) -> Boolean? = { error("Unavailable track must not be sent") }
         activateTrackRow("track", false, play, openDetails = { detailOpens++ }, notice = { notices += it })
         assertEquals(1, detailOpens)
         assertTrue(notices.isEmpty())

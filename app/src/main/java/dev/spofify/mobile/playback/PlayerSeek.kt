@@ -18,26 +18,21 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.spofify.mobile.core.content.TrackWaveform
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackView
 import dev.spofify.mobile.feature.library.duration
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun PlaybackSeek(state: PlaybackView, content: TrackContentState, onSeek: (Double) -> Unit) {
-    val actual = state.playback?.takeIf { it.hasReportedPlayback }
-    val seconds = actual?.elapsed ?: 0.0
-    val total = actual?.duration ?: 0.0
+internal fun PlaybackSeek(state: PlayerPresentation, binding: String, content: TrackContentState, onSeek: (Double) -> Unit) {
+    val seconds = state.elapsed
+    val total = state.duration
     val waveform = content.waveformForDuration(total)
-    val binding = listOf(state.current?.key, state.snapshot?.state?.occurrence?.eventId,
-        state.snapshot?.outputVersion, state.snapshot?.selectedDeviceId)
     key(binding) {
         var preview by remember { mutableStateOf<Float?>(null) }
         var focused by remember { mutableStateOf(false) }
         val value = (preview ?: seconds.toFloat()).coerceIn(0f, total.toFloat().coerceAtLeast(1f))
-        val enabled = state.connection == PlaybackConnectionState.READY && total > 0
+        val enabled = state.ready && total > 0
         val active = MaterialTheme.colorScheme.primary
         val inactive = MaterialTheme.colorScheme.onSurfaceVariant
         Column(Modifier.fillMaxWidth()) {

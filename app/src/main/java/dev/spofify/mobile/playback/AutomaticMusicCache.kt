@@ -20,9 +20,11 @@ import kotlinx.coroutines.flow.*
 /** App lifetime, shared even when the same account authenticates again before an old reader closes. */
 internal class MusicStorage(app: Application, private val scope: CoroutineScope) {
     val ready = MutableStateFlow<MusicBlobStore?>(null)
+    val initialized = CompletableDeferred<MusicBlobStore?>()
     fun release(pin: PinnedSong) { scope.launch(Dispatchers.IO) { pin.close() } }
     init { scope.launch(Dispatchers.IO) {
         ready.value = try { MusicBlobStore(File(app.noBackupFilesDir, "music-blobs")) } catch (_: Exception) { null }
+        initialized.complete(ready.value)
     } }
 }
 
@@ -67,17 +69,26 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
     private var lastQueue: dev.spofify.mobile.core.playback.PlaybackQueueState? = null
     private var window: CacheWindow? = null
     private var playing = false
-    private var link: CacheNetwork? = null
+    val link = MutableStateFlow<CacheNetwork?>(null)
     private val suppression = ClearSuppression()
     private var clearing = 0
     private val plan = MutableStateFlow(PrefetchPlan(options.value.cap, null, null, emptyList()))
 
     init {
-        scope.launch { network(app).collect { link = it; update() } }
-        scope.launch(Dispatchers.IO) {
-            val store = storage.ready.filterNotNull().first()
-            prefetchMusic(plan, owner, store, { sessions.isCurrent(identity) }, SystemClock::elapsedRealtime,
-                api::prepareMedia) { media -> sessions.versionedAudio(identity, media) }
+        scope.launch {
+            sessions.onlineGrant.collectLatest { grant ->
+                if (grant?.identity != identity) return@collectLatest
+                try {
+                    sessions.withOnlineGrant(grant) {
+                        launch(Dispatchers.IO) {
+                            val store = storage.initialized.await() ?: return@launch
+                            prefetchMusic(plan, owner, store, { sessions.onlineGrant.value === grant }, SystemClock::elapsedRealtime,
+                                api::prepareMedia) { media -> sessions.versionedAudio(identity, media) }
+                        }
+                        network(app).collect { link.value = it; update() }
+                    }
+                } finally { playing = false; link.value = null; update() }
+            }
         }
     }
 
@@ -98,7 +109,7 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
     }
     private fun update() {
         val old = plan.value
-        val next = window.plan(options.value, link, playing && clearing == 0, suppression)
+        val next = window.plan(options.value, link.value, playing && clearing == 0, suppression)
         if (old.copy(generation = 0) != next) plan.value = next.copy(generation = old.generation + 1)
     }
     fun configure(value: CacheOptions) {
@@ -117,5 +128,7 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
             finally { clearing--; update() }
         }
     }
-    fun sourceChoice() = MusicSourceChoice({ id -> storage.ready.value?.pin(SongKey(owner, id)) { sessions.isCurrent(identity) } }, storage::release)
+    fun sourceChoice(allowed: () -> Boolean = { true }) = MusicSourceChoice({ id ->
+        storage.ready.value?.pin(SongKey(owner, id)) { allowed() && sessions.isCurrent(identity) }
+    }, storage::release)
 }

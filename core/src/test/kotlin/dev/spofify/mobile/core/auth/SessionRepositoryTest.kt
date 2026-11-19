@@ -80,10 +80,79 @@ class SessionRepositoryTest {
         override fun cancel() = Unit // Deliberately uncooperative to test publication fences.
     }
 
-    private fun TestScope.repository(sessions: Sessions, logins: Logins, vararg api: Api): SessionRepository {
+    private class Policy(var offline: Boolean = false) : ManualOfflineStore {
+        var unreadable = false
+        var unwritable = false
+        override fun read(): Boolean { if (unreadable) throw IOException(); return offline }
+        override fun write(enabled: Boolean) { if (unwritable) throw IOException(); offline = enabled }
+    }
+    private fun TestScope.repository(sessions: Sessions, logins: Logins, vararg api: Api, policy: Policy? = null): SessionRepository {
         val queue = ArrayDeque(api.toList())
         return SessionRepository(sessions, logins, AuthApiFactory { queue.removeFirst() },
-            this, StandardTestDispatcher(testScheduler))
+            this, StandardTestDispatcher(testScheduler), policy)
+    }
+
+    @Test fun modeEntryJoinsUncooperativeAuthAndDiscardsLate401OrRenewal() = runTest {
+        for (unauthorized in listOf(true, false)) {
+            val original = stored(cookie = "spofify_session=old; Path=/; HttpOnly")
+            val sessions = Sessions(original)
+            val old = Api().apply {
+                sessionGate = CompletableDeferred()
+                if (unauthorized) sessionError = AuthFailure(AuthFailure.Kind.UNAUTHORIZED)
+                else sessionReply = AuthReply(summary(), "stale-cookie", "rolling-v1")
+            }
+            val repo = repository(sessions, Logins(), old, policy = Policy())
+            repo.start(); runCurrent()
+            val entering = launch { repo.setManualOffline(true) }
+            runCurrent(); assertTrue(repo.manualOffline.value); assertFalse(entering.isCompleted)
+            old.sessionGate!!.complete(Unit); advanceUntilIdle(); assertTrue(entering.isCompleted)
+            assertTrue(repo.state.value is AuthState.Authenticated); assertNull(repo.onlineGrant.value)
+            assertSame(original, sessions.record); assertTrue(sessions.writes.isEmpty())
+        }
+    }
+
+    @Test fun policyFailuresDoNotFallbackToNetworkOrAdvertiseUndurableSwitch() = runTest {
+        val policy = Policy(true).apply { unreadable = true }
+        val repo = repository(Sessions(stored(cookie = "spofify_session=x; Path=/; HttpOnly")), Logins(), policy = policy)
+        repo.start(); advanceUntilIdle(); repo.signIn(origin.value, "user", "no"); repo.refresh()
+        assertEquals(AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE), repo.state.value)
+        policy.unreadable = false; repo.retry(); advanceUntilIdle()
+        val id = (repo.state.value as AuthState.Authenticated).identity
+        policy.unwritable = true
+        assertTrue(runCatching { repo.setManualOffline(false) }.exceptionOrNull() is IOException)
+        assertTrue(repo.manualOffline.value); assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
+    }
+
+    @Test fun returnValidationRetainsLocalIdentityWithoutGrantButCurrent401PurgesIt() = runTest {
+        val sessions = Sessions(stored(cookie = "spofify_session=x; Path=/; HttpOnly"))
+        val unavailable = Api().apply { sessionError = AuthFailure(AuthFailure.Kind.UNAVAILABLE) }
+        val revoked = Api().apply { sessionGate = CompletableDeferred(); sessionError = AuthFailure(AuthFailure.Kind.UNAUTHORIZED) }
+        val policy = Policy(true)
+        val repo = repository(sessions, Logins(), unavailable, revoked, policy = policy)
+        repo.start(); advanceUntilIdle(); val id = (repo.state.value as AuthState.Authenticated).identity
+        repo.setManualOffline(false); advanceUntilIdle()
+        assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
+        assertEquals(AuthNotice.CONNECTION_FAILED, (repo.state.value as AuthState.Authenticated).notice)
+        repo.retry(); runCurrent(); assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
+        revoked.sessionGate!!.complete(Unit); advanceUntilIdle()
+        assertFalse(repo.isCurrent(id)); assertNull(sessions.record)
+        assertEquals(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED), repo.state.value)
+        repo.setManualOffline(true); advanceUntilIdle(); assertFalse(repo.isCurrent(id))
+        val restarted = repository(sessions, Logins(), policy = policy)
+        restarted.start(); advanceUntilIdle(); assertEquals(AuthState.SignedOut(), restarted.state.value)
+    }
+
+    @Test fun handoffTimeoutCannotPreventRetirementAndModeEntryCancelsPendingLogout() = runTest {
+        val policy = Policy()
+        val sessions = Sessions(stored(cookie = "spofify_session=x; Path=/; HttpOnly"))
+        val logout = Api().apply { logoutGate = CompletableDeferred() }
+        val repo = repository(sessions, Logins(), Api(), Api(), logout, policy = policy)
+        repo.start(); advanceUntilIdle(); val id = (repo.state.value as AuthState.Authenticated).identity
+        repo.setManualOffline(true) { awaitCancellation() }
+        assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
+        repo.setManualOffline(false); advanceUntilIdle(); repo.signOut(); runCurrent()
+        assertNotNull(logout.logoutCookie); assertNull(sessions.record)
+        repo.setManualOffline(true); advanceUntilIdle(); assertEquals(AuthState.SignedOut(), repo.state.value)
     }
 
     @Test fun restore200ValidatesBeforeGrantingAndKeepsLogicalIdentityOnRenewal() = runTest {

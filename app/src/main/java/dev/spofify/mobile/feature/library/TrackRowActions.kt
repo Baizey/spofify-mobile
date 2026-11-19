@@ -6,12 +6,12 @@ import dev.spofify.mobile.core.playback.PlaybackTrackReference
 internal fun activateTrackRow(
     id: String,
     hasAudio: Boolean,
-    play: (PlaybackTrackReference) -> String?,
+    play: (PlaybackTrackReference) -> Boolean?,
     openDetails: (() -> Unit)?,
     notice: (String?) -> Unit,
 ) {
     when {
-        hasAudio -> notice(if (play(PlaybackTrackReference(id)) == null) "Playback action wasn't sent." else null)
+        hasAudio -> notice(if (play(PlaybackTrackReference(id)) != true) "Playback action wasn't sent." else null)
         openDetails != null -> openDetails()
         else -> notice("Track unavailable.")
     }

@@ -67,7 +67,7 @@ internal class DetailViewModel(
 
     private fun load(offset: Int) {
         if (request?.isActive == true) return
-        mutable.value = mutable.value.copy(loading = true, failed = false)
+        mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.core.offline.LocalMusicCatalog, failed = false)
         retryOffset = offset
         request = viewModelScope.launch {
             try {
@@ -104,7 +104,7 @@ internal class DetailViewModel(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                mutable.value = mutable.value.copy(loading = false, failed = true)
+                mutable.value = mutable.value.copy(loading = false, failed = api !is dev.spofify.mobile.core.offline.LocalMusicCatalog)
             } finally {
                 mutable.value = mutable.value.copy(loading = false)
             }

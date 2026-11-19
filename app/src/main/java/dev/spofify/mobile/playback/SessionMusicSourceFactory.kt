@@ -25,15 +25,17 @@ internal class SessionMusicSourceFactory(private val sessions: SessionRepository
     override fun setLoadErrorHandlingPolicy(policy: LoadErrorHandlingPolicy) = apply { loadPolicy = policy }
 
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
-        var choice = cache.sourceChoice()
-        val factory = ProgressiveMediaSource.Factory(DataSource.Factory { SessionAudioDataSource(sessions, identity, choice, currentSource) })
+        val grant = sessions.onlineGrant.value?.takeIf { it.identity == identity }
+        val allowed = { grant != null && sessions.onlineGrant.value === grant }
+        var choice = cache.sourceChoice(allowed)
+        val factory = ProgressiveMediaSource.Factory(DataSource.Factory { SessionAudioDataSource(sessions, grant, choice, currentSource) })
         drm?.let(factory::setDrmSessionManagerProvider)
         loadPolicy?.let(factory::setLoadErrorHandlingPolicy)
         return object : WrappingMediaSource(factory.createMediaSource(mediaItem)) {
             override fun releaseSourceInternal() {
                 try { super.releaseSourceInternal() } finally {
                     choice.close() // Old DataSources remain fenced even if this source is prepared again.
-                    choice = cache.sourceChoice()
+                    choice = cache.sourceChoice(allowed)
                 }
             }
         }

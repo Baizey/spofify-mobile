@@ -5,6 +5,9 @@ import dev.spofify.mobile.core.playback.PlaybackConnection
 
 /** Internal, session-owned transport. Credentials never become feature or UI state. */
 internal interface FeatureTransport {
+    /** After authority retirement and Call.cancel(), finish transferred bodies off the authority monitor. */
+    fun closeRetiredStreams() {}
+
     suspend fun get(
         segments: List<String>,
         query: List<Pair<String, String>>,

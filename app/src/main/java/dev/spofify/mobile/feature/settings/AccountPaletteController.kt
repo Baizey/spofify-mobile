@@ -2,6 +2,8 @@ package dev.spofify.mobile.feature.settings
 
 import dev.spofify.mobile.core.auth.AccountIdentity
 import dev.spofify.mobile.core.auth.AuthState
+import dev.spofify.mobile.core.auth.OnlineGrant
+import kotlinx.coroutines.flow.combine
 import dev.spofify.mobile.core.palette.AccountPalette
 import dev.spofify.mobile.core.palette.PaletteApi
 import dev.spofify.mobile.core.palette.PaletteId
@@ -22,6 +24,7 @@ internal data class AccountPaletteState(
     val draft: PaletteId? = null,
     val loading: Boolean = false,
     val saving: Boolean = false,
+    val online: Boolean = true,
     val needsRefresh: Boolean = false,
     val notice: String? = null,
 )
@@ -31,11 +34,13 @@ internal class AccountPaletteController(
     private val auth: StateFlow<AuthState>,
     private val apiFactory: (AccountIdentity) -> PaletteApi,
     private val scope: CoroutineScope,
+    private val grants: StateFlow<OnlineGrant?>? = null,
 ) {
     private val mutable = MutableStateFlow(AccountPaletteState())
     val state = mutable.asStateFlow()
     private var started = false
     private var generation = 0L
+    private var bound: OnlineGrant? = null
     private var operation: Job? = null
     private var api: PaletteApi? = null
 
@@ -43,7 +48,8 @@ internal class AccountPaletteController(
         if (started || !scope.isActive) return
         started = true
         scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            auth.collect { synchronizeOwner() }
+            if (grants == null) auth.collect { synchronizeOwner() }
+            else combine(auth, grants) { _, _ -> Unit }.collect { synchronizeOwner() }
         }
     }
 
@@ -52,7 +58,7 @@ internal class AccountPaletteController(
         synchronizeOwner()
         val current = mutable.value
         val owner = current.owner ?: return
-        if (current.saving || current.loading || !scope.isActive) return
+        if (!current.online || current.saving || current.loading || !scope.isActive) return
         val client = clientForOwner(owner) ?: return
         read(owner, client)
     }
@@ -90,13 +96,17 @@ internal class AccountPaletteController(
     private fun synchronizeOwner() {
         if (!scope.isActive) return
         val owner = (auth.value as? AuthState.Authenticated)?.identity
-        if (owner == mutable.value.owner) return
+        val grant = grants?.value?.takeIf { it.identity == owner }
+        if (owner == mutable.value.owner && bound === grant) return
+        bound = grant
         generation++
         operation?.cancel()
         operation = null
         api = null
-        mutable.value = AccountPaletteState(owner = owner, needsRefresh = owner != null)
-        if (owner == null) return
+        val online = grants == null || grant != null
+        val confirmed = mutable.value.takeIf { it.owner == owner }?.confirmed
+        mutable.value = AccountPaletteState(owner = owner, confirmed = confirmed, needsRefresh = owner != null, online = online)
+        if (owner == null || !online) return
         val client = clientForOwner(owner) ?: return
         read(owner, client)
     }
@@ -148,6 +158,6 @@ internal class AccountPaletteController(
     }
 
     private fun isCurrent(owner: AccountIdentity, token: Long): Boolean = scope.isActive &&
-        token == generation && mutable.value.owner == owner &&
+        token == generation && (grants == null || bound != null && grants.value === bound) && mutable.value.owner == owner &&
         (auth.value as? AuthState.Authenticated)?.identity == owner
 }

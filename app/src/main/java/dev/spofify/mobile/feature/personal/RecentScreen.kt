@@ -16,9 +16,8 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.PersonalHistoryEntry
-import dev.spofify.mobile.core.personal.PersonalLibraryClient
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackController
+import dev.spofify.mobile.core.personal.PersonalLibraryApi
+import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.core.playback.PlaybackTrackReference
 import dev.spofify.mobile.feature.library.MusicRowGeometry
 import dev.spofify.mobile.feature.library.PageTitle
@@ -27,25 +26,25 @@ import dev.spofify.mobile.feature.library.activateTrackRow
 /** History's Recent list: persisted occurrences, latest first. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RecentScreen(
-    api: PersonalLibraryClient,
+internal fun RecentScreen(
+    api: PersonalLibraryApi,
     loader: ImageLoader,
-    playback: PlaybackController?,
+    playback: AppPlayback?,
     onNavigate: (MusicKind, String) -> Unit,
 ) {
     val owner = requireNotNull(LocalViewModelStoreOwner.current)
     val model: RecentViewModel = viewModel(owner, key = "recent-${System.identityHashCode(api)}",
         factory = viewModelFactory { initializer { RecentViewModel(api) } })
     val state by model.state.collectAsStateWithLifecycle()
-    val player = playback?.state?.collectAsStateWithLifecycle()?.value
-    val ready = player?.connection == PlaybackConnectionState.READY
+    val player = playback?.observe()
+    val ready = player?.ready == true
     var menu by remember(model) { mutableStateOf<PersonalHistoryEntry?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
-    val send: (() -> String?) -> Unit = { action -> actionError = if (action() == null) "Playback action wasn't sent." else null }
+    val send: (() -> Boolean?) -> Unit = { action -> actionError = if (action() != true) "Playback action wasn't sent." else null }
     val play: (PersonalHistoryEntry) -> Unit = { entry ->
         activateTrackRow(entry.track.id, entry.track.hasAudio,
             play = { playback?.playTrack(it) },
-            openDetails = if (entry.metadataMissing) null else ({ onNavigate(MusicKind.TRACK, entry.track.id) }),
+            openDetails = if (entry.metadataMissing || api is dev.spofify.mobile.playback.DevicePersonalLibrary && !entry.track.hasAudio) null else ({ onNavigate(MusicKind.TRACK, entry.track.id) }),
             notice = { actionError = it })
     }
     val queue: (PersonalHistoryEntry) -> Unit = { entry ->
@@ -72,7 +71,7 @@ fun RecentScreen(
                 items(state.items.orEmpty(), key = { "event:${it.origin.orEmpty()}:${it.id}" }) { entry ->
                     PersonalSongRow(entry.track, loader, onPlay = { play(entry) }, onMore = { menu = entry },
                         onQueue = if (ready && entry.track.hasAudio) ({ queue(entry) }) else null,
-                        gestureBinding = personalGestureBinding(entry, null, player))
+                        gestureBinding = playback to personalGestureBinding(entry, null, player?.online))
                 }
             }
         }

@@ -14,8 +14,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
-import dev.spofify.mobile.core.personal.PersonalLibraryClient
+import dev.spofify.mobile.core.personal.PersonalLibraryApi
+import dev.spofify.mobile.playback.DevicePersonalLibrary
 import dev.spofify.mobile.core.playback.*
+import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.personal.AddTrackToPlaylistSheet
 import java.util.Locale
@@ -25,15 +27,14 @@ internal data class MusicActionSelection(val item: MusicItem, val context: Playb
 @Composable
 internal fun MusicActionsSheet(
     selection: MusicActionSelection,
-    controller: PlaybackController?,
-    personal: PersonalLibraryClient,
+    controller: AppPlayback?,
+    personal: PersonalLibraryApi,
     loader: ImageLoader,
     onNavigate: (MusicKind, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val item = selection.item
-    val player = controller?.state?.collectAsStateWithLifecycle()?.value
-    val ready = player?.connection == PlaybackConnectionState.READY
+    val ready = controller?.observe()?.ready == true
     val playable = ready && if (item.kind == MusicKind.TRACK) item.hasAudio else item.availableTracks > 0
     val collection = selection.context ?: item.takeIf { it.kind != MusicKind.TRACK }?.let {
         PlaybackContext(it.kind.name.lowercase(Locale.ROOT), it.id, it.name)
@@ -70,7 +71,7 @@ internal fun MusicActionsSheet(
             }
             if (item.kind == MusicKind.TRACK) {
                 SheetGroup("Library")
-                SheetAction("Add to playlist", SpofifyGlyph.Plus, item.hasAudio) { adding = true }
+                SheetAction("Add to playlist", SpofifyGlyph.Plus, personal !is DevicePersonalLibrary && item.hasAudio) { adding = true }
                 val navigableArtists = item.artists.filter { it.id.isNotBlank() }
                 if (navigableArtists.isNotEmpty() || item.albumId.isNotBlank()) SheetGroup("Go to")
                 navigableArtists.forEach { artist ->

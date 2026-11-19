@@ -58,16 +58,18 @@ internal fun MusicRoot(
     val context = LocalContext.current
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
-    val api = remember(identity, sessions) { LibraryClient(sessions, identity) }
-    val searchApi = remember(identity, sessions) { SearchClient(sessions, identity) }
-    val personal = remember(identity, sessions) { PersonalLibraryClient(sessions, identity) }
-    val trackContent = remember(identity, sessions) { TrackContentClient(sessions, identity) }
-    val loader = remember(api) { artworkLoader(context.applicationContext, api) }
-    DisposableEffect(loader) { onDispose { loader.shutdown() } }
     val native by playbackOwner.state.collectAsStateWithLifecycle()
-    val player = native?.takeIf { it.identity == identity }
+    val player = native?.takeIf { it.identity == identity } ?: return
+    val source by player.music.sources.collectAsStateWithLifecycle()
+    val loader = remember(source) { artworkLoader(context.applicationContext, source.library, source.local) }
+    val stores = remember(source) { SourceModels() }
+    DisposableEffect(loader, stores) { onDispose { stores.retire(); loader.shutdown() } }
+    val currentStores by rememberUpdatedState(stores)
+    val currentSource by rememberUpdatedState(source)
+    val currentLoader by rememberUpdatedState(loader)
     val currentPlayer = rememberUpdatedState(player)
-    val currentController = rememberUpdatedState(player?.controller)
+    val target = player.target.collectAsStateWithLifecycle().value
+    val currentController = rememberUpdatedState(target)
     val navigation = rememberNavController()
     val currentAccount = rememberUpdatedState(account)
     var tab by rememberSaveable { mutableStateOf(MusicTab.HISTORY) }
@@ -99,12 +101,12 @@ internal fun MusicRoot(
             actions = MusicActionSelection(item, collection)
         }
     }
-    val open: (MusicItem) -> Unit = remember(navigate, focus, keyboard) {
+    val open: (MusicItem) -> Unit = remember(navigate, focus, keyboard, target) {
         { item ->
             focus.clearFocus()
             keyboard?.hide()
             if (item.kind == MusicKind.TRACK) activateTrackRow(item.id, item.hasAudio,
-                play = { currentController.value?.playTrack(it) },
+                play = { target?.playTrack(it) },
                 openDetails = { navigate(item.kind, item.id) },
                 notice = { text -> rowPlaybackNotice = text?.let { message ->
                     navigation.currentBackStackEntry?.id?.let { it to message }
@@ -113,60 +115,66 @@ internal fun MusicRoot(
         }
     }
     // The graph and its models must not be replaced by playback ticks or IME recomposition.
-    val graph: NavGraphBuilder.() -> Unit = remember(navigation, api, searchApi, personal, loader, open, navigate, openActions, palettes) {
+    val currentOpen by rememberUpdatedState(open)
+    val graph: NavGraphBuilder.() -> Unit = remember(navigation, navigate, openActions, palettes) {
         {
-            composable("history") { RecentScreen(personal, loader, currentController.value, navigate) }
+            composable("history") { currentStores.Content {
+                RecentScreen(currentSource.personal, currentLoader, currentController.value, navigate)
+            } }
             composable("search") { owner ->
-                val model: SearchViewModel = viewModel(owner, factory = viewModelFactory { initializer { SearchViewModel(searchApi) } })
-                SearchScreen(model, loader, currentFocusIntent.value, open, currentController.value,
+                val api = currentSource.search
+                val model: SearchViewModel = viewModel(owner, factory = viewModelFactory { initializer { SearchViewModel(api) } })
+                model.bind(api, currentSource.local)
+                SearchScreen(model, currentLoader, currentFocusIntent.value, currentOpen, currentController.value,
                     onMore = { openActions(it, null) })
             }
-            composable("playlists") {
-                PlaylistsScreen(personal, loader, currentController.value,
+            composable("playlists") { currentStores.Content {
+                PlaylistsScreen(currentSource.personal, currentLoader, currentController.value, currentPlayer.value.music,
                     { id -> navigation.navigate("playlist/${Uri.encode(id)}") }, navigate)
-            }
+            } }
             composable("playlist/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { owner ->
-                PlaylistDetailScreen(personal, requireNotNull(owner.arguments?.getString("id")), loader,
-                    currentController.value, { navigation.popBackStack() }, navigate)
+                currentStores.Content {
+                    PlaylistDetailScreen(currentSource.personal, requireNotNull(owner.arguments?.getString("id")), currentLoader,
+                        currentController.value, currentPlayer.value.music, { navigation.popBackStack() }, navigate)
+                }
             }
             composable("music/{kind}/{id}", arguments = listOf(
                 navArgument("kind") { type = NavType.StringType }, navArgument("id") { type = NavType.StringType },
             )) { owner ->
                 val kind = MusicKind.valueOf(requireNotNull(owner.arguments?.getString("kind")))
                 val id = requireNotNull(owner.arguments?.getString("id"))
-                val model: DetailViewModel = viewModel(owner, key = "detail-${kind.name}-$id",
-                    factory = viewModelFactory { initializer { DetailViewModel(api, kind, id) } })
-                DetailScreen(model, loader, {
-                    val returnOccurrence = owner.savedStateHandle.get<String>("returnPlayerOccurrence")
-                    navigation.popBackStack()
-                    if (returnOccurrence != null && returnOccurrence == currentController.value?.state?.value?.snapshot?.state?.occurrence?.eventId)
-                        expanded = true
-                }, open, playback = currentController.value, onNavigate = navigate, onMore = openActions)
+                val api = currentSource.library
+                currentStores.Content { models ->
+                    val model: DetailViewModel = viewModel(models, key = "detail-${kind.name}-$id",
+                        factory = viewModelFactory { initializer { DetailViewModel(api, kind, id) } })
+                    DetailScreen(model, currentLoader, {
+                        val returnOccurrence = owner.savedStateHandle.get<String>("returnPlayerOccurrence")
+                        navigation.popBackStack()
+                        if (returnOccurrence != null && returnOccurrence == currentController.value?.presentation?.queue?.occurrence?.eventId)
+                            expanded = true
+                    }, currentOpen, playback = currentController.value, onNavigate = navigate, onMore = openActions)
+                }
             }
             composable("settings") {
-                SettingsScreen(identity, palettes, currentPlayer.value?.cache, onCache = { navigation.navigate("music-cache") }, onAccount = { navigation.navigate("account") },
+                SettingsScreen(identity, palettes, currentPlayer.value.cache, modeSetting = { ManualModeSetting(identity, sessions, playbackOwner) }, onCache = { navigation.navigate("music-cache") }, onAccount = { navigation.navigate("account") },
                     onColours = { navigation.navigate("colours") }, onCredits = { navigation.navigate("credits") })
             }
-            composable("music-cache") { currentPlayer.value?.let { dev.spofify.mobile.feature.settings.MusicCacheScreen(it.cache) } }
+            composable("music-cache") { dev.spofify.mobile.feature.settings.MusicCacheScreen(currentPlayer.value.cache) }
             composable("colours") { AccountColoursScreen(identity, palettes) }
             composable("credits") { CreditsScreen { navigation.navigate("font-license") } }
             composable("font-license") { FontLicenseScreen() }
             composable("account") { currentAccount.value() }
         }
     }
-    LaunchedEffect(player) {
-        if (player == null) {
-            expanded = false
-            devices = false
-            actions = null
-        } else player.controller.state.collect { if (it.current == null) expanded = false }
-    }
+    val hasTrack = target?.observe()?.queue?.current != null
+    LaunchedEffect(target, source) { devices = false; actions = null; rowPlaybackNotice = null }
+    LaunchedEffect(hasTrack) { if (!hasTrack) expanded = false }
     Column(Modifier.fillMaxSize()) {
-        PlayerConnectionStatus(player, rowPlaybackNotice?.takeIf { it.first == entry?.id }?.second)
+        PlayerConnectionStatus(target, rowPlaybackNotice?.takeIf { it.first == entry?.id }?.second)
         NavHost(navigation, startDestination = "history", modifier = Modifier.weight(1f), builder = graph)
         if (!search || imeOcclusion == 0) {
-            player?.let {
-                MiniPlayer(it.controller, loader, {
+            target?.let {
+                MiniPlayer(it, loader, {
                     focus.clearFocus()
                     keyboard?.hide()
                     expanded = true
@@ -204,23 +212,26 @@ internal fun MusicRoot(
             }
         }
     }
-    currentPlayer.value?.let { active ->
-        if (expanded) FullPlayer(active.controller, loader, trackContent, onNavigate = { kind, id ->
-            val occurrence = active.controller.state.value.snapshot?.state?.occurrence?.eventId
+    stores.Content {
+      target?.let { active ->
+        if (expanded) FullPlayer(active, loader, source.content, onNavigate = { kind, id ->
+            val occurrence = active.presentation.queue?.occurrence?.eventId
             expanded = false
             navigate(kind, id)
             navigation.currentBackStackEntry?.savedStateHandle?.set("returnPlayerOccurrence", occurrence)
         }) { expanded = false }
-        if (devices) DevicesSheet(active.controller) { devices = false }
-    }
-    actions?.let { selection ->
-        MusicActionsSheet(selection, currentController.value, personal, loader, navigate) { actions = null }
+        if (devices && active is AppPlayback.Online) DevicesSheet(active.controller) { devices = false }
+      }
+      actions?.let { selection ->
+          MusicActionsSheet(selection, currentController.value, source.personal, loader, navigate) { actions = null }
+      }
     }
 }
 
 @Composable
-private fun PlayerConnectionStatus(player: NativePlayer?, rowNotice: String?) {
-    val state = player?.controller?.state?.collectAsStateWithLifecycle()?.value
+private fun PlayerConnectionStatus(player: AppPlayback?, rowNotice: String?) {
+    if (player !is AppPlayback.Online) return
+    val state = player.observe().online
     val notice = listOfNotNull(state?.let(::playbackNotice), rowNotice).joinToString(" · ")
     if (rowNotice == null && state?.connection == PlaybackConnectionState.CONNECTING) LinearProgressIndicator(Modifier.fillMaxWidth())
     else if (notice.isNotEmpty()) {

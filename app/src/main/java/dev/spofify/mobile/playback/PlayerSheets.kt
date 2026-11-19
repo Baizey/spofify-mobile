@@ -126,16 +126,17 @@ private fun DeviceNameSheet(controller: PlaybackController, device: PlaybackDevi
 }
 
 @Composable
-internal fun QueueSheet(controller: PlaybackController, loader: ImageLoader, onDismiss: () -> Unit) {
-    val state by controller.state.collectAsStateWithLifecycle()
-    val ready = state.connection == PlaybackConnectionState.READY
-    val position = state.snapshot?.state?.position ?: -1
-    val upcoming = state.queue.drop((position + 1).coerceAtLeast(0))
+internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss: () -> Unit) {
+    val state = controller.observe()
+    val online = (state as? PlayerPresentation.Online)?.view
+    val ready = state.ready
+    val position = state.queue?.position ?: -1
+    val upcoming = state.queue?.queue.orEmpty().drop((position + 1).coerceAtLeast(0))
     val list = rememberLazyListState()
-    var actions by remember { mutableStateOf<Long?>(null) }
+    var actions by remember(controller) { mutableStateOf<Long?>(null) }
     val selected = upcoming.firstOrNull { it.key == actions }
     SpofifySheet(onDismiss) {
-        state.undo?.let {
+        online?.undo?.let {
             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Removed from queue", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
@@ -146,13 +147,13 @@ internal fun QueueSheet(controller: PlaybackController, loader: ImageLoader, onD
         LazyColumn(Modifier.weight(1f, fill = false).fillMaxWidth(), state = list,
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") { SheetHeading("Queue") }
-            state.current?.let { current -> item("current") {
+            state.queue?.current?.let { current -> item("current") {
                 SheetGroup("Current song")
                 QueueTrack(current, loader)
             } }
             item("up-next") { SheetGroup("Up next") }
             itemsIndexed(upcoming, key = { _, track -> track.key }) { _, track ->
-                SwipeActionSurface(binding = listOf(state.sessionId, state.snapshot?.stateVersion, track.key),
+                SwipeActionSurface(binding = listOf(controller, online?.sessionId, online?.snapshot?.stateVersion ?: upcoming, track.key),
                     onRight = if (ready) ({ controller.queueTrack(PlaybackTrackReference(track.id)) }) else null,
                     onLeft = if (ready) ({ controller.remove(track.key) }) else null,
                     slideOutOnLeft = true) {

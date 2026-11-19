@@ -7,11 +7,11 @@ storage, native audio, lifecycle and presentation.
 Implemented surfaces include authentication, server-ranked Search, artist/album details,
 playlists, Recently played, mini/full player, queue/output controls, waveform/lyrics,
 and Settings appearance. Full History insights and artist rankings remain deferred.
-Settings → Automatic music cache controls a byte cache, not an offline playback mode.
+Settings → Offline mode switches the existing app to this account’s local music. It requires an explicit switch; network outages do not transfer playback ownership.
 Keep 3 / 10 / 100 / 1000 distinct songs to look ahead 1 / 3 / 6 / 12 songs respectively.
 Prefetch defaults to unmetered connections; requested streams are unrestricted. Clear removes
 only automatic retention. The count excludes songs held for offline use; stored bytes include
-shared and still-playing blobs. Playlist downloads and local-only playback are not enabled.
+shared and still-playing blobs. Save a fully playable playlist from its More menu. Only a verified complete save appears in offline Playlists. Offline History reads a previously observed online snapshot; device playback never records or uploads history. Display lyrics are not saved. Going online retires local output and its queue before validating the session and waiting for a fresh server snapshot.
 
 ## UI specification
 

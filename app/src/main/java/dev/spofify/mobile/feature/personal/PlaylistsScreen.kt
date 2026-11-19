@@ -25,10 +25,10 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
-import dev.spofify.mobile.core.personal.PersonalLibraryClient
+import dev.spofify.mobile.core.personal.PersonalLibraryApi
+import dev.spofify.mobile.playback.DevicePersonalLibrary
 import dev.spofify.mobile.core.personal.PersonalPlaylistSummary
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.PlaybackController
+import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicRowGeometry
 import kotlinx.coroutines.CancellationException
@@ -37,10 +37,11 @@ import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PlaylistsScreen(
-    api: PersonalLibraryClient,
+internal fun PlaylistsScreen(
+    api: PersonalLibraryApi,
     loader: ImageLoader,
-    playback: PlaybackController?,
+    playback: AppPlayback?,
+    music: dev.spofify.mobile.playback.AccountMusic?,
     onOpenPlaylist: (String) -> Unit,
     onNavigate: (MusicKind, String) -> Unit,
 ) {
@@ -48,8 +49,8 @@ fun PlaylistsScreen(
     val model: PlaylistsViewModel = viewModel(owner, key = "playlists-${System.identityHashCode(api)}",
         factory = viewModelFactory { initializer { PlaylistsViewModel(api) } })
     val state by model.state.collectAsStateWithLifecycle()
-    val player = playback?.state?.collectAsStateWithLifecycle()?.value
-    val ready = player?.connection == PlaybackConnectionState.READY
+    val player = playback?.observe()
+    val ready = player?.ready == true
     val scope = rememberCoroutineScope()
     var queueJob by remember { mutableStateOf<Job?>(null) }
     var queueError by remember { mutableStateOf<String?>(null) }
@@ -58,13 +59,13 @@ fun PlaylistsScreen(
     val queue: (PersonalPlaylistSummary) -> Unit = { summary ->
         if (queueJob?.isActive != true) {
             queueError = null
-            val captured = personalGestureBinding(summary, null, playback?.state?.value)
+            val captured = personalGestureBinding(summary, null, playback?.presentation?.online)
             queueJob = scope.launch {
                 try {
                     val context = freshPlaylistContext(api, summary.id)
-                    val current = playback?.state?.value
-                    if (current?.connection != PlaybackConnectionState.READY || captured != personalGestureBinding(summary, null, current) ||
-                        summary !in model.state.value.items || playback?.queueCollection(context) == null) {
+                    val current = playback?.presentation
+                    if (current?.ready != true || captured != personalGestureBinding(summary, null, current.online) ||
+                        summary !in model.state.value.items || playback?.queueCollection(context) != true) {
                         queueError = "Playback action wasn't sent."
                     }
                 } catch (cancelled: CancellationException) {
@@ -84,7 +85,7 @@ fun PlaylistsScreen(
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically) {
             Text("Playlists", Modifier.weight(1f).semantics { heading() }, style = MaterialTheme.typography.headlineMedium)
-            IconButton({ creating = true }, enabled = !state.writing && !state.needsReview, modifier = Modifier.size(48.dp)) {
+            IconButton({ creating = true }, enabled = api !is DevicePersonalLibrary && !state.writing && !state.needsReview, modifier = Modifier.size(48.dp)) {
                 SpofifyIcon(SpofifyGlyph.Plus, "Create playlist", Modifier.size(24.dp))
             }
         }
@@ -107,7 +108,7 @@ fun PlaylistsScreen(
                 items(state.items, key = { it.id }) { summary ->
                     PlaylistSummaryRow(summary,
                         onQueue = if (ready && summary.capabilities.play && summary.trackCount?.let { it > 0 } == true) ({ queue(summary) }) else null,
-                        onMore = { more = summary }, gestureBinding = personalGestureBinding(summary, null, player)) { onOpenPlaylist(summary.id) }
+                        onMore = { more = summary }, gestureBinding = playback to personalGestureBinding(summary, null, player?.online)) { onOpenPlaylist(summary.id) }
                 }
             }
         }
@@ -117,7 +118,7 @@ fun PlaylistsScreen(
         model.create(name, description)
     }
     more?.let { summary ->
-        PlaylistSummaryActions(api, summary, playback, onMutationAcknowledged = model::refresh, onDismiss = { more = null })
+        PlaylistSummaryActions(api, summary, playback, music, onMutationAcknowledged = model::refresh, onDismiss = { more = null })
     }
 }
 
@@ -159,7 +160,7 @@ internal fun PlaylistSummaryRow(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddTrackToPlaylistSheet(
-    api: PersonalLibraryClient,
+    api: PersonalLibraryApi,
     track: MusicItem,
     onDismiss: () -> Unit,
     onAdded: (PersonalPlaylistSummary) -> Unit = {},

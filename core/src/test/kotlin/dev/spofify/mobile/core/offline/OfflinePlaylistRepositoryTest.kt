@@ -1,0 +1,200 @@
+package dev.spofify.mobile.core.offline
+
+import dev.spofify.mobile.core.auth.FeatureAuthority
+import dev.spofify.mobile.core.cache.*
+import dev.spofify.mobile.core.http.AudioStream
+import dev.spofify.mobile.core.http.OkHttpAuthApi
+import dev.spofify.mobile.core.origin.ServerOrigin
+import dev.spofify.mobile.core.personal.*
+import java.io.File
+import java.io.IOException
+import java.net.InetAddress
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.*
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import org.junit.Assert.*
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+
+class OfflinePlaylistRepositoryTest {
+    @get:Rule val root = TemporaryFolder()
+    private val owner = MusicOwner("https://one.example", "account")
+    private fun key(id: String) = SongKey(owner, id)
+    private fun playlist(id: String, rev: Long, vararg ids: String): OfflineManifest {
+        val ref = OfflineCollectionRef(OfflineCollectionKind.PLAYLIST, id)
+        val c = OfflineCollection(ref, "name $rev", OfflinePlaylistKind.DERIVED, "description $rev", rev)
+        val rows = ids.mapIndexed { i, track -> OfflineOccurrence("entry-$rev-$i", i.toLong(),
+            PersonalTrack("track", track, "title $rev", true, PersonalCoverage(12, 9, 2),
+                listOf(PersonalArtist("artist", "artist name")), listOf("jazz"), "album", "album name",
+                "single", "2026", "relation", 123456, 1, 2)) }
+        return OfflineManifest(c, "fence-$rev", rows, rows.size.toLong(), rows.size.toLong())
+    }
+    private fun audio(data: ByteArray = bytes) = AudioStream(data.inputStream(), data.size.toLong(), permitted = { true }) {}
+    private fun repo(store: MusicBlobStore, account: MusicOwner = owner,
+        manifest: suspend (OfflineCollectionRef) -> OfflineManifest = { error("unexpected manifest call") },
+        prepare: suspend (String) -> OfflineMediaDescriptor = ::descriptor,
+        open: suspend (OfflineMediaDescriptor) -> AudioStream = { audio() },
+    ) = OfflinePlaylistRepository(store, account, manifest, prepare, open)
+    private suspend fun OfflinePlaylistRepository.save(id: String = "p") = refresh(id, 3) { true }
+    private fun blobCount(dir: File) = dir.listFiles()!!.count { it.extension == "blob" }
+
+    @Test fun deltaKeepsEveryOccurrenceAndMetadataWhileSharingAutoPlaylistsAndPins() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        var p = playlist("p", 1, "b", "a", "b")
+        val q = playlist("q", 7, "a", "a")
+        val prepared = mutableListOf<String>(); val opened = mutableListOf<String>()
+        val saved = repo(store, manifest = { if (it.id == "p") p else q },
+            prepare = { prepared.add(it); descriptor(it) }, open = { opened.add(it.trackId); audio() })
+        store.fill(key("a"), "auto", 3, emptyList(), { true }, { descriptor("a") }) { _, consume -> consume(bytes.inputStream()) }
+        saved.save(); saved.save("q")
+        store.clearAuto(owner); store.limit(owner, 3, emptyList())
+        val pin = store.pin(key("b")) { true }!!
+        p = playlist("p", 2, "c", "a", "c")
+        saved.save()
+        assertEquals(listOf("b", "c"), prepared); assertEquals(prepared, opened)
+        assertEquals(p, saved.select("p")); assertNull(store.pin(key("b")) { true })
+        assertEquals(3, blobCount(root.root)); pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }; pin.close()
+        val reopened = repo(MusicBlobStore(root.root))
+        assertEquals(setOf(p, q), reopened.complete().toSet()); assertEquals(2, blobCount(root.root))
+        assertTrue(reopened.remove("p", 3) { true }); assertEquals(1, blobCount(root.root))
+        assertEquals(listOf(q), reopened.complete()); assertTrue(reopened.remove("q", 3) { true })
+        assertFalse(reopened.remove("q", 3) { true }); assertTrue(root.root.listFiles()!!.isEmpty())
+    }
+
+    @Test fun samePlaylistAndTrackIdsIsolateOriginsAndAccountsIncludingRemovalAndReplacement() = runBlocking {
+        val accounts = listOf(owner, owner.copy(accountId = "other"), owner.copy(origin = "http://one.example"))
+        var store = MusicBlobStore(root.root)
+        for ((i, account) in accounts.withIndex()) {
+            val m = playlist("p", i + 1L, "a")
+            val r = repo(store, account, { m }); assertNull(r.select("p")); r.save()
+        }
+        assertEquals(3, blobCount(root.root)); store = MusicBlobStore(root.root)
+        val empty = playlist("p", 4)
+        repo(store, manifest = { empty }).save()
+        assertEquals(listOf(empty), repo(store).complete()); assertEquals(2, blobCount(root.root))
+        assertTrue(repo(store).remove("p", 3) { true })
+        accounts.drop(1).forEachIndexed { i, account ->
+            assertEquals(listOf(playlist("p", i + 2L, "a")), repo(store, account).complete())
+            store.pin(SongKey(account, "a")) { true }!!.close()
+        }
+    }
+
+    @Test fun pendingIsNotPlayableAndReopenReapsVerifiedButUncommittedStages() = runBlocking {
+        val dir = root.newFolder("music"); val crash = root.newFolder("process-image")
+        val store = MusicBlobStore(dir)
+        val original = playlist("p", 1, "a")
+        val saved = repo(store, manifest = { original }); saved.save()
+        val entered = CompletableDeferred<Unit>()
+        val next = playlist("p", 2, "b", "c")
+        val updating = repo(store, manifest = { next }, prepare = {
+            if (it == "c") { entered.complete(Unit); awaitCancellation() }; descriptor(it)
+        })
+        val task = launch { updating.save() }
+        try {
+            withTimeout(5000) { entered.await() }
+            assertEquals(listOf(original), saved.complete()); assertEquals(2, blobCount(dir))
+            assertNull(store.pin(key("b")) { true }); assertFalse(store.hasOfflineReference(key("b")))
+            assertEquals(listOf("a"), store.songs.value.map { it.key.id })
+            dir.copyRecursively(crash, overwrite = true) // Process death after verified .meta, before manifest rename.
+        } finally { task.cancelAndJoin() }
+        val recovered = MusicBlobStore(crash)
+        assertEquals(listOf(original), repo(recovered).complete()); assertEquals(1, blobCount(crash))
+        assertEquals(1, blobCount(dir)); assertEquals(original, repo(MusicBlobStore(dir)).select("p"))
+    }
+
+    @Test fun deathAfterReplacementRenameBeforeReclaimRecoversOnlyNewMembership() = runBlocking {
+        val dir = root.newFolder("music"); val oldFiles = root.newFolder("unreclaimed")
+        val store = MusicBlobStore(dir)
+        repo(store, manifest = { playlist("p", 1, "removed") }).save()
+        dir.listFiles()!!.filter { it.extension in setOf("blob", "meta") }.forEach { it.copyTo(File(oldFiles, it.name)) }
+        val next = playlist("p", 2, "new", "new")
+        repo(store, manifest = { next }).save()
+        // Image immediately after the atomic rename: old .blob/.meta still there, with no durable playlist ref.
+        oldFiles.listFiles()!!.forEach { it.copyTo(File(dir, it.name)) }; assertEquals(2, blobCount(dir))
+        val reopened = MusicBlobStore(dir)
+        assertEquals(listOf(next), repo(reopened).complete()); assertEquals(1, blobCount(dir))
+        assertNull(reopened.pin(key("removed")) { true }); reopened.pin(key("new")) { true }!!.close()
+    }
+
+    @Test fun badMetadataBadBytesOrManifestSpaceFailureNeverReleaseThePriorCommit() = runBlocking {
+        var free = Long.MAX_VALUE
+        val store = MusicBlobStore(root.root) { free }
+        val old = playlist("p", 1, "a"); repo(store, manifest = { old }).save()
+        val next = playlist("p", 2, "a", "b", "c")
+        val broken = listOf(
+            repo(store, manifest = { throw OfflineException(OfflineFailure.STALE_MANIFEST) }),
+            repo(store, manifest = { next.copy(total = 1) }),
+            repo(store, manifest = { next }, open = { audio(if (it.trackId == "c") bytes.reversedArray() else bytes) }),
+            repo(store, manifest = { playlist("p", 3, "a") }), // no transfers, manifest write still needs space
+        )
+        for ((i, failing) in broken.withIndex()) {
+            if (i == broken.lastIndex) free = 0
+            assertTrue(runCatching { failing.save() }.isFailure)
+            assertEquals(old, failing.select("p")); assertEquals(1, blobCount(root.root))
+            assertFalse(root.root.listFiles()!!.any { it.extension == "tmp" })
+        }
+        assertEquals(listOf(old), repo(MusicBlobStore(root.root)).complete())
+    }
+
+    @Test fun laterRetirementFencesNoncooperativePrepareAndTransientFailureIsBounded() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val live = AtomicBoolean(true)
+        val m = playlist("p", 1, "a")
+        var calls = 0
+        val r = repo(store, manifest = { m }, prepare = { calls++; live.set(false); descriptor(it) },
+            open = { error("retired body opened") })
+        assertTrue(runCatching { r.refresh("p", 3, live::get) }.exceptionOrNull() is CancellationException)
+        assertEquals(1, calls); assertNull(r.select("p"))
+        calls = 0
+        val busy = repo(store, manifest = { calls++; throw OfflineException(OfflineFailure.BUSY) })
+        assertTrue(runCatching { busy.save() }.exceptionOrNull() is OfflineException)
+        assertEquals(2, calls); assertTrue(root.root.listFiles()!!.isEmpty())
+    }
+
+    @Test fun joinsAutoFillAndAutoCanAdoptAnInFlightPlaylistFillWithoutDuplicateNetwork() = runBlocking {
+        for (autoFirst in listOf(true, false)) {
+            val dir = root.newFolder(); val store = MusicBlobStore(dir)
+            val entered = CompletableDeferred<Unit>(); val go = CompletableDeferred<Unit>()
+            var opens = 0
+            suspend fun gate() { opens++; entered.complete(Unit); go.await() }
+            val r = repo(store, manifest = { playlist("p", 1, "a") }, open = { gate(); audio() })
+            suspend fun auto() = store.fill(key("a"), "auto", 3, emptyList(), { true }, { descriptor("a") }) { _, consume ->
+                gate(); consume(bytes.inputStream())
+            }
+            val first = launch { if (autoFirst) auto() else r.save() }; entered.await()
+            val second = launch(start = CoroutineStart.UNDISPATCHED) { if (autoFirst) r.save() else auto() }
+            go.complete(Unit); joinAll(first, second)
+            assertEquals(1, opens); assertEquals(1, blobCount(dir))
+            val row = store.songs.value.single(); assertTrue(row.auto && row.offline)
+            assertTrue(r.remove("p", 3) { true }); assertTrue(store.songs.value.single().auto)
+        }
+    }
+
+    @Test fun cancelDuringOrdinaryVersionedHttpBodyInterruptsSocketWithoutRetiringSessionOrRetrying() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val old = playlist("p", 1, "old"); repo(store, manifest = { old }).save()
+        MockWebServer().use { server ->
+            server.start(InetAddress.getLoopbackAddress(), 0)
+            val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
+            val d = descriptor("new")
+            server.enqueue(MockResponse().setBody(bytes.decodeToString()).setHeader("ETag", "\"${d.mediaVersion}\"")
+                .throttleBody(1, 4, TimeUnit.SECONDS))
+            val saved = repo(store, manifest = { playlist("p", 2, "new") }, open = {
+                api.versionedAudio(it, "spofify_session=fixture; Path=/; HttpOnly", FeatureAuthority(Any()) { true }) { _, _ -> }
+            })
+            val worker = launch { saved.save() }
+            try {
+                withTimeout(5000) {
+                    while (root.root.listFiles()!!.none { it.extension == "tmp" && it.length() == 1L }) delay(10)
+                }
+                withTimeout(1500) { worker.cancelAndJoin() }
+                assertEquals(1, server.requestCount); assertEquals(old, saved.select("p"))
+                assertFalse(root.root.listFiles()!!.any { it.extension == "tmp" })
+            } finally { api.cancel(); worker.cancelAndJoin() }
+        }
+        assertEquals(old, repo(MusicBlobStore(root.root)).select("p")); assertEquals(1, blobCount(root.root))
+    }
+}

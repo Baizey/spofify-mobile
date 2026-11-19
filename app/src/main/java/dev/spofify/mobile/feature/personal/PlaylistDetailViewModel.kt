@@ -52,7 +52,7 @@ internal class PlaylistDetailViewModel(
         if (mutable.value.deleted) return
         reading?.cancel()
         val token = ++generation
-        mutable.value = mutable.value.copy(loading = true, error = null, context = null)
+        mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null, context = null)
         reading = viewModelScope.launch {
             try {
                 val summary = api.playlist(id)
@@ -68,7 +68,9 @@ internal class PlaylistDetailViewModel(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
-                if (token == generation) mutable.value = mutable.value.copy(loading = false, error = personalError(failure), needsRefresh = true)
+                if (token == generation) mutable.value = if (api is dev.spofify.mobile.playback.DevicePersonalLibrary)
+                    PlaylistDetailState(loaded = true, completeCollection = true, message = "Not saved on this device.")
+                else mutable.value.copy(loading = false, error = personalError(failure), needsRefresh = true)
             }
         }
     }
@@ -129,7 +131,8 @@ internal class PlaylistDetailViewModel(
         check(confirmed.kind == PersonalPlaylistKind.DERIVED && confirmed.revision == page.revision)
         if (!page.complete) return Loaded(confirmed, rows, null, complete = false)
         check(rows.size.toLong() == page.total)
-        val context = if (page.revision != null && page.fence.isNotBlank() && confirmed.evaluationState == PersonalEvaluationState.READY)
+        val context = if (page.revision != null && page.fence.isNotBlank() &&
+            (api is dev.spofify.mobile.playback.DevicePersonalLibrary || confirmed.evaluationState == PersonalEvaluationState.READY))
             PlaybackContext("derived", id, confirmed.name, page.revision, page.fence) else null
         return Loaded(confirmed, rows, context, complete = true)
     }

@@ -36,11 +36,11 @@ internal data class PlaylistSong(
     val occurrenceId: String? = null,
     val selectionToken: String? = null,
 ) {
-    fun reference(context: PlaybackContext?): PlaybackTrackReference? {
+    fun reference(context: PlaybackContext?, savedLocally: Boolean = false): PlaybackTrackReference? {
         if (context == null || !track.hasAudio) return null
         return when (context.kind) {
             "playlist" -> entryId?.let { PlaybackTrackReference(track.id, entryId = it) }
-            "derived" -> if (occurrenceId == null || selectionToken == null) null else PlaybackTrackReference(
+            "derived" -> if (occurrenceId == null || !savedLocally && selectionToken == null) null else PlaybackTrackReference(
                 track.id, targetId = context.id, occurrenceId = occurrenceId, selectionToken = selectionToken,
             )
             else -> null

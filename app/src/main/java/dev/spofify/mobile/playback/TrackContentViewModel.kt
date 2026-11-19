@@ -42,7 +42,7 @@ data class TrackContentState(
  * between stream-open and the FIRST metadata read cannot be independently detected.
  * Occurrence/version fences do not establish cross-response atomicity.
  */
-class TrackContentViewModel(private val api: TrackContentApi) : ViewModel() {
+class TrackContentViewModel(private val api: TrackContentApi, private val local: Boolean = false) : ViewModel() {
     private val mutable = MutableStateFlow(TrackContentState())
     val state = mutable.asStateFlow()
     private var generation = 0L
@@ -83,7 +83,7 @@ class TrackContentViewModel(private val api: TrackContentApi) : ViewModel() {
         val trackId = mutable.value.trackId ?: return
         val token = ++generation
         val binding = mutable.value.binding
-        mutable.value = mutable.value.copy(loadingWaveform = true, loadingLyrics = true,
+        mutable.value = mutable.value.copy(loadingWaveform = !local, loadingLyrics = !local,
             waveformFailure = null, lyricsFailure = null)
         waveformRequest = viewModelScope.launch {
             try {

@@ -49,7 +49,11 @@ class AudioStream internal constructor(
         private inline fun <T> access(read: () -> T): T {
             if (closed.get() || !permitted()) throw IOException("Audio session retired")
             try {
-                return read()
+                val value = read()
+                // A read that was already inside the source when the grant was retired
+                // may still finish from a buffer. Do not deliver that terminal result.
+                if (closed.get() || !permitted()) throw IOException("Audio session retired")
+                return value
             } catch (error: IOException) {
                 if (recoverable && !closed.get() && permitted() && error.isAudioInterruption(remaining > 0)) {
                     throw TransientAudioLoadFailure(error)

@@ -18,6 +18,19 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AccountPaletteControllerTest {
+    @Test fun authenticatedLocalOwnerWithoutGrantNeverConstructsPaletteClientOrRendersLoading() = runTest {
+        val owner = AccountIdentity("https://one.example", "one", "one", 1)
+        val controller = AccountPaletteController(MutableStateFlow(AuthState.Authenticated(owner)),
+            { error("No local palette transport") }, backgroundScope, MutableStateFlow(null))
+        controller.start(); runCurrent()
+        controller.refresh(); controller.choose(PaletteId.EMBER); runCurrent()
+        assertEquals(owner, controller.state.value.owner)
+        assertFalse(controller.state.value.online)
+        assertFalse(controller.state.value.loading)
+        assertFalse(controller.state.value.saving)
+        assertNull(controller.state.value.notice)
+    }
+
     @Test fun startAndRefreshAreSingleFlightAndChoicesAreIgnoredUntilInitialRead() = runTest {
         val h = Harness(this)
         val gate = CompletableDeferred<Unit>()

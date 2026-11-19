@@ -60,6 +60,7 @@ private fun AuthRoot(
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val inputNotice by model.inputNotice.collectAsStateWithLifecycle()
+    val manual by sessions.manualOffline.collectAsStateWithLifecycle()
     val owner = LocalLifecycleOwner.current
     val pages = rememberSaveableStateHolder()
     var previousPageKey by rememberSaveable { mutableStateOf<String?>(null) }
@@ -99,7 +100,7 @@ private fun AuthRoot(
                     }
                 }
                 is AuthState.SignedOut -> LoginScreen(model.inputs, false, current.notice ?: inputNotice,
-                    model::server, model::username, model::password, model::reveal, model::signIn)
+                    model::server, model::username, model::password, model::reveal, model::signIn, model::goOnline.takeIf { manual })
                 AuthState.SigningIn -> LoginScreen(model.inputs, true, null,
                     model::server, model::username, model::password, model::reveal, model::signIn)
                 AuthState.Starting, AuthState.Validating -> ConnectionScreen(null)

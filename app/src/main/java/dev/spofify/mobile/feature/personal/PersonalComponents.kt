@@ -33,7 +33,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
-import dev.spofify.mobile.core.personal.PersonalLibraryClient
+import dev.spofify.mobile.core.personal.PersonalLibraryApi
+import dev.spofify.mobile.playback.DevicePersonalLibrary
 import dev.spofify.mobile.core.personal.PersonalTrack
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
@@ -149,7 +150,7 @@ internal fun PlaylistNameSheet(
 
 @Composable
 internal fun PersonalSongActions(
-    api: PersonalLibraryClient,
+    api: PersonalLibraryApi,
     track: PersonalTrack,
     loader: ImageLoader,
     playable: Boolean,
@@ -191,7 +192,7 @@ internal fun PersonalSongActions(
                 onQueue()
             } }
             item("library") { SheetGroup("Library") }
-            item("add") { SheetAction("Add to playlist", SpofifyGlyph.Plus, track.hasAudio) { adding = true } }
+            item("add") { SheetAction("Add to playlist", SpofifyGlyph.Plus, api !is DevicePersonalLibrary && track.hasAudio) { adding = true } }
             onRemove?.let { remove -> item("remove") { SheetAction("Remove this entry", SpofifyGlyph.Trash) {
                 onDismiss()
                 remove()

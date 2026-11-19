@@ -1,6 +1,7 @@
 package dev.spofify.mobile.core.auth
 
 import dev.spofify.mobile.core.origin.ServerOrigin
+import dev.spofify.mobile.core.http.parseSessionCookie
 import dev.spofify.mobile.core.http.FeatureResponse
 import dev.spofify.mobile.core.http.FeatureTransport
 import dev.spofify.mobile.core.http.AudioStream
@@ -10,6 +11,8 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,10 +46,19 @@ class SessionRepository(
     private val apis: AuthApiFactory,
     private val scope: CoroutineScope,
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    private val manualOfflineStore: ManualOfflineStore? = null,
 ) {
     private val lock = Any()
     private val mutableState = MutableStateFlow<AuthState>(AuthState.Starting)
     val state: StateFlow<AuthState> = mutableState.asStateFlow()
+    private val modeChanges = Mutex()
+    private val mutableOffline = MutableStateFlow(false)
+    val manualOffline = mutableOffline.asStateFlow()
+    private val mutableGrant = MutableStateFlow<OnlineGrant?>(null)
+    val onlineGrant = mutableGrant.asStateFlow()
+    private var policyLoaded = manualOfflineStore == null
+    private var handingOff = false
+    private val bootstrapAllowed get() = policyLoaded && !mutableOffline.value && !handingOff
     private var generation = 0L
     private var initialized = false
     private var operation: Job? = null
@@ -57,6 +69,9 @@ class SessionRepository(
     private var api: AuthApi? = null
     private var saved: StoredSession? = null
     private var identity: AccountIdentity? = null
+    // Retiring authority cancels immediately. Keep membership until actual completion so a
+    // manual transition can also join work already retiring from an earlier auth generation.
+    private val authJobs = mutableSetOf<Job>()
     private val featureJobs = mutableSetOf<Job>()
     private val featureJson = Json
 
@@ -161,23 +176,16 @@ class SessionRepository(
     private suspend fun <T : Any> featureExchange(
         expected: AccountIdentity,
         exchange: suspend (AuthApi, StoredSession, (Int, String?) -> Unit, FeatureAuthority) -> T,
-    ): T = coroutineScope {
-        val job = currentCoroutineContext().job
-        val capture = synchronized(lock) {
-            if (!isCurrent(expected)) throw CancellationException("Session retired")
-            featureJobs.add(job)
-            Triple(generation, requireNotNull(saved), requireNotNull(api))
-        }
-        val authority = FeatureAuthority(lock) {
-            generation == capture.first && api === capture.third && isCurrent(expected)
-        }
-        fun checkCurrent() {
+    ): T = onlineWork(expected, null) { grant ->
+        val authority = FeatureAuthority(lock) { mutableGrant.value === grant }
+        val (record, client) = synchronized(lock) {
             if (!authority.isCurrent) throw CancellationException("Session retired")
+            requireNotNull(saved) to requireNotNull(api)
         }
         val headers: (Int, String?) -> Unit = { status, renewed ->
             val write = synchronized(lock) {
-                checkCurrent()
-                val same = sameCredential(saved, capture.second)
+                if (!authority.isCurrent) throw CancellationException("Session retired")
+                val same = sameCredential(saved, record)
                 when {
                     status == 401 && same -> {
                         advance(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED))
@@ -186,25 +194,55 @@ class SessionRepository(
                         persistLocked(null)
                     }
                     status == 401 -> throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
-                    renewed != null && same && capture.second.sessionMode == "rolling-v1" -> {
-                        val record = StoredSession(capture.second.server, renewed,
-                            capture.second.session, capture.second.sessionMode)
-                        saved = record
-                        persistLocked(record)
+                    renewed != null && same && record.sessionMode == "rolling-v1" -> {
+                        val updated = StoredSession(record.server, renewed, record.session, record.sessionMode)
+                        saved = updated
+                        persistLocked(updated)
                     }
                     else -> null
                 }
             }
             write?.start()
         }
+        exchange(client, record, headers, authority)
+    }
+
+    /** Own the entire online operation (including retries, parsing and terminal publication),
+     * not just an individual request. Never invoke mode changes from within this block. */
+    suspend fun <T : Any> withOnlineGrant(grant: OnlineGrant, block: suspend CoroutineScope.() -> T): T =
+        onlineWork(grant.identity, grant) { coroutineScope(block) }
+
+    /** For queued results delivered outside the network worker. Publication must be short and nonblocking. */
+    fun publishIfCurrent(grant: OnlineGrant, publish: () -> Unit): Boolean = synchronized(lock) {
+        if (mutableGrant.value !== grant || handingOff) false else { publish(); true }
+    }
+
+    private suspend fun <T : Any> onlineWork(
+        expected: AccountIdentity, required: OnlineGrant?, block: suspend (OnlineGrant) -> T,
+    ): T = coroutineScope {
+        val job = currentCoroutineContext().job
+        val grant = synchronized(lock) {
+            val current = mutableGrant.value
+            if (!bootstrapAllowed || current == null || current.identity != expected || (required != null && required !== current))
+                throw CancellationException("No online grant")
+            featureJobs.add(job)
+            current
+        }
+        fun checkCurrent() = synchronized(lock) {
+            if (mutableGrant.value !== grant) throw CancellationException("Session retired")
+        }
         var produced: T? = null
         try {
-            val result = exchange(capture.third, capture.second, headers, authority)
+            ensureActive()
+            val result = block(grant)
             produced = result
             ensureActive()
-            synchronized(lock) { checkCurrent(); result }
+            checkCurrent()
+            result
         } catch (failure: Exception) {
             (produced as? java.io.Closeable)?.let { runCatching { it.close() } }
+            ensureActive()
+            checkCurrent()
             throw failure
         } finally {
             synchronized(lock) { featureJobs.remove(job) }
@@ -220,17 +258,90 @@ class SessionRepository(
             if (initialized) return
             initialized = true
             val token = advance(AuthState.Starting)
-            operationLocked {
-                val record = try { readSession() } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
-                    return@operationLocked
+            if (policyLoaded) operationLocked { restoreStored(token) }
+            else scope.launch(io, start = CoroutineStart.LAZY) {
+                // Policy initialization survives a concurrent explicit sign-out. The old
+                // generation's session read does not. No bootstrap is allowed until known.
+                val offline = try { requireNotNull(manualOfflineStore).read() } catch (_: Exception) {
+                    synchronized(lock) { initialized = false; publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE)) }
+                    return@launch
                 }
-                if (record == null) publish(token, AuthState.SignedOut()) else restore(token, record, null)
+                synchronized(lock) {
+                    mutableOffline.value = offline
+                    policyLoaded = true
+                    if (generation == token) operationLocked { restoreStored(token) } else null
+                }?.start()
             }
         }
         job.start()
+    }
+
+    private suspend fun restoreStored(token: Long) {
+        val record = try { readSession() } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
+            return
+        }
+        if (record == null) publish(token, AuthState.SignedOut()) else restore(token, record, null)
+    }
+
+    /**
+     * Invoke from the mode controller, outside session-owned network work. Persist first:
+     * a failed write does not advertise a successful switch. Once committed, caller
+     * cancellation cannot strand half a transition. The optional cooperative handoff may
+     * use an existing socket only; it must check actual playback ownership itself.
+     */
+    suspend fun setManualOffline(enabled: Boolean, beforeDisconnect: suspend (AccountIdentity) -> Unit = {}) {
+        modeChanges.withLock {
+            synchronized(lock) {
+                check(policyLoaded) { "Session policy not loaded" }
+                if (mutableOffline.value == enabled) return
+            }
+            withContext(io + NonCancellable) {
+                checkNotNull(manualOfflineStore) { "No durable manual mode store" }.write(enabled)
+                val owner = synchronized(lock) {
+                    handingOff = true
+                    mutableGrant.value?.identity
+                }
+                try {
+                    if (enabled && owner != null) withTimeoutOrNull(1_000) { beforeDisconnect(owner) }
+                } finally {
+                    val transition = synchronized(lock) { switchModeLocked(enabled) }
+                    try { transition.transport?.closeRetiredStreams() } finally {
+                        transition.retired.joinAll()
+                        transition.next?.start()
+                    }
+                }
+            }
+        }
+    }
+
+    private class Transition(val transport: FeatureTransport?, val retired: List<Job>, val next: Job?)
+
+    private fun switchModeLocked(enabled: Boolean): Transition {
+        val retired = authJobs.toList() + featureJobs.toList()
+        val transport = api as? FeatureTransport
+        val current = state.value
+        val recovering = current is AuthState.Starting || current is AuthState.Validating || current is AuthState.Unavailable
+        val target = when {
+            current is AuthState.Authenticated || current is AuthState.SignedOut -> current
+            recovering -> AuthState.Starting
+            else -> AuthState.SignedOut() // unfinished login is never promoted locally
+        }
+        val token = advance(target)
+        retired.forEach { it.cancel() } // includes independent remote logouts
+        mutableOffline.value = enabled
+        handingOff = false
+        val record = saved
+        val previous = identity
+        val next = when {
+            enabled && current is AuthState.Authenticated -> null // retain exact identity and verified record
+            record != null && (current is AuthState.Authenticated || recovering) -> operationLocked { restore(token, record, previous) }
+            recovering -> operationLocked { restoreStored(token) }
+            else -> null
+        }
+        return Transition(transport, retired, next)
     }
 
     /** Secrets stay out of StateFlow; reads wait for already accepted saves, never on Main. */
@@ -243,6 +354,7 @@ class SessionRepository(
 
     fun signIn(server: String, username: String, password: String) {
         val job = synchronized(lock) {
+            if (!bootstrapAllowed) return
             val origin = try { ServerOrigin.parse(server) } catch (_: IllegalArgumentException) {
                 advance(AuthState.SignedOut(AuthNotice.INVALID_ORIGIN))
                 return
@@ -254,6 +366,7 @@ class SessionRepository(
             operationLocked {
                 try {
                     val login = client.login(username, password)
+                    ensureActive()
                     val cookie = requireNotNull(login.cookie)
                     val validated = client.session(cookie)
                     require(validated.session.accountId == login.session.accountId)
@@ -281,7 +394,9 @@ class SessionRepository(
     /** Explicit recovery, never login/password replay. */
     fun retry() {
         val job = synchronized(lock) {
-            if (state.value !is AuthState.Unavailable) return
+            if (!policyLoaded) { start(); return }
+            if (state.value is AuthState.Authenticated && mutableGrant.value == null) { refresh(); return }
+            if (handingOff || state.value !is AuthState.Unavailable) return
             val record = saved
             val previous = identity
             val token = advance(AuthState.Validating)
@@ -307,25 +422,28 @@ class SessionRepository(
     /** Main-safe even while Keystore/SharedPreferences is blocked in the durable lane. */
     fun refresh() {
         val job = synchronized(lock) {
-            if (state.value !is AuthState.Authenticated) return
+            val current = state.value as? AuthState.Authenticated ?: return
+            if (!bootstrapAllowed) return
+            val validatingReturn = mutableGrant.value == null
+            if (validatingReturn && operation?.isCompleted == false) return
             val record = saved ?: return
             val previous = identity
-            val token = advance(AuthState.Validating)
+            val token = advance(if (validatingReturn) current else AuthState.Validating)
             operationLocked { restore(token, record, previous) }
         }
         job.start()
     }
 
     fun signOut() {
-        val job = synchronized(lock) {
-            val retired = saved
+        val (clear, job) = synchronized(lock) {
+            val retired = saved.takeIf { bootstrapAllowed }
             val token = advance(AuthState.SignedOut())
             saved = null
             identity = null
             val clear = persistLocked(null)
             // Separate from the cancellable auth operation and from the durable lane.
-            scope.launch(io, start = CoroutineStart.LAZY) {
-                clear.start()
+            // The durable clear must start even if a mode switch cancels logout before dispatch.
+            clear to trackAuthLocked(scope.launch(io, start = CoroutineStart.LAZY) {
                 val localFailure = !clear.await()
                 val remoteFailure = if (retired == null) false else {
                     val logout = apis.create(ServerOrigin.parse(retired.server))
@@ -335,24 +453,37 @@ class SessionRepository(
                     finally { logout.cancel() }
                 }
                 if (!localFailure && remoteFailure) publish(token, AuthState.SignedOut(AuthNotice.REMOTE_LOGOUT_FAILED))
-            }
+            })
         }
+        clear.start()
         job.start()
     }
 
     private suspend fun restore(token: Long, record: StoredSession, previous: AccountIdentity?) {
         try {
             val origin = ServerOrigin.parse(record.server)
+            record.session.validated()
+            val localOnly = synchronized(lock) { if (token != generation) return; mutableOffline.value }
+            if (localOnly) {
+                // Only the installed authenticated SessionStore, never the remembered-login
+                // record. Validate its structure without constructing ANY transport.
+                parseSessionCookie(origin, record.cookie)
+                require(record.sessionMode == null || record.sessionMode == "rolling-v1")
+                synchronized(lock) {
+                    if (token == generation) promote(StoredSession(origin.value, record.cookie, record.session,
+                        record.sessionMode), previous?.incarnation ?: token)
+                }
+                return
+            }
             val client = apis.create(origin)
             client.validateCookie(record.cookie)
-            record.session.validated()
             synchronized(lock) {
                 if (token != generation) { client.cancel(); return }
                 saved = record
                 api = client
             }
             val response = client.session(record.cookie)
-            require(response.session.accountId == record.session.accountId)
+            if (response.session.accountId != record.session.accountId) throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
             val updated = StoredSession(origin.value, response.cookie ?: record.cookie, response.session, response.mode ?: record.sessionMode)
             currentCoroutineContext().ensureActive()
             val write = synchronized(lock) {
@@ -373,7 +504,11 @@ class SessionRepository(
                     persistLocked(null)
                 } else {
                     // Unavailability is not revocation: preserve all recovery material.
-                    mutableState.value = AuthState.Unavailable(AuthNotice.CONNECTION_FAILED)
+                    val active = (state.value as? AuthState.Authenticated)?.takeIf {
+                        error is AuthFailure && error.kind == AuthFailure.Kind.UNAVAILABLE
+                    }
+                    mutableState.value = active?.copy(notice = AuthNotice.CONNECTION_FAILED)
+                        ?: AuthState.Unavailable(AuthNotice.CONNECTION_FAILED)
                     null
                 }
             }
@@ -390,7 +525,13 @@ class SessionRepository(
 
     /** Caller holds only the short authority monitor; LAZY jobs start AFTER it is released. */
     private fun operationLocked(block: suspend CoroutineScope.() -> Unit): Job =
-        scope.launch(io, start = CoroutineStart.LAZY, block = block).also { operation = it }
+        trackAuthLocked(scope.launch(io, start = CoroutineStart.LAZY, block = block)).also { operation = it }
+
+    private fun trackAuthLocked(job: Job): Job {
+        authJobs.add(job)
+        job.invokeOnCompletion { synchronized(lock) { authJobs.remove(job) } }
+        return job
+    }
 
     /**
      * Acceptance-ordered durable lane, not an authority lock. Once accepted, a save
@@ -427,9 +568,9 @@ class SessionRepository(
 
     private fun advance(state: AuthState): Long {
         generation++
+        mutableGrant.value = null
         operation?.cancel()
         featureJobs.toList().forEach { it.cancel() }
-        featureJobs.clear()
         api?.cancel()
         api = null
         mutableState.value = if (state is AuthState.SignedOut) signedOutState(state.notice) else state
@@ -442,6 +583,7 @@ class SessionRepository(
         saved = record
         identity = AccountIdentity(record.server, record.session.accountId, record.session.username, incarnation)
         mutableState.value = AuthState.Authenticated(requireNotNull(identity), saveNotice())
+        if (!mutableOffline.value) mutableGrant.value = OnlineGrant(requireNotNull(identity), generation)
     }
 
     private fun signedOutState(notice: AuthNotice?) = AuthState.SignedOut(
