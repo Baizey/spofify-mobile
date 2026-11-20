@@ -45,40 +45,79 @@ class PlaylistOfflinePreferenceTest {
         assertEquals(disk.manifests.values.toList(), worker.complete())
     }
 
-    @Test fun persistedIntentResumesAcrossRestartEvenWithoutAnyCompletedDownload() = runTest {
+    @Test fun bothPlaylistIntentsRelaunchAfterRestartWithoutAnyCompletedDownload() = runTest {
         val disk = Disk()
+        val ids = setOf("manual", "derived")
         val firstScope = CoroutineScope(backgroundScope.coroutineContext + Job(backgroundScope.coroutineContext.job))
         val first = disk.owner(firstScope)
-        runCurrent()
-        first.set("pending", true); runCurrent()
-        firstScope.cancel(); runCurrent()
-        val next = disk.owner(backgroundScope)
-        backgroundScope.launch { next.download { id, _ -> disk.save(id) } }
-        runCurrent()
-        assertEquals(setOf("pending"), next.wanted.value)
-        assertEquals(1, next.complete().size)
-    }
-
-    @Test fun turningOffCancelsPendingDownloadAndFencesItsCommit() = runTest {
-        val disk = Disk()
-        val worker = disk.owner(backgroundScope)
-        var stopped = false
-        var attempts = 0
-        backgroundScope.launch {
-            worker.download { _, current ->
-                attempts++
-                try { awaitCancellation() }
-                finally { stopped = true; assertFalse(current()) }
+        val started = mutableSetOf<String>()
+        firstScope.launch {
+            first.download { id, _ ->
+                assertTrue(started.add(id))
+                awaitCancellation()
             }
         }
         runCurrent()
-        worker.set("pending", true); runCurrent()
-        assertEquals(1, attempts)
-        worker.set("pending", false); runCurrent()
-        assertTrue(stopped)
-        assertEquals(emptySet<String>(), disk.wanted)
+        first.set("manual", true)
+        first.set("derived", true)
+        runCurrent()
+        assertEquals(ids, started)
+        assertEquals(ids, disk.wanted)
+        assertTrue(disk.manifests.isEmpty())
+        firstScope.cancel(); runCurrent()
+
+        val next = disk.owner(backgroundScope)
+        val relaunched = mutableSetOf<String>()
+        backgroundScope.launch {
+            next.download { id, current ->
+                assertTrue(current())
+                assertTrue(relaunched.add(id))
+                disk.save(id)
+            }
+        }
+        runCurrent()
+        assertEquals(ids, next.wanted.value)
+        assertEquals(ids, relaunched)
+        assertEquals(ids, next.complete().map { it.collection.reference.id }.toSet())
+    }
+
+    @Test fun secondPlaylistCompletesWhileFirstIsSuspendedAndClearingFirstOnlyFencesIt() = runTest {
+        val disk = Disk()
+        val worker = disk.owner(backgroundScope)
+        val attempts = mutableListOf<String>()
+        var manualCurrentOnCancellation: Boolean? = null
+        backgroundScope.launch {
+            worker.download { id, current ->
+                attempts += id
+                assertTrue(current())
+                if (id == "manual") {
+                    try { awaitCancellation() }
+                    finally { manualCurrentOnCancellation = current() }
+                }
+                disk.save(id)
+            }
+        }
+        runCurrent()
+        worker.set("manual", true); runCurrent()
+        assertEquals(listOf("manual"), attempts)
+        assertTrue(worker.complete().isEmpty())
+
+        worker.set("derived", true); runCurrent()
+        assertEquals(listOf("manual", "derived"), attempts)
+        assertNull(manualCurrentOnCancellation)
+        assertEquals(setOf("manual", "derived"), disk.wanted)
+        val derived = disk.manifests.getValue("derived")
+        assertEquals(listOf(derived), worker.complete())
+
+        worker.set("manual", false); runCurrent()
+        assertEquals(false, manualCurrentOnCancellation)
+        assertEquals(setOf("derived"), disk.wanted)
+        assertEquals(setOf("derived"), worker.wanted.value)
         advanceTimeBy(300_000); runCurrent()
-        assertEquals(1, attempts)
+        assertEquals(listOf("manual", "derived"), attempts)
+        assertEquals(setOf("derived"), disk.manifests.keys)
+        assertSame(derived, disk.manifests["derived"])
+        assertEquals(listOf(derived), worker.complete())
     }
 
     @Test fun legacySavedPlaylistsStartOnAndOffRemovesOnlyThatPlaylistEvenWithoutNetwork() = runTest {

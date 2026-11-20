@@ -22,6 +22,24 @@ class OfflineParserTest {
         assertEquals(album, parsed.collection.reference)
     }
 
+    @Test fun olderPlaylistPagesWithMissingAudioAreUnavailableRatherThanMalformed() {
+        for (kind in listOf("manual", "derived")) {
+            val prefix = OfflineTestData.page(ids = listOf("one", "one"), total = 3, next = "of1_more")
+                .replace("\"kind\":\"manual\"", "\"kind\":\"$kind\"")
+                .replace("\"recordedAudioTotal\":3", "\"recordedAudioTotal\":2")
+            val emptyAudio = OfflineTestData.page()
+                .replace("\"kind\":\"manual\"", "\"kind\":\"$kind\"")
+                .replace("\"recordedAudioTotal\":1", "\"recordedAudioTotal\":0")
+                .replace("\"hasAudio\":true", "\"hasAudio\":false")
+            for (body in listOf(prefix, emptyAudio)) {
+                val failure = runCatching { page(body) }.exceptionOrNull() as OfflineException
+                assertEquals(OfflineFailure.SOURCE_UNAVAILABLE, failure.failure)
+            }
+            for (invalid in listOf(prefix.replace("of1_more", "invalid-cursor"), emptyAudio.replace("false", "true")))
+                assertTrue(runCatching { page(invalid) }.exceptionOrNull() is IllegalArgumentException)
+        }
+    }
+
     @Test fun malformedTypesCountsEligibilityPositionsAndWrongVariantFailWholePage() {
         val valid = OfflineTestData.page()
         for (body in listOf(

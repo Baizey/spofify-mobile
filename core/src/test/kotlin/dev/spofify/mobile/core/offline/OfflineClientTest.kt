@@ -75,6 +75,27 @@ class OfflineClientTest {
         }
     }
 
+    @Test fun eitherPlaylistKindWithMissingAudioRejectsTheWholeSnapshotBeforeFollowingCursors() = runBlocking {
+        fixture { server, sessions, identity ->
+            val api = OfflineClient(sessions, identity, pageSize = 2)
+            for (kind in listOf("manual", "derived")) {
+                server.enqueue(json(OfflineTestData.page(ids = listOf("one", "one"), total = 3, next = "of1_next")
+                    .replace("\"kind\":\"manual\"", "\"kind\":\"$kind\"")
+                    .replace("\"recordedAudioTotal\":3", "\"recordedAudioTotal\":2")))
+                fails(OfflineFailure.SOURCE_UNAVAILABLE) { api.manifest(OfflineTestData.playlist) }
+                val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+                assertNull(request.requestUrl!!.queryParameter("cursor"))
+            }
+            assertEquals(3, server.requestCount)
+            val valid = OfflineTestData.page()
+            for (invalid in listOf(valid.replace("\"recordedAudioTotal\":1", "\"recordedAudioTotal\":2"),
+                valid.replace("\"hasAudio\":true", "\"hasAudio\":false"))) {
+                server.enqueue(json(invalid))
+                fails(OfflineFailure.INVALID_RESPONSE) { api.manifest(OfflineTestData.playlist) }
+            }
+        }
+    }
+
     @Test fun albumArtistAndPreparationEscapeIdsOnceAndNeverFollowDownloadUrls() = runBlocking {
         fixture { server, sessions, identity ->
             val id = "a+日本:%"

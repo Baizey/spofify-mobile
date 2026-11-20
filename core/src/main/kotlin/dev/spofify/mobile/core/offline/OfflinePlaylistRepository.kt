@@ -7,7 +7,6 @@ import dev.spofify.mobile.core.cache.SongKey
 import dev.spofify.mobile.core.http.AudioStream
 import java.io.InputStream
 import kotlinx.coroutines.*
-import kotlinx.coroutines.sync.withLock
 
 /** Counts playlist entries, including each occurrence of a verified shared track. */
 data class OfflinePlaylistProgress(val verified: Int, val total: Int)
@@ -35,10 +34,12 @@ class OfflinePlaylistRepository(
         val job = currentCoroutineContext().job
         fun live() = job.isActive && current()
         fun checkCurrent() { if (!live()) throw CancellationException("Playlist work retired") }
-        store.playlistWriter.withLock {
+        store.attemptPlaylist(owner, id) {
             try {
                 checkCurrent()
-                val result = transient(::checkCurrent) { manifest(ref) }
+                val result = transient(::checkCurrent) {
+                    store.readPlaylistManifest(owner) { checkCurrent(); manifest(ref) }
+                }
                 checkCurrent()
                 validatePlaylist(id, result)
                 val remaining = result.items.groupingBy { it.track.id }.eachCount().toMutableMap()
@@ -73,7 +74,7 @@ class OfflinePlaylistRepository(
     suspend fun remove(id: String, cap: Int, current: () -> Boolean): Boolean = withContext(Dispatchers.IO) {
         require(cap in CacheOptions.caps)
         val job = currentCoroutineContext().job
-        store.playlistWriter.withLock {
+        store.writePlaylist(owner, id) {
             store.remove(owner, id, cap) {
                 if (!job.isActive || !current()) throw CancellationException("Playlist work retired")
             }

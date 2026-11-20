@@ -12,6 +12,7 @@ import java.net.InetAddress
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import okhttp3.mockwebserver.MockResponse
@@ -25,9 +26,9 @@ class OfflinePlaylistRepositoryTest {
     @get:Rule val root = TemporaryFolder()
     private val owner = MusicOwner("https://one.example", "account")
     private fun key(id: String) = SongKey(owner, id)
-    private fun playlist(id: String, rev: Long, vararg ids: String): OfflineManifest {
+    private fun playlist(id: String, rev: Long, vararg ids: String, kind: OfflinePlaylistKind = OfflinePlaylistKind.DERIVED): OfflineManifest {
         val ref = OfflineCollectionRef(OfflineCollectionKind.PLAYLIST, id)
-        val c = OfflineCollection(ref, "name $rev", OfflinePlaylistKind.DERIVED, "description $rev", rev)
+        val c = OfflineCollection(ref, "name $rev", kind, "description $rev", rev)
         val rows = ids.mapIndexed { i, track -> OfflineOccurrence("entry-$rev-$i", i.toLong(),
             PersonalTrack("track", track, "title $rev", true, PersonalCoverage(12, 9, 2),
                 listOf(PersonalArtist("artist", "artist name")), listOf("jazz"), "album", "album name",
@@ -201,6 +202,128 @@ class OfflinePlaylistRepositoryTest {
         assertEquals(audio, store.songs.value)
         assertEquals(setOf("two"), completed.first())
         assertEquals(setOf("two"), repo(MusicBlobStore(root.root)).completeIds().first())
+    }
+
+    @Test fun eitherPlaylistKindCanFinishWhileTheOtherDisjointDownloadIsSuspended() = runBlocking {
+        val manual = playlist("manual", 1, "m1", "m2", "m3", "m4", kind = OfflinePlaylistKind.MANUAL)
+        val derived = playlist("derived", 2, "d1", "d2", "d3", "d4")
+        for ((first, second) in listOf(manual to derived, derived to manual)) {
+            val dir = root.newFolder()
+            val store = MusicBlobStore(dir)
+            val firstId = first.collection.reference.id
+            val secondId = second.collection.reference.id
+            val blockedTrack = first.items[1].track.id
+            val suspended = CompletableDeferred<Unit>()
+            val resume = CompletableDeferred<Unit>()
+            val repository = repo(store, manifest = { if (it.id == firstId) first else second }, open = {
+                if (it.trackId == blockedTrack) { suspended.complete(Unit); resume.await() }
+                audio()
+            })
+            val firstProgress = mutableListOf<OfflinePlaylistProgress>()
+            val worker = async { repository.refresh(firstId, 3, firstProgress::add) { true } }
+            try {
+                withTimeout(5_000) { suspended.await() }
+                assertEquals(listOf(OfflinePlaylistProgress(0, 4), OfflinePlaylistProgress(1, 4)), firstProgress)
+                val secondProgress = mutableListOf<OfflinePlaylistProgress>()
+                assertEquals(second, withTimeout(5_000) { repository.refresh(secondId, 3, secondProgress::add) { true } })
+                assertEquals((0..4).map { OfflinePlaylistProgress(it, 4) }, secondProgress)
+                assertEquals(setOf(secondId), repository.completeIds().first())
+                assertNull(store.pin(key(first.items[0].track.id)) { true })
+                assertEquals(bytes.size.toLong(), store.storageUsage(owner).first().pendingDownloadBytes)
+
+                val pinnedKey = key(second.items[0].track.id)
+                store.pin(pinnedKey) { true }!!.use { pin ->
+                    store.clearAuto(owner)
+                    store.limit(owner, 3, emptyList())
+                    assertEquals(5, blobCount(dir))
+                    pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
+                }
+                resume.complete(Unit)
+                assertEquals(first, withTimeout(5_000) { worker.await() })
+                assertEquals((0..4).map { OfflinePlaylistProgress(it, 4) }, firstProgress)
+                assertEquals(MusicStorageUsage(offlinePlaylistCount = 2, offlineBytes = 8L * bytes.size),
+                    store.storageUsage(owner).first())
+                assertEquals(setOf(first, second), repo(MusicBlobStore(dir)).complete().toSet())
+            } finally { worker.cancelAndJoin() }
+        }
+    }
+
+    @Test fun disjointPlaylistsTakeTurnsReadingOneAccountsManifests() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val firstReading = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val secondReading = CompletableDeferred<Unit>()
+        val repository = repo(store, manifest = {
+            when (it.id) {
+                "manual" -> { firstReading.complete(Unit); releaseFirst.await() }
+                "derived" -> secondReading.complete(Unit)
+            }
+            if (it.id == "manual") playlist(it.id, 1, "m", kind = OfflinePlaylistKind.MANUAL) else playlist(it.id, 2, "d")
+        })
+        val first = async { repository.save("manual") }
+        try {
+            withTimeout(5_000) { firstReading.await() }
+            val second = async(start = CoroutineStart.UNDISPATCHED) { repository.save("derived") }
+            try {
+                assertNull(withTimeoutOrNull(200) { secondReading.await() })
+                releaseFirst.complete(Unit)
+                withTimeout(5_000) { first.await(); second.await() }
+                assertEquals(setOf("manual", "derived"), repository.completeIds().first())
+            } finally { second.cancelAndJoin() }
+        } finally { first.cancelAndJoin() }
+    }
+
+    @Test fun repeatedMediaBusyDoesNotBlockAnotherPlaylistOrDiscardVerifiedDrafts() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val manual = playlist("manual", 1, "m1", "m2", kind = OfflinePlaylistKind.MANUAL)
+        val derived = playlist("derived", 2, "d")
+        val opened = mutableListOf<String>()
+        var attempts = 0
+        val repository = repo(store, manifest = { if (it.id == "manual") manual else derived }, prepare = {
+            if (it == "m2" && ++attempts <= 2) throw OfflineException(OfflineFailure.BUSY)
+            descriptor(it)
+        }, open = { opened += it.trackId; audio() })
+        assertEquals(OfflineFailure.BUSY, (runCatching { repository.save("manual") }.exceptionOrNull() as OfflineException).failure)
+        assertEquals(2, attempts)
+        assertEquals(setOf("manual"), repository.retainedIds())
+        assertNull(repository.select("manual"))
+        assertEquals(derived, repository.save("derived"))
+        val progress = mutableListOf<OfflinePlaylistProgress>()
+        assertEquals(manual, repository.refresh("manual", 3, progress::add) { true })
+        assertEquals(listOf("m1", "d", "m2"), opened)
+        assertEquals(listOf(OfflinePlaylistProgress(1, 2), OfflinePlaylistProgress(2, 2)), progress)
+        assertEquals(setOf(manual, derived), repository.complete().toSet())
+    }
+
+    @Test fun lateSpacePressureRejectsAnAdmittedTrackWithoutReplacingExistingAudio() = runBlocking {
+        val reserve = 64L * 1024 * 1024
+        val free = AtomicLong(Long.MAX_VALUE)
+        val store = MusicBlobStore(root.root, free::get)
+        val old = playlist("p", 1, "old")
+        repo(store, manifest = { old }).save()
+        val openFirst = CompletableDeferred<Unit>()
+        val resumeFirst = CompletableDeferred<Unit>()
+        val next = playlist("p", 2, "new")
+        val other = playlist("q", 1, "disjoint")
+        val repository = repo(store, manifest = { if (it.id == "p") next else other }, open = {
+            if (it.trackId == "new") { openFirst.complete(Unit); resumeFirst.await() }
+            audio()
+        })
+        val worker = async { runCatching { repository.save() } }
+        try {
+            withTimeout(5_000) { openFirst.await() } // Passed descriptor admission with enough space.
+            assertEquals(other, withTimeout(5_000) { repository.save("q") })
+            free.set(reserve + bytes.size - 1)
+            resumeFirst.complete(Unit)
+            assertTrue(withTimeout(5_000) { worker.await() }.exceptionOrNull() is IOException)
+            assertEquals(setOf(old, other), repository.complete().toSet())
+            assertEquals(2, blobCount(root.root))
+            assertFalse(root.root.listFiles()!!.any { it.extension == "tmp" })
+            assertNull(store.pin(key("new")) { true })
+            store.pin(key("old")) { true }!!.use { pin ->
+                pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
+            }
+        } finally { worker.cancelAndJoin() }
     }
 
     @Test fun pendingIsNotPlayableAndReopenResumesVerifiedTracksWithoutAnotherTransfer() = runBlocking {

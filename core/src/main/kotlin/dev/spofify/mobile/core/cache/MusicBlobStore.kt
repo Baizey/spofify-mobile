@@ -6,6 +6,9 @@ import dev.spofify.mobile.core.offline.PlaylistFiles
 import dev.spofify.mobile.core.offline.trackKeys
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -64,7 +67,11 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     private val entries = mutableMapOf<SongKey, Entry>()
     // A metadata-only remnant never occupies a track's live entry.
     private val staleMetadata = mutableMapOf<Path, SongKey>()
-    internal val playlistWriter = Mutex()
+    private val playlistWriters = KeyedMutex<Pair<MusicOwner, String>>()
+    private val manifestReaders = KeyedMutex<MusicOwner>()
+    // Two disjoint downloads can make progress without opening a stream per wanted playlist.
+    private val playlistAttempts = Semaphore(2)
+    private val diskWrites = ReentrantLock()
     private val playlists = PlaylistFiles(dir)
     private class Ticket(val auto: Boolean) {
         @Volatile var cleared = false
@@ -269,6 +276,29 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             .thenBy { it.last }).take(budget.size - cap).forEach(::removeAuto)
     }
 
+    internal suspend fun <T> attemptPlaylist(owner: MusicOwner, id: String, write: suspend () -> T): T =
+        writePlaylist(owner, id) { playlistAttempts.withPermit { write() } }
+
+    // Keep same-playlist refresh/removal serialized, including across account facade lifetimes.
+    internal suspend fun <T> writePlaylist(owner: MusicOwner, id: String, write: suspend () -> T): T =
+        playlistWriters.run(owner to id, write)
+
+    // The server admits one playlist evaluation per account. Keep the whole paginated
+    // read together, but allow other manifests to load while this playlist transfers audio.
+    internal suspend fun <T> readPlaylistManifest(owner: MusicOwner, read: suspend () -> T): T =
+        manifestReaders.run(owner, read)
+
+    private class KeyedMutex<K> {
+        private class Entry(val mutex: Mutex = Mutex(), var users: Int = 0)
+        private val entries = mutableMapOf<K, Entry>()
+
+        suspend fun <T> run(key: K, block: suspend () -> T): T {
+            val entry = synchronized(entries) { entries.getOrPut(key) { Entry() }.also { it.users++ } }
+            try { return entry.mutex.withLock { block() } }
+            finally { synchronized(entries) { if (--entry.users == 0) entries.remove(key) } }
+        }
+    }
+
     internal fun complete(owner: MusicOwner) = lock.withLock { playlists.complete(owner) }
     internal fun select(owner: MusicOwner, id: String) = lock.withLock { playlists.select(owner, id) }
 
@@ -317,7 +347,8 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         check(keys.all { key -> entries.getValue(key).let { e ->
             (id in e.row.drafts || playlists.contains(owner, id, key)) && e.file.length() == e.row.size
         } })
-        afterCommit(owner, cap, playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, checkCurrent))
+        val old = diskWrites.withLock { playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, checkCurrent) }
+        afterCommit(owner, cap, old)
         // Keep the hold until the complete manifest rename is durable. A failed cleanup
         // is harmless; the tracks are already published and cleanup can run on retry.
         try { clearDraft(owner, id, emptySet(), {}) } catch (_: IOException) { }
@@ -397,10 +428,16 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                     val buffer = ByteArray(64 * 1024)
                     var left = media.byteLength
                     while (left > 0) {
-                        if (!live() || freeBytes() < RESERVE) throw IOException("Fill interrupted")
+                        if (!live()) throw IOException("Fill interrupted")
                         val n = input.read(buffer, 0, minOf(left, buffer.size.toLong()).toInt())
                         if (n <= 0) throw IOException("Incomplete media")
-                        out.write(buffer, 0, n); hash.update(buffer, 0, n); left -= n
+                        // Parallel transfers must not both spend the same free space. Never
+                        // hold this lock across a network read or a full audio download.
+                        diskWrites.withLock {
+                            if (!live() || n > freeBytes() - RESERVE) throw IOException("Fill interrupted")
+                            out.write(buffer, 0, n)
+                        }
+                        hash.update(buffer, 0, n); left -= n
                     }
                     require(input.read() == -1 && hash.digest().hex() == media.sha256)
                     out.fd.sync()

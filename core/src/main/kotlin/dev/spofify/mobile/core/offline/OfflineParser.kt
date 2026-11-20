@@ -48,7 +48,8 @@ internal object OfflineParser {
         val fence = root.string("fence").also { require(OfflineValidation.id(it, 16 * 1024)) }
         val total = root.count("total")
         val audioTotal = root.count("recordedAudioTotal")
-        require(total == audioTotal)
+        require(audioTotal <= total && (audioTotal == total || ref.kind == OfflineCollectionKind.PLAYLIST))
+        val incomplete = audioTotal < total
         if (expected != null && (collection != expected.collection || fence != expected.fence ||
                 total != expected.total || audioTotal != expected.recordedAudioTotal))
             throw OfflineException(OfflineFailure.STALE_MANIFEST)
@@ -59,7 +60,7 @@ internal object OfflineParser {
             entry.fields("occurrenceId", "position", "track")
             val id = entry.string("occurrenceId").also { require(OfflineValidation.id(it, 16 * 1024)) }
             val position = entry.long("position").also { require(it == offset.toLong() + index) }
-            OfflineOccurrence(id, position, track(entry.obj("track")))
+            OfflineOccurrence(id, position, track(entry.obj("track"), incomplete))
         }
         val cursor = root.getValue("nextCursor").let { if (it == JsonNull) null else root.string("nextCursor") }
         if (cursor == null) require(offset.toLong() + items.size == total)
@@ -68,13 +69,22 @@ internal object OfflineParser {
             require(OfflineValidation.id(cursor, 16 * 1024) &&
                 cursor.startsWith(if (ref.kind == OfflineCollectionKind.PLAYLIST) "of1_" else "ofc1_"))
         }
+        // Older v1 servers included unavailable playlist rows. Check this page, but
+        // don't follow cursors or stage a prefix of an unsavable snapshot.
+        if (incomplete) {
+            val available = items.count { it.track.hasAudio }
+            require(available <= audioTotal && items.size - available <= total - audioTotal)
+            require(items.distinctBy { it.occurrenceId }.size == items.size)
+            throw OfflineException(OfflineFailure.SOURCE_UNAVAILABLE)
+        }
         return Page(collection, fence, items, total, audioTotal, cursor)
     }
 
-    private fun track(root: JsonObject): PersonalTrack {
+    private fun track(root: JsonObject, incomplete: Boolean): PersonalTrack {
         require(root.keys.all { it in setOf("kind", "id", "name", "hasAudio", "coverage", "artists", "genres",
             "albumId", "albumName", "albumType", "releaseDate", "relation", "durationMs", "discNumber", "trackNumber") })
-        require(root.string("kind") == "track" && root.bool("hasAudio"))
+        val hasAudio = root.bool("hasAudio")
+        require(root.string("kind") == "track" && (hasAudio || incomplete))
         val id = root.string("id").also { require(OfflineValidation.id(it)) }
         val coverage = root.obj("coverage")
         coverage.fields("tracks", "inLibrary", "albums")
@@ -87,7 +97,7 @@ internal object OfflineParser {
         } }.orEmpty()
         val genres = root["genres"]?.let { root.array("genres").map { value -> displayText(value.stringValue()) } }.orEmpty()
         val albumId = root.optionalDisplay("albumId").also { require(it.isEmpty() || OfflineValidation.id(it)) }
-        return PersonalTrack("track", id, root.display("name"), true,
+        return PersonalTrack("track", id, root.display("name"), hasAudio,
             PersonalCoverage(tracks, available, coverage.count("albums")), artists, genres, albumId,
             root.optionalDisplay("albumName"), root.optionalDisplay("albumType"), root.optionalDisplay("releaseDate"),
             root.optionalDisplay("relation"), root.optionalCount("durationMs"),
