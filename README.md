@@ -9,9 +9,22 @@ playlists, Recently played, mini/full player, queue/output controls, waveform/ly
 and Settings appearance. Full History insights and artist rankings remain deferred.
 Settings → Offline mode switches the existing app to this account’s local music. It requires an explicit switch; network outages do not transfer playback ownership.
 Keep 3 / 10 / 100 / 1000 distinct songs to look ahead 1 / 3 / 6 / 12 songs respectively.
-Prefetch defaults to unmetered connections; requested streams are unrestricted. Clear removes
-only automatic retention. The count excludes songs held for offline use; stored bytes include
-shared and still-playing blobs. Save a fully playable playlist from its More menu. Only a verified complete save appears in offline Playlists. Offline History reads a previously observed online snapshot; device playback never records or uploads history. Display lyrics are not saved. Going online retires local output and its queue before validating the session and waiting for a fresh server snapshot.
+Prefetch defaults to unmetered connections; requested streams are unrestricted. Settings →
+Music storage separates offline playlist audio (including pending saves) from automatic
+cache, and counts shared audio once. Clear automatic cache preserves playlist downloads;
+bytes held by current playback may remain until that source closes. Save a fully playable
+playlist from its More menu. Only a verified complete save appears in offline Playlists.
+Online playback also prefers verified on-device audio for the selected track. Offline
+History reads a previously observed online snapshot; device playback never records or
+uploads history. Display lyrics are not saved. Going online retires local output and its
+queue before validating the session and waiting for a fresh server snapshot.
+
+Settings → Crossfade is off by default and applies to playback on this phone, including
+manual offline mode. It overlaps natural transitions by up to five seconds. Short tracks
+use less overlap, and a missing, unconfirmed, or late successor plays with the usual
+transition. Skips, seeks, pauses, and changes to the upcoming track cancel the overlap.
+Online crossfade can start loading the next track before the current one ends; it does not
+change which device owns playback or which queue entry is reported before natural EOF.
 
 ## UI specification
 

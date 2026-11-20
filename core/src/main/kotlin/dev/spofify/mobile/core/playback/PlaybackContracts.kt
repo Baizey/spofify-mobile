@@ -61,6 +61,16 @@ interface AudioExecutor {
     /** Synchronously cancel pending starts and stop sound; preserve prepared media. */
     fun pause()
     fun facts(): AudioFacts
+
+    /** Optional native preview. Resolve the live natural successor on the player looper, never by track ID. */
+    fun armCrossfade(binding: AudioBinding, successor: () -> PlaybackTrack?) {}
+
+    /** Revoke a preview of a removed/reordered occurrence before returning from a queue mutation. */
+    fun recheckCrossfade() {}
+
+    /** Called synchronously only after the outgoing native EOF and controller traversal decision.
+     * A successful promotion replaces the outgoing authority with the new binding. */
+    fun promoteCrossfade(from: AudioBinding, next: AudioBinding, track: PlaybackTrack, authorized: () -> Boolean): Boolean = false
 }
 
 interface PlaybackClock {

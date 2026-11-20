@@ -43,6 +43,7 @@ internal class AudioLoadScope(
  * once an interruption belongs to a binding, never hand its period/task to another binding. */
 internal class AudioSourceOwner(val key: String, val trackId: String) {
     val job = SupervisorJob()
+    @Volatile var usingNetwork = false
     private var binding: AudioLoadScope? = null
     private val interruptions = mutableSetOf<AudioLoadRetry>()
 

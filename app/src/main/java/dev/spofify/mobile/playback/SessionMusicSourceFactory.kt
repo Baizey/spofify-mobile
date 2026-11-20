@@ -27,15 +27,15 @@ internal class SessionMusicSourceFactory(private val sessions: SessionRepository
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
         val grant = sessions.onlineGrant.value?.takeIf { it.identity == identity }
         val allowed = { grant != null && sessions.onlineGrant.value === grant }
-        var choice = cache.sourceChoice(allowed)
-        val factory = ProgressiveMediaSource.Factory(DataSource.Factory { SessionAudioDataSource(sessions, grant, choice, currentSource) })
+        var ranges = cache.onlineRanges(allowed)
+        val factory = ProgressiveMediaSource.Factory(DataSource.Factory { SessionAudioDataSource(sessions, grant, ranges, currentSource) })
         drm?.let(factory::setDrmSessionManagerProvider)
         loadPolicy?.let(factory::setLoadErrorHandlingPolicy)
         return object : WrappingMediaSource(factory.createMediaSource(mediaItem)) {
             override fun releaseSourceInternal() {
                 try { super.releaseSourceInternal() } finally {
-                    choice.close() // Old DataSources remain fenced even if this source is prepared again.
-                    choice = cache.sourceChoice(allowed)
+                    ranges.close() // Old DataSources remain fenced even if this source is prepared again.
+                    ranges = cache.onlineRanges(allowed)
                 }
             }
         }

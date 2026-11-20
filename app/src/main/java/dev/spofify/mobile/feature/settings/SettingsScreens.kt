@@ -30,17 +30,19 @@ import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
 import dev.spofify.mobile.designsystem.paletteColor
 import dev.spofify.mobile.feature.library.PageTitle
+import dev.spofify.mobile.playback.AutomaticMusicCache
 
 @Composable
 internal fun SettingsScreen(
     identity: AccountIdentity,
     palettes: AccountPaletteController,
-    cache: dev.spofify.mobile.playback.AutomaticMusicCache?,
+    cache: AutomaticMusicCache?,
     modeSetting: @Composable () -> Unit,
     onCache: () -> Unit,
     onAccount: () -> Unit,
     onColours: () -> Unit,
     onCredits: () -> Unit,
+    playbackSetting: @Composable () -> Unit = {},
 ) {
     val paletteState by palettes.state.collectAsStateWithLifecycle()
     val palette = paletteState.takeIf { it.owner == identity }?.confirmed
@@ -48,9 +50,11 @@ internal fun SettingsScreen(
         SettingsGroup("Account")
         SettingsLink("Account and server", identity.username, onAccount)
         SettingsLink("Account colours", palette?.selected?.name, onColours)
+        SettingsGroup("Playback")
+        playbackSetting()
         SettingsGroup("Storage")
         modeSetting()
-        SettingsLink("Automatic music cache", cache?.let { cacheSummary(it.songs.collectAsStateWithLifecycle().value) }, onCache)
+        SettingsLink("Music storage", musicStorageSummary(cache?.usage?.collectAsStateWithLifecycle()?.value), onCache)
         SettingsGroup("About")
         SettingsLink("Credits", null, onCredits)
     }
@@ -151,7 +155,7 @@ internal fun FontLicenseScreen() {
 }
 
 @Composable
-private fun SettingsPage(title: String, content: @Composable ColumnScope.() -> Unit) {
+internal fun SettingsPage(title: String, content: @Composable ColumnScope.() -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
         PageTitle(title)
         content()

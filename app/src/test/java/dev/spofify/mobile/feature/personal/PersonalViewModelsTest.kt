@@ -8,6 +8,7 @@ import dev.spofify.mobile.core.playback.PlaybackQueueState
 import dev.spofify.mobile.core.playback.PlaybackSnapshot
 import dev.spofify.mobile.core.playback.PlaybackStatus
 import dev.spofify.mobile.core.playback.PlaybackView
+import dev.spofify.mobile.playback.LivePersonal
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -441,6 +442,40 @@ class PersonalViewModelsTest {
         assertEquals(PersonalLibraryErrorCode.STALE_EVALUATION, (failure as PersonalLibraryException).code)
         api.current = summary(revision = 9)
         assertEquals(PlaybackContext("playlist", "playlist", "Playlist"), freshPlaylistContext(api, "playlist"))
+    }
+
+    @Test fun onlineDerivedPlaylistRoutesExactLiveOccurrenceWithoutLegacySelectionToken() = runTest(dispatcher) {
+        val replica = AccountPersonalReplica()
+        val api = object : PersonalLibraryApi by Api(), LivePersonal {
+            override val replica = replica
+            override fun command(intent: PersonalIntent) = true
+            override fun watch(id: String): AutoCloseable {
+                replica.watch(id)
+                return AutoCloseable { replica.unwatch(id) }
+            }
+        }
+        val summary = summary(count = 3, kind = PersonalPlaylistKind.DERIVED)
+        val model = keep(PlaylistDetailViewModel(api, summary.id))
+        replica.receive(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
+        runCurrent()
+        assertNull(model.state.value.context)
+        val song = track()
+        replica.receive(PersonalUpdate(part = PersonalPart(summary, "v1", 0, listOf(
+            PersonalManualEntry("first", 0, song), PersonalManualEntry("second", 1, song),
+            PersonalManualEntry("unavailable", 2, track(audio = false)),
+        ), false)))
+        runCurrent()
+        val state = model.state.value
+        val context = state.context
+        assertTrue(state.completeCollection)
+        assertTrue(state.summary!!.capabilities.play)
+        assertEquals(PlaybackContext("derived", summary.id, summary.name), context)
+        val references = state.rows.map { it.reference(context) }
+        assertEquals(listOf("first", "second", null), references.map { it?.occurrenceId })
+        assertEquals(summary.id, references[1]?.targetId)
+        assertEquals(song.id, references[1]?.id)
+        assertNull(references[1]?.selectionToken)
+        assertNull(PlaylistSong("legacy", 0, song, occurrenceId = "legacy").reference(context))
     }
 
     @Test fun gestureBindingDistinguishesDuplicateOccurrencesAndFreshFencesWithoutResettingForQuietProgress() {

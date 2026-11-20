@@ -53,6 +53,8 @@ private fun network(app: Application) = callbackFlow {
     awaitClose { cm.unregisterNetworkCallback(callback) }
 }.conflate().catch { emit(null) }
 
+internal enum class CacheClearState { IDLE, CLEARING, FAILED }
+
 /** One session-bound consumer. Main only projects current facts; all file and transport work is on IO. */
 internal class AutomaticMusicCache(app: Application, private val sessions: SessionRepository,
     private val identity: AccountIdentity, private val storage: MusicStorage, private val scope: CoroutineScope) {
@@ -62,16 +64,17 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
     val options = MutableStateFlow(CacheOptions(
         prefs.getInt(prefix + "cap", 10).takeIf { it in CacheOptions.caps } ?: 10,
         prefs.getBoolean(prefix + "metered", false)))
-    @OptIn(ExperimentalCoroutinesApi::class)
-    val songs = storage.ready.filterNotNull().flatMapLatest { store -> store.songs.map { list -> list.filter { it.key.owner == owner } } }
-        .stateIn(scope, SharingStarted.WhileSubscribed(), null)
+    val usage: StateFlow<MusicStorageUsage?> = flow {
+        storage.initialized.await()?.let { emitAll(it.storageUsage(owner)) }
+    }.stateIn(scope, SharingStarted.WhileSubscribed(replayExpirationMillis = 0), null)
     private val api = OfflineClient(sessions, identity)
     private var lastQueue: dev.spofify.mobile.core.playback.PlaybackQueueState? = null
     private var window: CacheWindow? = null
     private var playing = false
     val link = MutableStateFlow<CacheNetwork?>(null)
     private val suppression = ClearSuppression()
-    private var clearing = 0
+    private val mutableClearState = MutableStateFlow(CacheClearState.IDLE)
+    val clearState = mutableClearState.asStateFlow()
     private val plan = MutableStateFlow(PrefetchPlan(options.value.cap, null, null, emptyList()))
 
     init {
@@ -109,7 +112,7 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
     }
     private fun update() {
         val old = plan.value
-        val next = window.plan(options.value, link.value, playing && clearing == 0, suppression)
+        val next = window.plan(options.value, link.value, playing && clearState.value != CacheClearState.CLEARING, suppression)
         if (old.copy(generation = 0) != next) plan.value = next.copy(generation = old.generation + 1)
     }
     fun configure(value: CacheOptions) {
@@ -119,15 +122,29 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
         }
         options.value = value; update()
     }
-    fun clear(id: String?) {
-        if (!sessions.isCurrent(identity)) return
-        suppression.clear(id); clearing++; update()
+    fun clearAutomaticCache() {
+        if (!sessions.isCurrent(identity) || clearState.value == CacheClearState.CLEARING) return
+        suppression.clear(null)
+        mutableClearState.value = CacheClearState.CLEARING
+        update()
         scope.launch {
-            try { withContext(Dispatchers.IO) { if (sessions.isCurrent(identity)) storage.ready.value?.clearAuto(owner, id) } }
-            catch (e: CancellationException) { throw e } catch (_: Exception) { /* Retain actual rows on storage failure. */ }
-            finally { clearing--; update() }
+            var result = CacheClearState.IDLE
+            try {
+                val store = storage.initialized.await() ?: error("Music storage unavailable")
+                withContext(Dispatchers.IO) { if (sessions.isCurrent(identity)) store.clearAuto(owner) }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { result = CacheClearState.FAILED }
+            finally { mutableClearState.value = result; update() }
         }
     }
+    fun onlineRanges(allowed: () -> Boolean) = OnlineMusicRanges(storage.initialized, sourceChoice(allowed), allowed)
+
+    // A hint to replace an installed HTTP representation at the next playback command.
+    // The loader still pins and validates the file; this is not a playable-availability check.
+    fun hasStoredAudio(trackId: String): Boolean = storage.ready.value?.songs?.value?.any {
+        it.key.owner == owner && it.key.id == trackId && (it.offline || it.auto)
+    } == true
+
     fun sourceChoice(allowed: () -> Boolean = { true }) = MusicSourceChoice({ id ->
         storage.ready.value?.pin(SongKey(owner, id)) { allowed() && sessions.isCurrent(identity) }
     }, storage::release)

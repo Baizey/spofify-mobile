@@ -92,7 +92,7 @@ internal fun MusicRow(
             // IconButton consumes its own click; it never bubbles a second Play/Open to this parent.
             Column(Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onOpen)) {
                 Row(Modifier.fillMaxWidth().heightIn(min = MusicRowGeometry.MIN_HEIGHT.dp)
-                    .padding(horizontal = geometry.gutter.dp, vertical = 10.dp),
+                    .padding(horizontal = geometry.gutter.dp, vertical = MusicRowGeometry.VERTICAL_PADDING.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     if (trackNumber != null) {
                         Text(trackNumber.toString(), Modifier.width(MusicRowGeometry.NUMBER_WIDTH.dp),

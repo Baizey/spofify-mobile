@@ -16,6 +16,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -156,8 +157,11 @@ internal fun MusicRoot(
                 }
             }
             composable("settings") {
-                SettingsScreen(identity, palettes, currentPlayer.value.cache, modeSetting = { ManualModeSetting(identity, sessions, playbackOwner) }, onCache = { navigation.navigate("music-cache") }, onAccount = { navigation.navigate("account") },
-                    onColours = { navigation.navigate("colours") }, onCredits = { navigation.navigate("credits") })
+                SettingsScreen(identity, palettes, currentPlayer.value.cache,
+                    modeSetting = { ManualModeSetting(identity, sessions, playbackOwner) },
+                    onCache = { navigation.navigate("music-cache") }, onAccount = { navigation.navigate("account") },
+                    onColours = { navigation.navigate("colours") }, onCredits = { navigation.navigate("credits") },
+                    playbackSetting = { CrossfadeSetting(currentPlayer.value) })
             }
             composable("music-cache") { dev.spofify.mobile.feature.settings.MusicCacheScreen(currentPlayer.value.cache) }
             composable("colours") { AccountColoursScreen(identity, palettes) }
@@ -181,7 +185,7 @@ internal fun MusicRoot(
                 }, { devices = true })
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            Row(Modifier.fillMaxWidth().heightIn(min = 68.dp).padding(start = 4.dp, end = 4.dp, top = 5.dp, bottom = 3.dp)) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)) {
                 MusicTab.entries.forEach { destination ->
                     val active = tab == destination
                     TextButton({
@@ -196,15 +200,15 @@ internal fun MusicRoot(
                             popUpTo(navigation.graph.id)
                             launchSingleTop = true
                         }
-                    }, Modifier.weight(1f).heightIn(min = 60.dp).semantics {
+                    }, Modifier.weight(1f).heightIn(min = 48.dp).semantics {
                         role = Role.Tab
                         selected = active
-                    }, contentPadding = PaddingValues(horizontal = 2.dp, vertical = 5.dp),
+                    }, contentPadding = PaddingValues(horizontal = 2.dp, vertical = 2.dp),
                         colors = ButtonDefaults.textButtonColors(contentColor = if (active)
                             MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant)) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(3.dp)) {
                             SpofifyIcon(destination.glyph, null, Modifier.size(24.dp))
-                            Text(destination.title, style = MaterialTheme.typography.labelSmall.copy(
+                            Text(destination.title, textAlign = TextAlign.Center, style = MaterialTheme.typography.labelSmall.copy(
                                 fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Normal))
                         }
                     }

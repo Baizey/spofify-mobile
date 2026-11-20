@@ -11,7 +11,14 @@ class MusicRowGeometryTest {
         assertEquals(48, MusicRowGeometry.ACTION_SLOT)
         assertEquals(344, row.moreStart(412))
         assertEquals(263, row.identityWidth(412))
-        assertEquals(72, MusicRowGeometry.MIN_HEIGHT)
+    }
+
+    @Test fun compactRowFitsBothSlotsAtFullSizeInsideVerticalPadding() {
+        val padding = MusicRowGeometry.VERTICAL_PADDING
+        val height = MusicRowGeometry.MIN_HEIGHT
+        assertEquals(4, padding)
+        assertEquals(56, height)
+        assertEquals(maxOf(MusicRowGeometry.ARTWORK_SLOT, MusicRowGeometry.ACTION_SLOT), height - 2 * padding)
     }
 
     @Test fun albumNumberAddsExactly22Plus10BeforeArtworkWithoutMovingMore() {

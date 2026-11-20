@@ -19,6 +19,8 @@ internal data class MusicRowGeometry(val numbered: Boolean = false, val gutter: 
         const val NUMBER_GAP = 10
         const val IDENTITY_GAP = 13
         const val POPULARITY_SLOT = 24
-        const val MIN_HEIGHT = 72
+        const val VERTICAL_PADDING = 4
+        // The artwork and action slots fit at normal text size; scaled text can grow the row.
+        const val MIN_HEIGHT = ACTION_SLOT + 2 * VERTICAL_PADDING
     }
 }

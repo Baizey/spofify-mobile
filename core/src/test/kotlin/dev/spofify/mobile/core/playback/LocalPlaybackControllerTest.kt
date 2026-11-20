@@ -318,6 +318,87 @@ class LocalPlaybackControllerTest {
         local("close");assertTrue(views.last().queue.isEmpty());assertFalse(audio.actual.isPlaying);assertFalse(audio.attempts.last().authorized());owner.close()
     }
 
+    @Test fun confirmedAccountPreviewPublishesOnlyOutgoingRunUntilRealEndThenAdoptsNativePosition() = runTest {
+        val audio = FakeAudio()
+        val facts = mutableListOf<AccountFact>()
+        val views = mutableListOf<AccountState>()
+        val owner = AccountPlayer(audio, backgroundScope, { true }, views::add, facts::add)
+        val rows = listOf(track("duplicate").copy(key = 1), track("duplicate").copy(key = 2))
+        val initial = AccountState(rows, AccountCursor(1, "chain", desired = true), "off", false)
+        owner.snapshot(initial, true)
+        runCurrent()
+        val outgoing = audio.starts.single()
+        val resolver = requireNotNull(audio.successor)
+        assertEquals(2L, resolver()?.key)
+        owner.local(fields("type" to "repeat", "repeat" to "one"))
+        assertNull(resolver()) // Optimistic repeat is not an authorized audible successor.
+        owner.update(AccountDelta(repeat = "one"))
+        assertNull(resolver()) // Confirmed repeat-one still does not overlap the same occurrence.
+        owner.update(AccountDelta(repeat = "off"))
+        audio.readyKey = resolver()?.key
+        audio.actual = audio.actual.copy(elapsed = 29.9)
+        advanceTimeBy(251)
+        assertTrue(facts.all { !it.ended && it.key == 1L })
+        audio.end(outgoing); runCurrent()
+        assertEquals(2L, facts.single { it.ended }.landed)
+        assertEquals(2L, views.last().cursor.key)
+        assertEquals(4.9, views.last().cursor.elapsed, 0.0)
+        assertEquals(1, audio.attempts.size) // The second deck wasn't restarted at zero.
+        assertNotEquals(outgoing.eventId, audio.actual.binding!!.eventId)
+        assertTrue(audio.outgoingAuthorizedDuringPromotion)
+        assertFalse(audio.attempts.single().authorized())
+        assertTrue(audio.promotedAuthority?.invoke() == true)
+        assertNull(resolver()) // Stale resolver cannot donate its deck to any later run.
+        owner.close()
+        assertFalse(audio.promotedAuthority?.invoke() == true)
+    }
+
+    @Test fun consecutiveFadePromotionsDoNotRevokeTheOutgoingLoaderEarly() = runTest {
+        val h = Harness(this)
+        h.controller.playCollection(playlist); runCurrent()
+        val a = h.audio.starts.single()
+        h.audio.readyKey = h.audio.successor?.invoke()?.key
+        h.audio.end(a); runCurrent()
+        assertEquals("b", h.state.current?.id)
+        val b = requireNotNull(h.audio.actual.binding)
+        val bAuthority = requireNotNull(h.audio.promotedAuthority)
+        h.audio.readyKey = h.audio.successor?.invoke()?.key
+        h.audio.end(b); runCurrent()
+        assertEquals("c", h.state.current?.id)
+        assertEquals(2, h.audio.promotions)
+        assertEquals(1, h.audio.attempts.size)
+        assertTrue(h.audio.outgoingAuthorizedDuringPromotion)
+        assertFalse(bAuthority())
+        assertTrue(h.audio.promotedAuthority?.invoke() == true)
+    }
+
+    @Test fun localPreviewTracksLiveQueueAndNeverPromotesOnSeekOrManualSkip() = runTest {
+        val h = Harness(this)
+        h.controller.playCollection(playlist); runCurrent()
+        val resolve = requireNotNull(h.audio.successor)
+        h.audio.readyKey = resolve()!!.key
+        h.controller.remove(h.audio.readyKey!!)
+        assertEquals("c", resolve()?.id)
+        h.controller.setRepeat("one")
+        assertNull(resolve())
+        h.controller.seek(24.0); runCurrent()
+        assertNull(resolve())
+        h.controller.next(); runCurrent()
+        assertEquals("c", h.state.current?.id)
+        assertEquals(0, h.audio.promotions)
+        val last = requireNotNull(h.audio.successor)
+        h.controller.pause()
+        assertNull(last())
+    }
+
+    @Test fun oneEntryRepeatAllDoesNotPreviewTheSameOccurrence() = runTest {
+        val h = Harness(this)
+        h.library.tracks = listOf(track("a"))
+        h.controller.playCollection(playlist); runCurrent()
+        h.controller.setRepeat("all")
+        assertNull(requireNotNull(h.audio.successor).invoke())
+    }
+
     private class Harness(scope: TestScope) {
         var allowed = true
         val audio = FakeAudio()
@@ -368,6 +449,21 @@ class LocalPlaybackControllerTest {
         val starts = mutableListOf<AudioBinding>()
         val authorizedWhenPaused = mutableListOf<Boolean>()
         var actual = AudioFacts()
+        var successor: (() -> PlaybackTrack?)? = null
+        var readyKey: Long? = null
+        var promotions = 0
+        var outgoingAuthorizedDuringPromotion = false
+        var promotedAuthority: (() -> Boolean)? = null
+        override fun armCrossfade(binding: AudioBinding, successor: () -> PlaybackTrack?) { this.successor = successor }
+        override fun promoteCrossfade(from: AudioBinding, next: AudioBinding, track: PlaybackTrack, authorized: () -> Boolean): Boolean {
+            promotions++
+            if (readyKey != track.key || actual.binding != from || !actual.ended || !authorized()) return false
+            val outgoingAuthority = promotedAuthority ?: attempts.last { it.binding == from }.authorized
+            outgoingAuthorizedDuringPromotion = outgoingAuthority()
+            promotedAuthority = authorized
+            actual = AudioFacts(next, 4.9, 30.0, isPlaying = true)
+            return true
+        }
         var hold: Gate? = null
 
         override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double): AudioResult =

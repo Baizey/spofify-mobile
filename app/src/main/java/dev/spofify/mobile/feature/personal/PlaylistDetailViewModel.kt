@@ -59,8 +59,9 @@ internal class PlaylistDetailViewModel(
                 val detail = snapshot.details[id]
                 val derived = summary.kind == PersonalPlaylistKind.DERIVED
                 val rows = detail?.rows.orEmpty().mapIndexed { index, row ->
+                    // Live selection identifies the occurrence directly; signed tokens are legacy HTTP only.
                     PlaylistSong(row.id, index.toLong(), row.track, entryId = row.id.takeUnless { derived },
-                        occurrenceId = row.id.takeIf { derived })
+                        occurrenceId = row.id.takeIf { derived }, liveOccurrence = derived)
                 }
                 mutable.value = mutable.value.copy(summary = summary, rows = rows,
                     loaded = detail != null, completeCollection = detail != null,

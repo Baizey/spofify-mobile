@@ -16,7 +16,7 @@ import java.security.MessageDigest
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-/** One account, one ExoPlayer. A command target, its external session and all controller work are
+/** One account, one authoritative output. A command target, its external session and all controller work are
  * shorter lived. Old remote controls and queued gestures never resolve to the successor's target. */
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class NativePlayer(private val app: Application, val identity: AccountIdentity,
@@ -28,7 +28,17 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
     val music = AccountMusic(app, identity, sessions, storage, cache, scope)
     private val mutable = MutableStateFlow<AppPlayback?>(null)
     val target = mutable.asStateFlow()
-    val audio = Media3AudioExecutor(app, sessions, identity, cache, ::systemPause, requestPlaybackStart)
+    private val playbackPrefs = app.getSharedPreferences("native-playback", Application.MODE_PRIVATE)
+    private val fade = MutableStateFlow(playbackPrefs.getBoolean("crossfade", false))
+    val crossfadeEnabled = fade.asStateFlow()
+    fun setCrossfadeEnabled(enabled: Boolean) {
+        playbackPrefs.edit().putBoolean("crossfade", enabled).apply()
+        fade.value = enabled
+        audio.setCrossfadeEnabled(enabled)
+    }
+    val audio: Media3AudioExecutor = Media3AudioExecutor(app, sessions, identity, cache, ::systemPause, requestPlaybackStart) { player ->
+        mutable.value?.let { selected -> mediaSession?.setPlayer(routed(player, selected)) }
+    }.apply { setCrossfadeEnabled(fade.value) }
     var mediaSession: MediaSession? = null
         private set
     private var life: Job? = null
@@ -87,14 +97,16 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
             mode.launch { controller.state.collect { reconcile() } }
             AppPlayback.Online(controller, current)
         }
-        mediaSession = MediaSession.Builder(app, RoutingPlayer(audio.player, selected) {
-            target.value === selected && mediaSession?.controllerForCurrentRequest != null
-        }).setSessionActivity(PendingIntent.getActivity(app, 0, Intent(app, MainActivity::class.java)
+        mediaSession = MediaSession.Builder(app, routed(audio.player, selected)).setSessionActivity(PendingIntent.getActivity(app, 0, Intent(app, MainActivity::class.java)
             .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build()
         mutable.value = selected
         maintenance?.start()
         reconnect?.expedite()
+    }
+
+    private fun routed(player: androidx.media3.common.Player, selected: AppPlayback): RoutingPlayer = RoutingPlayer(player, selected) {
+        audio.player === player && target.value === selected && mediaSession?.controllerForCurrentRequest != null
     }
 
     fun foreground() { reconnect?.expedite(); maintenance?.refreshNow() }

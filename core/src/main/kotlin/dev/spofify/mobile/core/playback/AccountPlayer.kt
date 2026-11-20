@@ -62,7 +62,16 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
     private val engine = LocalPlaybackController(audio, object : LocalPlaybackLibrary {
         override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = null
         override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
-    }, scope, { owner && allowed() }, onNaturalEnd = ::ended, onObserved = ::observed)
+    }, scope, { owner && allowed() }, onNaturalEnd = ::ended, onObserved = ::observed, allowPreview = ::confirmedSuccessor)
+
+    // No preview on a speculative Play/Add/Shuffle or a locally predicted visit awaiting its echo.
+    // The ordinary EOF path is unchanged; preloading never emits a command or fact.
+    private fun confirmedSuccessor(track: PlaybackTrack): Boolean {
+        val live = state ?: return false
+        val confirmed = published ?: return false
+        return owner && allowed() && live.queue === confirmed.queue && live.repeat == confirmed.repeat &&
+            live.cursor.sameRun(confirmed.cursor) && confirmed.cursor.desired && isPublishedQueueKey(track.key)
+    }
 
     fun snapshot(next: AccountState, output: Boolean) { if(next.collectionFirst!=0L)cache(next.queue,next.collectionFirst); published = next; adopt(next, output) }
     private fun cache(rows: List<PlaybackTrack>, first: Long) {
@@ -98,14 +107,14 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
         } else adopt(next, owner)
     }
     fun output(value: Boolean) { state?.let { adopt(it, value) } }
-    private fun adopt(next: AccountState, output: Boolean, confirm: Boolean = false) {
+    private fun adopt(next: AccountState, output: Boolean, confirm: Boolean = false, natural: Boolean = false) {
         val old = state
         val start = !owner || old == null || !old.cursor.sameRun(next.cursor) || old.cursor.desired != next.cursor.desired
         if (owner && !output) engine.stop()
         owner = output
         state = next
         publish(next)
-        if (owner) engine.adopt(next.presentation(), start && !confirm)
+        if (owner) engine.adopt(next.presentation(), start && !confirm, natural)
     }
     private var preview = 0L
     fun local(command: JsonObject) {
@@ -173,7 +182,7 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
             else AccountCursor(old.queue[next].key, old.cursor.chain, old.cursor.visit + 1, desired = true)
         // Report the source end before any synchronous successor facts. No response needed for adopt().
         if (old.cursor.key < (1L shl 52) && !old.cursor.chain.startsWith("local:")) report(fact(old.cursor, facts, next?.let { old.queue[it].key } ?: 0L))
-        adopt(old.copy(cursor = cursor), true)
+        adopt(old.copy(cursor = cursor), true, natural = next != null && confirmedSuccessor(old.queue[next]))
     }
     private fun observed(facts: AudioFacts) {
         val c = state?.cursor ?: return

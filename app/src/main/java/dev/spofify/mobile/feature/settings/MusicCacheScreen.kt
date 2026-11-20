@@ -2,53 +2,80 @@ package dev.spofify.mobile.feature.settings
 
 import android.text.format.Formatter
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.spofify.mobile.core.cache.CacheOptions
-import dev.spofify.mobile.core.cache.StoredSong
-import dev.spofify.mobile.feature.library.PageTitle
+import dev.spofify.mobile.core.cache.MusicStorageUsage
+import dev.spofify.mobile.designsystem.SpofifySwitchIndicator
 import dev.spofify.mobile.playback.AutomaticMusicCache
+import dev.spofify.mobile.playback.CacheClearState
 
 @Composable
-internal fun cacheSummary(songs: List<StoredSong>?): String {
-    if (songs == null) return "Storage unavailable"
-    val n = songs.count { it.auto && !it.offline }
-    val bytes = Formatter.formatShortFileSize(LocalContext.current, songs.sumOf { it.bytes })
-    return "$n ${if (n == 1) "song" else "songs"} · $bytes stored"
-}
+private fun storageSize(bytes: Long) = Formatter.formatShortFileSize(LocalContext.current, bytes)
+
+@Composable
+internal fun musicStorageSummary(usage: MusicStorageUsage?) =
+    if (usage == null) "Storage unavailable" else "${storageSize(usage.totalBytes)} total"
 
 @Composable
 internal fun MusicCacheScreen(cache: AutomaticMusicCache) {
     val options by cache.options.collectAsStateWithLifecycle()
-    val songs by cache.songs.collectAsStateWithLifecycle()
-    val rows = remember(songs) { songs.orEmpty().filter { it.auto }.sortedBy { it.title } }
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
-        item {
-            PageTitle("Automatic music cache")
-            Text(cacheSummary(songs), style = MaterialTheme.typography.bodySmall)
-            CacheSelector("Keep songs", options.cap, CacheOptions.caps) { cache.configure(options.copy(cap = it)) }
-            Row(Modifier.fillMaxWidth().heightIn(min = 62.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Cache on metered networks", Modifier.weight(1f))
-                Switch(options.metered, { cache.configure(options.copy(metered = it)) })
+    val usage by cache.usage.collectAsStateWithLifecycle()
+    val clear by cache.clearState.collectAsStateWithLifecycle()
+    val storage = usage
+    SettingsPage("Music storage") {
+        StorageCaption(musicStorageSummary(storage))
+
+        SettingsGroup("Offline playlist storage")
+        if (storage != null) {
+            Text("${storageSize(storage.offlineBytes)} · ${storage.offlinePlaylistCount} " +
+                if (storage.offlinePlaylistCount == 1) "saved playlist" else "saved playlists")
+            if (storage.pendingDownloadBytes > 0) {
+                StorageCaption("Includes ${storageSize(storage.pendingDownloadBytes)} from unfinished downloads.")
             }
-            TextButton({ cache.clear(null) }, enabled = songs != null) { Text("Clear all cached songs") }
         }
-        items(rows, key = { it.key.id }) { song ->
-            val bytes = Formatter.formatShortFileSize(LocalContext.current, song.bytes)
-            Row(Modifier.fillMaxWidth().heightIn(min = 62.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) { Text(song.title); Text(if (song.offline) "$bytes · shared" else bytes, style = MaterialTheme.typography.bodySmall) }
-                TextButton({ cache.clear(song.key.id) }) { Text("Clear") }
+        StorageCaption("Shared songs count here only. To remove a download, turn off Save for offline in the playlist’s menu.")
+
+        SettingsGroup("Automatic music cache")
+        if (storage != null) {
+            Text("${storageSize(storage.cacheBytes)} · ${storage.cachedSongCount} " +
+                if (storage.cachedSongCount == 1) "cached song" else "cached songs")
+            if (storage.inUseBytes > 0) {
+                StorageCaption("Includes ${storageSize(storage.inUseBytes)} still in use by playback.")
             }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        }
+        StorageCaption("Clearing this cache won’t remove your offline playlist downloads.")
+        TextButton(cache::clearAutomaticCache, enabled = storage != null && clear != CacheClearState.CLEARING) {
+            Text(if (clear == CacheClearState.CLEARING) "Clearing automatic cache…" else "Clear automatic cache")
+        }
+        if (clear == CacheClearState.FAILED) {
+            Text("Couldn’t finish clearing the automatic cache.", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+        }
+        CacheSelector("Keep cached songs", options.cap, CacheOptions.caps) { cache.configure(options.copy(cap = it)) }
+        Row(Modifier.fillMaxWidth().heightIn(min = 62.dp)
+            .toggleable(options.metered, role = Role.Switch) { cache.configure(options.copy(metered = it)) },
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("Cache on metered networks", Modifier.weight(1f))
+            SpofifySwitchIndicator(options.metered, enabled = true)
         }
     }
+}
+
+@Composable
+private fun StorageCaption(text: String) {
+    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 6.dp))
 }
 
 @Composable

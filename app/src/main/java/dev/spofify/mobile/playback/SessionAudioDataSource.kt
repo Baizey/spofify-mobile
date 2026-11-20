@@ -10,20 +10,52 @@ import dev.spofify.mobile.core.cache.MusicSourceChoice
 import dev.spofify.mobile.core.http.AudioRepresentation
 import dev.spofify.mobile.core.http.AudioStream
 import dev.spofify.mobile.core.http.TransientAudioLoadFailure
+import java.io.Closeable
 import java.io.EOFException
 import java.io.IOException
 import java.io.InterruptedIOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+
+/** Resolve storage recovery before choosing the representation, off the player looper. A real
+ * disk miss may use HTTP, but startup must not make an already saved track look absent.
+ */
+internal class OnlineMusicRanges(
+    private val initialized: Deferred<*>,
+    private val choice: MusicSourceChoice,
+    private val current: () -> Boolean,
+) : Closeable {
+    fun openLocal(source: AudioSourceOwner, position: Long): AudioStream? {
+        fun retired() = !source.job.isActive || !current()
+        if (retired()) throw InterruptedIOException("Online audio source retired")
+        if (!initialized.isCompleted) try {
+            runBlocking(source.job) { initialized.await() }
+        } catch (_: CancellationException) {
+            throw InterruptedIOException("Audio storage wait cancelled")
+        } catch (_: InterruptedException) {
+            throw InterruptedIOException("Audio storage wait interrupted")
+        }
+        if (retired()) throw InterruptedIOException("Online audio source retired")
+        val local = choice.openLocal(source.trackId, position)
+        if (retired()) {
+            local?.close()
+            throw InterruptedIOException("Online audio source retired")
+        }
+        return local
+    }
+
+    override fun close() = choice.close()
+}
 
 /** Both branches use the same Media3 range. Only HTTP contributes bandwidth or retry events. */
 @UnstableApi
 internal class SessionAudioDataSource(
     private val sessions: SessionRepository,
     private val grant: OnlineGrant?,
-    private val choice: MusicSourceChoice,
+    private val ranges: OnlineMusicRanges,
     private val currentSource: () -> AudioSourceOwner?,
 ) : DataSource {
     private var local: AudioStream? = null
@@ -40,11 +72,12 @@ internal class SessionAudioDataSource(
         require(uri.scheme == "spofify" && uri.authority == "audio" && uri.pathSegments.size == 1 && uri.query == null && uri.fragment == null)
         val id = requireNotNull(uri.lastPathSegment)
         val installed = currentSource().forRange(id, dataSpec.key)
-        local = choice.openLocal(id, dataSpec.position)
+        local = ranges.openLocal(installed, dataSpec.position)
         val source = if (local != null) disk else network
         active = source
         return try {
             if (source === network) {
+                installed.usingNetwork = true
                 if (!::retry.isInitialized) retry = AudioLoadRetry(installed)
                 if (retry.source !== installed) throw InterruptedIOException("Audio period replaced")
             }

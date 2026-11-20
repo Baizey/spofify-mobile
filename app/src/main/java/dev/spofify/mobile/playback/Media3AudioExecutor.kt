@@ -19,22 +19,29 @@ import kotlinx.coroutines.flow.asSharedFlow
 /** The sole local audio executor. Every operation and callback runs on the player looper. */
 @UnstableApi
 internal class Media3AudioExecutor(
-    context: Context,
-    sessions: SessionRepository,
-    identity: AccountIdentity,
+    private val context: Context,
+    private val sessions: SessionRepository,
+    private val identity: AccountIdentity,
     private val cache: AutomaticMusicCache,
     private val onSystemPause: () -> Unit,
     private val requestPlaybackStart: () -> Boolean,
+    private val onPlayerChanged: (ExoPlayer) -> Unit = {},
 ) : AudioExecutor, Closeable {
     private var audioLoadScope: AudioLoadScope? = null
-    @Volatile private var source: AudioSourceOwner? = null
-    val player: ExoPlayer = ExoPlayer.Builder(context)
-        .setMediaSourceFactory(SessionMusicSourceFactory(sessions, identity, cache) { source }
-            .setLoadErrorHandlingPolicy(AudioLoadRecovery()))
-        .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(), true)
-        .setHandleAudioBecomingNoisy(true)
-        .setWakeMode(C.WAKE_MODE_LOCAL)
-        .build()
+    private val attrs = AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build()
+    private inner class Deck(focus: Boolean) {
+        @Volatile var source: AudioSourceOwner? = null
+        val player = ExoPlayer.Builder(context)
+            .setMediaSourceFactory(SessionMusicSourceFactory(sessions, identity, cache) { source }
+                .setLoadErrorHandlingPolicy(AudioLoadRecovery()))
+            .setAudioAttributes(attrs, focus).setHandleAudioBecomingNoisy(focus)
+            .setWakeMode(C.WAKE_MODE_LOCAL).build()
+    }
+    private var primary = Deck(true)
+    private var source: AudioSourceOwner?
+        get() = primary.source
+        set(value) { primary.source = value }
+    val player: ExoPlayer get() = primary.player
     private val mutableObservations = MutableSharedFlow<AudioObservation>(
         extraBufferCapacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     override val observations = mutableObservations.asSharedFlow()
@@ -50,7 +57,10 @@ internal class Media3AudioExecutor(
 
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
-            if (released) return
+            if (released || player !== this@Media3AudioExecutor.player) return
+            if ((!player.isPlaying && player.playbackState != Player.STATE_ENDED || !player.playWhenReady ||
+                    player.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE) &&
+                preview?.deck?.player?.playWhenReady == true) discardPreview()
             val current = binding ?: return
             if (player.currentMediaItem?.mediaId != current.trackId) return
             val pending = preparation?.takeIf { it.matches(generation, current, player.currentMediaItem?.mediaId) }
@@ -95,6 +105,14 @@ internal class Media3AudioExecutor(
             desiredPlaying: Boolean, isAuthorized: () -> Boolean) =
             executeOn(binding, track, elapsed, desiredPlaying, localOnly) { current() && isAuthorized() }
         override fun pause() { if (current()) this@Media3AudioExecutor.pause() }
+        override fun armCrossfade(binding: AudioBinding, successor: () -> PlaybackTrack?) {
+            if (current() && this@Media3AudioExecutor.binding == binding) arm(localOnly, successor)
+        }
+        override fun recheckCrossfade() {
+            if (current() && preview?.let { it.row.key != successor?.invoke()?.key } == true) discardPreview()
+        }
+        override fun promoteCrossfade(from: AudioBinding, next: AudioBinding, track: PlaybackTrack, authorized: () -> Boolean) =
+            current() && promote(from, next, track) { current() && authorized() }
     }
 
     private suspend fun executeOn(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
@@ -154,22 +172,15 @@ internal class Media3AudioExecutor(
             val position = (elapsed * 1000).toLong()
             val wait = NativePreparation(token, next, track.id, position, playRequested)
             preparation = wait
-            if (localOnly || player.currentMediaItem?.mediaId != track.id || player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED)
-                || player.playerError != null || source?.bind(owner) != true) {
+            val preferSaved = source?.usingNetwork == true && cache.hasStoredAudio(track.id)
+            if (localOnly || preferSaved || player.currentMediaItem?.mediaId != track.id ||
+                player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED) ||
+                player.playerError != null || source?.bind(owner) != true) {
                 retireSource()
                 val installed = AudioSourceOwner(token.toString(), track.id)
                 check(installed.bind(owner))
                 source = installed
-                val metadata = MediaMetadata.Builder().setTitle(track.name)
-                    .setArtist(track.artists.joinToString(", ") { it.name }).setAlbumTitle(track.albumName).build()
-                val uri = Uri.Builder().scheme("spofify").authority("audio").appendPath(track.id).build()
-                // IDs are opaque: a suffix such as .mpd must not select a manifest media source.
-                val item = MediaItem.Builder().setMediaId(track.id).setUri(uri).setCustomCacheKey(installed.key)
-                    .setMimeType("application/octet-stream").setMediaMetadata(metadata).build()
-                if (localOnly) player.setMediaSource(localMusicSource(item,
-                    LocalMusicRanges(installed, owner::isCurrent, cache::sourceChoice)), position)
-                else player.setMediaItem(item, position)
-                player.prepare()
+                install(primary, track, installed, owner, localOnly, position)
             } else if (playRequested || elapsed != player.currentPosition / 1000.0) {
                 // In-place stop: don't round-trip an already exact native millisecond through a seek.
                 player.seekTo(position)
@@ -191,6 +202,169 @@ internal class Media3AudioExecutor(
         }
     }
 
+    private fun install(deck: Deck, track: PlaybackTrack, installed: AudioSourceOwner, owner: AudioLoadScope,
+        localOnly: Boolean, position: Long) {
+        val metadata = MediaMetadata.Builder().setTitle(track.name)
+            .setArtist(track.artists.joinToString(", ") { it.name }).setAlbumTitle(track.albumName).build()
+        val uri = Uri.Builder().scheme("spofify").authority("audio").appendPath(track.id).build()
+        val item = MediaItem.Builder().setMediaId(track.id).setUri(uri).setCustomCacheKey(installed.key)
+            .setMimeType("application/octet-stream").setMediaMetadata(metadata).build()
+        if (localOnly) deck.player.setMediaSource(localMusicSource(item,
+            LocalMusicRanges(installed, owner::isCurrent, cache::sourceChoice)), position)
+        else deck.player.setMediaItem(item, position)
+        deck.player.prepare()
+    }
+
+    // Only the primary deck can publish facts or acquire focus. The secondary shares its focus
+    // and foreground lifetime, and cannot run beyond that binding except by explicit EOF promotion.
+    private class Gate(private var authorized: () -> Boolean) {
+        @Synchronized fun allows() = authorized()
+        @Synchronized fun bind(next: () -> Boolean) { authorized = next }
+    }
+    private inner class Preview(val deck: Deck, val row: PlaybackTrack, val gate: Gate, val load: AudioLoadScope) {
+        var span = 0L
+    }
+    private val handler = android.os.Handler(player.applicationLooper)
+    private var enabled = false
+    private var successor: (() -> PlaybackTrack?)? = null
+    private var localPreview = false
+    private var preview: Preview? = null
+    private var attempted: Long? = null
+    private val tick = Runnable { updateFade() }
+
+    fun setCrossfadeEnabled(value: Boolean) {
+        if (released || enabled == value) return
+        enabled = value
+        attempted = null
+        handler.removeCallbacks(tick)
+        if (!value) discardPreview() else if (successor != null) handler.post(tick)
+    }
+
+    private fun arm(local: Boolean, resolve: () -> PlaybackTrack?) {
+        disarm()
+        localPreview = local
+        successor = resolve
+        if (enabled) handler.post(tick)
+    }
+
+    private fun disarm() {
+        handler.removeCallbacks(tick)
+        handler.removeCallbacks(tickTimeout)
+        successor = null
+        attempted = null
+        discardPreview()
+    }
+
+    private fun discardPreview() {
+        val p = preview ?: return
+        preview = null
+        p.gate.bind { false }
+        p.deck.player.volume = 0f
+        p.deck.player.pause()
+        player.volume = 1f
+        p.load.job.cancel()
+        p.deck.source?.job?.cancel()
+        p.deck.player.release()
+    }
+
+    private fun updateFade() {
+        val resolve = successor ?: return
+        if (!enabled || !hasPlaybackAuthority()) { disarm(); return }
+        val left = if (player.duration > 0) player.duration - player.currentPosition else Long.MAX_VALUE
+        if (left > CrossfadeWindow.PREPARE_MS) {
+            discardPreview()
+            handler.postDelayed(tick, 500)
+            return
+        }
+        val row = resolve()
+        if (preview?.row?.key != row?.key) discardPreview()
+        if (row == null || row.key != attempted) attempted = null
+        val ended = player.playbackState == Player.STATE_ENDED
+        if (!ended && !player.isPlaying) discardPreview()
+        if (row != null && player.isPlaying && left > 500 && preview == null && attempted == null) {
+            attempted = row.key
+            val outgoingLoad = audioLoadScope ?: return
+            val gate = Gate(outgoingLoad::isCurrent)
+            val load = AudioLoadScope(row.id, authorized = gate::allows)
+            try {
+                val deck = Deck(false)
+                preview = Preview(deck, row, gate, load)
+                deck.player.volume = 0f
+                val installed = AudioSourceOwner("fade-$generation-${row.key}", row.id)
+                check(installed.bind(load))
+                deck.source = installed
+                install(deck, row, installed, load, localPreview, 0)
+            } catch (_: Exception) { discardPreview(); load.job.cancel() }
+        }
+        preview?.let { p ->
+            val incoming = p.deck.player
+            val span = CrossfadeWindow.length(player.duration, incoming.duration)
+            when {
+                incoming.playerError != null || incoming.playbackState == Player.STATE_ENDED -> discardPreview()
+                ended -> { // Give the actual native end observation one looper turn to land.
+                    handler.postDelayed(tickTimeout, 250)
+                    return
+                }
+                p.span > 0 && (!incoming.isPlaying || !requestPlaybackStart()) -> discardPreview()
+                span >= 400 && left in 1..span && incoming.playbackState == Player.STATE_READY -> {
+                    if (p.span == 0L) {
+                        // Late preparation or a seek straight into the tail: ordinary EOF instead.
+                        if (span - left > 300 || !requestPlaybackStart()) discardPreview() else {
+                            p.span = left
+                            p.load.playing = true
+                            incoming.play()
+                            Log.i("SpofifyPlayer", "Crossfade overlap started: ${p.span} ms")
+                        }
+                    }
+                    if (preview === p) {
+                        val (outGain, inGain) = CrossfadeWindow.gains(left, p.span)
+                        player.volume = outGain
+                        incoming.volume = inGain
+                    }
+                }
+            }
+        }
+        if (!ended) handler.postDelayed(tick, if (preview == null) 200 else 40)
+    }
+    private val tickTimeout = Runnable { if (player.playbackState == Player.STATE_ENDED) discardPreview() }
+
+    private fun promote(from: AudioBinding, next: AudioBinding, row: PlaybackTrack, authorized: () -> Boolean): Boolean {
+        val p = preview ?: return false
+        if (!enabled || !authorized() || endedBinding != from || binding != from || row.key != p.row.key ||
+            row.id != p.row.id || p.span <= 0 || !p.deck.player.isPlaying ||
+            !player.playWhenReady || player.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE ||
+            !requestPlaybackStart()) return false
+        p.gate.bind(authorized)
+        preview = null
+        handler.removeCallbacks(tickTimeout)
+        disarm()
+        val old = primary
+        old.player.removeListener(listener)
+        old.source?.job?.cancel()
+        audioLoadScope?.job?.cancel()
+        generation++
+        primary = p.deck
+        audioLoadScope = p.load
+        binding = next
+        traversalBinding = next
+        endedBinding = null
+        playbackAuthority = authorized
+        // Mute across the focus handoff. Disable/release the old focus owner before the new
+        // playback looper receives its ordered focus and gain commands.
+        player.volume = 0f
+        player.addListener(listener)
+        onPlayerChanged(player)
+        old.player.release()
+        val continuePlaying = hasPlaybackAuthority() && requestPlaybackStart()
+        if (!continuePlaying) pause()
+        player.setHandleAudioBecomingNoisy(true)
+        player.setAudioAttributes(attrs, true)
+        player.volume = 1f // If revoked, the preceding pause is processed before this gain command.
+        if (!continuePlaying) return false
+        Log.i("SpofifyPlayer", "Crossfade promoted at native EOF: ${player.currentPosition} ms")
+        return true
+    }
+
     private fun retireSource() {
         val old = source
         source = null
@@ -199,6 +373,8 @@ internal class Media3AudioExecutor(
 
     override fun pause() {
         checkThread()
+        player.pause()
+        disarm()
         generation++
         source?.unbind()
         audioLoadScope?.job?.cancel()
@@ -208,7 +384,6 @@ internal class Media3AudioExecutor(
         val pending = preparation
         preparation = null
         pending?.result?.cancel()
-        player.pause()
     }
 
     /** Source handoff on the player looper; even an in-buffer seek cannot inherit retired bytes. */

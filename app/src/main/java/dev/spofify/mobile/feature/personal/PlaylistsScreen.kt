@@ -135,7 +135,7 @@ internal fun PlaylistSummaryRow(
         excludeEnd = geometry.swipeEndExclusion(onMore != null).dp) {
         Column(Modifier.fillMaxWidth().clickable(enabled = enabled, role = Role.Button, onClick = onClick)) {
             Row(Modifier.fillMaxWidth().heightIn(min = MusicRowGeometry.MIN_HEIGHT.dp)
-                .padding(horizontal = geometry.gutter.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                .padding(horizontal = geometry.gutter.dp, vertical = MusicRowGeometry.VERTICAL_PADDING.dp), verticalAlignment = Alignment.CenterVertically) {
                 PlaylistOfflineIndicator(offlineStatus, Modifier.size(MusicRowGeometry.ARTWORK_SLOT.dp), tile = true)
                 Spacer(Modifier.width(geometry.identityGap.dp))
                 Column(Modifier.weight(1f)) {

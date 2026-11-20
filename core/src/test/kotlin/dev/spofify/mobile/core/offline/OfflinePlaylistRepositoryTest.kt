@@ -9,6 +9,7 @@ import dev.spofify.mobile.core.personal.*
 import java.io.File
 import java.io.IOException
 import java.net.InetAddress
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.*
@@ -63,6 +64,85 @@ class OfflinePlaylistRepositoryTest {
         assertTrue(reopened.remove("p", 3) { true }); assertEquals(1, blobCount(root.root))
         assertEquals(listOf(q), reopened.complete()); assertTrue(reopened.remove("q", 3) { true })
         assertFalse(reopened.remove("q", 3) { true }); assertTrue(root.root.listFiles()!!.isEmpty())
+    }
+
+    @Test fun savedPlaylistPinDoesNotBecomeAnHttpMissWhileAnotherManifestIsCommitting() = runBlocking {
+        val locked = CompletableDeferred<Unit>()
+        val release = CountDownLatch(1)
+        val holdCommit = AtomicBoolean(false)
+        val store = MusicBlobStore(root.root) {
+            if (holdCommit.get()) {
+                locked.complete(Unit)
+                check(release.await(5, TimeUnit.SECONDS))
+            }
+            Long.MAX_VALUE
+        }
+        repo(store, manifest = { playlist("p", 1, "saved") }).save()
+        assertFalse(store.songs.value.single().auto)
+        holdCommit.set(true)
+        val committing = launch { repo(store, manifest = { playlist("q", 1) }).save("q") }
+        try {
+            withTimeout(5_000) { locked.await() }
+            val readerThread = CompletableDeferred<Thread>()
+            MusicSourceChoice({ id -> store.pin(key(id)) { true } }).use { choice ->
+                val opening = async(Dispatchers.IO) {
+                    readerThread.complete(Thread.currentThread())
+                    choice.openLocal("saved", 1)?.use { it.input.readBytes() }
+                }
+                try {
+                    val reader = withTimeout(5_000) { readerThread.await() }
+                    withTimeout(5_000) {
+                        while (!opening.isCompleted && reader.state != Thread.State.WAITING) delay(1)
+                    }
+                } finally { release.countDown() }
+                assertArrayEquals(bytes.copyOfRange(1, bytes.size), opening.await())
+            }
+        } finally { release.countDown(); committing.join() }
+    }
+
+    @Test fun storageUsageDeduplicatesSharedAudioAndClearOnlyReclaimsAutomaticRetention() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        val other = owner.copy(accountId = "other")
+        val size = bytes.size.toLong()
+        val p = playlist("p", 1, "shared", "offline", "shared")
+        val q = playlist("q", 1, "shared")
+        val saved = repo(store, manifest = { if (it.id == "p") p else q })
+        suspend fun auto(key: SongKey) = store.fill(key, key.id, 3, emptyList(), { true }, { descriptor(key.id) }) {
+            _, consume -> consume(bytes.inputStream())
+        }
+        suspend fun usage() = store.storageUsage(owner).first()
+        fun diskBytes() = root.root.listFiles()!!.filter { it.extension == "blob" }.sumOf(File::length)
+        auto(key("shared")); saved.save(); saved.save("q")
+        auto(key("evict")); auto(key("playing")); auto(key("draft-shared")); auto(SongKey(other, "evict"))
+        val draft = repo(store, manifest = { playlist("unfinished", 1, "draft-shared", "draft-only", "fail") },
+            open = { if (it.trackId == "fail") throw IOException("fixture interrupted") else audio() })
+        assertTrue(runCatching { draft.save("unfinished") }.isFailure)
+        val before = MusicStorageUsage(offlinePlaylistCount = 2, offlineBytes = 4 * size,
+            pendingDownloadBytes = 2 * size, cachedSongCount = 2, cacheBytes = 2 * size)
+        assertEquals(before, usage()); assertEquals(6 * size, usage().totalBytes)
+        assertEquals(size, store.storageUsage(other).first().totalBytes)
+        assertEquals(diskBytes(), usage().totalBytes + size)
+
+        store.pin(key("playing")) { true }!!.use { pin ->
+            store.clearAuto(owner)
+            assertEquals(before.copy(cachedSongCount = 0, cacheBytes = size, inUseBytes = size), usage())
+            assertEquals(5 * size, usage().totalBytes); assertEquals(diskBytes(), usage().totalBytes + size)
+            assertNull(store.pin(key("evict")) { true }); assertNull(store.pin(key("playing")) { true })
+            assertNull(store.pin(key("draft-shared")) { true }); assertNull(store.pin(key("draft-only")) { true })
+            pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
+        }
+        assertEquals(before.copy(cachedSongCount = 0, cacheBytes = 0), usage())
+        assertEquals(diskBytes(), usage().totalBytes + size)
+        val reopened = MusicBlobStore(root.root)
+        assertEquals(usage(), reopened.storageUsage(owner).first())
+        assertEquals(setOf(p, q), repo(reopened).complete().toSet())
+        reopened.pin(key("shared")) { true }!!.use { pin ->
+            pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
+        }
+        reopened.pin(SongKey(other, "evict")) { true }!!.close()
+        assertEquals(setOf("p", "q", "unfinished"), repo(reopened).retainedIds())
+        for (id in listOf("p", "q", "unfinished")) assertTrue(repo(reopened).remove(id, 3) { true })
+        assertEquals(MusicStorageUsage(), reopened.storageUsage(owner).first()); assertEquals(size, diskBytes())
     }
 
     @Test fun samePlaylistAndTrackIdsIsolateOriginsAndAccountsIncludingRemovalAndReplacement() = runBlocking {
@@ -140,6 +220,8 @@ class OfflinePlaylistRepositoryTest {
             assertEquals(setOf("p"), saved.completeIds().first())
             assertNull(store.pin(key("b")) { true }); assertFalse(store.hasOfflineReference(key("b")))
             assertEquals(listOf("a"), store.songs.value.map { it.key.id })
+            store.clearAuto(owner) // Clearing during an incomplete update preserves its verified draft.
+            assertEquals(bytes.size.toLong(), store.storageUsage(owner).first().pendingDownloadBytes)
             dir.copyRecursively(crash, overwrite = true) // Process death after verified .meta, before manifest rename.
         } finally { task.cancelAndJoin() }
         val recovered = MusicBlobStore(crash)
@@ -153,6 +235,8 @@ class OfflinePlaylistRepositoryTest {
         assertEquals(listOf("c"), transfers)
         assertEquals(listOf(OfflinePlaylistProgress(1, 2), OfflinePlaylistProgress(2, 2)), progress)
         assertEquals(next, resumed.select("p")); assertEquals(2, blobCount(crash))
+        assertEquals(MusicStorageUsage(offlinePlaylistCount = 1, offlineBytes = 2L * bytes.size),
+            recovered.storageUsage(owner).first())
         recovered.pin(key("b")) { true }!!.use { pin ->
             pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
         }

@@ -42,6 +42,7 @@ class LocalPlaybackController(
     private val random: Random = Random.Default,
     private val onNaturalEnd: ((PlaybackQueueState, AudioFacts) -> Unit)? = null,
     private val onObserved: ((AudioFacts) -> Unit)? = null,
+    private val allowPreview: (PlaybackTrack) -> Boolean = { true },
 ) {
     private val mutableState = MutableStateFlow(PlaybackQueueState())
     val state: StateFlow<PlaybackQueueState> = mutableState.asStateFlow()
@@ -50,6 +51,7 @@ class LocalPlaybackController(
     private var nextKey = 0L
     @Volatile private var retired = false
     @Volatile private var active: Operation? = null
+    @Volatile private var promotingFrom: Operation? = null
 
     private class Operation(val binding: AudioBinding) {
         var job: Job? = null
@@ -185,7 +187,7 @@ class LocalPlaybackController(
         val previous = state.value
         val updated = LocalPlaybackQueue.insert(previous, allocate(items, context, if (next) "next" else "low"), next)
         if (previous.current == null) start(LocalPlaybackQueue.select(updated.copy(context = context), 0))
-        else mutableState.value = updated
+        else publishEdit(updated)
         return true
     }
 
@@ -195,17 +197,22 @@ class LocalPlaybackController(
     }
 
     private inline fun edit(change: (PlaybackQueueState) -> PlaybackQueueState) {
-        if (allowed()) mutableState.value = change(state.value)
+        if (allowed()) publishEdit(change(state.value))
+    }
+
+    private fun publishEdit(next: PlaybackQueueState) {
+        mutableState.value = next
+        audio.recheckCrossfade()
     }
 
     // The online owner adopts an already-resolved traversal. A queue-only edit or
     // reconciliation of its current native binding must not restart that binding.
-    internal fun adopt(next: PlaybackQueueState, execute: Boolean) {
+    internal fun adopt(next: PlaybackQueueState, execute: Boolean, natural: Boolean = false) {
         if (!allowed()) return
-        if (execute && next.current != null) start(next)
+        if (execute && next.current != null) start(next, natural)
         else {
             if (execute) invalidate()
-            mutableState.value = next
+            publishEdit(next)
         }
     }
 
@@ -213,6 +220,8 @@ class LocalPlaybackController(
 
     private fun allowed(): Boolean = !retired && scope.isActive && isOutputAllowed()
     private fun authorized(op: Operation): Boolean = active === op && allowed()
+    // Only loader/native handoff callbacks can bridge the outgoing operation; events recognize only active.
+    private fun loaderAuthorized(op: Operation): Boolean = (active === op || promotingFrom === op) && allowed()
 
     private fun invalidate(pauseNative: Boolean = true) {
         val op = active ?: return
@@ -227,16 +236,43 @@ class LocalPlaybackController(
         return false
     }
 
-    private fun start(next: PlaybackQueueState) {
+    private fun arm(op: Operation) {
+        audio.armCrossfade(op.binding) {
+            val q = state.value
+            if (!authorized(op) || !q.desiredPlaying) null else
+                LocalPlaybackQueue.successor(q, true)?.let(q.queue::get)
+                    ?.takeIf { it.key != q.current?.key && allowPreview(it) }
+        }
+    }
+
+    private fun start(next: PlaybackQueueState, natural: Boolean = false) {
         val track = next.current ?: return
         if (!allowed()) return
-        invalidate()
+        val outgoing = active.takeIf { natural }
+        if (outgoing == null) invalidate()
         val serial = ++generation
         val id = "local-$owner-$serial"
         val op = Operation(AudioBinding(id, serial, id, track.id))
+        promotingFrom = outgoing
         active = op
+        if (outgoing != null) {
+            val promoted = try {
+                audio.promoteCrossfade(outgoing.binding, op.binding, track) { loaderAuthorized(op) }
+            } finally {
+                promotingFrom = null
+                outgoing.job?.cancel()
+            }
+            if (promoted) {
+                mutableState.value = next
+                op.ready = true
+                arm(op)
+                sample(op, audio.facts())
+                return
+            }
+            audio.pause()
+        }
         op.job = scope.launch(start = CoroutineStart.LAZY) {
-            val permitted = { authorized(op) }
+            val permitted = { loaderAuthorized(op) }
             try {
                 if (!keep(op)) return@launch
                 val available = library.hasAudio(track, permitted)
@@ -248,6 +284,7 @@ class LocalPlaybackController(
                 when (result) {
                     AudioResult.OK -> {
                         op.ready = true
+                        if (next.desiredPlaying) arm(op)
                         op.earlyEnd?.let { ended(op, it) } ?: sample(op, audio.facts())
                         op.earlyEnd = null
                     }
@@ -296,7 +333,7 @@ class LocalPlaybackController(
         val previous = state.value
         if (!keep(op) || !previous.desiredPlaying || facts.error.isNotEmpty()) return
         if (onNaturalEnd != null) onNaturalEnd.invoke(previous, facts)
-        else LocalPlaybackQueue.successor(previous, naturalEnd = true)?.let(::select) ?: pause()
+        else LocalPlaybackQueue.successor(previous, naturalEnd = true)?.let { start(LocalPlaybackQueue.select(previous, it), natural = true) } ?: pause()
     }
 
     private fun fail(op: Operation, error: String, native: AudioFacts = audio.facts()) {

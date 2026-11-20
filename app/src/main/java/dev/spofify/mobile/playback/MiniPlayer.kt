@@ -1,6 +1,5 @@
 package dev.spofify.mobile.playback
 
-import android.os.SystemClock
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -18,15 +17,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.compose.LifecycleEventEffect
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.playback.*
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
-import kotlinx.coroutines.delay
+
+private val PlayerTouchTarget = 48.dp
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -56,10 +53,12 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
     Surface(color = MaterialTheme.colorScheme.surface) {
         Column {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            Row(Modifier.fillMaxWidth().heightIn(min = 76.dp).padding(start = 12.dp, end = 8.dp, top = 7.dp, bottom = 7.dp),
-                verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 if (track == null) {
-                    Text("No song selected", Modifier.weight(1f).padding(vertical = 10.dp),
+                    Text("No song selected", Modifier.weight(1f),
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     SwipeActionSurface(binding,
@@ -72,7 +71,7 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
                                 translationX = if (offset > 0) -width + offset else width + offset
                             }) { MiniIdentity(neighbour, loader, Modifier.fillMaxSize()) }
                         }) {
-                        MiniIdentity(track, loader, Modifier.fillMaxWidth().heightIn(min = 64.dp)
+                        MiniIdentity(track, loader, Modifier.fillMaxWidth()
                             .semantics {
                                 contentDescription = "Open player for ${track.name}"
                             }
@@ -87,7 +86,7 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
                     }
                 }
                 PlayerOutputButton(state, onDevices)
-                IconButton({ controller.toggle() }, enabled = ready && track != null, modifier = Modifier.size(48.dp)) {
+                IconButton({ controller.toggle() }, enabled = ready && track != null, modifier = Modifier.size(PlayerTouchTarget)) {
                     val wantsPlay = queue?.desiredPlaying == true
                     SpofifyIcon(if (wantsPlay) SpofifyGlyph.Pause else SpofifyGlyph.Play,
                         if (wantsPlay) "Pause" else "Play")
@@ -106,8 +105,12 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
 
 @Composable
 private fun MiniIdentity(track: PlaybackTrack, loader: ImageLoader, modifier: Modifier) {
-    Row(modifier.background(MaterialTheme.colorScheme.surface).padding(vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+    // The identity stays tappable when large text hides artwork, and can grow with the text.
+    Row(
+        modifier.heightIn(min = PlayerTouchTarget).background(MaterialTheme.colorScheme.surface).padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
         if (LocalDensity.current.fontScale < 1.5f) MusicArtwork(MusicKind.TRACK, track.id, loader, Modifier.size(40.dp))
         Column(Modifier.weight(1f)) {
             Text(track.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -125,7 +128,7 @@ internal fun PlayerOutputButton(state: PlayerPresentation, onClick: () -> Unit) 
     val selected = online?.devices?.firstOrNull { it.deviceId == online.snapshot?.selectedDeviceId }
     val remote = state.isPlaying && selected != null && selected.deviceId != online.deviceId
     val output = selected?.name ?: if (state is PlayerPresentation.Local) "this phone" else "no output"
-    IconButton(onClick, enabled = online != null && state.ready, modifier = Modifier.size(48.dp)) {
+    IconButton(onClick, enabled = online != null && state.ready, modifier = Modifier.size(PlayerTouchTarget)) {
         Box(contentAlignment = Alignment.Center) {
             SpofifyIcon(SpofifyGlyph.Devices,
                 "Playback devices: ${if (state.isPlaying) "playing" else "paused"} on $output",

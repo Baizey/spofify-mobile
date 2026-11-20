@@ -3,6 +3,7 @@ package dev.spofify.mobile.core.cache
 import dev.spofify.mobile.core.offline.OfflineMediaDescriptor
 import java.io.File
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.security.MessageDigest
 import kotlinx.coroutines.*
 import org.junit.Assert.*
@@ -152,6 +153,18 @@ class MusicBlobStoreTest {
             assertEquals(1, pins)
         }
         assertEquals(1, releases)
+    }
+
+    @Test fun interruptedPinAcquisitionDoesNotLatchAnHttpMiss() = runBlocking {
+        val store = MusicBlobStore(root.root).also { it.put() }
+        var first = true
+        MusicSourceChoice({ id ->
+            if (first) { first = false; throw InterruptedIOException("pin interrupted") }
+            store.pin(key.copy(id = id)) { true }
+        }).use { choice ->
+            assertThrows(InterruptedIOException::class.java) { choice.openLocal(key.id, 0) }
+            choice.openLocal(key.id, 1)!!.use { assertArrayEquals(bytes.copyOfRange(1, bytes.size), it.input.readBytes()) }
+        }
     }
 
     @Test fun freshSourceHitsAtOffsetButAnExistingMissDoesNotSwitchRepresentation() = runBlocking {
