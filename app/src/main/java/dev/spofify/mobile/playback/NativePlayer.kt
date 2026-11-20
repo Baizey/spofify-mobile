@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import androidx.core.content.edit
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaSession
 import dev.spofify.mobile.MainActivity
@@ -32,7 +33,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
     private val fade = MutableStateFlow(playbackPrefs.getBoolean("crossfade", false))
     val crossfadeEnabled = fade.asStateFlow()
     fun setCrossfadeEnabled(enabled: Boolean) {
-        playbackPrefs.edit().putBoolean("crossfade", enabled).apply()
+        playbackPrefs.edit { putBoolean("crossfade", enabled) }
         fade.value = enabled
         audio.setCrossfadeEnabled(enabled)
     }
