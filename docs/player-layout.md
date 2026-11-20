@@ -56,8 +56,8 @@ actual-duration gates, account/content fences and seek behavior are unchanged.
 Fetching jobs save lyrics beside the music. Display reads use the adjacent `.lrc`
 first, otherwise embedded lyrics; they never fetch or require an imported cache.
 Mobile renders that response, including plain text and retained provider credits.
-Attribution and old cache expiry dates do not gate file-backed lyrics. Refresh may
-pick up new lyrics for the same recording without reopening the player; recording,
-account and occurrence fences still reject stale responses. The sheet has one
-read-only **Refresh** action, including when no lyrics were present on the initial
-read. No automatic polling or acquisition is introduced.
+Attribution and old cache expiry dates do not gate file-backed lyrics. The player
+opens the sheet only for available plain or timed lyrics. Otherwise it shows
+**Lyrics unavailable** as non-interactive text once the read returns. The sheet
+has no Refresh action. Reopening the player reads the lyrics again; there is no
+automatic polling or acquisition.

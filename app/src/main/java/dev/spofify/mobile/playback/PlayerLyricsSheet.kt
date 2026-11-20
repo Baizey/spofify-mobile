@@ -13,8 +13,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.semantics.heading
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -30,14 +28,13 @@ internal fun PlayerLyricsSheet(
     content: TrackContentState,
     elapsedMs: Long,
     durationMs: Long,
-    onRefresh: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val lyrics = content.lyrics
+    val lyrics = content.lyrics ?: return
     val index = content.currentLineIndex(elapsedMs, durationMs)
-    val timed = lyrics?.state == LyricsState.TIMED && lyrics.withinDuration(durationMs)
+    val timed = lyrics.state == LyricsState.TIMED && lyrics.withinDuration(durationMs)
     val list = rememberLazyListState()
-    var following by remember(content.binding, lyrics?.recordingVersion) { mutableStateOf(true) }
+    var following by remember(content.binding, lyrics.recordingVersion) { mutableStateOf(true) }
     val dragged by list.interactionSource.collectIsDraggedAsState()
     LaunchedEffect(dragged) { if (dragged) following = false }
     LaunchedEffect(index, following) {
@@ -56,24 +53,19 @@ internal fun PlayerLyricsSheet(
             }, contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             stickyHeader("heading") {
                 Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(bottom = 16.dp)) {
-                    Row(Modifier.fillMaxWidth()) {
-                        Box(Modifier.weight(1f)) { SheetHeading(track.name) }
-                        TextButton(onClick = onRefresh, enabled = !content.loading) { Text("Refresh") }
-                    }
+                    SheetHeading(track.name)
                     Text(track.artists.joinToString(", ") { it.name }, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (lyrics?.state in setOf(LyricsState.PLAIN, LyricsState.TIMED)) {
-                        val kind = if (timed) "Timed lyrics" else "Plain lyrics"
-                        val source = lyrics?.attribution?.name ?: when (lyrics?.provenance) {
-                            LyricProvenance.LOCAL_LRC, LyricProvenance.EMBEDDED -> "File text"
-                            else -> null
-                        }
-                        Text(listOfNotNull(kind, source).joinToString(" · "), Modifier.padding(top = 12.dp),
-                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    val kind = if (timed) "Timed lyrics" else "Plain lyrics"
+                    val source = lyrics.attribution?.name ?: when (lyrics.provenance) {
+                        LyricProvenance.LOCAL_LRC, LyricProvenance.EMBEDDED -> "File text"
+                        else -> null
                     }
+                    Text(listOfNotNull(kind, source).joinToString(" · "), Modifier.padding(top = 12.dp),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
-            when (lyrics?.state) {
+            when (lyrics.state) {
                 LyricsState.PLAIN -> item("plain") {
                     Text(lyrics.plainText, Modifier.fillMaxWidth().padding(vertical = 18.dp),
                         style = MaterialTheme.typography.bodyLarge.copy(fontSize = 20.25.sp, lineHeight = 30.38.sp))
@@ -84,16 +76,7 @@ internal fun PlayerLyricsSheet(
                         style = MaterialTheme.typography.bodyLarge.copy(fontSize = 20.25.sp, lineHeight = 30.38.sp,
                             fontWeight = if (timed && i == index) FontWeight.Bold else FontWeight.Normal))
                 }
-                else -> item("status") {
-                    val label = when {
-                        content.loadingLyrics -> "Loading lyrics"
-                        lyrics?.state == LyricsState.PENDING -> "Lyrics pending"
-                        lyrics?.state == LyricsState.INSTRUMENTAL -> "Instrumental"
-                        content.lyricsFailure != null || lyrics?.state == LyricsState.ERROR -> "Can’t load lyrics"
-                        else -> "Lyrics unavailable"
-                    }
-                    Text(label, Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+                else -> Unit
             }
         }
         if (timed) Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 22.dp),

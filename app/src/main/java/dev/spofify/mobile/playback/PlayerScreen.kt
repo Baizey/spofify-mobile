@@ -32,7 +32,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
-import dev.spofify.mobile.core.content.LyricsState
 import dev.spofify.mobile.core.content.TrackContentApi
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.playback.*
@@ -61,8 +60,8 @@ internal fun FullPlayer(
     val currentContent = content.takeIf { it.trackId == track.id && it.binding == binding } ?: TrackContentState()
     val elapsedMs = (state.elapsed * 1000).toLong()
     val durationMs = (state.duration * 1000).toLong()
-    val inlineLine = lyricViewportKey(currentContent, elapsedMs, durationMs)
-    val lyricsEntryLabel = lyricSheetEntryLabel(currentContent).takeUnless { controller is AppPlayback.Local && inlineLine == null && currentContent.lyrics?.state != LyricsState.PLAIN }
+    val lyricsEntry = lyricEntry(currentContent)
+    val inlineLine = if (lyricsEntry == LyricEntry.AVAILABLE) lyricViewportKey(currentContent, elapsedMs, durationMs) else null
     val ready = state.ready
     var queue by remember { mutableStateOf(false) }
     var devices by remember { mutableStateOf(false) }
@@ -83,7 +82,7 @@ internal fun FullPlayer(
                 PlayerBodyLayout(
                     availableHeight = (maxHeight - 34.dp).coerceAtLeast(0.dp),
                     largeText = largeText,
-                    reserveLyrics = currentContent.lyrics?.state == LyricsState.TIMED || lyricsEntryLabel != null,
+                    reserveLyrics = lyricsEntry != LyricEntry.HIDDEN,
                     modifier = Modifier.fillMaxWidth().verticalScroll(scroll)
                         .padding(start = horizontal, end = horizontal, top = 16.dp, bottom = 18.dp)
                         .semantics { customActions = listOf(CustomAccessibilityAction("Dismiss player") { onDismiss(); true }) },
@@ -109,8 +108,13 @@ internal fun FullPlayer(
                                 PlayerLyricViewport(inlineLine, (height - 8.dp).coerceAtLeast(0.dp)) { lyrics = true }
                                 Spacer(Modifier.height(8.dp))
                             }
-                            lyricsEntryLabel != null -> Box(Modifier.fillMaxWidth().height(height), contentAlignment = Alignment.Center) {
-                                TextButton({ lyrics = true }) { Text(lyricsEntryLabel) }
+                            lyricsEntry != LyricEntry.HIDDEN -> Box(Modifier.fillMaxWidth().height(height), contentAlignment = Alignment.Center) {
+                                if (lyricsEntry == LyricEntry.AVAILABLE) {
+                                    TextButton({ lyrics = true }) { Text("View lyrics") }
+                                } else {
+                                    Text("Lyrics unavailable", color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall)
+                                }
                             }
                             else -> Spacer(Modifier.fillMaxWidth().height(height).then(dismissGesture))
                         }
@@ -166,7 +170,9 @@ internal fun FullPlayer(
         }
         if (queue) QueueSheet(controller, loader) { queue = false }
         if (devices && controller is AppPlayback.Online) DevicesSheet(controller.controller) { devices = false }
-        if (lyrics) PlayerLyricsSheet(track, currentContent, elapsedMs, durationMs, contentModel::refresh) { lyrics = false }
+        if (lyrics && lyricsEntry == LyricEntry.AVAILABLE) {
+            PlayerLyricsSheet(track, currentContent, elapsedMs, durationMs) { lyrics = false }
+        }
     }
 }
 

@@ -21,13 +21,14 @@ import androidx.compose.ui.unit.dp
 import dev.spofify.mobile.core.content.LyricsState
 import kotlinx.coroutines.launch
 
-/** Keep lyric reads accessible when jobs add files after the player opens. */
-internal fun lyricSheetEntryLabel(content: TrackContentState): String? {
-    if (content.lyricsFailure != null) return "Lyrics"
-    return when (content.lyrics?.state) {
-        LyricsState.PLAIN, LyricsState.TIMED -> "View lyrics"
-        null -> null
-        else -> "Lyrics"
+internal enum class LyricEntry { HIDDEN, AVAILABLE, UNAVAILABLE }
+
+internal fun lyricEntry(content: TrackContentState): LyricEntry = when {
+    content.lyricsFailure != null -> LyricEntry.UNAVAILABLE
+    else -> when (content.lyrics?.state) {
+        LyricsState.PLAIN, LyricsState.TIMED -> LyricEntry.AVAILABLE
+        null -> LyricEntry.HIDDEN
+        else -> LyricEntry.UNAVAILABLE
     }
 }
 

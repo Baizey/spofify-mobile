@@ -145,42 +145,35 @@ class PlayerLayoutTest {
         val content = timedContent().let { it.copy(lyrics = it.lyrics!!.copy(
             state = LyricsState.PLAIN, plainText = "Full plain lyrics", lines = emptyList())) }
         assertNull(lyricViewportKey(content, 1_000, 60_000))
-        assertEquals("View lyrics", lyricSheetEntryLabel(content))
-        assertEquals("View lyrics", lyricSheetEntryLabel(content.copy(loadingLyrics = true)))
+        assertEquals(LyricEntry.AVAILABLE, lyricEntry(content))
     }
 
     @Test fun timedClearingLinesAndUnconfirmedDurationRetainTheFullSheetEntry() {
         val content = timedContent()
         assertNull(lyricViewportKey(content, 21_000, 60_000))
         assertNull(lyricViewportKey(content, 1_000, 0))
-        assertEquals("View lyrics", lyricSheetEntryLabel(content))
+        assertEquals(LyricEntry.AVAILABLE, lyricEntry(content))
     }
 
-    @Test fun pendingAndCachedErrorsOfferTheExistingSheetAndRetryAccess() {
-        val content = timedContent()
-        for (state in listOf(LyricsState.PENDING, LyricsState.ERROR)) {
-            val cached = content.copy(lyrics = content.lyrics!!.copy(state = state))
-            assertEquals("Lyrics", lyricSheetEntryLabel(cached))
-            assertEquals("Lyrics", lyricSheetEntryLabel(cached.copy(loadingLyrics = true)))
+    @Test fun lyricResponsesWithoutTextShowTheUnavailableState() {
+        for (state in LyricsState.entries - setOf(LyricsState.PLAIN, LyricsState.TIMED)) {
+            val content = TrackContentState(lyrics = TrackLyrics("track", state, "recording", "source"))
+            assertEquals(state.name, LyricEntry.UNAVAILABLE, lyricEntry(content))
         }
     }
 
-    @Test fun lyricReadFailuresOfferTheSheetAndDoNotClaimViewableContent() {
+    @Test fun lyricReadFailuresNeverOfferTheSheet() {
         for (failure in TrackContentFailure.entries) {
-            assertEquals("Lyrics", lyricSheetEntryLabel(TrackContentState(lyricsFailure = failure)))
-            assertEquals("Lyrics", lyricSheetEntryLabel(timedContent().copy(lyricsFailure = failure)))
+            assertEquals(LyricEntry.UNAVAILABLE, lyricEntry(TrackContentState(lyricsFailure = failure)))
+            assertEquals(LyricEntry.UNAVAILABLE, lyricEntry(timedContent().copy(lyricsFailure = failure)))
         }
     }
 
-    @Test fun initialLoadingHasNoPlaceholderButReportedMissingLyricsRemainRefreshable() {
-        assertNull(lyricSheetEntryLabel(TrackContentState()))
-        assertNull(lyricSheetEntryLabel(TrackContentState(loadingLyrics = true)))
-        assertNull(lyricSheetEntryLabel(TrackContentState(loadingWaveform = true,
+    @Test fun initialLoadingAndUnrelatedWaveformFailuresDoNotShowALyricsPlaceholder() {
+        assertEquals(LyricEntry.HIDDEN, lyricEntry(TrackContentState()))
+        assertEquals(LyricEntry.HIDDEN, lyricEntry(TrackContentState(loadingLyrics = true)))
+        assertEquals(LyricEntry.HIDDEN, lyricEntry(TrackContentState(loadingWaveform = true,
             waveformFailure = TrackContentFailure.UNAVAILABLE)))
-        val content = timedContent()
-        for (state in listOf(LyricsState.INSTRUMENTAL, LyricsState.NOT_FOUND, LyricsState.UNAVAILABLE)) {
-            assertEquals("Lyrics", lyricSheetEntryLabel(content.copy(lyrics = content.lyrics!!.copy(state = state))))
-        }
     }
 
     private fun budget(width: Float = 360f, height: Float, header: Float = 48f, controls: Float = 240f,
