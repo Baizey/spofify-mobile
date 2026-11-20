@@ -1,8 +1,10 @@
 # spofify-mobile
 
-## Product copy
+## User-facing design and information
 
-- Use headings, labels, values, and status first. Show the data, not a sentence about the data: `Offline playlists` and `12 GB · 3 playlists`.
-- Omit copy that does not help the user act or understand the current state. Trust familiar terms: `Crossfade` needs no definition, duration, subtitle, or tooltip on a simple switch. Delete redundant copy rather than shortening it.
-- Add one short sentence only when it helps someone decide, avoid data loss, or recover from a problem. Say what happened and give the next action if there is one. Put mechanics and edge cases in docs.
-- Keep accessible names and states clear without repeating visible copy. Before shipping, read the screen as a whole and cut anything the layout, labels, or values already say.
+This applies to every user-facing surface in Spofify, including admin tools, setup, settings, lists, dialogs, empty and error states, and notifications.
+
+- Build for direct understanding. Use hierarchy, grouping, familiar controls, clear labels, and visible state so users can tell what matters and what they can do without reading instructions. If prose is needed to explain the interface, improve the interface first.
+- Show the information itself: a heading, value, status, or action. Trust familiar terms. Delete redundant copy rather than shortening it. No default subtitles, tooltips, or filler.
+- Add short, specific context only when it changes a decision, makes a consequence clear, or helps someone recover. Put optional details on demand and implementation mechanics in docs. Preserve accessible names and states.
+- Review the whole surface before shipping. Remove anything the design or another label already communicates.
