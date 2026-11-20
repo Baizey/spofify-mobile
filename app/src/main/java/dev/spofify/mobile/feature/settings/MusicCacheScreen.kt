@@ -36,30 +36,22 @@ internal fun MusicCacheScreen(cache: AutomaticMusicCache) {
     SettingsPage("Music storage") {
         StorageCaption(musicStorageSummary(storage))
 
-        SettingsGroup("Offline playlist storage")
+        SettingsGroup("Offline playlists")
         if (storage != null) {
             Text("${storageSize(storage.offlineBytes)} · ${storage.offlinePlaylistCount} " +
-                if (storage.offlinePlaylistCount == 1) "saved playlist" else "saved playlists")
-            if (storage.pendingDownloadBytes > 0) {
-                StorageCaption("Includes ${storageSize(storage.pendingDownloadBytes)} from unfinished downloads.")
-            }
+                if (storage.offlinePlaylistCount == 1) "playlist" else "playlists")
         }
-        StorageCaption("Shared songs count here only. To remove a download, turn off Save for offline in the playlist’s menu.")
 
-        SettingsGroup("Automatic music cache")
+        SettingsGroup("Automatic cache")
         if (storage != null) {
             Text("${storageSize(storage.cacheBytes)} · ${storage.cachedSongCount} " +
-                if (storage.cachedSongCount == 1) "cached song" else "cached songs")
-            if (storage.inUseBytes > 0) {
-                StorageCaption("Includes ${storageSize(storage.inUseBytes)} still in use by playback.")
-            }
+                if (storage.cachedSongCount == 1) "song" else "songs")
         }
-        StorageCaption("Clearing this cache won’t remove your offline playlist downloads.")
         TextButton(cache::clearAutomaticCache, enabled = storage != null && clear != CacheClearState.CLEARING) {
-            Text(if (clear == CacheClearState.CLEARING) "Clearing automatic cache…" else "Clear automatic cache")
+            Text(if (clear == CacheClearState.CLEARING) "Clearing…" else "Clear cache")
         }
         if (clear == CacheClearState.FAILED) {
-            Text("Couldn’t finish clearing the automatic cache.", style = MaterialTheme.typography.bodySmall,
+            Text("Couldn’t clear cache", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
         }
         CacheSelector("Keep cached songs", options.cap, CacheOptions.caps) { cache.configure(options.copy(cap = it)) }
