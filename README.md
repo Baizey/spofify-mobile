@@ -6,7 +6,7 @@ storage, native audio, lifecycle and presentation.
 
 Implemented surfaces include authentication, server-ranked Search, artist/album details,
 playlists, Recently played, mini/full player, queue/output controls, waveform/lyrics,
-and Settings appearance. Full History insights and artist rankings remain deferred.
+and Settings. Full History insights and artist rankings remain deferred.
 Settings → Offline mode switches the existing app to this account’s local music. It requires an explicit switch; network outages do not transfer playback ownership.
 Keep 3 / 10 / 100 / 1000 distinct songs to look ahead 1 / 3 / 6 / 12 songs respectively.
 Prefetch defaults to unmetered connections; requested streams are unrestricted. Settings →
@@ -40,12 +40,10 @@ The subsequently approved player changes are recorded in
 scrollable lyrics at the 13.2sp album/artist scale with tap-to-open text and no
 menu, lyric icon or scroll hint, compact
 identity/seek spacing, and time labels aligned with Shuffle and Repeat.
-[Settings appearance](docs/settings-appearance.md) records native palette ownership
-and persistence. The wireframe’s **Palette study** is a separate proposal: use the
-preview picker to compare Pulse Green, Electric Blue, and Hot Coral on the same screen. It does
-not change Android or the palette API. [Unified search](docs/search.md) records the subsequent
-search migration: the server now owns matching and cross-kind ranking, rather than
-the reference fixture’s local ranking heuristic. Search layout and bottom-oriented
+[Settings appearance](docs/settings-appearance.md) describes Android’s fixed dark theme.
+[Unified search](docs/search.md) records the subsequent search migration: the
+server now owns matching and cross-kind ranking, rather than the reference fixture’s
+local ranking heuristic. Search layout and bottom-oriented
 results remain unchanged. [Artist discography](docs/artist-discography.md) records
 the subsequent native grouping refinement: separate own Albums and Singles, with
 Appears on collapsed at the bottom using backend release relationships.
@@ -59,8 +57,8 @@ node docs/reference/check.cjs "$PLAYWRIGHT_MODULE" "$CHROMIUM_HEADLESS_SHELL" "$
 
 Supply a private output directory for the browser profile, temporary state and
 screenshots. The check does not download browsers, start a server or contact a
-backend. It covers player geometry/lyrics/navigation, palette stability and row
-action alignment; it is not a native Android or cross-browser acceptance test.
+backend. It covers player geometry, lyrics, navigation, and row action alignment;
+it is not a native Android or cross-browser acceptance test.
 
 ## Development
 

@@ -50,7 +50,7 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
     val binding = listOf(controller, online?.connectionId, track?.key, previous?.key, next?.key)
     var actions by remember(controller) { mutableStateOf(false) }
     LaunchedEffect(binding) { actions = false }
-    Surface(color = MaterialTheme.colorScheme.surface) {
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Row(
@@ -107,7 +107,7 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
 private fun MiniIdentity(track: PlaybackTrack, loader: ImageLoader, modifier: Modifier) {
     // The identity stays tappable when large text hides artwork, and can grow with the text.
     Row(
-        modifier.heightIn(min = PlayerTouchTarget).background(MaterialTheme.colorScheme.surface).padding(vertical = 4.dp),
+        modifier.heightIn(min = PlayerTouchTarget).background(MaterialTheme.colorScheme.surfaceContainerLow).padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {

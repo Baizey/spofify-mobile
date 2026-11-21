@@ -1,5 +1,6 @@
 package dev.spofify.mobile.feature.auth
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
@@ -53,13 +54,18 @@ internal fun LoginScreen(
 @Composable
 private fun LoginHeading() {
     Column(Modifier.padding(horizontal = Spacing.page).padding(top = Spacing.group)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Icon(painterResource(R.drawable.ic_music_note), contentDescription = null, modifier = Modifier.size(22.dp))
-            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleMedium)
-        }
+        BrandWordmark()
         Spacer(Modifier.height(Spacing.group))
         Text(stringResource(R.string.sign_in), style = MaterialTheme.typography.headlineLarge,
             modifier = Modifier.semantics { heading() })
+    }
+}
+
+@Composable
+private fun BrandWordmark() {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Image(painterResource(R.drawable.ic_spofify_mark), contentDescription = null, modifier = Modifier.size(44.dp))
+        Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleMedium)
     }
 }
 
@@ -126,7 +132,7 @@ private fun loginFieldColors() = TextFieldDefaults.colors(
     focusedContainerColor = MaterialTheme.colorScheme.background,
     unfocusedContainerColor = MaterialTheme.colorScheme.background,
     disabledContainerColor = MaterialTheme.colorScheme.background,
-    focusedIndicatorColor = MaterialTheme.colorScheme.secondary,
+    focusedIndicatorColor = MaterialTheme.colorScheme.tertiary,
     unfocusedIndicatorColor = MaterialTheme.colorScheme.outline,
 )
 
@@ -177,7 +183,7 @@ internal fun ConnectionScreen(notice: AuthNotice?, onRetry: (() -> Unit)? = null
     onManual: (() -> Unit)? = null, onSignOut: (() -> Unit)? = null) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(Spacing.page),
         verticalArrangement = Arrangement.spacedBy(Spacing.fieldGap)) {
-        Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleMedium)
+        BrandWordmark()
         if (notice == null) {
             CircularProgressIndicator()
             Text(stringResource(R.string.connecting), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
@@ -203,7 +209,7 @@ internal fun Notice(notice: AuthNotice?) {
         AuthNotice.REMOTE_LOGOUT_FAILED -> R.string.remote_logout_failed
         AuthNotice.LOCAL_LOGOUT_FAILED -> R.string.local_logout_failed
     }
-    Text(stringResource(resource), style = MaterialTheme.typography.bodyMedium,
+    Text(stringResource(resource), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error,
         modifier = Modifier.padding(bottom = 12.dp).semantics { liveRegion = LiveRegionMode.Polite })
 }
 

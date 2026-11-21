@@ -2,9 +2,6 @@ package dev.spofify.mobile.core.json
 
 import dev.spofify.mobile.core.content.TrackContentParser
 import dev.spofify.mobile.core.content.WaveformState
-import dev.spofify.mobile.core.palette.PaletteParser
-import dev.spofify.mobile.core.palette.PaletteId
-import dev.spofify.mobile.core.palette.PaletteTestData
 import kotlinx.serialization.json.*
 import org.junit.Assert.*
 import org.junit.Test
@@ -32,11 +29,7 @@ class StrictJsonObjectTest {
             assertTrue(runCatching { parse(invalid) }.isFailure)
     }
 
-    @Test fun existingPaletteAndTrackDomainProjectionsAndIndividualLimitsRemainUnchanged() {
-        val palette = PaletteTestData.document()
-        assertEquals(PaletteId.JADE, PaletteParser.parse(palette.toByteArray(), "account").paletteId)
-        assertTrue(runCatching { PaletteParser.parse(palette.replace("\"revision\":0", "\"revision\":0,\"revision\":1").toByteArray(), "account") }.isFailure)
-        assertTrue(runCatching { PaletteParser.parse(" ".repeat(16 * 1024 + 1).toByteArray(), "account") }.isFailure)
+    @Test fun trackDomainProjectionAndLimitsRemainUnchanged() {
         val waveform = """{"version":1,"trackId":"one","state":"unavailable","sourceGeneration":"","algorithmVersion":"peak-u8-two-pass-v1-half-up"}"""
         assertEquals(WaveformState.UNAVAILABLE, TrackContentParser.waveform(waveform.toByteArray(), "one").state)
         assertTrue(runCatching { TrackContentParser.waveform(waveform.replace("\"version\":1", "\"version\":1,\"version\":2").toByteArray(), "one") }.isFailure)

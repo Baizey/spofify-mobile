@@ -28,8 +28,9 @@ fun SpofifySheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> U
         modifier = Modifier.heightIn(max = windowHeight * .94f),
         shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
         containerColor = MaterialTheme.colorScheme.surface,
-        scrimColor = androidx.compose.ui.graphics.Color.Black.copy(alpha = .5f),
+        scrimColor = MaterialTheme.colorScheme.scrim.copy(alpha = .5f),
         tonalElevation = 0.dp,
+        properties = ModalBottomSheetProperties(isAppearanceLightStatusBars = false, isAppearanceLightNavigationBars = false),
         dragHandle = {
             Box(Modifier.fillMaxWidth().height(48.dp).clickable(role = Role.Button, onClick = onDismiss)
                 .semantics { contentDescription = "Dismiss sheet" }, contentAlignment = Alignment.Center) {

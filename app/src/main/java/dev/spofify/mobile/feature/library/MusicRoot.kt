@@ -1,6 +1,7 @@
 package dev.spofify.mobile.feature.library
 
 import android.net.Uri
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
@@ -53,7 +54,6 @@ internal fun MusicRoot(
     identity: AccountIdentity,
     sessions: SessionRepository,
     playbackOwner: PlaybackOwner,
-    palettes: AccountPaletteController,
     account: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
@@ -117,7 +117,7 @@ internal fun MusicRoot(
     }
     // The graph and its models must not be replaced by playback ticks or IME recomposition.
     val currentOpen by rememberUpdatedState(open)
-    val graph: NavGraphBuilder.() -> Unit = remember(navigation, navigate, openActions, palettes) {
+    val graph: NavGraphBuilder.() -> Unit = remember(navigation, navigate, openActions) {
         {
             composable("history") { currentStores.Content {
                 RecentScreen(currentSource.personal, currentLoader, currentController.value, navigate)
@@ -157,14 +157,13 @@ internal fun MusicRoot(
                 }
             }
             composable("settings") {
-                SettingsScreen(identity, palettes, currentPlayer.value.cache,
+                SettingsScreen(identity, currentPlayer.value.cache,
                     modeSetting = { ManualModeSetting(identity, sessions, playbackOwner) },
                     onCache = { navigation.navigate("music-cache") }, onAccount = { navigation.navigate("account") },
-                    onColours = { navigation.navigate("colours") }, onCredits = { navigation.navigate("credits") },
+                    onCredits = { navigation.navigate("credits") },
                     playbackSetting = { CrossfadeSetting(currentPlayer.value) })
             }
             composable("music-cache") { dev.spofify.mobile.feature.settings.MusicCacheScreen(currentPlayer.value.cache) }
-            composable("colours") { AccountColoursScreen(identity, palettes) }
             composable("credits") { CreditsScreen { navigation.navigate("font-license") } }
             composable("font-license") { FontLicenseScreen() }
             composable("account") { currentAccount.value() }
@@ -185,7 +184,8 @@ internal fun MusicRoot(
                 }, { devices = true })
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)) {
+            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainerLow)
+                .padding(horizontal = 4.dp, vertical = 2.dp)) {
                 MusicTab.entries.forEach { destination ->
                     val active = tab == destination
                     TextButton({
@@ -205,7 +205,7 @@ internal fun MusicRoot(
                         selected = active
                     }, contentPadding = PaddingValues(horizontal = 2.dp, vertical = 2.dp),
                         colors = ButtonDefaults.textButtonColors(contentColor = if (active)
-                            MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant)) {
+                            MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(3.dp)) {
                             SpofifyIcon(destination.glyph, null, Modifier.size(24.dp))
                             Text(destination.title, textAlign = TextAlign.Center, style = MaterialTheme.typography.labelSmall.copy(

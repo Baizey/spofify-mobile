@@ -1,9 +1,7 @@
 package dev.spofify.mobile.playback
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -12,7 +10,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -33,8 +31,9 @@ internal fun PlaybackSeek(state: PlayerPresentation, binding: String, content: T
         var focused by remember { mutableStateOf(false) }
         val value = (preview ?: seconds.toFloat()).coerceIn(0f, total.toFloat().coerceAtLeast(1f))
         val enabled = state.ready && total > 0
-        val active = MaterialTheme.colorScheme.primary
-        val inactive = MaterialTheme.colorScheme.onSurfaceVariant
+        val colors = MaterialTheme.colorScheme
+        val active = colors.primary
+        val inactive = colors.onSurfaceVariant
         Column(Modifier.fillMaxWidth()) {
             Slider(value, onValueChange = { preview = it }, enabled = enabled,
                 valueRange = 0f..total.toFloat().coerceAtLeast(1f),
@@ -44,15 +43,21 @@ internal fun PlaybackSeek(state: PlayerPresentation, binding: String, content: T
                     contentDescription = if (waveform == null) "Playback position" else "Waveform seek"
                 },
                 thumb = {
-                    if (waveform == null) Box(Modifier.size(14.dp).background(if (enabled) active else inactive, CircleShape))
-                    else Spacer(Modifier.size(0.dp))
+                    if (waveform == null) Canvas(Modifier.size(14.dp)) {
+                        if (focused) {
+                            drawCircle(colors.background, 14.dp.toPx())
+                            drawCircle(colors.tertiary, 11.dp.toPx(), style = Stroke(2.dp.toPx()))
+                        }
+                        drawCircle(if (enabled) active else inactive)
+                    } else Spacer(Modifier.size(0.dp))
                 },
                 track = {
                     if (waveform == null) Canvas(Modifier.fillMaxWidth().height(48.dp)) {
                         val x = size.width * value / total.toFloat().coerceAtLeast(1f)
                         drawLine(inactive.copy(alpha = .5f), Offset.Zero.copy(y = size.height / 2),
                             Offset(size.width, size.height / 2), strokeWidth = 3.dp.toPx())
-                        drawLine(active, Offset(0f, size.height / 2), Offset(x, size.height / 2), strokeWidth = 3.dp.toPx())
+                        drawLine(if (enabled) active else inactive, Offset(0f, size.height / 2),
+                            Offset(x, size.height / 2), strokeWidth = 3.dp.toPx())
                     } else WaveformTrack(waveform, value / total.toFloat().coerceAtLeast(1f), preview != null, focused)
                 })
             Row(Modifier.fillMaxWidth()) {
@@ -100,12 +105,11 @@ internal fun displayWaveformBins(bins: List<Int>, maximum: Int = 56): List<Int> 
 @Composable
 private fun WaveformTrack(waveform: TrackWaveform, progress: Float, seeking: Boolean, focused: Boolean) {
     val bins = remember(waveform) { displayWaveformBins(waveform.bins) }
-    val played = if (seeking) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
-    val unplayed = if (seeking) MaterialTheme.colorScheme.tertiary.copy(alpha = .8f)
-        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .65f)
-    val ink = MaterialTheme.colorScheme.onSurface
-    val background = MaterialTheme.colorScheme.background
-    val focus = MaterialTheme.colorScheme.secondary
+    val colors = MaterialTheme.colorScheme
+    val played = colors.primary
+    val unplayed = colors.onSurfaceVariant.copy(alpha = .65f)
+    val ink = colors.onSurface
+    val background = colors.background
     Canvas(Modifier.fillMaxWidth().height(48.dp)) {
         if (bins.isEmpty()) return@Canvas
         val step = size.width / bins.size
@@ -116,11 +120,15 @@ private fun WaveformTrack(waveform: TrackWaveform, progress: Float, seeking: Boo
                 topLeft = Offset(index * step + step * .3f, size.height * 22f / 48f - height / 2),
                 size = Size(step * .4f, height))
         }
-        drawLine(if (focused) focus else ink, Offset(cursor, size.height * 3f / 48f), Offset(cursor, size.height * 45f / 48f),
-            strokeWidth = (if (seeking || focused) 4.dp else 2.dp).toPx())
+        val handle = Offset(cursor, size.height * 3f / 48f)
+        val end = Offset(cursor, size.height * 45f / 48f)
+        val width = if (seeking || focused) 4.dp else 2.dp
+        // Isolate the marker from the mint bars so the playhead and focus ring stay legible.
+        drawLine(background, handle, end, strokeWidth = (width + 4.dp).toPx())
+        drawLine(ink, handle, end, strokeWidth = width.toPx())
         val radius = (if (focused) 5.dp else 3.dp).toPx()
-        drawCircle(if (focused) focus else background, radius, Offset(cursor, size.height * 3f / 48f))
-        drawCircle(ink, radius, Offset(cursor, size.height * 3f / 48f),
-            style = androidx.compose.ui.graphics.drawscope.Stroke(2.dp.toPx()))
+        drawCircle(background, radius + 2.dp.toPx(), handle)
+        drawCircle(if (focused) colors.tertiary else ink, radius, handle,
+            style = Stroke(2.dp.toPx()))
     }
 }

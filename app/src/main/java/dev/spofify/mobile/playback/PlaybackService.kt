@@ -2,8 +2,10 @@ package dev.spofify.mobile.playback
 
 import android.content.Intent
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import dev.spofify.mobile.R
 import dev.spofify.mobile.SpofifyApplication
 
 /** Media3 owns the foreground notification; the Application owns playback authority and resources. */
@@ -14,6 +16,10 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
+        // Supply transparent brand artwork as the small icon; SystemUI owns its media card styling.
+        setMediaNotificationProvider(DefaultMediaNotificationProvider.Builder(this).build().apply {
+            setSmallIcon(R.drawable.ic_spofify_mark)
+        })
         setListener(object : MediaSessionService.Listener {
             override fun onForegroundServiceStartNotAllowedException() {
                 owner.backgroundStartBlocked(attached)

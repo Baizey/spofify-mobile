@@ -263,7 +263,7 @@ private fun DetailTopTracks(mode: DetailRankMode, onToggle: () -> Unit) {
         }, contentPadding = PaddingValues(vertical = 8.dp)) {
             Text(mode.label, Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge.copy(
                 fontSize = 12.45.sp, lineHeight = 16.81.sp, textDecoration = TextDecoration.Underline),
-                textAlign = TextAlign.End, color = MaterialTheme.colorScheme.secondary, maxLines = 1)
+                textAlign = TextAlign.End, color = MaterialTheme.colorScheme.primary, maxLines = 1)
         }
     }
     Text(DETAIL_RANKINGS_UNAVAILABLE, Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -2,15 +2,17 @@ package dev.spofify.mobile.designsystem
 
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.res.ResourcesCompat
 import dev.spofify.mobile.R
-import dev.spofify.mobile.core.palette.PaletteTokens
 
 object Spacing {
     val page = 20.dp
@@ -45,25 +47,48 @@ private val typography = Typography(
     labelMedium = TextStyle(fontFamily = mono, fontWeight = FontWeight.Medium, fontSize = 13.sp, lineHeight = 20.sp),
 )
 
-private val dark = darkColorScheme(
-    background = Color(0xFF101216), onBackground = Color(0xFFF4F6FA),
-    surface = Color(0xFF1A1E24), onSurface = Color(0xFFF4F6FA),
-    surfaceVariant = Color(0xFF252B34), onSurfaceVariant = Color(0xFFB4BDCB),
-    primary = Color(0xFF66E3B4), onPrimary = Color(0xFF08271D),
-    secondary = Color(0xFF91BFFF), tertiary = Color(0xFFDFBD78),
-    outline = Color(0xFF68778A), outlineVariant = Color(0xFF353E49),
-)
-
-/** Palette tokens have already passed the coordinated v1 catalog validation in core. */
-internal fun paletteColor(hex: String): Color = Color(0xFF000000L or hex.removePrefix("#").toLong(16))
-
-internal fun spofifyColorScheme(palette: PaletteTokens? = null): ColorScheme =
-    if (palette == null) dark else dark.copy(
-        primary = paletteColor(palette.primary), onPrimary = paletteColor(palette.onPrimary),
-        secondary = paletteColor(palette.secondary), tertiary = paletteColor(palette.tertiary),
+internal fun spofifyColorScheme(color: (Int) -> Color): ColorScheme {
+    val canvas = color(R.color.theme_canvas)
+    val chrome = color(R.color.theme_chrome)
+    val panel = color(R.color.theme_panel)
+    val raised = color(R.color.theme_raised)
+    val divider = color(R.color.theme_divider)
+    val text = color(R.color.theme_text)
+    val muted = color(R.color.theme_muted)
+    val subtle = color(R.color.theme_subtle)
+    val primary = color(R.color.theme_primary)
+    val onPrimary = color(R.color.theme_on_primary)
+    val tertiary = color(R.color.theme_tertiary)
+    val error = color(R.color.theme_error)
+    return darkColorScheme(
+        primary = primary, onPrimary = onPrimary,
+        primaryContainer = raised, onPrimaryContainer = primary, inversePrimary = primary,
+        // Material components still ask for secondary roles, but they don't get another hue.
+        secondary = primary, onSecondary = onPrimary,
+        secondaryContainer = raised, onSecondaryContainer = primary,
+        tertiary = tertiary, onTertiary = canvas,
+        tertiaryContainer = raised, onTertiaryContainer = tertiary,
+        background = canvas, onBackground = text,
+        surface = panel, onSurface = text, surfaceTint = panel,
+        surfaceVariant = raised, onSurfaceVariant = muted,
+        inverseSurface = raised, inverseOnSurface = text,
+        error = error, onError = canvas, errorContainer = raised, onErrorContainer = error,
+        outline = subtle, outlineVariant = divider, scrim = Color.Black,
+        surfaceBright = raised, surfaceDim = chrome,
+        surfaceContainerLowest = canvas, surfaceContainerLow = chrome, surfaceContainer = panel,
+        surfaceContainerHigh = raised, surfaceContainerHighest = raised,
+        primaryFixed = primary, primaryFixedDim = primary,
+        onPrimaryFixed = onPrimary, onPrimaryFixedVariant = onPrimary,
+        secondaryFixed = primary, secondaryFixedDim = primary,
+        onSecondaryFixed = onPrimary, onSecondaryFixedVariant = onPrimary,
+        tertiaryFixed = tertiary, tertiaryFixedDim = tertiary,
+        onTertiaryFixed = canvas, onTertiaryFixedVariant = canvas,
     )
+}
 
 @Composable
-fun SpofifyTheme(palette: PaletteTokens? = null, content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = spofifyColorScheme(palette), typography = typography, content = content)
+fun SpofifyTheme(content: @Composable () -> Unit) {
+    val resources = LocalResources.current
+    val colors = remember(resources) { spofifyColorScheme { Color(ResourcesCompat.getColor(resources, it, null)) } }
+    MaterialTheme(colorScheme = colors, typography = typography, content = content)
 }

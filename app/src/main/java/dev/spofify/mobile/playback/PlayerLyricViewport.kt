@@ -99,7 +99,7 @@ internal fun PlayerLyricViewport(line: LyricViewportKey, height: Dp, onOpen: () 
                 Box(Modifier.fillMaxWidth().heightIn(min = height).padding(horizontal = 8.dp, vertical = 12.dp),
                     contentAlignment = Alignment.Center) {
                     Text(line.text, style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle),
-                        textAlign = TextAlign.Center)
+                        textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.tertiary)
                 }
             }
         }

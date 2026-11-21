@@ -151,7 +151,7 @@ internal fun PlaylistSummaryRow(
                     } }
                 }
             }
-            HorizontalDivider(Modifier.padding(horizontal = geometry.gutter.dp), color = MaterialTheme.colorScheme.surface)
+            HorizontalDivider(Modifier.padding(horizontal = geometry.gutter.dp), color = MaterialTheme.colorScheme.outlineVariant)
         }
     }
 }

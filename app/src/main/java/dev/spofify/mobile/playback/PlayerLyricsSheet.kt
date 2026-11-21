@@ -72,7 +72,7 @@ internal fun PlayerLyricsSheet(
                 }
                 LyricsState.TIMED -> itemsIndexed(lyrics.lines, key = { i, _ -> i }) { i, line ->
                     Text(line.text, Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                        color = if (timed && i == index) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (timed && i == index) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodyLarge.copy(fontSize = 20.25.sp, lineHeight = 30.38.sp,
                             fontWeight = if (timed && i == index) FontWeight.Bold else FontWeight.Normal))
                 }

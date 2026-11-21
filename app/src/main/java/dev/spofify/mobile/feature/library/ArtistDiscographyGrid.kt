@@ -73,7 +73,7 @@ internal fun ArtistDiscographyGrid(
                         style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.4.sp, lineHeight = 21.75.sp,
                             fontWeight = FontWeight(620)))
                     Text(if (appearancesExpanded) "Collapse" else "Expand", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.secondary, modifier = Modifier.padding(start = 12.dp))
+                        color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(start = 12.dp))
                 }
             }
             if (appearancesExpanded) {

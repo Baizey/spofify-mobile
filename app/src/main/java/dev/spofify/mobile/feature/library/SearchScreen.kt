@@ -130,7 +130,7 @@ internal fun SearchScreen(
         }
         Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).background(Brush.verticalGradient(
             0f to Color.Transparent, .2f to Color.Transparent,
-            1f to MaterialTheme.colorScheme.secondary.copy(alpha = .16f * illumination)))
+            1f to MaterialTheme.colorScheme.primary.copy(alpha = .16f * illumination)))
             .padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             SpofifyIcon(SpofifyGlyph.Search, null, Modifier.size(20.dp), MaterialTheme.colorScheme.onSurfaceVariant)
             BasicTextField(state.query, model::query, Modifier.weight(1f).heightIn(min = 54.dp)
@@ -139,7 +139,7 @@ internal fun SearchScreen(
                 .semantics { contentDescription = "Search music" },
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
                 singleLine = true,
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.secondary),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { focus.clearFocus(); keyboard?.hide() }),
                 decorationBox = { input ->
@@ -151,6 +151,6 @@ internal fun SearchScreen(
             }
         }
         HorizontalDivider(thickness = if (editing) 2.dp else 1.dp,
-            color = if (editing) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline)
+            color = if (editing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline)
     }
 }

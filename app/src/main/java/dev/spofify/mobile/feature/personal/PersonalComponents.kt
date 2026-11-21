@@ -23,6 +23,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
@@ -66,8 +67,9 @@ internal fun PersonalSongFilter(value: String, onChange: (String) -> Unit) {
     var focused by remember { mutableStateOf(false) }
     val focus = LocalFocusManager.current
     val amount by animateFloatAsState(if (focused) 1f else 0f, tween(240), label = "filter illumination")
-    val glow = MaterialTheme.colorScheme.secondary.copy(alpha = .16f * amount)
-    val line = if (focused) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline
+    val colors = MaterialTheme.colorScheme
+    val glow = colors.primary.copy(alpha = .16f * amount)
+    val line = if (focused) colors.primary else colors.outline
     Column(Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 10.dp)
         .background(Brush.verticalGradient(0f to glow, .8f to Color.Transparent, 1f to Color.Transparent))
         .drawBehind {
@@ -80,6 +82,7 @@ internal fun PersonalSongFilter(value: String, onChange: (String) -> Unit) {
             textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface), singleLine = true,
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
             keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
+            cursorBrush = SolidColor(colors.primary),
             decorationBox = { field ->
                 if (value.isEmpty()) Text("Filter songs", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 field()
@@ -121,9 +124,10 @@ internal fun PlaylistNameSheet(
     var focused by remember { mutableStateOf(false) }
     val requester = remember { FocusRequester() }
     val valid = name.isNotBlank() && name.codePointCount(0, name.length) <= 100 && name.none(Char::isISOControl)
-    val line = if (focused) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline
+    val colors = MaterialTheme.colorScheme
+    val line = if (focused) colors.tertiary else colors.outline
     val amount by animateFloatAsState(if (focused) 1f else 0f, tween(240), label = "name illumination")
-    val glow = MaterialTheme.colorScheme.secondary.copy(alpha = .16f * amount)
+    val glow = colors.tertiary.copy(alpha = .16f * amount)
     LaunchedEffect(Unit) { requester.requestFocus() }
     SpofifySheet(onDismiss) {
         Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(bottom = 22.dp)) {
@@ -139,7 +143,8 @@ internal fun PlaylistNameSheet(
                 }.padding(horizontal = 20.dp, vertical = 14.dp).semantics { contentDescription = "Playlist name" },
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface), singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { if (valid) onSave(name, initialDescription) }))
+                keyboardActions = KeyboardActions(onDone = { if (valid) onSave(name, initialDescription) }),
+                cursorBrush = SolidColor(colors.tertiary))
             Box(Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp)) {
                 PersonalSheetButtons(if (initialName.isEmpty()) "Create" else "Save", valid, onDismiss) { onSave(name, initialDescription) }
             }

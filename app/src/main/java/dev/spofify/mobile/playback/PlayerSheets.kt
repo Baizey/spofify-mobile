@@ -89,7 +89,7 @@ private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, 
             BasicTextField(name, { name = it }, Modifier.fillMaxWidth().heightIn(min = 56.dp)
                 .semantics { contentDescription = "Device name" }.padding(horizontal = 20.dp, vertical = 14.dp),
                 singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.secondary))
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary))
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(onDismiss, Modifier.weight(1f)) { Text("Cancel") }

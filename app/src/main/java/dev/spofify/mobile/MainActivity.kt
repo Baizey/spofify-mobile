@@ -27,25 +27,21 @@ import dev.spofify.mobile.feature.library.MusicRoot
 import dev.spofify.mobile.playback.PlaybackOwner
 import dev.spofify.mobile.designsystem.SpofifyTheme
 import dev.spofify.mobile.feature.auth.*
-import dev.spofify.mobile.feature.settings.AccountPaletteController
-import dev.spofify.mobile.feature.settings.accountPaletteTokens
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val canvas = getColor(R.color.theme_canvas)
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            statusBarStyle = SystemBarStyle.dark(canvas),
+            navigationBarStyle = SystemBarStyle.dark(canvas),
         )
         val app = application as SpofifyApplication
         val repository = app.sessions
         setContent {
-            val authentication by repository.state.collectAsStateWithLifecycle()
-            val palette by app.palettes.state.collectAsStateWithLifecycle()
-            val identity = (authentication as? AuthState.Authenticated)?.identity
-            SpofifyTheme(accountPaletteTokens(palette, identity)) {
+            SpofifyTheme {
                 val model: AuthViewModel = viewModel(factory = AuthViewModel.Factory(repository))
-                AuthRoot(model, repository, app.playback, app.palettes)
+                AuthRoot(model, repository, app.playback)
             }
         }
     }
@@ -56,7 +52,6 @@ private fun AuthRoot(
     model: AuthViewModel,
     sessions: SessionRepository,
     playback: PlaybackOwner,
-    palettes: AccountPaletteController,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val inputNotice by model.inputNotice.collectAsStateWithLifecycle()
@@ -76,11 +71,10 @@ private fun AuthRoot(
             previousPageKey = null
         }
     }
-    DisposableEffect(owner, model, playback, palettes) {
+    DisposableEffect(owner, model, playback) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_START) {
                 if (playback.current != null) playback.foreground() else model.foreground()
-                palettes.refresh()
             }
         }
         owner.lifecycle.addObserver(observer)
@@ -93,7 +87,7 @@ private fun AuthRoot(
                 is AuthState.Authenticated -> {
                     pages.SaveableStateProvider(requireNotNull(pageKey)) {
                         var credits by rememberSaveable { mutableStateOf(false) }
-                        MusicRoot(current.identity, sessions, playback, palettes) {
+                        MusicRoot(current.identity, sessions, playback) {
                             AccountScreen(current, model::signOut) { credits = true }
                         }
                         if (credits) FontCredits { credits = false }

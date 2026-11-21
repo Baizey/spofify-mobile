@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Spofify" parent="Theme.Spofify.Base">
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowSplashScreenBackground">@color/theme_canvas</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_spofify_mark</item>
+    </style>
+</resources>

@@ -12,12 +12,12 @@ class FeatureErrorResponseTest {
     @Test fun mutationPreservesBoundedSemanticErrorWithoutRetrying() = runBlocking {
         MockWebServer().use { server ->
             server.start()
-            val body = """{"code":"PALETTE_CATALOG_CONFLICT","error":"Refresh the catalog"}"""
+            val body = """{"code":"FEATURE_CONFLICT","error":"Refresh the resource"}"""
             server.enqueue(MockResponse().setResponseCode(409).setHeader("Content-Type", "application/json").setBody(body))
             val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
             try {
                 val statuses = mutableListOf<Int>()
-                val response = api.mutate(listOf("api", "me", "palette"), "PUT", "{}", cookie(), "fixture-csrf") { code, _ -> statuses += code }
+                val response = api.mutate(listOf("api", "feature"), "PUT", "{}", cookie(), "fixture-csrf") { code, _ -> statuses += code }
                 assertEquals(409, response.status)
                 assertEquals(body, response.bytes.decodeToString())
                 assertEquals(listOf(409), statuses)
@@ -41,7 +41,7 @@ class FeatureErrorResponseTest {
                 server.enqueue(fixture)
                 val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
                 try {
-                    val response = api.mutate(listOf("api", "me", "palette"), "PUT", "{}", cookie(), "fixture-csrf") { _, _ -> }
+                    val response = api.mutate(listOf("api", "feature"), "PUT", "{}", cookie(), "fixture-csrf") { _, _ -> }
                     assertTrue(response.status >= 400)
                     assertTrue(response.bytes.isEmpty())
                     assertEquals(1, server.requestCount)
