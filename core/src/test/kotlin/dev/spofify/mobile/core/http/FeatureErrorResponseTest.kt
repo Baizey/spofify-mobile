@@ -17,7 +17,7 @@ class FeatureErrorResponseTest {
             val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
             try {
                 val statuses = mutableListOf<Int>()
-                val response = api.mutate(listOf("api", "feature"), "PUT", "{}", cookie(), "fixture-csrf") { code, _ -> statuses += code }
+                val response = api.mutate(listOf("api", "me", "feature"), "PUT", "{}", cookie(), "fixture-csrf") { code, _ -> statuses += code }
                 assertEquals(409, response.status)
                 assertEquals(body, response.bytes.decodeToString())
                 assertEquals(listOf(409), statuses)
@@ -41,7 +41,7 @@ class FeatureErrorResponseTest {
                 server.enqueue(fixture)
                 val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
                 try {
-                    val response = api.mutate(listOf("api", "feature"), "PUT", "{}", cookie(), "fixture-csrf") { _, _ -> }
+                    val response = api.mutate(listOf("api", "me", "feature"), "PUT", "{}", cookie(), "fixture-csrf") { _, _ -> }
                     assertTrue(response.status >= 400)
                     assertTrue(response.bytes.isEmpty())
                     assertEquals(1, server.requestCount)
