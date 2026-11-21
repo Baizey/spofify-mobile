@@ -107,14 +107,18 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
         } else adopt(next, owner)
     }
     fun output(value: Boolean) { state?.let { adopt(it, value) } }
-    private fun adopt(next: AccountState, output: Boolean, confirm: Boolean = false, natural: Boolean = false) {
+    private fun adopt(next: AccountState, output: Boolean, confirm: Boolean = false, natural: Boolean = false,
+        terminalEnd: Boolean = false) {
         val old = state
         val start = !owner || old == null || !old.cursor.sameRun(next.cursor) || old.cursor.desired != next.cursor.desired
         if (owner && !output) engine.stop()
         owner = output
         state = next
         publish(next)
-        if (owner) engine.adopt(next.presentation(), start && !confirm, natural)
+        if (owner) {
+            if (terminalEnd) engine.finishNaturalEnd(next.presentation())
+            else engine.adopt(next.presentation(), start && !confirm, natural)
+        }
     }
     private var preview = 0L
     fun local(command: JsonObject) {
@@ -178,11 +182,11 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
         val old = state ?: return
         if (!owner || !allowed() || !old.cursor.desired || facts.binding?.trackId != old.queue.getOrNull(previous.position)?.id) return
         val next = LocalPlaybackQueue.successor(previous, naturalEnd = true)
-        val cursor = if (next == null) old.cursor.copy(run = old.cursor.run + 1, desired = false, playing = false, elapsed = facts.elapsed)
+        val cursor = if (next == null) old.cursor.copy(run = old.cursor.run + 1, desired = false, playing = false, elapsed = 0.0)
             else AccountCursor(old.queue[next].key, old.cursor.chain, old.cursor.visit + 1, desired = true)
         // Report the source end before any synchronous successor facts. No response needed for adopt().
         if (old.cursor.key < (1L shl 52) && !old.cursor.chain.startsWith("local:")) report(fact(old.cursor, facts, next?.let { old.queue[it].key } ?: 0L))
-        adopt(old.copy(cursor = cursor), true, natural = next != null && confirmedSuccessor(old.queue[next]))
+        adopt(old.copy(cursor = cursor), true, natural = next != null && confirmedSuccessor(old.queue[next]), terminalEnd = next == null)
     }
     private fun observed(facts: AudioFacts) {
         val c = state?.cursor ?: return

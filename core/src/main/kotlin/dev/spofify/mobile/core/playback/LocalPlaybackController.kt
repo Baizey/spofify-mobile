@@ -104,8 +104,7 @@ class LocalPlaybackController(
     fun resume() {
         val previous = state.value
         if (previous.current == null || !allowed()) return
-        val elapsed = currentElapsed()
-        start(previous.copy(desiredPlaying = true, elapsed = if (previous.duration > 0 && elapsed >= previous.duration) 0.0 else elapsed))
+        start(previous.copy(desiredPlaying = true, elapsed = currentElapsed()))
     }
 
     fun toggle() { if (state.value.desiredPlaying) pause() else resume() }
@@ -216,6 +215,13 @@ class LocalPlaybackController(
         }
     }
 
+    /** The source already ended. Revoke it without opening another source until Play. */
+    internal fun finishNaturalEnd(next: PlaybackQueueState) {
+        if (!allowed()) return
+        invalidate()
+        mutableState.value = next.copy(desiredPlaying = false, isPlaying = false, elapsed = 0.0)
+    }
+
     private fun select(position: Int) = start(LocalPlaybackQueue.select(state.value, position))
 
     private fun allowed(): Boolean = !retired && scope.isActive && isOutputAllowed()
@@ -312,8 +318,9 @@ class LocalPlaybackController(
     private fun currentElapsed(): Double {
         val previous = state.value
         val op = active?.takeIf { it.ready } ?: return previous.elapsed
+        // Metadata is display-only here; it is not a bound on the measured pause position.
         return audio.facts().takeIf { it.binding == op.binding && it.elapsed.isFinite() && it.elapsed >= 0 }
-            ?.let { boundedElapsed(it.elapsed, duration(it, previous)) } ?: previous.elapsed
+            ?.elapsed ?: previous.elapsed
     }
 
     private fun sample(op: Operation, facts: AudioFacts) {
@@ -333,7 +340,8 @@ class LocalPlaybackController(
         val previous = state.value
         if (!keep(op) || !previous.desiredPlaying || facts.error.isNotEmpty()) return
         if (onNaturalEnd != null) onNaturalEnd.invoke(previous, facts)
-        else LocalPlaybackQueue.successor(previous, naturalEnd = true)?.let { start(LocalPlaybackQueue.select(previous, it), natural = true) } ?: pause()
+        else LocalPlaybackQueue.successor(previous, naturalEnd = true)
+            ?.let { start(LocalPlaybackQueue.select(previous, it), natural = true) } ?: finishNaturalEnd(previous)
     }
 
     private fun fail(op: Operation, error: String, native: AudioFacts = audio.facts()) {

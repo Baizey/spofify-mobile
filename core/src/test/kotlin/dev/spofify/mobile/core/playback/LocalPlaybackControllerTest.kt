@@ -79,6 +79,66 @@ class LocalPlaybackControllerTest {
         assertNull(h.state.occurrence)
     }
 
+    @Test fun finalNativeEofStopsAtZeroAndPlayReplaysTheExactRow() = runTest {
+        val h = Harness(this)
+        h.library.tracks = listOf(track("a", "first"), track("a", "second").copy(duration = 0.0))
+        h.audio.nativeDuration = 0.0
+        h.controller.playCollection(playlist)
+        h.controller.jump(h.state.queue.last().key)
+        runCurrent()
+        val pauseCount = h.audio.authorizedWhenPaused.size
+        val rows = h.state.queue
+        val outgoing = h.audio.attempts.single()
+        h.audio.end(outgoing.binding, elapsed = 42.0)
+        runCurrent()
+        assertEquals(rows, h.state.queue)
+        assertEquals(rows.last(), h.state.current)
+        assertFalse(h.state.desiredPlaying)
+        assertFalse(h.state.isPlaying)
+        assertEquals(0.0, h.state.elapsed, 0.0)
+        assertFalse(outgoing.authorized())
+        assertEquals(listOf(false), h.audio.authorizedWhenPaused.drop(pauseCount))
+        assertEquals(1, h.audio.attempts.size)
+        assertEquals(listOf("a"), h.library.probes)
+
+        h.controller.toggle()
+        runCurrent()
+        val replay = h.audio.attempts.last()
+        assertEquals(2, h.audio.attempts.size)
+        assertEquals(0.0, replay.elapsed, 0.0)
+        assertTrue(replay.play)
+        assertNotEquals(outgoing.binding, replay.binding)
+        assertEquals(rows.last(), h.state.current)
+        h.audio.end(outgoing.binding, elapsed = 42.0)
+        runCurrent()
+        assertTrue(h.state.isPlaying)
+        assertTrue(replay.authorized())
+    }
+
+    @Test fun pauseAndManualNextAtTailResumeMeasuredPositionBeyondInaccurateMetadata() = runTest {
+        val h = Harness(this)
+        h.audio.nativeDuration = 0.0
+        h.controller.playTrack(PlaybackTrackReference("a"))
+        runCurrent()
+        for ((elapsed, stop) in listOf(30.0 to h.controller::pause, 34.5 to h.controller::next)) {
+            h.audio.actual = h.audio.actual.copy(elapsed = elapsed)
+            stop()
+            assertFalse(h.state.desiredPlaying)
+            assertEquals(elapsed, h.state.elapsed, 0.0)
+            h.controller.toggle()
+            runCurrent()
+            assertEquals(elapsed, h.audio.attempts.last().elapsed, 0.0)
+            assertTrue(h.state.isPlaying)
+        }
+        h.controller.pause()
+        h.controller.seek(30.0)
+        runCurrent()
+        assertEquals(30.0, h.state.elapsed, 0.0)
+        h.controller.toggle()
+        runCurrent()
+        assertEquals(30.0, h.audio.attempts.last().elapsed, 0.0)
+    }
+
     @Test fun newSeekFencesPendingStartEvenForSameTrack() = runTest {
         val h = Harness(this)
         val pending = Gate().also { h.audio.hold = it }
@@ -292,6 +352,64 @@ class LocalPlaybackControllerTest {
         owner.close()
     }
 
+    @Test fun accountFinalEofReportsActualElapsedWithoutPreparingAndReplaysBeforeEcho() = runTest {
+        val audio = FakeAudio().apply { nativeDuration = 0.0 }
+        val facts = mutableListOf<AccountFact>()
+        val views = mutableListOf<AccountState>()
+        val owner = AccountPlayer(audio, backgroundScope, { true }, views::add, facts::add)
+        val rows = listOf(track("same", "first").copy(key = 7), track("same", "last").copy(key = 8))
+        val before = AccountCursor(8, "source", visit = 3, run = 9, desired = true)
+        owner.snapshot(AccountState(rows, before, "off", false), true)
+        runCurrent()
+        val outgoing = audio.attempts.single()
+        audio.end(outgoing.binding, elapsed = 42.0)
+        runCurrent()
+        val stopped = before.copy(run = 10, desired = false)
+        assertEquals(stopped, views.last().cursor)
+        assertEquals(rows, views.last().queue)
+        assertFalse(outgoing.authorized())
+        assertEquals(listOf(false), audio.authorizedWhenPaused)
+        assertEquals(1, audio.attempts.size)
+        assertEquals(AccountFact(key = 8, chain = "source", visit = 3, run = 9, elapsed = 42.0,
+            playing = false, buffering = false, ended = true, landed = 0), facts.single { it.ended })
+
+        owner.local(fields("type" to "resume"))
+        runCurrent()
+        val replaying = stopped.copy(run = 11, desired = true)
+        assertEquals(replaying.copy(playing = true), views.last().cursor)
+        assertEquals(0.0, audio.attempts.last().elapsed, 0.0)
+        owner.update(AccountDelta(cursor = stopped, observed = true))
+        owner.update(AccountDelta(cursor = replaying), ownSelection = true)
+        runCurrent()
+        assertEquals(2, audio.attempts.size)
+        assertTrue(views.last().cursor.desired)
+        assertEquals(rows.last(), views.last().presentation().current)
+        owner.close()
+    }
+
+    @Test fun accountOwnerPauseAndResumeUseMeasuredPositionNotMetadata() = runTest {
+        val audio = FakeAudio().apply { nativeDuration = 0.0 }
+        val facts = mutableListOf<AccountFact>()
+        val views = mutableListOf<AccountState>()
+        val owner = AccountPlayer(audio, backgroundScope, { true }, views::add, facts::add)
+        val row = track("track").copy(key = 7)
+        val before = AccountCursor(7, "source", desired = true)
+        owner.snapshot(AccountState(listOf(row), before, "off", false), true)
+        runCurrent()
+        audio.actual = audio.actual.copy(elapsed = 34.5)
+        owner.local(fields("type" to "pause"))
+        runCurrent()
+        val paused = before.copy(run = 1, elapsed = 34.5, desired = false)
+        assertEquals(paused, views.last().cursor)
+        assertTrue(facts.none { it.ended })
+        owner.update(AccountDelta(cursor = paused), ownSelection = true)
+        owner.local(fields("type" to "resume"))
+        runCurrent()
+        assertTrue(audio.attempts.last().play)
+        assertEquals(34.5, audio.attempts.last().elapsed, 0.0)
+        owner.close()
+    }
+
     @Test fun accountOwnerEditsCachedTraversalAndPromotesExactNativeBinding() = runTest {
         val audio=FakeAudio(); val facts=mutableListOf<AccountFact>(); val views=mutableListOf<AccountState>()
         val owner=AccountPlayer(audio,backgroundScope,{true},views::add,facts::add)
@@ -449,6 +567,7 @@ class LocalPlaybackControllerTest {
         val starts = mutableListOf<AudioBinding>()
         val authorizedWhenPaused = mutableListOf<Boolean>()
         var actual = AudioFacts()
+        var nativeDuration = 30.0
         var successor: (() -> PlaybackTrack?)? = null
         var readyKey: Long? = null
         var promotions = 0
@@ -473,11 +592,11 @@ class LocalPlaybackControllerTest {
             isAuthorized: () -> Boolean): AudioResult {
             assertTrue(isAuthorized())
             attempts += Attempt(binding, elapsed, desiredPlaying, isAuthorized)
-            actual = AudioFacts(binding, elapsed, 30.0, isLoading = true, isBuffering = true)
+            actual = AudioFacts(binding, elapsed, nativeDuration, isLoading = true, isBuffering = true)
             hold?.await()
             if (!isAuthorized()) return AudioResult.REJECTED
             if (desiredPlaying) starts += binding
-            actual = AudioFacts(binding, elapsed, 30.0, isPlaying = desiredPlaying)
+            actual = AudioFacts(binding, elapsed, nativeDuration, isPlaying = desiredPlaying)
             return AudioResult.OK
         }
 
@@ -487,8 +606,8 @@ class LocalPlaybackControllerTest {
             actual = actual.copy(isPlaying = false, isLoading = false, isBuffering = false)
         }
 
-        fun end(binding: AudioBinding) {
-            val facts = AudioFacts(binding, elapsed = 30.0, duration = 30.0, ended = true)
+        fun end(binding: AudioBinding, elapsed: Double = 30.0) {
+            val facts = AudioFacts(binding, elapsed = elapsed, duration = nativeDuration, ended = true)
             if (actual.binding == binding) actual = facts
             check(observations.tryEmit(AudioObservation(binding, facts)))
         }
