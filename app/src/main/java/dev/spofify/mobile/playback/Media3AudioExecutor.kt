@@ -24,7 +24,8 @@ internal class Media3AudioExecutor(
     private val identity: AccountIdentity,
     private val cache: AutomaticMusicCache,
     private val onSystemPause: () -> Unit,
-    private val requestPlaybackStart: () -> Boolean,
+    private val requestPlaybackStart: suspend () -> Boolean,
+    private val canContinuePlayback: () -> Boolean,
     private val onPlayerChanged: (ExoPlayer) -> Unit = {},
 ) : AudioExecutor, Closeable {
     private var audioLoadScope: AudioLoadScope? = null
@@ -123,19 +124,32 @@ internal class Media3AudioExecutor(
         if (result != AudioResult.OK) return result
         if (this.binding != binding) return AudioResult.REJECTED
         if (!isAuthorized()) { pause(); return AudioResult.REJECTED }
-        // A known terminal position cannot start sound or justify a new foreground-service deadline.
+        // A known terminal position cannot start sound or justify foreground admission.
         if (track != null && desiredPlaying && player.playbackState != Player.STATE_ENDED) {
             val nativeGeneration = generation
             playbackAuthority = {
                 !released && this.binding == binding && generation == nativeGeneration && isAuthorized()
             }
-            if (!requestPlaybackStart()) {
+            val admitted = try {
+                requestPlaybackStart()
+            } catch (cancelled: CancellationException) {
+                if (!released && generation == nativeGeneration) pause()
+                throw cancelled
+            }
+            // Admission may suspend while Media3 connects and publishes the notification. A pause,
+            // newer execute or retired grant must not be turned into a blocked successor or sound.
+            if (released || this.binding != binding || generation != nativeGeneration) return AudioResult.REJECTED
+            if (!hasPlaybackAuthority()) { pause(); return AudioResult.REJECTED }
+            if (player.playerError != null || player.playbackState == Player.STATE_IDLE) { pause(); return AudioResult.MEDIA }
+            if (player.playbackState == Player.STATE_ENDED) {
+                mutableObservations.tryEmit(AudioObservation(binding, facts()))
+                return AudioResult.OK
+            }
+            if (!admitted) {
                 pause()
                 blocked = true
                 return AudioResult.BLOCKED
             }
-            if (this.binding != binding) return AudioResult.REJECTED
-            if (!hasPlaybackAuthority()) { pause(); return AudioResult.REJECTED }
             audioLoadScope?.playing = true
             player.play()
             if (!player.playWhenReady) {
@@ -305,11 +319,11 @@ internal class Media3AudioExecutor(
                     handler.postDelayed(tickTimeout, 250)
                     return
                 }
-                p.span > 0 && (!incoming.isPlaying || !requestPlaybackStart()) -> discardPreview()
+                p.span > 0 && (!incoming.isPlaying || !canContinuePlayback()) -> discardPreview()
                 span >= 400 && left in 1..span && incoming.playbackState == Player.STATE_READY -> {
                     if (p.span == 0L) {
                         // Late preparation or a seek straight into the tail: ordinary EOF instead.
-                        if (span - left > 300 || !requestPlaybackStart()) discardPreview() else {
+                        if (span - left > 300 || !canContinuePlayback()) discardPreview() else {
                             p.span = left
                             p.load.playing = true
                             incoming.play()
@@ -333,7 +347,7 @@ internal class Media3AudioExecutor(
         if (!enabled || !authorized() || endedBinding != from || binding != from || row.key != p.row.key ||
             row.id != p.row.id || p.span <= 0 || !p.deck.player.isPlaying ||
             !player.playWhenReady || player.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE ||
-            !requestPlaybackStart()) return false
+            !canContinuePlayback()) return false
         p.gate.bind(authorized)
         preview = null
         handler.removeCallbacks(tickTimeout)
@@ -355,7 +369,7 @@ internal class Media3AudioExecutor(
         player.addListener(listener)
         onPlayerChanged(player)
         old.player.release()
-        val continuePlaying = hasPlaybackAuthority() && requestPlaybackStart()
+        val continuePlaying = hasPlaybackAuthority() && canContinuePlayback()
         if (!continuePlaying) pause()
         player.setHandleAudioBecomingNoisy(true)
         player.setAudioAttributes(attrs, true)

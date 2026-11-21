@@ -1,9 +1,14 @@
 package dev.spofify.mobile.playback
 
 import android.app.Application
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
+import android.os.Build
+import android.os.IBinder
 import android.util.Log
-import androidx.core.content.ContextCompat
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaSession
 import dev.spofify.mobile.core.auth.*
@@ -21,9 +26,37 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
     private val storage = MusicStorage(app, scope)
     private val modeChanges = Mutex()
     private var started = false
-    private var serviceSession: MediaSession? = null
-    private var startingSession: MediaSession? = null
-    private var stoppingSession: MediaSession? = null
+    private var attachment: Attachment? = null
+
+    private inner class Attachment(
+        val session: MediaSession, var recoveryUsed: Boolean, var admission: CompletableDeferred<Boolean>?,
+    ) : ServiceConnection {
+        var service: PlaybackService? = null
+        var recoveryTimeout: Job? = null
+
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            if (attachment !== this || service != null) return
+            val instance = (binder as? PlaybackService.LocalBinder)?.service
+            val p = eligiblePlayer(session)
+            // Native work can be retired between bind() and this callback. Never attach whatever
+            // account happens to be current; the binding belongs to this exact session and work.
+            if (instance == null) { loseAttachment(this); return }
+            if (p == null || admission == null && !p.hasPendingNativePlayback()) {
+                retireAttachment(this)
+                return
+            }
+            service = instance
+            instance.attach(session)
+            reconcileServiceFor(p)
+            // A trusted controller may already have registered this MediaSession with Media3.
+            // In that case attach() won't cause a fresh notification-controller callback.
+            if (attachment === this) instance.triggerNotificationUpdate()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) = loseAttachment(this)
+        override fun onBindingDied(name: ComponentName) = loseAttachment(this)
+        override fun onNullBinding(name: ComponentName) = loseAttachment(this)
+    }
 
     fun start() {
         if (started) return
@@ -34,12 +67,15 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
                 if (mutable.value?.identity == identity) return@collect
                 val retired = mutable.value
                 mutable.value = null
+                val retiredAttachment = attachment
+                if (retiredAttachment != null) retireAttachment(retiredAttachment)
+                else app.stopService(Intent(app, PlaybackService::class.java))
                 retired?.close()
-                serviceSession = null; startingSession = null; stoppingSession = null
-                app.stopService(Intent(app, PlaybackService::class.java))
                 if (identity != null && sessions.isCurrent(identity)) {
                     val player = NativePlayer(app, identity, sessions, scope, storage,
-                        requestPlaybackStart = { ensureService(identity) }, reconcile = { current?.let(::reconcileServiceFor) },
+                        requestPlaybackStart = { admitPlaybackStart(identity) },
+                        canContinuePlayback = { canContinuePlayback(identity) }, acceptsNotificationControl = ::acceptsNotificationControl,
+                        reconcile = { current?.let(::reconcileServiceFor) },
                         detachService = { current?.let(::stopServiceFor) })
                     mutable.value = player
                     player.start()
@@ -73,54 +109,191 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
                 view.queue.desiredPlaying && p.audio.hasPlaybackAuthority() && !p.audio.facts().ended
         }
     }
-    internal fun onTaskRemoved() {
-        if (retainServiceAfterTaskRemoval()) return
-        val p = current
-        if (p == null) app.stopService(Intent(app, PlaybackService::class.java)) else stopServiceFor(p)
+    internal fun onTaskRemoved(service: PlaybackService) {
+        val request = attachment?.takeIf { it.service === service }
+        if (request != null && retainServiceAfterTaskRemoval()) return
+        if (request == null) service.stopSelf() else retireAttachment(request)
     }
 
-    internal fun serviceStarted(session: MediaSession) {
-        val p = current?.takeIf { it.mediaSession === session } ?: return
-        serviceSession = session; startingSession = null; stoppingSession = null
-        reconcileServiceFor(p)
+    internal fun serviceStopped(service: PlaybackService) {
+        attachment?.takeIf { it.service === service }?.let { loseAttachment(it, destroyed = true) }
     }
-    internal fun serviceStopped(session: MediaSession?) {
-        if (session == null) return
-        if (serviceSession === session) serviceSession = null
-        if (startingSession === session) startingSession = null
-        if (stoppingSession === session) stoppingSession = null
-        val p = current?.takeIf { it.mediaSession === session } ?: return
+
+    private fun loseAttachment(request: Attachment, destroyed: Boolean = false, retry: Boolean = true) {
+        if (attachment !== request) return
+        val pending = request.admission
+        val canRecover = retry && !request.recoveryUsed && eligiblePlayer(request.session) != null
+        val canMoveAdmission = pending != null && !pending.isCompleted && canRecover
+        retireAttachment(request, stopService = !destroyed, settleAdmission = !canMoveAdmission)
+        // Move the still-authorized ticket, not the execute or any assumed native play state.
+        if (pending != null) {
+            if (canMoveAdmission && bindService(request.session, afterLoss = true, admission = pending) == null) {
+                pending.complete(false)
+            }
+            return
+        }
+        val p = current?.takeIf { it.mediaSession === request.session } ?: return
         val view = p.view ?: return
         val facts = p.audio.facts()
         if (view is PlayerPresentation.Online) handlePlaybackServiceLoss(view.view, facts, p.audio.player.playWhenReady,
-            p.audio.hasPlaybackAuthority(), { ensureService(p.identity) }, p.audio::pause, p.audio::backgroundStartBlocked)
-        else if (facts.isPlaying || p.audio.player.playWhenReady && !facts.ended) {
-            if (!p.audio.hasPlaybackAuthority()) p.audio.pause() else if (!ensureService(p.identity)) p.audio.backgroundStartBlocked()
-        }
-    }
-    internal fun backgroundStartBlocked(session: MediaSession?) {
-        val p = current?.takeIf { session != null && it.mediaSession === session } ?: return
-        val view = p.view ?: return
-        if (view is PlayerPresentation.Online) handlePlaybackServiceStartRefusal(view.view, p.audio.hasPlaybackAuthority(),
+            p.audio.hasPlaybackAuthority(), { canRecover && recoverPlayingSession(request.session) },
             p.audio::pause, p.audio::backgroundStartBlocked)
-        else if (p.audio.hasPlaybackAuthority()) p.audio.backgroundStartBlocked() else p.audio.pause()
-        reconcileServiceFor(p)
-    }
-    private fun ensureService(identity: AccountIdentity): Boolean {
-        val p = current?.takeIf { it.identity == identity } ?: return false
-        val session = p.mediaSession ?: return false
-        val view = p.view ?: return false
-        if (!p.audio.hasPlaybackAuthority() || view is PlayerPresentation.Online && !view.view.isLocalOutputConnection()) return false
-        if (stoppingSession !== session && (serviceSession === session || startingSession === session)) return true
-        return try {
-            ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))
-            startingSession = session; stoppingSession = null
-            true
-        } catch (_: IllegalStateException) {
-            Log.w("SpofifyPlayer", "Local playback service start refused"); false
-        } catch (_: SecurityException) {
-            Log.w("SpofifyPlayer", "Local playback service start denied"); false
+        else if (p.hasPendingNativePlayback()) {
+            if (!p.audio.hasPlaybackAuthority()) p.audio.pause()
+            else if (!canRecover || !recoverPlayingSession(request.session)) p.audio.backgroundStartBlocked()
         }
+    }
+
+    private fun recoverPlayingSession(session: MediaSession): Boolean {
+        val restarted = bindService(session, afterLoss = true) ?: return false
+        restarted.recoveryTimeout = scope.launch {
+            delay(PLAYBACK_SERVICE_ADMISSION_TIMEOUT_MS)
+            if (attachment === restarted && restarted.admission == null && restarted.service?.hasMediaForeground() != true) {
+                loseAttachment(restarted) // The recovery already used its one attempt.
+            }
+        }
+        return true
+    }
+
+    // Capture the native operation as well as the binding; a notification callback is not a
+    // command to stop or recover whatever operation is using the same service by delivery time.
+    internal fun notificationLossCallback(service: PlaybackService, session: MediaSession): ((retry: Boolean) -> Unit)? {
+        val request = attachment?.takeIf { it.service === service && it.session === session } ?: return null
+        val p = current?.takeIf { it.mediaSession === session } ?: return null
+        val operation = p.audio.facts().binding ?: return null
+        return { retry ->
+            if (attachment === request && current === p && p.audio.facts().binding == operation &&
+                !service.hasMediaForeground() && (request.admission != null || p.hasPendingNativePlayback())) {
+                loseAttachment(request, retry = retry)
+            }
+        }
+    }
+    private fun NativePlayer.hasPendingNativePlayback(): Boolean =
+        hasPendingNativePlayback(audio.facts(), audio.player.playWhenReady)
+
+    private fun localPlayer(session: MediaSession): NativePlayer? {
+        val p = current?.takeIf { it.mediaSession === session && it.hasCurrentOutput() } ?: return null
+        return when (val view = p.view) {
+            is PlayerPresentation.Online -> p.takeIf { view.view.isLocalOutputConnection() }
+            is PlayerPresentation.Local -> p
+            null -> null
+        }
+    }
+
+    private fun eligiblePlayer(session: MediaSession): NativePlayer? = localPlayer(session)?.takeIf { it.audio.hasPlaybackAuthority() }
+
+    internal fun ownsLocalNotification(service: PlaybackService, session: MediaSession): Boolean =
+        attachment?.let { it.service === service && it.session === session } == true && localPlayer(session) != null
+
+    internal fun acceptsNotificationControl(session: MediaSession, intent: Intent): Boolean {
+        val service = attachment?.service ?: return false
+        return ownsLocalNotification(service, session) && service.matchesNotificationControl(session, intent)
+    }
+
+    private suspend fun admitPlaybackStart(identity: AccountIdentity): Boolean {
+        val session = current?.takeIf { it.identity == identity }?.mediaSession ?: return false
+        if (eligiblePlayer(session) == null) return false
+        val request = attachment?.takeIf { it.session === session } ?: bindService(session) ?: return false
+        // A new native execute supersedes recovery of the outgoing operation, not its binding.
+        request.recoveryTimeout?.cancel()
+        request.recoveryTimeout = null
+        request.recoveryUsed = false
+        // Android 15+ may deny ExoPlayer's focus request unless the app is top or already an FGS.
+        // Do not optimistically set playWhenReady just to coax Media3 into foreground.
+        if (Build.VERSION.SDK_INT < 35 || request.service?.hasMediaForeground() == true) return true
+        val pending = CompletableDeferred<Boolean>()
+        val previous = request.admission
+        request.admission = pending
+        previous?.complete(false)
+        var admitted = false
+        try {
+            request.service?.triggerNotificationUpdate()
+            admitted = awaitPlaybackServiceAdmission(pending) {
+                // A recovery may move this exact ticket to a new instance. A retired request or a
+                // different play may not consume the old success, even on the same MediaSession.
+                attachment?.let { live -> live.session === session && live.admission === pending &&
+                    live.service?.hasMediaForeground() == true && eligiblePlayer(session) != null } == true
+            }
+            return admitted
+        } finally {
+            attachment?.takeIf { it.admission === pending }?.let { live ->
+                live.admission = null
+                if (!admitted) retireAttachment(live)
+            }
+        }
+    }
+
+    private fun canContinuePlayback(identity: AccountIdentity): Boolean {
+        val session = current?.takeIf { it.identity == identity }?.mediaSession ?: return false
+        val request = attachment?.takeIf { it.session === session } ?: return false
+        return eligiblePlayer(session) != null && (Build.VERSION.SDK_INT < 35 || request.service?.hasMediaForeground() == true)
+    }
+
+    internal fun notificationAdmission(service: PlaybackService, session: MediaSession): CompletableDeferred<Boolean>? {
+        val request = attachment?.takeIf { it.service === service && it.session === session } ?: return null
+        val player = eligiblePlayer(session)?.audio?.player ?: return null
+        // Keep the paused promotion while a successful acknowledgment is waiting to be consumed.
+        return request.admission?.takeIf { player.isReadyForForeground() && (it.isActive || service.hasMediaForeground()) }
+    }
+
+    private fun Player.isReadyForForeground(): Boolean = playerError == null &&
+        (playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING)
+
+    internal fun shouldRunInForeground(service: PlaybackService, session: MediaSession, media3Requested: Boolean): Boolean {
+        val p = localPlayer(session) ?: return false
+        val view = p.view ?: return false
+        val facts = p.audio.facts()
+        val playWhenReady = p.audio.player.playWhenReady
+        // Media3's notification controller can briefly lag the native play immediately after
+        // admission. Keep foreground for actual authorized work, not for the controller's echo.
+        if (p.audio.hasPlaybackAuthority() && p.audio.player.isReadyForForeground() &&
+            hasPendingNativePlayback(facts, playWhenReady)) return true
+        // Media3 owns the grace period on an already foreground output between tracks or after pause.
+        if (!media3Requested || !service.hasMediaForeground()) return false
+        return when (view) {
+            is PlayerPresentation.Online -> !shouldStopPlaybackService(view.view, facts, playWhenReady)
+            is PlayerPresentation.Local -> facts.error.isEmpty() || hasPendingNativePlayback(facts, playWhenReady)
+        }
+    }
+
+    private fun bindService(
+        session: MediaSession, afterLoss: Boolean = false, admission: CompletableDeferred<Boolean>? = null,
+    ): Attachment? {
+        attachment?.let(::retireAttachment)
+        val request = Attachment(session, afterLoss, admission)
+        attachment = request
+        // Binding creates no Android foreground-start obligation. Media3 requests its own FGS
+        // only once it has a real media notification and promotes synchronously with that request.
+        val bound = try {
+            app.bindService(Intent(app, PlaybackService::class.java).setAction(PlaybackService.ATTACH_LOCAL),
+                request, Context.BIND_AUTO_CREATE)
+        } catch (e: RuntimeException) {
+            if (e !is IllegalStateException && e !is SecurityException) throw e
+            Log.w("SpofifyPlayer", "Local playback service binding refused", e)
+            false
+        }
+        if (!bound) {
+            attachment = null
+            // Even a false bind result can register the connection on the caller side.
+            unbind(request)
+        }
+        return request.takeIf { bound }
+    }
+
+    private fun unbind(request: Attachment) {
+        try { app.unbindService(request) } catch (_: IllegalArgumentException) { /* Never registered. */ }
+    }
+
+    private fun retireAttachment(request: Attachment, stopService: Boolean = true, settleAdmission: Boolean = true) {
+        if (attachment !== request) return
+        attachment = null // Clear before callbacks or any asynchronous destruction of this instance.
+        if (stopService) request.service?.let { service ->
+            service.detach(request.session)
+            service.stopSelf()
+        }
+        unbind(request)
+        request.recoveryTimeout?.cancel()
+        if (settleAdmission) request.admission?.complete(false)
     }
     private fun reconcileServiceFor(p: NativePlayer) {
         val view = p.view ?: return
@@ -132,9 +305,6 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         } else if (facts.error.isNotEmpty() && !facts.isPlaying && !p.audio.player.playWhenReady) stopServiceFor(p)
     }
     private fun stopServiceFor(player: NativePlayer) {
-        val session = player.mediaSession ?: return
-        if ((serviceSession !== session && startingSession !== session) || stoppingSession === session) return
-        stoppingSession = session
-        app.stopService(Intent(app, PlaybackService::class.java))
+        attachment?.takeIf { it.session === player.mediaSession }?.let(::retireAttachment)
     }
 }

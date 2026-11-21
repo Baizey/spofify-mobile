@@ -14,6 +14,7 @@ import dev.spofify.mobile.MainActivity
 import dev.spofify.mobile.core.auth.*
 import dev.spofify.mobile.core.playback.*
 import java.security.MessageDigest
+import java.util.UUID
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
@@ -22,8 +23,9 @@ import kotlinx.coroutines.flow.*
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class NativePlayer(private val app: Application, val identity: AccountIdentity,
     private val sessions: SessionRepository, parentScope: CoroutineScope, storage: MusicStorage,
-    requestPlaybackStart: () -> Boolean, private val reconcile: () -> Unit,
-    private val detachService: () -> Unit) {
+    requestPlaybackStart: suspend () -> Boolean, canContinuePlayback: () -> Boolean,
+    private val acceptsNotificationControl: (MediaSession, Intent) -> Boolean,
+    private val reconcile: () -> Unit, private val detachService: () -> Unit) {
     val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]))
     val cache = AutomaticMusicCache(app, sessions, identity, storage, scope)
     val music = AccountMusic(app, identity, sessions, storage, cache, scope)
@@ -37,7 +39,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         fade.value = enabled
         audio.setCrossfadeEnabled(enabled)
     }
-    val audio: Media3AudioExecutor = Media3AudioExecutor(app, sessions, identity, cache, ::systemPause, requestPlaybackStart) { player ->
+    val audio: Media3AudioExecutor = Media3AudioExecutor(app, sessions, identity, cache, ::systemPause, requestPlaybackStart, canContinuePlayback) { player ->
         mutable.value?.let { selected -> mediaSession?.setPlayer(routed(player, selected)) }
     }.apply { setCrossfadeEnabled(fade.value) }
     var mediaSession: MediaSession? = null
@@ -47,6 +49,11 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
     private var reconnect: PlaybackReconnect? = null
     private var maintenance: PlaybackSessionMaintenance? = null
     val view get() = target.value?.presentation
+    fun hasCurrentOutput(): Boolean = when (target.value) {
+        is AppPlayback.Local -> sessions.manualOffline.value
+        is AppPlayback.Online -> !sessions.manualOffline.value && grant != null && sessions.onlineGrant.value === grant
+        null -> false
+    }
 
     private val deviceId: String by lazy(::registeredDeviceId)
     @SuppressLint("HardwareIds")
@@ -98,7 +105,15 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
             mode.launch { controller.state.collect { reconcile() } }
             AppPlayback.Online(controller, current)
         }
-        mediaSession = MediaSession.Builder(app, routed(audio.player, selected)).setSessionActivity(PendingIntent.getActivity(app, 0, Intent(app, MainActivity::class.java)
+        // A queued notification control belongs to this output lifetime, not a successor session.
+        mediaSession = MediaSession.Builder(app, routed(audio.player, selected)).setId(UUID.randomUUID().toString())
+            .setCallback(object : MediaSession.Callback {
+                override fun onMediaButtonEvent(session: MediaSession, controllerInfo: MediaSession.ControllerInfo, intent: Intent): Boolean =
+                    // Media3 posts legacy notification buttons. Consume one that lost local ownership
+                    // after onStartCommand; leave ordinary trusted controller requests alone.
+                    intent.hasExtra(PlaybackNotifications.CONTROL_TOKEN) && !acceptsNotificationControl(session, intent)
+            })
+            .setSessionActivity(PendingIntent.getActivity(app, 0, Intent(app, MainActivity::class.java)
             .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build()
         mutable.value = selected

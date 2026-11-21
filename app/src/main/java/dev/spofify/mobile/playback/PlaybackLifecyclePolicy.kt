@@ -4,6 +4,8 @@ import dev.spofify.mobile.core.playback.AudioFacts
 import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.AccountChannel
 import dev.spofify.mobile.core.playback.PlaybackView
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Logical device grouping is not executor identity; only this exact live socket may own local sound. */
 internal fun PlaybackView.isLocalSelectedConnection(): Boolean =
@@ -67,7 +69,7 @@ internal fun handlePlaybackServiceLoss(
     if (!view.isLocalOutputConnection()) return
     // ExoPlayer can retain PWR after natural end. That is not pending sound or
     // a reason to launch an FGS that has nothing to promote into foreground.
-    val nativePlaybackPending = facts.isPlaying || localPlayWhenReady && !facts.ended
+    val nativePlaybackPending = hasPendingNativePlayback(facts, localPlayWhenReady)
     if (!hasPlaybackAuthority) {
         if (nativePlaybackPending) pauseNative()
         return
@@ -75,13 +77,11 @@ internal fun handlePlaybackServiceLoss(
     if (nativePlaybackPending && !restartLocalService()) reportLocalBlocked()
 }
 
-/** Only actual platform refusal retires a live local operation as blocked. */
-internal fun handlePlaybackServiceStartRefusal(
-    view: PlaybackView,
-    hasPlaybackAuthority: Boolean,
-    pauseNative: () -> Unit,
-    reportLocalBlocked: () -> Unit,
-) {
-    if (!view.isLocalOutputConnection()) return
-    if (hasPlaybackAuthority) reportLocalBlocked() else pauseNative()
-}
+internal fun hasPendingNativePlayback(facts: AudioFacts, localPlayWhenReady: Boolean): Boolean =
+    facts.isPlaying || localPlayWhenReady && !facts.ended
+
+internal const val PLAYBACK_SERVICE_ADMISSION_TIMEOUT_MS = 5_000L
+
+/** The platform can acknowledge promotion before a suspended play consumes it. Recheck the live lease. */
+internal suspend fun awaitPlaybackServiceAdmission(promoted: Deferred<Boolean>, stillAdmitted: () -> Boolean): Boolean =
+    withTimeoutOrNull(PLAYBACK_SERVICE_ADMISSION_TIMEOUT_MS) { promoted.await() } == true && stillAdmitted()

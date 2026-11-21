@@ -207,9 +207,6 @@ class PlaybackLifetimeTest {
                 restartLocalService = { error("Remote controller must not start FGS") },
                 pauseNative = { error("Remote cleanup does not need a native operation") },
                 reportLocalBlocked = { error("Remote output must not receive a local blocked report") })
-            handlePlaybackServiceStartRefusal(view, true,
-                pauseNative = { error("An unrelated service callback must be ignored") },
-                reportLocalBlocked = { error("An unrelated service callback must be ignored") })
             h.reconnect.expedite()
             runCurrent()
             assertTrue(h.transport.sockets.single().commands().isEmpty())
@@ -253,8 +250,8 @@ class PlaybackLifetimeTest {
                 restartLocalService = { starts++; promotionRefused }, pauseNative = h.audio::pause, reportLocalBlocked = h.audio::blocked)
             if (promotionRefused) {
                 assertTrue(h.audio.actual.isPlaying)
-                handlePlaybackServiceStartRefusal(h.controller.state.value, h.audio.hasAuthority,
-                    pauseNative = h.audio::pause, reportLocalBlocked = h.audio::blocked)
+                handlePlaybackServiceLoss(h.controller.state.value, h.audio.facts(), true, h.audio.hasAuthority,
+                    restartLocalService = { false }, pauseNative = h.audio::pause, reportLocalBlocked = h.audio::blocked)
             }
             runCurrent()
             assertEquals(1, starts)
