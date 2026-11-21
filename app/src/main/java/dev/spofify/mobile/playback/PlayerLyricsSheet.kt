@@ -16,7 +16,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import dev.spofify.mobile.core.content.*
+import dev.spofify.mobile.core.content.LyricsState
 import dev.spofify.mobile.core.playback.PlaybackTrack
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.duration
@@ -56,13 +56,6 @@ internal fun PlayerLyricsSheet(
                     SheetHeading(track.name)
                     Text(track.artists.joinToString(", ") { it.name }, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    val kind = if (timed) "Timed lyrics" else "Plain lyrics"
-                    val source = lyrics.attribution?.name ?: when (lyrics.provenance) {
-                        LyricProvenance.LOCAL_LRC, LyricProvenance.EMBEDDED -> "File text"
-                        else -> null
-                    }
-                    Text(listOfNotNull(kind, source).joinToString(" · "), Modifier.padding(top = 12.dp),
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             when (lyrics.state) {

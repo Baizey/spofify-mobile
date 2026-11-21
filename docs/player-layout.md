@@ -19,9 +19,8 @@ interactive visual reference.
 - There is no visible “Scroll lyrics” hint, arrow row, or reserved hint space.
   Tap opens the existing full lyrics sheet; vertical dragging reads the text,
   never invokes the player-dismiss gesture. Plain lyrics and timed silent gaps
-  retain a direct “View lyrics” entry; missing/pending/error states retain access
-  to the sheet and its refresh action, without restoring the removed menu. Loading-only
-  states do not add a flashing placeholder. Accessibility scroll semantics and
+  retain a direct “View lyrics” entry. Loading-only states do not add a
+  flashing placeholder. Accessibility scroll semantics and
   keyboard arrows/Page Up/Page Down/Home/End are available.
 - Elapsed and total time labels are centered in the first and fifth equal
   transport columns, directly above Shuffle and Repeat. The seek target remains
@@ -55,8 +54,8 @@ actual-duration gates, account/content fences and seek behavior are unchanged.
 
 Fetching jobs save lyrics beside the music. Display reads use the adjacent `.lrc`
 first, otherwise embedded lyrics; they never fetch or require an imported cache.
-Mobile renders that response, including plain text and retained provider credits.
-Attribution and old cache expiry dates do not gate file-backed lyrics. The player
+Mobile renders the lyric text without a format or source label in the sheet.
+Attribution remains response metadata and does not gate file-backed lyrics. The player
 opens the sheet only for available plain or timed lyrics. Otherwise it shows
 **Lyrics unavailable** as non-interactive text once the read returns. The sheet
 has no Refresh action. Reopening the player reads the lyrics again; there is no
