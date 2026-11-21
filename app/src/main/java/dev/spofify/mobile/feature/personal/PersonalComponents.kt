@@ -2,11 +2,9 @@ package dev.spofify.mobile.feature.personal
 
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -15,12 +13,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -69,13 +64,8 @@ internal fun PersonalSongFilter(value: String, onChange: (String) -> Unit) {
     val amount by animateFloatAsState(if (focused) 1f else 0f, tween(240), label = "filter illumination")
     val colors = MaterialTheme.colorScheme
     val glow = colors.primary.copy(alpha = .16f * amount)
-    val line = if (focused) colors.primary else colors.outline
     Column(Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 10.dp)
-        .background(Brush.verticalGradient(0f to glow, .8f to Color.Transparent, 1f to Color.Transparent))
-        .drawBehind {
-            val stroke = if (focused) 2.dp.toPx() else 1.dp.toPx()
-            drawLine(line, Offset(0f, stroke / 2), Offset(size.width, stroke / 2), stroke)
-        }) {
+        .spofifyField(focused, illumination = Brush.verticalGradient(0f to glow, .8f to Color.Transparent, 1f to Color.Transparent))) {
         BasicTextField(value, onChange, Modifier.fillMaxWidth().heightIn(min = 48.dp)
             .onFocusChanged { focused = it.isFocused }.padding(horizontal = 20.dp, vertical = 12.dp)
             .semantics { contentDescription = "Filter songs" },
@@ -107,7 +97,7 @@ private fun PersonalSheetButtons(label: String, enabled: Boolean, onDismiss: () 
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
         TextButton(onDismiss, Modifier.weight(1f).heightIn(min = 52.dp), colors = ButtonDefaults.textButtonColors(
             contentColor = MaterialTheme.colorScheme.onSurface)) { Text("Cancel") }
-        Button(onConfirm, Modifier.weight(1f).heightIn(min = 52.dp), enabled = enabled, shape = RoundedCornerShape(8.dp)) { Text(label) }
+        Button(onConfirm, Modifier.weight(1f).heightIn(min = 52.dp), enabled = enabled, shape = SpofifySurfaces.control) { Text(label) }
     }
 }
 
@@ -125,7 +115,6 @@ internal fun PlaylistNameSheet(
     val requester = remember { FocusRequester() }
     val valid = name.isNotBlank() && name.codePointCount(0, name.length) <= 100 && name.none(Char::isISOControl)
     val colors = MaterialTheme.colorScheme
-    val line = if (focused) colors.tertiary else colors.outline
     val amount by animateFloatAsState(if (focused) 1f else 0f, tween(240), label = "name illumination")
     val glow = colors.tertiary.copy(alpha = .16f * amount)
     LaunchedEffect(Unit) { requester.requestFocus() }
@@ -136,11 +125,9 @@ internal fun PlaylistNameSheet(
                 style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.6.sp, fontWeight = FontWeight.Medium))
             BasicTextField(name, { name = it }, Modifier.fillMaxWidth().heightIn(min = 56.dp)
                 .focusRequester(requester).onFocusChanged { focused = it.isFocused }
-                .background(Brush.verticalGradient(0f to Color.Transparent, .2f to Color.Transparent, 1f to glow))
-                .drawBehind {
-                    val stroke = if (focused) 2.dp.toPx() else 1.dp.toPx()
-                    drawLine(line, Offset(0f, size.height - stroke / 2), Offset(size.width, size.height - stroke / 2), stroke)
-                }.padding(horizontal = 20.dp, vertical = 14.dp).semantics { contentDescription = "Playlist name" },
+                .spofifyField(focused, focusColor = colors.tertiary,
+                    illumination = Brush.verticalGradient(0f to Color.Transparent, .2f to Color.Transparent, 1f to glow))
+                .padding(horizontal = 20.dp, vertical = 14.dp).semantics { contentDescription = "Playlist name" },
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface), singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = { if (valid) onSave(name, initialDescription) }),
@@ -176,7 +163,7 @@ internal fun PersonalSongActions(
             item("heading") {
                 Row(Modifier.padding(bottom = 16.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(15.dp)) {
-                    MusicArtwork(track.musicItem(), loader, Modifier.size(48.dp).clip(RoundedCornerShape(4.dp)))
+                    MusicArtwork(track.musicItem(), loader, Modifier.size(48.dp))
                     Column(Modifier.weight(1f)) {
                         Text(track.name.ifBlank { "Unavailable track" }, style = MaterialTheme.typography.titleLarge.copy(
                             fontSize = 22.5.sp, fontWeight = FontWeight(650), lineHeight = 26.1.sp), modifier = Modifier.semantics { heading() })

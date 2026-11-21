@@ -10,6 +10,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.painterResource
@@ -20,7 +22,9 @@ import androidx.compose.ui.tooling.preview.Preview
 import dev.spofify.mobile.R
 import dev.spofify.mobile.core.auth.*
 import dev.spofify.mobile.designsystem.Spacing
+import dev.spofify.mobile.designsystem.SpofifySurfaces
 import dev.spofify.mobile.designsystem.SpofifyTheme
+import dev.spofify.mobile.designsystem.spofifyField
 
 @Composable
 internal fun LoginScreen(
@@ -46,7 +50,7 @@ internal fun LoginScreen(
         if (goOnline == null) LoginActions(busy, notice, inputs, submit)
         else Column(Modifier.fillMaxWidth().padding(Spacing.page)) {
             Notice(notice)
-            Button(goOnline, Modifier.fillMaxWidth().heightIn(min = Spacing.action)) { Text("Go online") }
+            Button(goOnline, Modifier.fillMaxWidth().heightIn(min = Spacing.action), shape = SpofifySurfaces.control) { Text("Go online") }
         }
     }
 }
@@ -90,7 +94,7 @@ private fun LoginFields(
                 modifier = Modifier.padding(horizontal = Spacing.page))
             TextField(
                 value = inputs.password, onValueChange = onPassword, enabled = !busy,
-                modifier = Modifier.fillMaxWidth().semantics { contentDescription = passwordLabel },
+                modifier = Modifier.fillMaxWidth().loginFieldSurface(enabled = !busy).semantics { contentDescription = passwordLabel },
                 singleLine = true,
                 visualTransformation = if (inputs.revealed) VisualTransformation.None else PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done,
@@ -104,6 +108,7 @@ private fun LoginFields(
                         Text(stringResource(if (inputs.revealed) R.string.hide_password else R.string.show_password))
                     }
                 },
+                shape = SpofifySurfaces.control,
                 colors = loginFieldColors(),
             )
         }
@@ -122,18 +127,26 @@ private fun LoginField(
         Text(label, style = MaterialTheme.typography.labelMedium,
             modifier = Modifier.padding(horizontal = Spacing.page))
         TextField(value, change, enabled = !busy, singleLine = true,
-            modifier = Modifier.fillMaxWidth().semantics { contentDescription = label },
-            keyboardOptions = keyboard, colors = loginFieldColors())
+            modifier = Modifier.fillMaxWidth().loginFieldSurface(enabled = !busy).semantics { contentDescription = label },
+            keyboardOptions = keyboard, shape = SpofifySurfaces.control, colors = loginFieldColors())
     }
 }
 
 @Composable
+private fun Modifier.loginFieldSurface(enabled: Boolean): Modifier {
+    var focused by remember { mutableStateOf(false) }
+    return onFocusChanged { focused = it.isFocused }
+        .spofifyField(focused, focusColor = MaterialTheme.colorScheme.tertiary, enabled = enabled)
+}
+
+@Composable
 private fun loginFieldColors() = TextFieldDefaults.colors(
-    focusedContainerColor = MaterialTheme.colorScheme.background,
-    unfocusedContainerColor = MaterialTheme.colorScheme.background,
-    disabledContainerColor = MaterialTheme.colorScheme.background,
-    focusedIndicatorColor = MaterialTheme.colorScheme.tertiary,
-    unfocusedIndicatorColor = MaterialTheme.colorScheme.outline,
+    focusedContainerColor = Color.Transparent,
+    unfocusedContainerColor = Color.Transparent,
+    disabledContainerColor = Color.Transparent,
+    focusedIndicatorColor = Color.Transparent,
+    unfocusedIndicatorColor = Color.Transparent,
+    disabledIndicatorColor = Color.Transparent,
 )
 
 @Composable
@@ -143,7 +156,7 @@ private fun LoginActions(busy: Boolean, notice: AuthNotice?, inputs: LoginInputs
         Button(onClick = submit, enabled = !busy && inputs.server.isNotEmpty() &&
             inputs.username.isNotEmpty() && inputs.password.isNotEmpty(),
             modifier = Modifier.fillMaxWidth().heightIn(min = Spacing.action),
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)) {
+            shape = SpofifySurfaces.control) {
             Text(stringResource(if (busy) R.string.signing_in else R.string.sign_in))
         }
     }
@@ -171,7 +184,7 @@ internal fun AccountScreen(state: AuthState.Authenticated, onSignOut: () -> Unit
             }
             Spacer(Modifier.weight(1f))
             OutlinedButton(onClick = onSignOut, modifier = Modifier.fillMaxWidth().heightIn(min = Spacing.action),
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)) {
+                shape = SpofifySurfaces.control) {
                 Text(stringResource(R.string.sign_out))
             }
         }
@@ -189,7 +202,7 @@ internal fun ConnectionScreen(notice: AuthNotice?, onRetry: (() -> Unit)? = null
             Text(stringResource(R.string.connecting), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
         } else {
             Notice(notice)
-            onRetry?.let { Button(onClick = it) { Text(stringResource(R.string.retry)) } }
+            onRetry?.let { Button(onClick = it, shape = SpofifySurfaces.control) { Text(stringResource(R.string.retry)) } }
             onManual?.let { TextButton(onClick = it) { Text(stringResource(R.string.sign_in)) } }
             onSignOut?.let { TextButton(onClick = it) { Text(stringResource(R.string.sign_out)) } }
         }

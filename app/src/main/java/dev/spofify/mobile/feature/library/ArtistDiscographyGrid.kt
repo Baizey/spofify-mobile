@@ -1,13 +1,11 @@
 package dev.spofify.mobile.feature.library
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -15,7 +13,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
@@ -97,8 +94,7 @@ private fun DiscographyHeading(title: String) {
 @Composable
 private fun DiscographyTile(album: MusicItem, loader: ImageLoader, onOpen: (MusicItem) -> Unit) {
     Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button) { onOpen(album) }) {
-        MusicArtwork(album, loader, Modifier.fillMaxWidth().aspectRatio(1f)
-            .clip(RoundedCornerShape(7.dp)).background(MaterialTheme.colorScheme.surfaceVariant))
+        MusicArtwork(album, loader, Modifier.fillMaxWidth().aspectRatio(1f))
         Text(album.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyLarge.copy(
             fontSize = 14.1.sp, lineHeight = 19.04.sp, fontWeight = FontWeight.SemiBold),
             modifier = Modifier.padding(top = 7.dp))

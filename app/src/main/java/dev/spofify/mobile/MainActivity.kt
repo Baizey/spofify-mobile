@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -25,6 +26,7 @@ import dev.spofify.mobile.core.auth.AuthState
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.feature.library.MusicRoot
 import dev.spofify.mobile.playback.PlaybackOwner
+import dev.spofify.mobile.designsystem.SpofifySurfaces
 import dev.spofify.mobile.designsystem.SpofifyTheme
 import dev.spofify.mobile.feature.auth.*
 
@@ -108,7 +110,10 @@ private fun AuthRoot(
 private fun FontCredits(onDismiss: () -> Unit) {
     val context = LocalContext.current
     val license = remember { context.assets.open("licenses/JetBrainsMono-OFL.txt").bufferedReader().use { it.readText() } }
+    val colors = MaterialTheme.colorScheme
     AlertDialog(onDismissRequest = onDismiss, title = { Text(stringResource(R.string.font_name)) },
+        modifier = Modifier.border(1.dp, colors.outlineVariant, SpofifySurfaces.panel),
+        shape = SpofifySurfaces.panel, containerColor = colors.surface, tonalElevation = 0.dp,
         text = { Text(license, style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) },
         confirmButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.close)) } })

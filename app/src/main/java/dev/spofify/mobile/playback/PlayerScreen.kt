@@ -99,6 +99,7 @@ internal fun FullPlayer(
                         }
                     },
                     artwork = { size ->
+                        // Keep the swipe region's original corners; MusicArtwork paints the shared tile.
                         MusicArtwork(MusicKind.TRACK, track.id, loader,
                             Modifier.size(size).clip(RoundedCornerShape(7.dp)).then(dismissGesture))
                     },

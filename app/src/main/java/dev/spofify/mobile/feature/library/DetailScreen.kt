@@ -1,19 +1,16 @@
 package dev.spofify.mobile.feature.library
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
@@ -174,11 +171,9 @@ internal fun DetailScreen(
 @Composable
 private fun DetailHeading(item: MusicItem, loader: ImageLoader, onNavigate: ((MusicKind, String) -> Unit)?) {
     val largeText = LocalDensity.current.fontScale > 1.4f
-    val shape = if (item.kind == MusicKind.ARTIST) CircleShape else RoundedCornerShape(5.dp)
     Row(Modifier.fillMaxWidth().padding(bottom = 16.dp), horizontalArrangement = Arrangement.spacedBy(15.dp),
         verticalAlignment = if (largeText) Alignment.Top else Alignment.CenterVertically) {
-        MusicArtwork(item, loader, Modifier.size(if (largeText) 52.dp else 76.dp).clip(shape)
-            .background(MaterialTheme.colorScheme.surfaceVariant))
+        MusicArtwork(item, loader, Modifier.size(if (largeText) 52.dp else 76.dp))
         Column(Modifier.weight(1f)) {
             Text(item.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyLarge.copy(
                 fontSize = 22.5.sp, lineHeight = 26.1.sp, fontWeight = FontWeight(650)),
@@ -219,7 +214,7 @@ private fun DetailHeading(item: MusicItem, loader: ImageLoader, onNavigate: ((Mu
 private fun DetailSongMenuHeading(item: MusicItem, loader: ImageLoader) {
     Row(Modifier.fillMaxWidth().padding(bottom = 16.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(15.dp)) {
-        MusicArtwork(item, loader, Modifier.size(48.dp).clip(RoundedCornerShape(4.dp)))
+        MusicArtwork(item, loader, Modifier.size(48.dp))
         Column(Modifier.weight(1f)) {
             Text(item.name.ifBlank { "Unknown title" }, style = MaterialTheme.typography.bodyLarge.copy(
                 fontSize = 22.5.sp, lineHeight = 26.1.sp, fontWeight = FontWeight(650)))

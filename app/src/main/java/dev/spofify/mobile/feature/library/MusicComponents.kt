@@ -1,8 +1,10 @@
 package dev.spofify.mobile.feature.library
 
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,6 +22,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
+import dev.spofify.mobile.designsystem.SpofifySurfaces
 import dev.spofify.mobile.designsystem.SwipeActionSurface
 import coil3.ImageLoader
 import coil3.compose.AsyncImage
@@ -58,11 +61,17 @@ internal fun MusicArtwork(kind: MusicKind, id: String, loader: ImageLoader, modi
     val request = remember(context, kind, id) {
         ImageRequest.Builder(context).data(Cover(kind, id)).memoryCacheKey("${kind.name}:$id").build()
     }
-    val shape = if (kind == MusicKind.ARTIST) androidx.compose.foundation.shape.CircleShape
-        else androidx.compose.foundation.shape.RoundedCornerShape(4.dp)
-    Box(modifier.size(48.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-        if (!loaded) SpofifyIcon(SpofifyGlyph.Note, null, Modifier.size(22.dp),
-            MaterialTheme.colorScheme.onSurfaceVariant)
+    val shape = if (kind == MusicKind.ARTIST) CircleShape else SpofifySurfaces.artwork
+    Box(modifier.size(48.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceVariant),
+        contentAlignment = Alignment.Center) {
+        if (!loaded) {
+            val glyph = when (kind) {
+                MusicKind.ARTIST -> SpofifyGlyph.Artist
+                MusicKind.ALBUM -> SpofifyGlyph.Album
+                MusicKind.TRACK -> SpofifyGlyph.Note
+            }
+            SpofifyIcon(glyph, null, Modifier.size(22.dp), MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         AsyncImage(model = request, imageLoader = loader, contentDescription = null,
             contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize(),
             onLoading = { loaded = false }, onSuccess = { loaded = true }, onError = { loaded = false })
@@ -122,7 +131,10 @@ internal fun MusicRow(
                             IconButton({ if (onMore != null) onMore() else menu = true }, Modifier.fillMaxSize()) {
                                 SpofifyIcon(SpofifyGlyph.More, "More actions for ${item.name}")
                             }
-                            DropdownMenu(menu, onDismissRequest = { menu = false }) {
+                            val colors = MaterialTheme.colorScheme
+                            DropdownMenu(menu, onDismissRequest = { menu = false },
+                                shape = SpofifySurfaces.panel, containerColor = colors.surface, tonalElevation = 0.dp,
+                                border = BorderStroke(1.dp, colors.outlineVariant)) {
                                 onQueue?.let { queue -> DropdownMenuItem(text = { Text("Queue") }, onClick = { menu = false; queue() }) }
                                 onPlayNext?.let { next -> DropdownMenuItem(text = { Text("Play next") }, onClick = { menu = false; next() }) }
                             }

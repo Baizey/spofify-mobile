@@ -3,7 +3,6 @@ package dev.spofify.mobile.feature.library
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -20,6 +19,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
+import dev.spofify.mobile.designsystem.spofifyField
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -128,7 +128,7 @@ internal fun SearchScreen(
                 }
             }
         }
-        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).background(Brush.verticalGradient(
+        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).spofifyField(editing, illumination = Brush.verticalGradient(
             0f to Color.Transparent, .2f to Color.Transparent,
             1f to MaterialTheme.colorScheme.primary.copy(alpha = .16f * illumination)))
             .padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -150,7 +150,7 @@ internal fun SearchScreen(
                 SpofifyIcon(SpofifyGlyph.Close, "Clear search", Modifier.size(20.dp))
             }
         }
-        HorizontalDivider(thickness = if (editing) 2.dp else 1.dp,
-            color = if (editing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline)
+        // Preserve the previous divider's space; the field now paints its border within its bounds.
+        Spacer(Modifier.height(if (editing) 2.dp else 1.dp))
     }
 }

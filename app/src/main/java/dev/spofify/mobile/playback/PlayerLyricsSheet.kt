@@ -82,7 +82,7 @@ internal fun PlayerLyricsSheet(
         if (timed) Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 22.dp),
             horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             Text(duration(elapsedMs), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            OutlinedButton({ following = true }) { Text(if (following) "Following" else "Current line") }
+            OutlinedButton({ following = true }, shape = SpofifySurfaces.control) { Text(if (following) "Following" else "Current line") }
         }
     }
 }

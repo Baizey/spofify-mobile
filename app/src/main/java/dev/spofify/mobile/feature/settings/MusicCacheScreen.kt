@@ -1,6 +1,7 @@
 package dev.spofify.mobile.feature.settings
 
 import android.text.format.Formatter
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.*
@@ -16,6 +17,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.spofify.mobile.core.cache.CacheOptions
 import dev.spofify.mobile.core.cache.MusicStorageUsage
+import dev.spofify.mobile.designsystem.SpofifySurfaces
 import dev.spofify.mobile.designsystem.SpofifySwitchIndicator
 import dev.spofify.mobile.playback.AutomaticMusicCache
 import dev.spofify.mobile.playback.CacheClearState
@@ -75,7 +77,10 @@ private fun CacheSelector(label: String, value: Int, choices: List<Int>, select:
     var expanded by remember { mutableStateOf(false) }
     Box {
         SettingsLink(label, value.toString()) { expanded = true }
-        DropdownMenu(expanded, { expanded = false }) {
+        val colors = MaterialTheme.colorScheme
+        DropdownMenu(expanded, { expanded = false },
+            shape = SpofifySurfaces.panel, containerColor = colors.surface, tonalElevation = 0.dp,
+            border = BorderStroke(1.dp, colors.outlineVariant)) {
             choices.forEach { DropdownMenuItem(text = { Text(it.toString()) }, onClick = { expanded = false; select(it) }) }
         }
     }

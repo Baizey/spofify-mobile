@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.semantics.Role
@@ -26,14 +27,17 @@ fun SpofifySheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> U
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         modifier = Modifier.heightIn(max = windowHeight * .94f),
-        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+        shape = SpofifySurfaces.sheet,
         containerColor = MaterialTheme.colorScheme.surface,
         scrimColor = MaterialTheme.colorScheme.scrim.copy(alpha = .5f),
         tonalElevation = 0.dp,
         properties = ModalBottomSheetProperties(isAppearanceLightStatusBars = false, isAppearanceLightNavigationBars = false),
         dragHandle = {
-            Box(Modifier.fillMaxWidth().height(48.dp).clickable(role = Role.Button, onClick = onDismiss)
-                .semantics { contentDescription = "Dismiss sheet" }, contentAlignment = Alignment.Center) {
+            Box(Modifier.fillMaxWidth().height(48.dp)
+                // The visible sheet corners are smaller; retain the handle's original hit outline.
+                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                .clickable(role = Role.Button, onClick = onDismiss).semantics { contentDescription = "Dismiss sheet" },
+                contentAlignment = Alignment.Center) {
                 Box(Modifier.size(36.dp, 4.dp).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .65f),
                     RoundedCornerShape(2.dp)))
             }

@@ -13,8 +13,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -80,6 +79,7 @@ internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
 private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, onDismiss: () -> Unit) {
     val state by controller.state.collectAsStateWithLifecycle()
     var name by remember(device.deviceId) { mutableStateOf(device.name) }
+    var focused by remember { mutableStateOf(false) }
     val valid = isValidDeviceName(name)
     val currentName = state.devices.firstOrNull { it.deviceId == device.deviceId }?.name
     SpofifySheet(onDismiss) {
@@ -87,16 +87,17 @@ private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, 
             Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading("Rename device") }
             Text("Device name", Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 9.dp), style = MaterialTheme.typography.bodySmall)
             BasicTextField(name, { name = it }, Modifier.fillMaxWidth().heightIn(min = 56.dp)
+                .onFocusChanged { focused = it.isFocused }.spofifyField(focused)
                 .semantics { contentDescription = "Device name" }.padding(horizontal = 20.dp, vertical = 14.dp),
                 singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
                 cursorBrush = SolidColor(MaterialTheme.colorScheme.primary))
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+            Spacer(Modifier.height(1.dp)) // Keep the former divider's space.
             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(onDismiss, Modifier.weight(1f)) { Text("Cancel") }
+                OutlinedButton(onDismiss, Modifier.weight(1f), shape = SpofifySurfaces.control) { Text("Cancel") }
                 Button({
                     if (currentName != name.trim()) controller.renameDevice(name.trim(), device.deviceId)
                     onDismiss()
-                }, Modifier.weight(1f), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+                }, Modifier.weight(1f), shape = SpofifySurfaces.control,
                     enabled = valid && state.connection == PlaybackConnectionState.READY) { Text("Save") }
             }
         }
