@@ -11,7 +11,6 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -51,6 +50,51 @@ class RoutingPlayerTest {
             assertTrue(h.nativeCalls.isEmpty())
             // Dispatching an intention does not optimistically rewrite authoritative playback.
             assertTrue(h.controller.state.value.desiredPlaying)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    @Test fun transportProjectionDoesNotDependOnNativeQueueOrSeekability() {
+        val nativeOnly = setOf(Player.COMMAND_PREPARE, Player.COMMAND_SEEK_TO_DEFAULT_POSITION,
+            Player.COMMAND_SEEK_TO_MEDIA_ITEM, Player.COMMAND_CHANGE_MEDIA_ITEMS)
+        val transport = setOf(Player.COMMAND_PLAY_PAUSE, Player.COMMAND_STOP,
+            Player.COMMAND_SEEK_TO_NEXT, Player.COMMAND_SEEK_TO_NEXT_WINDOW,
+            Player.COMMAND_SEEK_TO_PREVIOUS, Player.COMMAND_SEEK_TO_PREVIOUS_WINDOW,
+            Player.COMMAND_SEEK_FORWARD, Player.COMMAND_SEEK_BACK, Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM)
+        val emptyDeck = mutableSetOf(Player.COMMAND_GET_TIMELINE)
+        val preparedDeck = (emptyDeck + nativeOnly + Player.COMMAND_SEEK_FORWARD).toMutableSet()
+        for (projected in listOf(emptyDeck, preparedDeck)) {
+            projectTransportCommands(add = { projected.add(it) }, remove = { projected.remove(it) })
+            assertTrue(projected.containsAll(transport))
+            assertTrue(projected.contains(Player.COMMAND_GET_TIMELINE))
+            assertTrue(projected.intersect(nativeOnly).isEmpty())
+        }
+        assertEquals(emptyDeck, preparedDeck)
+    }
+
+    @Test fun hardwareCommandFormsRouteOnlyThroughCurrentDeck() = runTest {
+        Harness(this).use { h ->
+            h.remotePlaying()
+            var currentDeck = false
+            val old = RoutingPlayer(h.native, h.target) { h.controllerRequest && !currentDeck }
+            val replacement = RoutingPlayer(h.native, h.target) { h.controllerRequest && currentDeck }
+            h.controllerRequest = true
+            currentDeck = true
+            old.seekToNext()
+            replacement.seekToNext()
+            replacement.seekToNextMediaItem()
+            replacement.seekToPrevious()
+            replacement.seekToPreviousMediaItem()
+            replacement.seekForward()
+            replacement.seekBack()
+            replacement.pause()
+            replacement.play()
+            replacement.stop()
+            assertEquals(listOf("next", "next", "previous", "previous", "seek", "seek", "pause", "resume", "pause"), h.commands)
+            assertEquals(listOf(10.0, 0.0), h.seeks)
+            assertEquals(10_000L, replacement.seekForwardIncrement)
+            assertEquals(10_000L, replacement.seekBackIncrement)
+            assertTrue(h.nativeCalls.isEmpty())
         }
     }
 
@@ -106,6 +150,12 @@ class RoutingPlayerTest {
             assertFalse(local.state.value.desiredPlaying)
             player.seekForward()
             assertEquals(10.0, local.state.value.elapsed, 0.0)
+            player.seekBack()
+            assertEquals(0.0, local.state.value.elapsed, 0.0)
+            player.play()
+            assertTrue(local.state.value.desiredPlaying)
+            player.stop()
+            assertFalse(local.state.value.desiredPlaying)
             local.retire()
             h.current = false
             player.play()
@@ -147,9 +197,12 @@ class RoutingPlayerTest {
             }
         } as Player
         var current = true
-        val player = RoutingPlayer(native, AppPlayback.Online(controller) { current }) { controllerRequest }
-        val commands: List<String> get() = sent.map { Json.parseToJsonElement(it).jsonObject }
-            .map { it.getValue("type").jsonPrimitive.content }.filterNot { it == "presence" }
+        val target = AppPlayback.Online(controller) { current }
+        val player = RoutingPlayer(native, target) { controllerRequest }
+        private val frames get() = sent.map { Json.parseToJsonElement(it).jsonObject }
+        val commands: List<String> get() = frames.map { it.getValue("type").jsonPrimitive.content }.filterNot { it == "presence" }
+        val seeks: List<Double> get() = frames.filter { it.getValue("type").jsonPrimitive.content == "seek" }
+            .map { it.getValue("value").jsonPrimitive.content.toDouble() }
 
         suspend fun remotePlaying() {
             controller.connect("Phone", "phone")
