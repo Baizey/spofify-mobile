@@ -8,6 +8,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.platform.LocalDensity
@@ -50,8 +53,18 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
     val binding = listOf(controller, online?.connectionId, track?.key, previous?.key, next?.key)
     var actions by remember(controller) { mutableStateOf(false) }
     LaunchedEffect(binding) { actions = false }
-    Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
-        Column {
+    val colors = MaterialTheme.colorScheme
+    val progress = track?.let { miniPlayerProgress(state.elapsed, state.duration) }
+    Surface(color = colors.surfaceContainerLow) {
+        Column(Modifier.drawWithContent {
+            drawContent()
+            if (progress != null) {
+                val height = 2.dp.toPx()
+                val bottomEdge = Offset(0f, size.height - height)
+                drawRect(colors.outlineVariant, bottomEdge, Size(size.width, height))
+                drawRect(colors.primary, bottomEdge, Size(size.width * progress, height))
+            }
+        }) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Row(
                 Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
@@ -102,6 +115,11 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
         }
     }
 }
+
+internal fun miniPlayerProgress(elapsed: Double, duration: Double): Float? =
+    if (elapsed.isFinite() && duration.isFinite() && duration > 0.0) {
+        (elapsed.coerceIn(0.0, duration) / duration).toFloat()
+    } else null
 
 @Composable
 private fun MiniIdentity(track: PlaybackTrack, loader: ImageLoader, modifier: Modifier) {

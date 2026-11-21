@@ -10,6 +10,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -32,7 +33,8 @@ internal fun PlaybackSeek(state: PlayerPresentation, binding: String, content: T
         val value = (preview ?: seconds.toFloat()).coerceIn(0f, total.toFloat().coerceAtLeast(1f))
         val enabled = state.ready && total > 0
         val colors = MaterialTheme.colorScheme
-        val active = colors.primary
+        val showFocus = enabled && focused
+        val active = if (showFocus) colors.tertiary else colors.primary
         val inactive = colors.onSurfaceVariant
         Column(Modifier.fillMaxWidth()) {
             Slider(value, onValueChange = { preview = it }, enabled = enabled,
@@ -44,10 +46,6 @@ internal fun PlaybackSeek(state: PlayerPresentation, binding: String, content: T
                 },
                 thumb = {
                     if (waveform == null) Canvas(Modifier.size(14.dp)) {
-                        if (focused) {
-                            drawCircle(colors.background, 14.dp.toPx())
-                            drawCircle(colors.tertiary, 11.dp.toPx(), style = Stroke(2.dp.toPx()))
-                        }
                         drawCircle(if (enabled) active else inactive)
                     } else Spacer(Modifier.size(0.dp))
                 },
@@ -58,7 +56,7 @@ internal fun PlaybackSeek(state: PlayerPresentation, binding: String, content: T
                             Offset(size.width, size.height / 2), strokeWidth = 3.dp.toPx())
                         drawLine(if (enabled) active else inactive, Offset(0f, size.height / 2),
                             Offset(x, size.height / 2), strokeWidth = 3.dp.toPx())
-                    } else WaveformTrack(waveform, value / total.toFloat().coerceAtLeast(1f), preview != null, focused)
+                    } else WaveformTrack(waveform, value / total.toFloat().coerceAtLeast(1f), preview != null, active, showFocus)
                 })
             Row(Modifier.fillMaxWidth()) {
                 Box(Modifier.weight(1f).playerTimeLabelColumn(end = false)) {
@@ -103,12 +101,11 @@ internal fun displayWaveformBins(bins: List<Int>, maximum: Int = 56): List<Int> 
 }
 
 @Composable
-private fun WaveformTrack(waveform: TrackWaveform, progress: Float, seeking: Boolean, focused: Boolean) {
+private fun WaveformTrack(waveform: TrackWaveform, progress: Float, seeking: Boolean, played: Color, focused: Boolean) {
     val bins = remember(waveform) { displayWaveformBins(waveform.bins) }
     val colors = MaterialTheme.colorScheme
-    val played = colors.primary
     val unplayed = colors.onSurfaceVariant.copy(alpha = .65f)
-    val ink = colors.onSurface
+    val ink = if (focused) played else colors.onSurface
     val background = colors.background
     Canvas(Modifier.fillMaxWidth().height(48.dp)) {
         if (bins.isEmpty()) return@Canvas
@@ -122,13 +119,12 @@ private fun WaveformTrack(waveform: TrackWaveform, progress: Float, seeking: Boo
         }
         val handle = Offset(cursor, size.height * 3f / 48f)
         val end = Offset(cursor, size.height * 45f / 48f)
-        val width = if (seeking || focused) 4.dp else 2.dp
-        // Isolate the marker from the mint bars so the playhead and focus ring stay legible.
+        val width = if (seeking) 4.dp else 2.dp
+        // Keep the playhead distinct from the waveform bars.
         drawLine(background, handle, end, strokeWidth = (width + 4.dp).toPx())
         drawLine(ink, handle, end, strokeWidth = width.toPx())
-        val radius = (if (focused) 5.dp else 3.dp).toPx()
-        drawCircle(background, radius + 2.dp.toPx(), handle)
-        drawCircle(if (focused) colors.tertiary else ink, radius, handle,
-            style = Stroke(2.dp.toPx()))
+        drawCircle(background, 5.dp.toPx(), handle)
+        if (focused) drawCircle(ink, 4.dp.toPx(), handle)
+        else drawCircle(ink, 3.dp.toPx(), handle, style = Stroke(2.dp.toPx()))
     }
 }
