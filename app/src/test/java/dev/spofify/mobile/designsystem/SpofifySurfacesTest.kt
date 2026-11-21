@@ -7,12 +7,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class SpofifySurfacesTest {
-    @Test fun cornersShareDesktopLogicalUnitsWithoutRoundingTheDockedSheetEdge() {
+    @Test fun cornersShareDesktopLogicalUnits() {
         for (density in listOf(1f, 2.5f)) {
             assertCorners(SpofifySurfaces.control, density, listOf(8f, 8f, 8f, 8f))
             assertCorners(SpofifySurfaces.artwork, density, listOf(8f, 8f, 8f, 8f))
             assertCorners(SpofifySurfaces.panel, density, listOf(12f, 12f, 12f, 12f))
-            assertCorners(SpofifySurfaces.sheet, density, listOf(12f, 12f, 0f, 0f))
         }
     }
 

@@ -16,7 +16,6 @@ internal object SpofifySurfaces {
     val control = RoundedCornerShape(controlRadius)
     val artwork = RoundedCornerShape(controlRadius)
     val panel = RoundedCornerShape(panelRadius)
-    val sheet = RoundedCornerShape(topStart = panelRadius, topEnd = panelRadius)
 }
 
 @Composable
