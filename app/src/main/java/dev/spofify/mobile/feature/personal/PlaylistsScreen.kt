@@ -151,7 +151,7 @@ internal fun PlaylistSummaryRow(
                     } }
                 }
             }
-            HorizontalDivider(Modifier.padding(horizontal = geometry.gutter.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            ListRowDivider()
         }
     }
 }
@@ -190,20 +190,23 @@ fun AddTrackToPlaylistSheet(
     } else SpofifySheet(onDismiss) {
         Box {
             LazyColumn(Modifier.fillMaxWidth(), state = scroll,
-                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
+                contentPadding = PaddingValues(bottom = 22.dp)) {
                 item("heading") {
-                    SheetHeading("Add to playlist")
-                    PersonalStatus(state.writing, state.error ?: state.message)
-                    SheetAction("New playlist", SpofifyGlyph.Plus, !state.writing && !state.needsReview) { creating = true }
+                    Column(Modifier.padding(horizontal = 20.dp)) {
+                        SheetHeading("Add to playlist")
+                        PersonalStatus(state.writing, state.error ?: state.message)
+                    }
+                    SheetListAction("New playlist", SpofifyGlyph.Plus, !state.writing && !state.needsReview) { creating = true }
                 }
                 items(state.items.filter { it.capabilities.addTracks }, key = { it.id }) { summary ->
-                    SheetAction(summary.name, SpofifyGlyph.Playlists,
+                    SheetListAction(summary.name, SpofifyGlyph.Playlists,
                         !state.writing && !state.loading && !state.needsReview && track.kind == MusicKind.TRACK && track.hasAudio) {
                         model.add(track.id, summary)
                     }
                 }
                 if (state.loaded && state.items.none { it.capabilities.addTracks }) item("empty") {
-                    Text("No playlists", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("No playlists", Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }

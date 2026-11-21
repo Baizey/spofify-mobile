@@ -1,7 +1,6 @@
 package dev.spofify.mobile.playback
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -21,6 +20,7 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -36,39 +36,41 @@ internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
     val ready = state.connection == PlaybackConnectionState.READY
     var renaming by remember { mutableStateOf<PlaybackDevice?>(null) }
     SpofifySheet(onDismiss) {
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
-            SheetHeading("Playback devices")
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 22.dp)) {
+            Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading("Playback devices") }
             state.devices.forEach { device ->
                 val active = device.deviceId == state.snapshot?.selectedDeviceId
                 val available = ready && device.available && device.canPlay
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(Modifier.weight(1f).heightIn(min = 80.dp).clickable(enabled = available, role = Role.Button) {
-                        controller.selectDevice(device.deviceId); onDismiss()
-                    }.semantics { selected = active }.padding(vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        SpofifyIcon(SpofifyGlyph.Devices, null)
-                        Column(Modifier.weight(1f)) {
-                            Text(device.name)
-                            val kind = when {
-                                !device.available -> "Unavailable"
-                                !device.canPlay -> "Controller only"
-                                device.deviceId == state.deviceId -> "This phone"
-                                else -> "Playback device"
+                ListRowIndication(onClick = { controller.selectDevice(device.deviceId); onDismiss() },
+                    enabled = available, role = Role.Button) { target ->
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(Modifier.weight(1f).heightIn(min = 80.dp).then(target)
+                            .semantics { selected = active }.padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            SpofifyIcon(SpofifyGlyph.Devices, null)
+                            Column(Modifier.weight(1f)) {
+                                Text(device.name)
+                                val kind = when {
+                                    !device.available -> "Unavailable"
+                                    !device.canPlay -> "Controller only"
+                                    device.deviceId == state.deviceId -> "This phone"
+                                    else -> "Playback device"
+                                }
+                                Text(kind + if (active) " · Selected" else "", Modifier.padding(top = 4.dp),
+                                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            Text(kind + if (active) " · Selected" else "", Modifier.padding(top = 4.dp),
-                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Box(Modifier.width(18.dp)) { if (active) SpofifyIcon(SpofifyGlyph.Check, "Selected", Modifier.size(18.dp)) }
                         }
-                        Box(Modifier.width(18.dp)) { if (active) SpofifyIcon(SpofifyGlyph.Check, "Selected", Modifier.size(18.dp)) }
-                    }
-                    TextButton({ renaming = device }, enabled = ready, contentPadding = PaddingValues(vertical = 8.dp)) {
-                        Text("Rename", style = MaterialTheme.typography.bodySmall)
+                        TextButton({ renaming = device }, enabled = ready, contentPadding = PaddingValues(vertical = 8.dp)) {
+                            Text("Rename", style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                ListRowDivider()
             }
-            if (state.devices.isEmpty()) Text("No connected devices", Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (state.snapshot?.transfer != null) Text("Switching output", Modifier.padding(vertical = 12.dp),
+            if (state.devices.isEmpty()) Text("No connected devices", Modifier.padding(horizontal = 20.dp, vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (state.snapshot?.transfer != null) Text("Switching output", Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -117,24 +119,32 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
     val selected = upcoming.firstOrNull { it.key == actions && editable(it.key) }
     SpofifySheet(onDismiss) {
         LazyColumn(Modifier.weight(1f, fill = false).fillMaxWidth(), state = list,
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
-            item("heading") { SheetHeading("Queue") }
+            contentPadding = PaddingValues(bottom = 22.dp)) {
+            item("heading") { Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading("Queue") } }
             state.queue?.current?.let { current -> item("current") {
-                SheetGroup("Current song")
+                Box(Modifier.padding(horizontal = 20.dp)) { SheetGroup("Current song") }
                 QueueTrack(current, loader)
             } }
-            item("up-next") { SheetGroup("Up next") }
+            item("up-next") { Box(Modifier.padding(horizontal = 20.dp)) { SheetGroup("Up next") } }
             itemsIndexed(upcoming, key = { _, track -> track.key }) { _, track ->
-                SwipeActionSurface(binding = listOf(controller, online?.sessionId, online?.snapshot?.stateVersion ?: upcoming, track.key),
-                    onRight = if (ready) ({ controller.queueTrack(PlaybackTrackReference(track.id)) }) else null,
-                    onLeft = if (ready && editable(track.key)) ({ controller.remove(track.key) }) else null,
-                    slideOutOnLeft = true) {
-                    QueueTrack(track, loader,
-                        onOpen = if (ready && editable(track.key)) ({ controller.jump(track.key) }) else null,
-                        onMore = if (editable(track.key)) ({ actions = track.key }) else null)
+                ListRowIndication(onClick = if (ready && editable(track.key)) ({ controller.jump(track.key) }) else null) { target ->
+                    // The outer layer paints the gutters; the inset face keeps its original
+                    // divider, measured swipe width, action exclusion, and translation clip.
+                    ListRowDivider(Modifier.align(Alignment.BottomCenter))
+                    SwipeActionSurface(binding = listOf(controller, online?.sessionId, online?.snapshot?.stateVersion ?: upcoming, track.key),
+                        onRight = if (ready) ({ controller.queueTrack(PlaybackTrackReference(track.id)) }) else null,
+                        modifier = Modifier.padding(horizontal = 20.dp),
+                        onLeft = if (ready && editable(track.key)) ({ controller.remove(track.key) }) else null,
+                        slideOutOnLeft = true) {
+                        QueueTrack(track, loader, target = target,
+                            onMore = if (editable(track.key)) ({ actions = track.key }) else null,
+                            gutter = 0.dp)
+                    }
                 }
             }
-            if (upcoming.isEmpty()) item("empty") { Text("Nothing up next", Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            if (upcoming.isEmpty()) item("empty") {
+                Text("Nothing up next", Modifier.padding(horizontal = 20.dp, vertical = 16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
     if (selected != null) SpofifySheet({ actions = null }) {
@@ -162,10 +172,16 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
 }
 
 @Composable
-private fun QueueTrack(track: PlaybackTrack, loader: ImageLoader, onOpen: (() -> Unit)? = null, onMore: (() -> Unit)? = null) {
+private fun QueueTrack(
+    track: PlaybackTrack,
+    loader: ImageLoader,
+    target: Modifier = Modifier,
+    onMore: (() -> Unit)? = null,
+    gutter: Dp = 20.dp,
+) {
     Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 72.dp), verticalAlignment = Alignment.CenterVertically) {
-            Row(Modifier.weight(1f).heightIn(min = 70.dp).then(if (onOpen == null) Modifier else Modifier.clickable(onClick = onOpen))
+        Row(Modifier.fillMaxWidth().padding(horizontal = gutter).heightIn(min = 72.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.weight(1f).heightIn(min = 70.dp).then(target)
                 .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(13.dp)) {
                 MusicArtwork(MusicKind.TRACK, track.id, loader)
@@ -181,6 +197,6 @@ private fun QueueTrack(track: PlaybackTrack, loader: ImageLoader, onOpen: (() ->
                 IconButton(onMore, Modifier.size(48.dp)) { SpofifyIcon(SpofifyGlyph.More, "More actions for ${track.name}") }
             }
         }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        ListRowDivider()
     }
 }

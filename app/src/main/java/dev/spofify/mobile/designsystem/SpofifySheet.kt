@@ -51,13 +51,28 @@ fun SheetHeading(title: String) {
 @Composable
 fun SheetAction(label: String, glyph: SpofifyGlyph, enabled: Boolean = true, onClick: () -> Unit) {
     Column {
-        Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).alpha(if (enabled) 1f else .5f)
-            .clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            SpofifyIcon(glyph, null, Modifier.size(22.dp))
-            Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
-        }
+        SheetActionContent(label, glyph, enabled, Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onClick))
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+    }
+}
+
+@Composable
+internal fun SheetListAction(label: String, glyph: SpofifyGlyph, enabled: Boolean, onClick: () -> Unit) {
+    Column {
+        ListRowIndication(onClick, enabled, Role.Button) { target ->
+            SheetActionContent(label, glyph, enabled, target, Modifier.padding(horizontal = 20.dp))
+        }
+        ListRowDivider()
+    }
+}
+
+@Composable
+private fun SheetActionContent(label: String, glyph: SpofifyGlyph, enabled: Boolean, target: Modifier, modifier: Modifier = Modifier) {
+    Row(modifier.fillMaxWidth().heightIn(min = 54.dp).alpha(if (enabled) 1f else .5f)
+        .then(target).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+        SpofifyIcon(glyph, null, Modifier.size(22.dp))
+        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
     }
 }
 

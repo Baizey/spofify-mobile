@@ -20,6 +20,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.spofify.mobile.designsystem.ListRowDivider
 import dev.spofify.mobile.designsystem.SpofifyGlyph
 import dev.spofify.mobile.designsystem.SpofifyIcon
 import dev.spofify.mobile.designsystem.SpofifySurfaces
@@ -141,7 +142,7 @@ internal fun MusicRow(
                         }
                     }
                 }
-                HorizontalDivider(Modifier.padding(horizontal = geometry.gutter.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                ListRowDivider()
             }
         }
     }
