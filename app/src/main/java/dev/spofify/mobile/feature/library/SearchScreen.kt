@@ -128,6 +128,7 @@ internal fun SearchScreen(
                 }
             }
         }
+        val searchTextStyle = MaterialTheme.typography.bodyLarge
         Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).spofifyField(editing, illumination = Brush.verticalGradient(
             0f to Color.Transparent, .2f to Color.Transparent,
             1f to MaterialTheme.colorScheme.primary.copy(alpha = .16f * illumination)))
@@ -137,14 +138,17 @@ internal fun SearchScreen(
                 .padding(horizontal = 8.dp, vertical = 12.dp)
                 .focusRequester(requester).onFocusChanged { editing = it.isFocused }
                 .semantics { contentDescription = "Search music" },
-                textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                textStyle = searchTextStyle.copy(color = MaterialTheme.colorScheme.onSurface),
                 singleLine = true,
                 cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { focus.clearFocus(); keyboard?.hide() }),
                 decorationBox = { input ->
-                    if (state.query.isEmpty()) Text("Search your music", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    input()
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
+                        if (state.query.isEmpty()) Text("Search your music",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, style = searchTextStyle)
+                        input()
+                    }
                 })
             if (state.query.isNotEmpty()) IconButton({ model.query(""); requester.requestFocus(); keyboard?.show() }, Modifier.size(48.dp)) {
                 SpofifyIcon(SpofifyGlyph.Close, "Clear search", Modifier.size(20.dp))
