@@ -1,6 +1,17 @@
 package dev.spofify.mobile.feature.library
 
 import androidx.lifecycle.ViewModelStore
+import dev.spofify.mobile.core.auth.AuthApi
+import dev.spofify.mobile.core.auth.AuthApiFactory
+import dev.spofify.mobile.core.auth.AuthFailure
+import dev.spofify.mobile.core.auth.AuthReply
+import dev.spofify.mobile.core.auth.LoginStore
+import dev.spofify.mobile.core.auth.ManualOfflineStore
+import dev.spofify.mobile.core.auth.RememberedLogin
+import dev.spofify.mobile.core.auth.SessionRepository
+import dev.spofify.mobile.core.auth.SessionStore
+import dev.spofify.mobile.core.auth.SessionSummary
+import dev.spofify.mobile.core.auth.StoredSession
 import dev.spofify.mobile.core.library.Artist
 import dev.spofify.mobile.core.library.LibraryApi
 import dev.spofify.mobile.core.library.LibraryException
@@ -8,15 +19,20 @@ import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.library.MusicPage
 import dev.spofify.mobile.core.playback.PlaybackContext
+import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -50,8 +66,8 @@ class DetailViewModelTest {
         override suspend fun artwork(kind: MusicKind, id: String): ByteArray? = null
     }
 
-    private fun model(api: Api, kind: MusicKind = MusicKind.ALBUM) =
-        DetailViewModel(api, kind, "collection").also { store.put("detail", it) }
+    private fun model(api: Api, kind: MusicKind = MusicKind.ALBUM, owner: LibraryReadOwner? = null) =
+        DetailViewModel(api, kind, "collection", owner).also { store.put("detail", it) }
 
     @Test fun entireAlbumLoadsWithoutPageCapInSourceOrder() = runTest(dispatcher) {
         val api = Api().apply { readPage = { offset -> page(offset, 201) } }
@@ -105,41 +121,103 @@ class DetailViewModelTest {
         assertEquals("40", model.state.value.rows.last().id)
     }
 
-    @Test fun refreshFailurePreservesTheWholeOldSnapshotThenRetryRestartsAtZero() = runTest(dispatcher) {
+    @Test fun albumRefreshPreservesTheWholeOldSnapshotUntilTheDelayedReadSucceeds() = runTest(dispatcher) {
         val api = Api().apply { readPage = { offset -> page(offset, 41) } }
         val model = model(api)
         advanceUntilIdle()
         val old = model.state.value
         api.readDetail = { item(MusicKind.ALBUM, "collection").copy(name = "New name") }
-        api.readPage = { offset -> if (offset > 0) throw LibraryException(503) else page(offset, 42, revision = 2) }
+        api.readPage = { offset ->
+            if (api.offsets == listOf(0, 40, 0, 40)) throw LibraryException(503)
+            page(offset, 42, revision = 2)
+        }
         model.refresh()
-        advanceUntilIdle()
-        assertTrue(model.state.value.failed)
-        assertEquals(old.item, model.state.value.item)
-        assertEquals(old.rows, model.state.value.rows)
-        assertEquals(old.revision, model.state.value.revision)
-        api.readPage = { offset -> page(offset, 42, revision = 2) }
-        model.retry()
-        advanceUntilIdle()
-        assertEquals(listOf(0, 40, 0, 40, 0, 40), api.offsets)
+        runCurrent()
+        assertEquals(old.copy(loading = true), model.state.value)
+        advanceTimeBy(999)
+        runCurrent()
+        assertEquals(listOf(0, 40, 0, 40), api.offsets)
+        assertEquals(old.copy(loading = true), model.state.value)
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(listOf(0, 40, 0, 40, 40), api.offsets)
+        assertEquals(2, api.detailReads)
         assertEquals(42, model.state.value.rows.size)
+        assertEquals(2L, model.state.value.revision)
         assertEquals("New name", model.state.value.item?.name)
+        assertFalse(model.state.value.loading)
         assertFalse(model.state.value.failed)
     }
 
-    @Test fun mixedAlbumRevisionsNeverPublishAndRetryReadsAFreshCompleteAlbum() = runTest(dispatcher) {
-        val api = Api().apply { readPage = { offset -> page(offset, 41, revision = if (offset == 0) 1 else 2) } }
+    @Test fun secondTransientFailureStopsAndPreservesTheOldSnapshot() = runTest(dispatcher) {
+        val api = Api().apply { readPage = { offset -> page(offset, 41) } }
         val model = model(api)
         advanceUntilIdle()
-        assertTrue(model.state.value.failed)
-        assertFalse(model.state.value.loaded)
-        assertTrue(model.state.value.rows.isEmpty())
-        api.readPage = { offset -> page(offset, 41, revision = 3) }
-        model.retry()
+        val old = model.state.value
+        api.readDetail = { item(MusicKind.ALBUM, "collection").copy(name = "New name") }
+        api.readPage = { offset ->
+            if (offset > 0) throw LibraryException(503)
+            page(offset, 42, revision = 2)
+        }
+        model.refresh()
         advanceUntilIdle()
-        assertEquals(listOf(0, 40, 0, 40), api.offsets)
-        assertEquals(3L, model.state.value.revision)
-        assertEquals(41, model.state.value.rows.size)
+        assertEquals(listOf(0, 40, 0, 40, 40), api.offsets)
+        assertEquals(1_000L, testScheduler.currentTime)
+        assertEquals(old.copy(failed = true), model.state.value)
+        assertEquals(2, api.detailReads)
+    }
+
+    @Test fun recoveryBudgetIsSharedAcrossDetailAndPages() = runTest(dispatcher) {
+        val api = Api()
+        api.readDetail = {
+            if (api.detailReads == 1) throw AuthFailure(AuthFailure.Kind.UNAVAILABLE, transient = true)
+            item(MusicKind.ALBUM, "collection")
+        }
+        api.readPage = { throw LibraryException(503) }
+        val model = model(api)
+        runCurrent()
+        assertEquals(1, api.detailReads)
+        assertTrue(model.state.value.loading)
+        assertFalse(model.state.value.failed)
+        assertNull(model.state.value.item)
+        advanceUntilIdle()
+        assertEquals(1_000L, testScheduler.currentTime)
+        assertEquals(2, api.detailReads)
+        assertEquals(listOf(0), api.offsets)
+        assertTrue(model.state.value.failed)
+        assertFalse(model.state.value.loading)
+    }
+
+    @Test fun permanentThrottledAndUntypedFailuresStopWithoutWaiting() = runTest(dispatcher) {
+        val failures = listOf(LibraryException(404), LibraryException(429), LibraryException(503, transient = false),
+            AuthFailure(AuthFailure.Kind.UNAVAILABLE), AuthFailure(AuthFailure.Kind.INVALID_RESPONSE), IOException())
+        for (failure in failures) {
+            val api = Api().apply { readDetail = { throw failure } }
+            val model = model(api)
+            runCurrent()
+            assertEquals(DetailState(failed = true), model.state.value)
+            advanceUntilIdle()
+            assertEquals(1, api.detailReads)
+            assertEquals(0L, testScheduler.currentTime)
+        }
+    }
+
+    @Test fun mixedAlbumRevisionsStopWithoutPublishingOrReplaying() = runTest(dispatcher) {
+        for (withTransientFailure in listOf(false, true)) {
+            val api = Api().apply {
+                readPage = { offset ->
+                    if (withTransientFailure && offsets == listOf(0, 40)) throw LibraryException(503)
+                    page(offset, 41, revision = if (offset == 0) 1 else 2)
+                }
+            }
+            val model = model(api)
+            advanceUntilIdle()
+            assertTrue(model.state.value.failed)
+            assertFalse(model.state.value.loaded)
+            assertTrue(model.state.value.rows.isEmpty())
+            assertEquals(if (withTransientFailure) listOf(0, 40, 40) else listOf(0, 40), api.offsets)
+            assertEquals(if (withTransientFailure) 1_000L else 0L, testScheduler.currentTime)
+        }
     }
 
     @Test fun artistPagesRetainReleaseRelationshipsAndTypesAcrossContinuation() = runTest(dispatcher) {
@@ -171,23 +249,26 @@ class DetailViewModelTest {
         assertNull(model.state.value.nextOffset)
     }
 
-    @Test fun artistContinuationFailureRetriesTheFailedPageNotTheFirstPage() = runTest(dispatcher) {
+    @Test fun artistContinuationAutomaticallyRepeatsOnlyTheFailedPage() = runTest(dispatcher) {
+        var failedOnce = false
         val api = Api().apply {
             readDetail = { item(MusicKind.ARTIST, "collection") }
             readPage = { offset ->
-                if (offset > 0) throw LibraryException(503)
+                if (offset > 0 && !failedOnce) {
+                    failedOnce = true
+                    throw LibraryException(503)
+                }
                 page(offset, 41, kind = MusicKind.ALBUM)
             }
         }
         val model = model(api, MusicKind.ARTIST)
         advanceUntilIdle()
-        assertEquals(listOf(0), api.offsets)
+        val old = model.state.value
         model.more()
-        advanceUntilIdle()
-        assertEquals(40, model.state.value.rows.size)
-        assertTrue(model.state.value.failed)
-        api.readPage = { offset -> page(offset, 41, kind = MusicKind.ALBUM) }
-        model.retry()
+        runCurrent()
+        assertEquals(listOf(0, 40), api.offsets)
+        assertEquals(old.copy(loading = true), model.state.value)
+        model.more()
         advanceUntilIdle()
         assertEquals(listOf(0, 40, 40), api.offsets)
         assertEquals(1, api.detailReads)
@@ -195,42 +276,47 @@ class DetailViewModelTest {
         assertFalse(model.state.value.failed)
     }
 
-    @Test fun artistRevisionChangeRequiresRefreshInsteadOfAppendingOrRetryingAnIncompatiblePage() = runTest(dispatcher) {
+    @Test fun artistRecoveryStillRequiresMatchingTheOldRevision() = runTest(dispatcher) {
         val api = Api().apply {
             readDetail = { item(MusicKind.ARTIST, "collection") }
             readPage = { offset -> page(offset, 41, kind = MusicKind.ALBUM) }
         }
         val model = model(api, MusicKind.ARTIST)
         advanceUntilIdle()
-        api.readPage = { offset -> page(offset, 42, revision = 2, kind = MusicKind.ALBUM) }
+        val old = model.state.value
+        api.readPage = { offset ->
+            if (api.offsets == listOf(0, 40)) throw LibraryException(503)
+            page(offset, 42, revision = 2, kind = MusicKind.ALBUM)
+        }
         model.more()
         advanceUntilIdle()
-        assertTrue(model.state.value.failed)
-        assertEquals(1L, model.state.value.revision)
-        assertEquals(40, model.state.value.rows.size)
-        model.retry()
+        assertEquals(old.copy(failed = true), model.state.value)
+        model.more() // The end-of-grid trigger must not silently restart a failed continuation.
         advanceUntilIdle()
-        assertEquals(listOf(0, 40, 0), api.offsets)
+        assertEquals(listOf(0, 40, 40), api.offsets)
+        assertEquals(1, api.detailReads)
+        model.refresh()
+        advanceUntilIdle()
+        assertEquals(listOf(0, 40, 40, 0), api.offsets)
         assertEquals(2, api.detailReads)
         assertEquals(2L, model.state.value.revision)
         assertEquals(40, model.state.value.rows.size)
         assertEquals(40, model.state.value.nextOffset)
     }
 
-    @Test fun duplicateRowsAndNonAdvancingPagesFailWithoutPublishingPartialAlbum() = runTest(dispatcher) {
-        val api = Api().apply { readPage = { offset ->
-            if (offset == 0) page(0, 41)
-            else MusicPage(listOf(item(MusicKind.TRACK, "0")), 41, offset, 40, 1)
-        } }
-        val model = model(api)
-        advanceUntilIdle()
-        assertTrue(model.state.value.failed)
-        assertTrue(model.state.value.rows.isEmpty())
-        api.readPage = { offset -> MusicPage(emptyList(), 41, offset, 40, 1) }
-        model.retry()
-        advanceUntilIdle()
-        assertTrue(model.state.value.failed)
-        assertEquals(listOf(0, 40, 0), api.offsets)
+    @Test fun duplicateRowsAndNonAdvancingPagesFailWithoutReplayOrPartialAlbum() = runTest(dispatcher) {
+        for (invalidRows in listOf(listOf(item(MusicKind.TRACK, "0")), emptyList())) {
+            val api = Api().apply { readPage = { offset ->
+                if (offset == 0) page(0, 41)
+                else MusicPage(invalidRows, 41, offset, 40, 1)
+            } }
+            val model = model(api)
+            advanceUntilIdle()
+            assertTrue(model.state.value.failed)
+            assertTrue(model.state.value.rows.isEmpty())
+            assertEquals(listOf(0, 40), api.offsets)
+            assertEquals(0L, testScheduler.currentTime)
+        }
     }
 
     @Test fun totalChangeWithinAlbumIsRejectedEvenWhenRevisionMatches() = runTest(dispatcher) {
@@ -240,6 +326,102 @@ class DetailViewModelTest {
         assertTrue(model.state.value.failed)
         assertFalse(model.state.value.loaded)
         assertTrue(model.state.value.rows.isEmpty())
+    }
+
+    @Test fun clearingViewModelDuringBackoffPreventsTheSecondReadAndAnyPublication() = runTest(dispatcher) {
+        val api = Api().apply { readPage = { throw LibraryException(503) } }
+        val model = model(api)
+        runCurrent()
+        val pending = model.state.value
+        assertTrue(pending.loading)
+        assertEquals(listOf(0), api.offsets)
+        store.clear()
+        advanceUntilIdle()
+        assertEquals(listOf(0), api.offsets)
+        assertEquals(pending, model.state.value)
+    }
+
+    @Test fun nonCooperativeRecoveryCannotReadMoreOrPublishWhenCleared() = runTest(dispatcher) {
+        for (lateFailure in listOf(false, true)) {
+            val gate = CompletableDeferred<Unit>()
+            val api = Api().apply {
+                readPage = { offset ->
+                    if (offsets.size == 1) throw LibraryException(503)
+                    withContext(NonCancellable) { gate.await() }
+                    if (lateFailure) throw LibraryException(503)
+                    page(offset, 41)
+                }
+            }
+            val model = model(api)
+            advanceTimeBy(1_000)
+            runCurrent()
+            val pending = model.state.value
+            assertTrue(pending.loading)
+            assertEquals(listOf(0, 0), api.offsets)
+            store.clear()
+            gate.complete(Unit)
+            advanceUntilIdle()
+            assertEquals(listOf(0, 0), api.offsets)
+            assertEquals(pending, model.state.value)
+        }
+    }
+
+    @Test fun retiringTheOnlineGrantDuringBackoffStopsTheExistingAndFutureOldOwnerLoads() = runTest(dispatcher) {
+        val sessions = onlineSessions()
+        val owner = LibraryReadOwner(sessions, requireNotNull(sessions.onlineGrant.value))
+        val api = Api()
+        val model = model(api, owner = owner)
+        runCurrent()
+        val old = model.state.value
+        assertTrue(old.loaded)
+        api.readPage = { throw LibraryException(503) }
+        model.refresh()
+        runCurrent()
+        val pending = model.state.value
+        assertEquals(old.copy(loading = true), pending)
+        sessions.setManualOffline(true)
+        advanceUntilIdle()
+        assertNull(sessions.onlineGrant.value)
+        assertEquals(listOf(0, 0), api.offsets)
+        assertEquals(pending, model.state.value)
+        model.refresh()
+        model.toggleRankMode()
+        advanceUntilIdle()
+        assertEquals(2, api.detailReads)
+        assertEquals(listOf(0, 0), api.offsets)
+        assertEquals(pending, model.state.value)
+    }
+
+    private fun TestScope.onlineSessions(): SessionRepository {
+        val account = SessionSummary("account", "user", "user", "csrf")
+        val sessions = object : SessionStore {
+            var saved: StoredSession? = StoredSession("https://music.example", "session=fixture", account)
+            override fun read() = saved
+            override fun write(value: StoredSession?) { saved = value }
+        }
+        val logins = object : LoginStore {
+            override fun read() = null
+            override fun write(value: RememberedLogin) = Unit
+        }
+        val apis = AuthApiFactory { server ->
+            object : AuthApi {
+                override val origin = server
+                override suspend fun session(cookie: String) = AuthReply(account, null, null)
+                override suspend fun login(username: String, password: String): AuthReply = error("Not used")
+                override suspend fun logout(cookie: String, csrfToken: String) = Unit
+                override fun cancel() = Unit
+                override fun validateCookie(cookie: String) = Unit
+            }
+        }
+        val offline = object : ManualOfflineStore {
+            private var value = false
+            override fun read() = value
+            override fun write(enabled: Boolean) { value = enabled }
+        }
+        return SessionRepository(sessions, logins, apis, backgroundScope, dispatcher, offline).also {
+            it.start()
+            runCurrent()
+        }
     }
 
     @Test fun presentationUsesRealMetadataAvailabilityAndCollectionIdentity() {

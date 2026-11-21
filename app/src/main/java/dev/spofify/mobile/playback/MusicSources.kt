@@ -6,12 +6,13 @@ import dev.spofify.mobile.core.library.*
 import dev.spofify.mobile.core.offline.*
 import dev.spofify.mobile.core.personal.*
 import dev.spofify.mobile.core.search.*
+import dev.spofify.mobile.feature.library.LibraryReadOwner
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
 
 /** One logical data generation, independent of navigation destinations and playback ticks. */
 internal class MusicSources(val library: LibraryApi, val search: SearchApi, val personal: PersonalLibraryApi,
-    val content: TrackContentApi, val local: Boolean)
+    val content: TrackContentApi, val local: Boolean, val readOwner: LibraryReadOwner? = null)
 
 internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant, catalog: LocalMusicCatalog, account: LivePersonal): MusicSources {
     val id = grant.identity
@@ -65,7 +66,7 @@ internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant,
         override suspend fun waveform(trackId: String) = read { content.waveform(trackId) }
         override suspend fun lyrics(trackId: String) = read { content.lyrics(trackId) } // Display rights only, never persist text.
     }
-    return MusicSources(browse, ranked, user, track, false)
+    return MusicSources(browse, ranked, user, track, false, LibraryReadOwner(sessions, grant))
 }
 
 /** Read-only projection of complete saved memberships, not server mutation or derived-selection authority. */

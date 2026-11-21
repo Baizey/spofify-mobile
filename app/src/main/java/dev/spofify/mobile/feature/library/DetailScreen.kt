@@ -12,8 +12,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -46,7 +48,7 @@ internal fun DetailScreen(
     onNavigate: ((MusicKind, String) -> Unit)? = null,
     onMore: ((MusicItem, PlaybackContext?) -> Unit)? = null,
 ) {
-    val state by model.state.collectAsStateWithLifecycle()
+    val state by key(model) { model.state.collectAsStateWithLifecycle() }
     val ready = playback?.observe()?.ready == true
     var menuItem by remember(model) { mutableStateOf<MusicItem?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
@@ -280,10 +282,9 @@ private fun DetailLoadState(state: DetailState, model: DetailViewModel) {
     when {
         state.loading -> CircularProgressIndicator(Modifier.padding(vertical = 24.dp).size(24.dp)
             .semantics { contentDescription = "Loading music" })
-        state.failed -> Column(Modifier.padding(vertical = 24.dp)) {
-            Text("Can’t load music", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(model::retry, Modifier.heightIn(min = 48.dp)) { Text("Retry") }
-        }
+        state.failed -> Text("Can’t load music", Modifier.padding(vertical = 24.dp)
+            .semantics { liveRegion = LiveRegionMode.Polite },
+            style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
         state.loaded && state.rows.isEmpty() && state.item?.kind != MusicKind.TRACK ->
             Text(if (state.item?.kind == MusicKind.ARTIST) "No releases yet" else "No songs yet",
                 Modifier.padding(vertical = 24.dp), style = MaterialTheme.typography.bodyLarge,

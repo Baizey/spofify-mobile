@@ -12,7 +12,6 @@
     <string name="account">Account</string>
     <string name="connecting">Connecting…</string>
     <string name="signing_in">Signing in…</string>
-    <string name="retry">Retry</string>
     <string name="credits">Credits</string>
     <string name="font_name">JetBrains Mono</string>
     <string name="close">Close</string>

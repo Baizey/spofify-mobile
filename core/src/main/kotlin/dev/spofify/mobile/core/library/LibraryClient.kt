@@ -2,6 +2,7 @@ package dev.spofify.mobile.core.library
 
 import dev.spofify.mobile.core.auth.AccountIdentity
 import dev.spofify.mobile.core.auth.SessionRepository
+import dev.spofify.mobile.core.http.isTransientReadStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -44,7 +45,7 @@ fun validSearchQuery(value: String): Boolean = value.codePointCount(0, value.len
             !(Character.isLowSurrogate(character) && index > 0 && Character.isHighSurrogate(value[index - 1]))
     }
 
-class LibraryException(val status: Int) : Exception("Music request failed")
+class LibraryException(val status: Int, val transient: Boolean = isTransientReadStatus(status)) : Exception("Music request failed")
 
 interface LibraryApi {
     suspend fun search(kind: MusicKind, query: String, offset: Int = 0): MusicPage
@@ -104,7 +105,7 @@ class LibraryClient(private val sessions: SessionRepository, private val identit
 
     private suspend fun read(segments: List<String>, query: List<Pair<String, String>> = emptyList()): ByteArray {
         val response = sessions.get(identity, segments, query)
-        if (response.status != 200) throw LibraryException(response.status)
+        if (response.status != 200) throw LibraryException(response.status, isTransientReadStatus(response.status, response.retryAfter))
         return response.bytes
     }
 

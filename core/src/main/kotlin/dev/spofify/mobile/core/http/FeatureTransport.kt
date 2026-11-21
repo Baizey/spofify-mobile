@@ -50,4 +50,8 @@ internal interface FeatureTransport {
     ): FeatureResponse
 }
 
-internal class FeatureResponse(val status: Int, val bytes: ByteArray, val mediaType: String?)
+internal class FeatureResponse(val status: Int, val bytes: ByteArray, val mediaType: String?, val retryAfter: Boolean = false)
+
+/** Only known temporary HTTP failures are candidates; never race a server's Retry-After. */
+internal fun isTransientReadStatus(status: Int, retryAfter: Boolean = false): Boolean =
+    !retryAfter && status in setOf(408, 502, 503, 504)

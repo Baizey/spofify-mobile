@@ -192,8 +192,7 @@ internal fun AccountScreen(state: AuthState.Authenticated, onSignOut: () -> Unit
 }
 
 @Composable
-internal fun ConnectionScreen(notice: AuthNotice?, onRetry: (() -> Unit)? = null,
-    onManual: (() -> Unit)? = null, onSignOut: (() -> Unit)? = null) {
+internal fun ConnectionScreen(notice: AuthNotice?, onManual: (() -> Unit)? = null, onSignOut: (() -> Unit)? = null) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(Spacing.page),
         verticalArrangement = Arrangement.spacedBy(Spacing.fieldGap)) {
         BrandWordmark()
@@ -202,7 +201,6 @@ internal fun ConnectionScreen(notice: AuthNotice?, onRetry: (() -> Unit)? = null
             Text(stringResource(R.string.connecting), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
         } else {
             Notice(notice)
-            onRetry?.let { Button(onClick = it, shape = SpofifySurfaces.control) { Text(stringResource(R.string.retry)) } }
             onManual?.let { TextButton(onClick = it) { Text(stringResource(R.string.sign_in)) } }
             onSignOut?.let { TextButton(onClick = it) { Text(stringResource(R.string.sign_out)) } }
         }

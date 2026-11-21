@@ -34,7 +34,7 @@ class ManualOfflineBoundaryTest {
         assertTrue("Expected cancellation, got $error", error is CancellationException)
     }
     private suspend fun probe(repo: SessionRepository, id: AccountIdentity) {
-        repo.retry(); repo.refresh(); repo.signIn(id.origin, "user", "never-submit")
+        repo.refresh(); repo.signIn(id.origin, "user", "never-submit")
         rejected { repo.renew(id) }
         rejected { repo.get(id, listOf("api", "library")) }
         rejected { repo.mutate(id, listOf("api", "me", "queue"), "PUT", "{}") }

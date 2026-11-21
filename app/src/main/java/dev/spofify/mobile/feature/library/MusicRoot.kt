@@ -125,7 +125,7 @@ internal fun MusicRoot(
             composable("search") { owner ->
                 val api = currentSource.search
                 val model: SearchViewModel = viewModel(owner, factory = viewModelFactory { initializer { SearchViewModel(api) } })
-                model.bind(api, currentSource.local)
+                model.bind(api, currentSource.local, currentSource.readOwner)
                 SearchScreen(model, currentLoader, currentFocusIntent.value, currentOpen, currentController.value,
                     onMore = { openActions(it, null) })
             }
@@ -144,10 +144,10 @@ internal fun MusicRoot(
             )) { owner ->
                 val kind = MusicKind.valueOf(requireNotNull(owner.arguments?.getString("kind")))
                 val id = requireNotNull(owner.arguments?.getString("id"))
-                val api = currentSource.library
+                val source = currentSource
                 currentStores.Content { models ->
                     val model: DetailViewModel = viewModel(models, key = "detail-${kind.name}-$id",
-                        factory = viewModelFactory { initializer { DetailViewModel(api, kind, id) } })
+                        factory = viewModelFactory { initializer { DetailViewModel(source.library, kind, id, source.readOwner) } })
                     DetailScreen(model, currentLoader, {
                         val returnOccurrence = owner.savedStateHandle.get<String>("returnPlayerOccurrence")
                         navigation.popBackStack()

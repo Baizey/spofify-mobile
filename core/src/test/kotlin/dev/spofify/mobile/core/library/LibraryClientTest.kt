@@ -52,6 +52,24 @@ class LibraryClientTest {
         }
     }
 
+    @Test fun detailReadsPreserveRetryAfterAndDoNotReplayStatusFailuresAtTransport() = runBlocking {
+        fixture { server, sessions, identity ->
+            val library = LibraryClient(sessions, identity)
+            val cases = listOf(Triple(503, null, true), Triple(503, "0", false), Triple(502, "10", false),
+                Triple(429, null, false), Triple(404, null, false))
+            for ((index, case) in cases.withIndex()) {
+                val (status, retryAfter, transient) = case
+                server.enqueue(json("{}", status).apply { retryAfter?.let { setHeader("Retry-After", it) } })
+                val error = runCatching { withTimeout(2_000) { library.detail(MusicKind.ALBUM, "one") } }.exceptionOrNull()
+                assertTrue(error is LibraryException)
+                error as LibraryException
+                assertEquals(status, error.status)
+                assertEquals(transient, error.transient)
+                assertEquals(index + 2, server.requestCount)
+            }
+        }
+    }
+
     private fun json(body: String, status: Int = 200) = MockResponse().setResponseCode(status)
         .setHeader("Content-Type", "application/json").setBody(body)
     private fun page(kind: String = "track", availability: String = "\"hasAudio\":true") =

@@ -56,12 +56,17 @@ class SessionRepository(
     val manualOffline = mutableOffline.asStateFlow()
     private val mutableGrant = MutableStateFlow<OnlineGrant?>(null)
     val onlineGrant = mutableGrant.asStateFlow()
-    private var policyLoaded = manualOfflineStore == null
+    private val mutablePolicyLoaded = MutableStateFlow(manualOfflineStore == null)
+    val offlinePolicyLoaded = mutablePolicyLoaded.asStateFlow()
     private var handingOff = false
-    private val bootstrapAllowed get() = policyLoaded && !mutableOffline.value && !handingOff
+    private val bootstrapAllowed get() = mutablePolicyLoaded.value && !mutableOffline.value && !handingOff
     private var generation = 0L
     private var initialized = false
     private var operation: Job? = null
+    // Application startup may validate before the first Activity.onStart; only an actual stop disallows recovery.
+    private var appBackgrounded = false
+    private var foregroundEpoch = 0L
+    private var validationRetry: Job? = null
     private var persistenceTail: Job? = null
     private var sessionSaveFailed = false
     private var profileSaveFailed = false
@@ -258,17 +263,19 @@ class SessionRepository(
             if (initialized) return
             initialized = true
             val token = advance(AuthState.Starting)
-            if (policyLoaded) operationLocked { restoreStored(token) }
+            if (mutablePolicyLoaded.value) operationLocked { restoreStored(token) }
             else scope.launch(io, start = CoroutineStart.LAZY) {
                 // Policy initialization survives a concurrent explicit sign-out. The old
                 // generation's session read does not. No bootstrap is allowed until known.
-                val offline = try { requireNotNull(manualOfflineStore).read() } catch (_: Exception) {
-                    synchronized(lock) { initialized = false; publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE)) }
+                val offline = try { requireNotNull(manualOfflineStore).read() } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
                     return@launch
                 }
                 synchronized(lock) {
                     mutableOffline.value = offline
-                    policyLoaded = true
+                    mutablePolicyLoaded.value = true
                     if (generation == token) operationLocked { restoreStored(token) } else null
                 }?.start()
             }
@@ -295,7 +302,7 @@ class SessionRepository(
     suspend fun setManualOffline(enabled: Boolean, beforeDisconnect: suspend (AccountIdentity) -> Unit = {}) {
         modeChanges.withLock {
             synchronized(lock) {
-                check(policyLoaded) { "Session policy not loaded" }
+                check(mutablePolicyLoaded.value) { "Session policy not loaded" }
                 if (mutableOffline.value == enabled) return
             }
             withContext(io + NonCancellable) {
@@ -325,7 +332,8 @@ class SessionRepository(
         val current = state.value
         val recovering = current is AuthState.Starting || current is AuthState.Validating || current is AuthState.Unavailable
         val target = when {
-            current is AuthState.Authenticated || current is AuthState.SignedOut -> current
+            current is AuthState.Authenticated -> current.copy(notice = saveNotice())
+            current is AuthState.SignedOut -> current
             recovering -> AuthState.Starting
             else -> AuthState.SignedOut() // unfinished login is never promoted locally
         }
@@ -337,16 +345,6 @@ class SessionRepository(
         val previous = identity
         val next = when {
             enabled && current is AuthState.Authenticated -> null // retain exact identity and verified record
-            !enabled && record != null && current is AuthState.Authenticated -> operationLocked {
-                var backoff = 1_000L
-                do {
-                    restore(token, record, previous, quiet = true)
-                    val waiting = synchronized(lock) { token == generation && bootstrapAllowed && mutableGrant.value == null && state.value is AuthState.Authenticated }
-                    if (!waiting) break
-                    delay(backoff)
-                    backoff = (backoff * 2).coerceAtMost(30_000L)
-                } while (isActive)
-            }
             record != null && (current is AuthState.Authenticated || recovering) -> operationLocked { restore(token, record, previous) }
             recovering -> operationLocked { restoreStored(token) }
             else -> null
@@ -401,44 +399,29 @@ class SessionRepository(
         job.start()
     }
 
-    /** Explicit recovery, never login/password replay. */
-    fun retry() {
-        val job = synchronized(lock) {
-            if (!policyLoaded) { start(); return }
-            if (state.value is AuthState.Authenticated && mutableGrant.value == null) { refresh(); return }
-            if (handingOff || state.value !is AuthState.Unavailable) return
-            val record = saved
-            val previous = identity
-            val token = advance(AuthState.Validating)
-            operationLocked {
-                val candidate = record ?: try { readSession() } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
-                    return@operationLocked
-                }
-                if (candidate == null) publish(token, AuthState.SignedOut()) else restore(token, candidate, previous)
-            }
-        }
-        job.start()
-    }
-
-    fun useManualLogin() = synchronized(lock) {
+    fun useManualLogin(): Unit = synchronized(lock) {
+        if (!mutablePolicyLoaded.value) return
         advance(AuthState.SignedOut())
         saved = null
         identity = null
     }
 
-    /** Main-safe even while Keystore/SharedPreferences is blocked in the durable lane. */
+    /** Bootstrap permits one bounded sequence; after the first stop, recovery needs the foreground. */
+    fun setAppForeground(foreground: Boolean): Unit = synchronized(lock) {
+        appBackgrounded = !foreground
+        if (!foreground) {
+            foregroundEpoch++
+            validationRetry?.cancel(ValidationBackgrounded())
+        }
+    }
+
+    /** Main-safe foreground revalidation of a live grant; never restarts a terminal validation. */
     fun refresh() {
         val job = synchronized(lock) {
-            val current = state.value as? AuthState.Authenticated ?: return
-            if (!bootstrapAllowed) return
-            val validatingReturn = mutableGrant.value == null
-            if (validatingReturn && operation?.isCompleted == false) return
+            if (!bootstrapAllowed || mutableGrant.value == null) return
             val record = saved ?: return
             val previous = identity
-            val token = advance(if (validatingReturn) current else AuthState.Validating)
+            val token = advance(AuthState.Validating)
             operationLocked { restore(token, record, previous) }
         }
         job.start()
@@ -469,16 +452,18 @@ class SessionRepository(
         job.start()
     }
 
-    private suspend fun restore(token: Long, record: StoredSession, previous: AccountIdentity?, quiet: Boolean = false) {
+    private suspend fun restore(token: Long, record: StoredSession, previous: AccountIdentity?) {
+        var retryEpoch: Long? = null
         try {
             val origin = ServerOrigin.parse(record.server)
             record.session.validated()
-            val localOnly = synchronized(lock) { if (token != generation) return; mutableOffline.value }
+            val localOnly = synchronized(lock) { if (token != generation || handingOff) return; mutableOffline.value }
             if (localOnly) {
                 // Only the installed authenticated SessionStore, never the remembered-login
                 // record. Validate its structure without constructing ANY transport.
                 parseSessionCookie(origin, record.cookie)
                 require(record.sessionMode == null || record.sessionMode == "rolling-v1")
+                currentCoroutineContext().ensureActive()
                 synchronized(lock) {
                     if (token == generation) promote(StoredSession(origin.value, record.cookie, record.session,
                         record.sessionMode), previous?.incarnation ?: token)
@@ -488,16 +473,19 @@ class SessionRepository(
             val client = apis.create(origin)
             client.validateCookie(record.cookie)
             synchronized(lock) {
-                if (token != generation) { client.cancel(); return }
+                if (token != generation || !bootstrapAllowed) { client.cancel(); return }
                 saved = record
                 api = client
             }
-            val response = client.session(record.cookie)
+            val validation = validateStoredSession(token, client, record.cookie)
+            retryEpoch = validation.retryEpoch
+            val response = validation.result.getOrThrow()
             if (response.session.accountId != record.session.accountId) throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
             val updated = StoredSession(origin.value, response.cookie ?: record.cookie, response.session, response.mode ?: record.sessionMode)
             currentCoroutineContext().ensureActive()
             val write = synchronized(lock) {
-                if (token != generation) return
+                if (token != generation || !bootstrapAllowed) return
+                if (retryEpoch != null && retryEpoch != foregroundEpoch) throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
                 promote(updated, previous?.incarnation ?: token)
                 persistLocked(updated)
             }
@@ -505,9 +493,12 @@ class SessionRepository(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
+            currentCoroutineContext().ensureActive()
             val clear = synchronized(lock) {
                 if (token != generation) return
-                if (error is AuthFailure && error.kind == AuthFailure.Kind.UNAUTHORIZED) {
+                // A child can finish before onStop yet have its result dispatched afterward.
+                val retiredRetry = retryEpoch != null && retryEpoch != foregroundEpoch
+                if (!retiredRetry && error is AuthFailure && error.kind == AuthFailure.Kind.UNAUTHORIZED) {
                     saved = null
                     identity = null
                     mutableState.value = signedOutState(AuthNotice.SESSION_EXPIRED)
@@ -515,14 +506,61 @@ class SessionRepository(
                 } else {
                     // Unavailability is not revocation: preserve all recovery material.
                     val active = (state.value as? AuthState.Authenticated)?.takeIf {
-                        error is AuthFailure && error.kind == AuthFailure.Kind.UNAVAILABLE
+                        retiredRetry || error is AuthFailure && error.kind == AuthFailure.Kind.UNAVAILABLE
                     }
-                    mutableState.value = active?.copy(notice = if (quiet) null else AuthNotice.CONNECTION_FAILED)
+                    mutableState.value = active?.copy(notice = AuthNotice.CONNECTION_FAILED)
                         ?: AuthState.Unavailable(AuthNotice.CONNECTION_FAILED)
                     null
                 }
             }
             clear?.start()
+        }
+    }
+
+    private class ValidationBackgrounded : CancellationException("App no longer foreground")
+    private class StoredValidation(val result: Result<AuthReply>, val retryEpoch: Long? = null)
+
+    private fun AuthFailure.canRetryValidation(): Boolean = kind == AuthFailure.Kind.UNAVAILABLE && transient
+
+    private suspend fun validateStoredSession(token: Long, client: AuthApi, cookie: String): StoredValidation {
+        val initialFailure = try { return StoredValidation(Result.success(client.session(cookie))) } catch (failure: AuthFailure) {
+            if (!failure.canRetryValidation()) throw failure
+            failure
+        }
+        // One child owns both the delays and the retried calls. Backgrounding cancels just that
+        // child so restore can report failure; retiring auth authority cancels the whole operation.
+        return supervisorScope {
+            val (epoch, retry) = synchronized(lock) {
+                if (token != generation || !bootstrapAllowed || appBackgrounded) throw initialFailure
+                foregroundEpoch to async(start = CoroutineStart.LAZY) {
+                    var lastFailure = initialFailure
+                    repeat(3) { attempt ->
+                        delay(1_000L shl attempt)
+                        synchronized(lock) {
+                            ensureActive()
+                            if (token != generation || !bootstrapAllowed) throw lastFailure
+                        }
+                        try { return@async client.session(cookie) } catch (failure: AuthFailure) {
+                            if (!failure.canRetryValidation()) throw failure
+                            lastFailure = failure
+                        }
+                    }
+                    throw lastFailure
+                }.also { validationRetry = it }
+            }
+            val result = try {
+                Result.success(retry.await())
+            } catch (_: ValidationBackgrounded) {
+                ensureActive()
+                Result.failure(initialFailure)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                Result.failure(failure)
+            } finally {
+                synchronized(lock) { if (validationRetry === retry) validationRetry = null }
+            }
+            StoredValidation(result, epoch)
         }
     }
 
@@ -561,9 +599,10 @@ class SessionRepository(
                 if (profile != null) profileSaveFailed = !profileOk
                 val current = mutableState.value
                 if (current is AuthState.Authenticated) {
-                    // Storage health can outlive a validation generation; do not hide a
-                    // failed remembered-profile save merely because foreground revalidated.
-                    mutableState.value = current.copy(notice = saveNotice())
+                    // Keep the current connection failure visible if an older write finishes.
+                    // Storage health is still retained for the next successful validation.
+                    if (current.notice != AuthNotice.CONNECTION_FAILED)
+                        mutableState.value = current.copy(notice = saveNotice())
                 } else if (current is AuthState.SignedOut) {
                     // A newer FAILED login does not make a failed clear restart-safe.
                     mutableState.value = if (localInvalidationFailed) signedOutState(current.notice)

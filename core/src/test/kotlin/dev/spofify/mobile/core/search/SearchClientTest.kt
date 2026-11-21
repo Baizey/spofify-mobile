@@ -4,13 +4,16 @@ import dev.spofify.mobile.core.auth.*
 import dev.spofify.mobile.core.http.OkHttpAuthApi
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.origin.ServerOrigin
+import java.io.ByteArrayOutputStream
 import java.time.Instant
 import java.util.concurrent.TimeUnit
+import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.*
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okio.Buffer
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -100,7 +103,9 @@ class SearchClientTest {
                 val (status, code) = case
                 server.enqueue(json("""{"code":"${code.name}","error":"private/secret/query/cursor"}""", status)
                     .setHeader("Retry-After", "0"))
-                fails(code, status) { api.search("private-query") }
+                val failure = fails(code, status) { api.search("private-query") }
+                assertTrue(failure.retryAfter)
+                assertFalse(failure.transient)
                 val request = server.takeRequest(2, TimeUnit.SECONDS)!!
                 assertEquals("/search", request.requestUrl!!.encodedPath)
                 assertEquals(index + 2, server.requestCount)
@@ -112,6 +117,39 @@ class SearchClientTest {
                 server.takeRequest(2, TimeUnit.SECONDS)
             }
             assertEquals(10, server.requestCount)
+        }
+    }
+
+    @Test fun serverBusyIndexNotReadyAndRateLimitAreNotTransientButTemporaryServiceFailureIs() = runBlocking {
+        fixture { server, sessions, identity ->
+            val api = SearchClient(sessions, identity)
+            val cases = listOf(
+                Triple(503, SearchErrorCode.SEARCH_BUSY, false),
+                Triple(503, SearchErrorCode.SEARCH_INDEX_NOT_READY, false),
+                Triple(503, SearchErrorCode.SEARCH_UNAVAILABLE, true),
+                Triple(429, SearchErrorCode.HTTP_ERROR, false),
+                Triple(502, SearchErrorCode.HTTP_ERROR, true),
+            )
+            for ((index, case) in cases.withIndex()) {
+                val (status, code, transient) = case
+                server.enqueue(json("""{"code":"${code.name}","error":"fixture"}""", status))
+                val failure = fails(code, status) { api.search("query") }
+                assertFalse(failure.retryAfter)
+                assertEquals(transient, failure.transient)
+                assertEquals(index + 2, server.requestCount)
+            }
+        }
+    }
+
+    @Test fun compressedBusy503KeepsItsSemanticCodeAndCannotBeReplayed() = runBlocking {
+        fixture { server, sessions, identity ->
+            val data = ByteArrayOutputStream()
+            GZIPOutputStream(data).use { it.write("""{"code":"SEARCH_BUSY","error":"fixture"}""".toByteArray()) }
+            server.enqueue(MockResponse().setResponseCode(503).setHeader("Content-Type", "application/json")
+                .setHeader("Content-Encoding", "gzip").setBody(Buffer().write(data.toByteArray())))
+            val failure = fails(SearchErrorCode.SEARCH_BUSY, 503) { SearchClient(sessions, identity).search("query") }
+            assertFalse(failure.transient)
+            assertEquals(2, server.requestCount)
         }
     }
 
@@ -152,7 +190,7 @@ class SearchClientTest {
         }
     }
 
-    private suspend fun fails(code: SearchErrorCode, status: Int, action: suspend () -> Any) {
+    private suspend fun fails(code: SearchErrorCode, status: Int, action: suspend () -> Any): SearchException {
         val failure = runCatching { action() }.exceptionOrNull()
         assertTrue("Expected sanitized SearchException", failure is SearchException)
         assertEquals(code, (failure as SearchException).code)
@@ -161,6 +199,7 @@ class SearchClientTest {
         assertNull(failure.cause)
         assertFalse(failure.toString().contains("private/secret"))
         assertFalse(failure.toString().contains("private-query"))
+        return failure
     }
 
     private class Sessions(var value: StoredSession?) : SessionStore {

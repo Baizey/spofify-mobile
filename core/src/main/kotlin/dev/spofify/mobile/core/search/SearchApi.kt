@@ -26,4 +26,9 @@ enum class SearchErrorCode {
 }
 
 /** Raw server diagnostics, queries, cursors and transport causes never escape this boundary. */
-class SearchException(val code: SearchErrorCode, val status: Int = 0) : Exception("Search request failed")
+class SearchException(
+    val code: SearchErrorCode,
+    val status: Int = 0,
+    val transient: Boolean = false,
+    val retryAfter: Boolean = false,
+) : Exception("Search request failed")

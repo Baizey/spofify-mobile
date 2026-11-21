@@ -4,6 +4,7 @@ import dev.spofify.mobile.core.auth.AccountIdentity
 import dev.spofify.mobile.core.auth.AuthFailure
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.http.FeatureResponse
+import dev.spofify.mobile.core.http.isTransientReadStatus
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.library.validSearchQuery
 import java.io.IOException
@@ -34,8 +35,10 @@ class SearchClient(
     private fun decode(response: FeatureResponse, limit: Int? = null, kind: MusicKind? = null, cursor: String? = null): SearchPage {
         if (response.status != 200) {
             val code = if (isJson(response)) SearchParser.errorCode(response.bytes, response.status) else null
-            throw SearchException(code ?: if (response.status in 200..299) SearchErrorCode.INVALID_RESPONSE
-                else SearchErrorCode.HTTP_ERROR, response.status)
+            val reason = code ?: if (response.status in 200..299) SearchErrorCode.INVALID_RESPONSE else SearchErrorCode.HTTP_ERROR
+            val transient = reason in setOf(SearchErrorCode.HTTP_ERROR, SearchErrorCode.SEARCH_UNAVAILABLE) &&
+                isTransientReadStatus(response.status, response.retryAfter)
+            throw SearchException(reason, response.status, transient, response.retryAfter)
         }
         return try {
             require(isJson(response))
@@ -72,7 +75,7 @@ class SearchClient(
             checkCurrent()
             throw when (failure.kind) {
                 AuthFailure.Kind.UNAUTHORIZED -> SearchException(SearchErrorCode.HTTP_ERROR, 401)
-                AuthFailure.Kind.UNAVAILABLE -> SearchException(SearchErrorCode.CONNECTION_FAILED)
+                AuthFailure.Kind.UNAVAILABLE -> SearchException(SearchErrorCode.CONNECTION_FAILED, transient = failure.transient)
                 AuthFailure.Kind.INVALID_RESPONSE -> SearchException(SearchErrorCode.INVALID_RESPONSE)
             }
         } catch (_: IOException) {

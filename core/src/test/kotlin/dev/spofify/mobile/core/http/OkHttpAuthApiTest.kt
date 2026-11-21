@@ -93,6 +93,30 @@ class OkHttpAuthApiTest {
         }
     }
 
+    @Test fun sessionClassifiesOnlyUnthrottledTransientStatusesAndNeverReplaysAtTransport() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val api = OkHttpAuthApi(ServerOrigin.parse(server.url("/").toString()))
+            val cases = listOf(
+                Triple(503, null, true), Triple(502, null, true), Triple(408, null, true),
+                Triple(503, "0", false), Triple(503, "120", false), Triple(429, null, false),
+                Triple(401, null, false), Triple(403, null, false), Triple(404, null, false),
+            )
+            for ((index, case) in cases.withIndex()) {
+                val (status, retryAfter, transient) = case
+                server.enqueue(MockResponse().setResponseCode(status).apply {
+                    retryAfter?.let { setHeader("Retry-After", it) }
+                })
+                val failure = runCatching { withTimeout(2_000) { api.session(cookie()) } }.exceptionOrNull()
+                assertTrue("Expected AuthFailure for $status, got $failure", failure is AuthFailure)
+                failure as AuthFailure
+                assertEquals(if (status == 401) AuthFailure.Kind.UNAUTHORIZED else AuthFailure.Kind.UNAVAILABLE, failure.kind)
+                assertEquals(transient, failure.transient)
+                assertEquals(index + 1, server.requestCount)
+            }
+        }
+    }
+
     @Test fun invalidOrMissingCookieAndInvalidJsonCannotAuthenticate() = runBlocking {
         val invalid = listOf(
             response(),

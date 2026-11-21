@@ -48,7 +48,7 @@ interface LoginStore {
     fun write(value: RememberedLogin)
 }
 
-class AuthFailure(val kind: Kind) : IOException("Authentication request failed") {
+class AuthFailure(val kind: Kind, val transient: Boolean = false) : IOException("Authentication request failed") {
     enum class Kind { UNAUTHORIZED, UNAVAILABLE, INVALID_RESPONSE }
 }
 

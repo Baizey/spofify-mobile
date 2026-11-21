@@ -45,7 +45,8 @@ internal fun SearchScreen(
     playback: AppPlayback? = null,
     onMore: ((MusicItem) -> Unit)? = null,
 ) {
-    val state by model.state.collectAsStateWithLifecycle()
+    // The loader changes with the source; seed only the collection anew, not the list or focus.
+    val state by key(model, loader) { model.state.collectAsStateWithLifecycle() }
     val scroll = rememberLazyListState()
     val latestState = rememberUpdatedState(state)
     val requester = remember { FocusRequester() }
@@ -117,10 +118,8 @@ internal fun SearchScreen(
                         .semantics { liveRegion = LiveRegionMode.Polite },
                         horizontalAlignment = Alignment.CenterHorizontally) {
                         state.error?.let { error ->
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text(searchErrorMessage(error), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                                TextButton(model::retry) { Text("Retry") }
-                            }
+                            Text(searchErrorMessage(error), Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                                style = MaterialTheme.typography.bodySmall)
                         }
                         if (state.busy) CircularProgressIndicator(Modifier.padding(16.dp).size(24.dp))
                         else if (state.empty) Text("No matches", Modifier.padding(vertical = 24.dp))

@@ -60,20 +60,22 @@ an unchanged presentation token preserve the viewport when those results still
 exist; catalogue changes that remove the visible row can necessarily change its
 position. No local-clock deadline clears results.
 
-Each operation permits only one automatic expiry recovery attempt. Further expiry,
-network/service failure or invalid data retains the old prefix and offers generic
-**Retry**, without exposing cache-expiry language. An ordinary failed continuation
-retries its cursor; an interrupted or failed rebuild restarts coherent staging to
-the same target depth. Returning to a completed or failed view does not silently
-rerun it. No query read occurs while the view is paused.
+Each operation permits only one automatic recovery: an expiry rebuild or one
+backed-off repeat of a classified transient online read under the same session.
+A transient continuation repeats its cursor; a known expired cursor is never
+reissued. An interrupted rebuild can resume coherent staging to the same target
+depth. Terminal failure retains the old prefix and shows a concise status without
+an action. Returning to a completed or failed view does not rerun it. No query
+read occurs while the view is paused.
 
 ## Errors and trust boundaries
 
 Index-not-ready, unavailable, busy, invalid-response and connection errors are
 distinct from successful empty results. UI notices use fixed client text, never
 backend diagnostics. Exhausted cache recovery uses a generic load failure rather
-than an expiration notice. No automatic 503 retry or old-search fallback hides an
-unconfigured service. Index maintenance remains an explicit server administrator operation.
+than an expiration notice. Busy, index-not-ready, rate-limited and `Retry-After`
+responses do not trigger recovery. There is no old-search fallback; index
+maintenance remains an explicit server administrator operation.
 
 The GET transport prevents automatic 408/421/503 status follow-ups. Search explicitly
 opts into bounded JSON 503 diagnostics, at most 8 KiB, so stable search codes survive.

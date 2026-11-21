@@ -155,7 +155,7 @@ class SearchViewModelTest {
         assertEquals(27, model.state.value.items.size)
     }
 
-    @Test fun continuationFailureKeepsThePrefixAndRetryUsesTheSameCursor() = runTest(dispatcher) {
+    @Test fun busyContinuationKeepsThePrefixWithoutRepeatingTheCursor() = runTest(dispatcher) {
         val first = batch(0, 25)
         val api = Api().apply {
             this.first = { page(first, 27, "cursor-a") }
@@ -172,12 +172,12 @@ class SearchViewModelTest {
         model.more()
         advanceUntilIdle()
         assertEquals(1, api.cursors.size)
-        api.continuation = { page(batch(25, 2), 27) }
-        model.retry()
+        model.pause()
+        model.resume()
         advanceUntilIdle()
-        assertEquals(listOf("cursor-a", "cursor-a"), api.cursors)
-        assertEquals(27, model.state.value.items.size)
-        assertNull(model.state.value.error)
+        assertEquals(listOf("cursor-a"), api.cursors)
+        assertEquals(first, model.state.value.items)
+        assertEquals(SearchErrorCode.SEARCH_BUSY, model.state.value.error)
     }
 
     @Test fun expiredContinuationQuietlyStagesTheWholeFreshPrefixAndKeepsTheAnchor() = runTest(dispatcher) {
@@ -259,10 +259,16 @@ class SearchViewModelTest {
         assertEquals(listOf("other"), model.state.value.items.map { it.id })
     }
 
-    @Test fun anchorWaitsForRowsThroughLoadingFailureAndRetryAndIsNotReissuedOnReentry() = runTest(dispatcher) {
+    @Test fun anchorWaitsThroughAutomaticRecoveryAndIsNotReissuedOnReentry() = runTest(dispatcher) {
         val gate = CompletableDeferred<Unit>()
         val api = Api().apply {
-            first = { gate.await(); throw SearchException(SearchErrorCode.SEARCH_BUSY) }
+            first = {
+                if (firstRequests.size == 1) {
+                    gate.await()
+                    throw SearchException(SearchErrorCode.CONNECTION_FAILED, transient = true)
+                }
+                page(batch(0, 25))
+            }
         }
         val model = model(api)
         model.query("love")
@@ -274,10 +280,11 @@ class SearchViewModelTest {
         assertTrue(model.state.value.loading)
         assertFalse(model.consumeInitialAnchor(generation))
         gate.complete(Unit)
-        advanceUntilIdle()
+        advanceTimeBy(999)
+        runCurrent()
+        assertEquals(1, api.firstRequests.size)
+        assertNull(model.state.value.error)
         assertFalse(model.consumeInitialAnchor(generation))
-        api.first = { page(batch(0, 25)) }
-        model.retry()
         advanceUntilIdle()
         assertTrue(model.consumeInitialAnchor(generation))
         assertFalse(model.consumeInitialAnchor(generation))
@@ -374,7 +381,7 @@ class SearchViewModelTest {
             assertEquals(if (code == SearchErrorCode.SEARCH_EXPIRED) 2 else 1, api.firstRequests.size)
             assertFalse(searchErrorMessage(code).contains("expired", ignoreCase = true))
             api.first = { page(emptyList()) }
-            model.retry()
+            model.query("new query")
             advanceUntilIdle()
             assertNull(model.state.value.error)
             assertTrue(model.state.value.empty)

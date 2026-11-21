@@ -80,7 +80,7 @@ class SearchRecoveryTest {
         assertTrue(freshPublications.all { it.items == batch("fresh", 0, 75) })
     }
 
-    @Test fun expiryDuringRecoveryStopsAfterOneAttemptAndGenericUserRetryStartsAFreshDeepRebuild() = runTest(dispatcher) {
+    @Test fun expiryDuringRecoveryStopsAfterOneAttemptEvenOnReentry() = runTest(dispatcher) {
         val api = Api()
         val model = model(api)
         loadOldPrefix(api, model)
@@ -105,24 +105,16 @@ class SearchRecoveryTest {
         assertEquals(2, api.firstRequests.size)
         assertEquals(3, api.cursors.size)
 
-        api.first = { page("retry", 0, expiry = retryExpiry) }
-        api.continuation = { cursor ->
-            when (cursor) {
-                "retry:25" -> page("retry", 25, expiry = retryExpiry)
-                "retry:50" -> page("retry", 50, expiry = retryExpiry)
-                else -> error("Retry reused an obsolete cursor")
-            }
-        }
-        model.retry()
+        model.pause()
+        model.resume()
         advanceUntilIdle()
-        assertEquals(3, api.firstRequests.size)
-        assertEquals(listOf("old:25", "old:50", "failed:25", "retry:25", "retry:50"), api.cursors)
-        assertEquals(batch("retry", 0, 75), model.state.value.items)
+        assertEquals(2, api.firstRequests.size)
+        assertEquals(listOf("old:25", "old:50", "failed:25"), api.cursors)
+        assertEquals(old.items, model.state.value.items)
         assertEquals(old.queryGeneration, model.state.value.queryGeneration)
-        assertNull(model.state.value.error)
     }
 
-    @Test fun failedRebuildRetainsTheOldPrefixAndRetryRestartsFreshRatherThanRetryingItsOldCursor() = runTest(dispatcher) {
+    @Test fun transientFailureDuringRebuildDoesNotSpendAnotherRecoveryAllowance() = runTest(dispatcher) {
         val api = Api()
         val model = model(api)
         loadOldPrefix(api, model)
@@ -131,7 +123,7 @@ class SearchRecoveryTest {
         api.continuation = { cursor ->
             when (cursor) {
                 "old:50" -> expired()
-                "failed:25" -> throw SearchException(SearchErrorCode.CONNECTION_FAILED)
+                "failed:25" -> throw SearchException(SearchErrorCode.CONNECTION_FAILED, transient = true)
                 else -> error("Unexpected cursor")
             }
         }
@@ -142,26 +134,11 @@ class SearchRecoveryTest {
         assertEquals(old.expiresAt, model.state.value.expiresAt)
         assertEquals(SearchErrorCode.CONNECTION_FAILED, model.state.value.error)
         assertGenericRetry(model.state.value)
-        val gate = CompletableDeferred<Unit>()
-        api.first = { page("retry", 0, expiry = retryExpiry) }
-        api.continuation = { cursor ->
-            when (cursor) {
-                "retry:25" -> page("retry", 25, expiry = retryExpiry)
-                "retry:50" -> { gate.await(); page("retry", 50, expiry = retryExpiry) }
-                else -> error("Retry reused an obsolete cursor")
-            }
-        }
-        model.retry()
-        runCurrent()
-        assertOldWhileBusy(old, model.state.value)
-        assertEquals(3, api.firstRequests.size)
-        assertEquals(listOf("old:25", "old:50", "failed:25", "retry:25", "retry:50"), api.cursors)
-        gate.complete(Unit)
+        model.more()
+        model.resume()
         advanceUntilIdle()
-        assertEquals(batch("retry", 0, 75), model.state.value.items)
-        assertEquals(retryExpiry, model.state.value.expiresAt)
-        assertNull(model.state.value.error)
-        assertFalse(model.state.value.busy)
+        assertEquals(2, api.firstRequests.size)
+        assertEquals(listOf("old:25", "old:50", "failed:25"), api.cursors)
     }
 
     @Test fun pauseAndResumeRememberTheRebuildGoalWithoutReusingAnExpiredOrCancelledCursor() = runTest(dispatcher) {
@@ -295,14 +272,14 @@ class SearchRecoveryTest {
         }
     }
 
-    @Test fun firstGetExpiryIsQuietlyRetriedOnceAndRebuildRetryHasItsOwnBoundedAttempt() = runTest(dispatcher) {
+    @Test fun firstGetExpiryIsQuietlyRebuiltOnceEvenWhenTheRebuildExpires() = runTest(dispatcher) {
         for (secondExpiry in listOf(false, true)) {
             val api = Api()
             val model = model(api)
             val gate = CompletableDeferred<Unit>()
             api.first = {
                 val call = api.firstRequests.size
-                if (call == 1 || secondExpiry && call == 3) expired()
+                if (call == 1) expired()
                 if (call == 2) {
                     gate.await()
                     if (secondExpiry) expired()
@@ -325,16 +302,95 @@ class SearchRecoveryTest {
                 repeat(3) { model.more(); model.resume() }
                 advanceUntilIdle()
                 assertEquals(2, api.firstRequests.size)
-                model.retry() // A new operation permits one recovery even for Request.Rebuild.
-                advanceUntilIdle()
-                assertEquals(4, api.firstRequests.size)
+                assertTrue(model.state.value.items.isEmpty())
+            } else {
+                assertEquals(batch("accepted", 0, 25), model.state.value.items)
+                assertTrue(model.state.value.loaded)
+                assertNull(model.state.value.error)
             }
-            assertEquals(batch("accepted", 0, 25), model.state.value.items)
-            assertTrue(model.state.value.loaded)
             assertFalse(model.state.value.busy)
-            assertNull(model.state.value.error)
             assertTrue(api.cursors.isEmpty())
         }
+    }
+
+    @Test fun transientContinuationWaitsAndStopsAtTwoReadsAcrossPauseAndResume() = runTest(dispatcher) {
+        val api = Api()
+        val model = model(api)
+        loadOldPrefix(api, model)
+        val old = model.state.value
+        api.continuation = { throw SearchException(SearchErrorCode.SEARCH_UNAVAILABLE, 503, transient = true) }
+        model.more()
+        runCurrent()
+        assertOldWhileBusy(old, model.state.value)
+        advanceTimeBy(500)
+        model.pause()
+        advanceTimeBy(5_000)
+        assertEquals(listOf("old:25", "old:50"), api.cursors)
+        model.resume()
+        runCurrent()
+        advanceTimeBy(999)
+        assertOldWhileBusy(old, model.state.value)
+        assertEquals(2, api.cursors.size)
+        advanceUntilIdle()
+        assertEquals(listOf("old:25", "old:50", "old:50"), api.cursors)
+        assertEquals(SearchErrorCode.SEARCH_UNAVAILABLE, model.state.value.error)
+        assertEquals(old.items, model.state.value.items)
+        repeat(3) { model.more(); model.pause(); model.resume() }
+        advanceUntilIdle()
+        assertEquals(3, api.cursors.size)
+    }
+
+    @Test fun replacingTheDataSourceDuringBackoffCannotReplayTheOldCursorOrPublishItsError() = runTest(dispatcher) {
+        val oldApi = Api()
+        val model = model(oldApi)
+        loadOldPrefix(oldApi, model)
+        oldApi.continuation = { throw SearchException(SearchErrorCode.CONNECTION_FAILED, transient = true) }
+        model.more()
+        runCurrent()
+        assertTrue(model.state.value.busy)
+        val replacementApi = Api().apply { first = { page("new", 0, total = 25) } }
+        model.bind(replacementApi, device = true)
+        advanceUntilIdle()
+        assertEquals(listOf("old:25", "old:50"), oldApi.cursors)
+        assertEquals(batch("new", 0, 25), model.state.value.items)
+        assertNull(model.state.value.error)
+        assertFalse(model.state.value.busy)
+    }
+
+    @Test fun deviceSearchStillRebuildsAnExpiredCursorButDoesNotRepeatTransportFailures() = runTest(dispatcher) {
+        val api = Api().apply { first = { page("old", 0, total = 26) } }
+        val model = model(api)
+        model.bind(api, device = true)
+        model.query("query")
+        runCurrent()
+        api.first = { page("fresh", 0, total = 27, expiry = freshExpiry) }
+        api.continuation = { cursor ->
+            if (cursor == "old:25") expired()
+            page("fresh", 25, total = 27, expiry = freshExpiry)
+        }
+        model.more()
+        advanceUntilIdle()
+        assertEquals(listOf("old:25", "fresh:25"), api.cursors)
+        assertEquals(batch("fresh", 0, 27), model.state.value.items)
+        api.first = { throw SearchException(SearchErrorCode.CONNECTION_FAILED, transient = true) }
+        model.query("new query")
+        advanceUntilIdle()
+        assertEquals(3, api.firstRequests.size)
+        assertEquals(SearchErrorCode.CONNECTION_FAILED, model.state.value.error)
+    }
+
+    @Test fun retryAfterPreventsEvenAnExpiredSnapshotRebuild() = runTest(dispatcher) {
+        val api = Api()
+        val model = model(api)
+        loadOldPrefix(api, model)
+        val old = model.state.value
+        api.continuation = { throw SearchException(SearchErrorCode.SEARCH_EXPIRED, 410, retryAfter = true) }
+        model.more()
+        advanceUntilIdle()
+        assertEquals(1, api.firstRequests.size)
+        assertEquals(listOf("old:25", "old:50"), api.cursors)
+        assertEquals(old.items, model.state.value.items)
+        assertEquals(SearchErrorCode.SEARCH_EXPIRED, model.state.value.error)
     }
 
     private fun TestScope.loadOldPrefix(api: Api, model: SearchViewModel) {
@@ -400,7 +456,9 @@ class SearchRecoveryTest {
         private fun assertGenericRetry(state: SearchState) {
             assertFalse(state.busy)
             assertNotNull(state.error)
-            assertFalse(searchErrorMessage(requireNotNull(state.error)).contains("expired", ignoreCase = true))
+            val message = searchErrorMessage(requireNotNull(state.error))
+            assertFalse(message.contains("expired", ignoreCase = true))
+            assertFalse(message.contains("try again", ignoreCase = true))
         }
     }
 }

@@ -17,15 +17,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.spofify.mobile.core.auth.AuthNotice
 import dev.spofify.mobile.core.auth.AuthState
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.feature.library.MusicRoot
 import dev.spofify.mobile.playback.PlaybackOwner
+import dev.spofify.mobile.designsystem.Spacing
 import dev.spofify.mobile.designsystem.SpofifySurfaces
 import dev.spofify.mobile.designsystem.SpofifyTheme
 import dev.spofify.mobile.feature.auth.*
@@ -47,6 +46,18 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        val app = application as SpofifyApplication
+        app.sessions.setAppForeground(true)
+        if (app.playback.current != null) app.playback.foreground() else app.sessions.refresh()
+    }
+
+    override fun onStop() {
+        (application as SpofifyApplication).sessions.setAppForeground(false)
+        super.onStop()
+    }
 }
 
 @Composable
@@ -58,7 +69,7 @@ private fun AuthRoot(
     val state by model.state.collectAsStateWithLifecycle()
     val inputNotice by model.inputNotice.collectAsStateWithLifecycle()
     val manual by sessions.manualOffline.collectAsStateWithLifecycle()
-    val owner = LocalLifecycleOwner.current
+    val policyLoaded by sessions.offlinePolicyLoaded.collectAsStateWithLifecycle()
     val pages = rememberSaveableStateHolder()
     var previousPageKey by rememberSaveable { mutableStateOf<String?>(null) }
     val pageKey = (state as? AuthState.Authenticated)?.identity?.let {
@@ -73,15 +84,6 @@ private fun AuthRoot(
             previousPageKey = null
         }
     }
-    DisposableEffect(owner, model, playback) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_START) {
-                if (playback.current != null) playback.foreground() else model.foreground()
-            }
-        }
-        owner.lifecycle.addObserver(observer)
-        onDispose { owner.lifecycle.removeObserver(observer) }
-    }
     // Single owner consumes system/cutout/gesture/IME safe drawing insets.
     Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -89,18 +91,34 @@ private fun AuthRoot(
                 is AuthState.Authenticated -> {
                     pages.SaveableStateProvider(requireNotNull(pageKey)) {
                         var credits by rememberSaveable { mutableStateOf(false) }
-                        MusicRoot(current.identity, sessions, playback) {
-                            AccountScreen(current, model::signOut) { credits = true }
+                        val connectionFailed = current.notice == AuthNotice.CONNECTION_FAILED
+                        Column(Modifier.fillMaxSize()) {
+                            if (connectionFailed) {
+                                Box(Modifier.padding(horizontal = Spacing.page).padding(top = Spacing.fieldGap)) {
+                                    Notice(current.notice)
+                                }
+                            }
+                            Box(Modifier.weight(1f)) {
+                                MusicRoot(current.identity, sessions, playback) {
+                                    val account = if (connectionFailed) current.copy(notice = null) else current
+                                    AccountScreen(account, model::signOut) { credits = true }
+                                }
+                            }
                         }
                         if (credits) FontCredits { credits = false }
                     }
                 }
-                is AuthState.SignedOut -> LoginScreen(model.inputs, false, current.notice ?: inputNotice,
-                    model::server, model::username, model::password, model::reveal, model::signIn, model::goOnline.takeIf { manual })
+                is AuthState.SignedOut -> if (policyLoaded) {
+                    LoginScreen(model.inputs, false, current.notice ?: inputNotice,
+                        model::server, model::username, model::password, model::reveal, model::signIn, model::goOnline.takeIf { manual })
+                } else {
+                    ConnectionScreen(current.notice ?: AuthNotice.STORAGE_UNAVAILABLE)
+                }
                 AuthState.SigningIn -> LoginScreen(model.inputs, true, null,
                     model::server, model::username, model::password, model::reveal, model::signIn)
                 AuthState.Starting, AuthState.Validating -> ConnectionScreen(null)
-                is AuthState.Unavailable -> ConnectionScreen(current.notice, model::retry, model::manualLogin, model::signOut)
+                is AuthState.Unavailable -> ConnectionScreen(current.notice,
+                    onManual = model::manualLogin.takeIf { policyLoaded }, onSignOut = model::signOut)
             }
         }
     }

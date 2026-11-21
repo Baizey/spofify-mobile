@@ -57,10 +57,14 @@ class SessionRepositoryTest {
         var logoutError: Exception? = null
         var loginGate: CompletableDeferred<Unit>? = null
         var sessionGate: CompletableDeferred<Unit>? = null
+        var beforeSessionReturn: (() -> Unit)? = null
         var logoutGate: CompletableDeferred<Unit>? = null
+        var loginCalls = 0
         var sessionCalls = 0
+        var logoutCalls = 0
         var logoutCookie: String? = null
         override suspend fun login(username: String, password: String): AuthReply {
+            loginCalls++
             loginGate?.let { withContext(NonCancellable) { it.await() } }
             loginError?.let { throw it }
             return loginReply
@@ -68,10 +72,12 @@ class SessionRepositoryTest {
         override suspend fun session(cookie: String): AuthReply {
             sessionCalls++
             sessionGate?.let { withContext(NonCancellable) { it.await() } }
+            beforeSessionReturn?.invoke()
             sessionError?.let { throw it }
             return sessionReply
         }
         override suspend fun logout(cookie: String, csrfToken: String) {
+            logoutCalls++
             logoutCookie = cookie
             logoutGate?.await()
             logoutError?.let { throw it }
@@ -91,6 +97,8 @@ class SessionRepositoryTest {
         return SessionRepository(sessions, logins, AuthApiFactory { queue.removeFirst() },
             this, StandardTestDispatcher(testScheduler), policy)
     }
+
+    private fun transientUnavailable() = AuthFailure(AuthFailure.Kind.UNAVAILABLE, transient = true)
 
     @Test fun modeEntryJoinsUncooperativeAuthAndDiscardsLate401OrRenewal() = runTest {
         for (unauthorized in listOf(true, false)) {
@@ -116,26 +124,36 @@ class SessionRepositoryTest {
         val repo = repository(Sessions(stored(cookie = "spofify_session=x; Path=/; HttpOnly")), Logins(), policy = policy)
         repo.start(); advanceUntilIdle(); repo.signIn(origin.value, "user", "no"); repo.refresh()
         assertEquals(AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE), repo.state.value)
-        policy.unreadable = false; repo.retry(); advanceUntilIdle()
-        val id = (repo.state.value as AuthState.Authenticated).identity
+        assertFalse(repo.offlinePolicyLoaded.value)
+        repo.useManualLogin()
+        assertEquals(AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE), repo.state.value)
+        policy.unreadable = false
+        repo.setAppForeground(false); repo.setAppForeground(true); repo.start(); advanceUntilIdle()
+        assertEquals(AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE), repo.state.value)
+        val local = repository(Sessions(stored(cookie = "spofify_session=x; Path=/; HttpOnly")), Logins(), policy = policy)
+        local.start(); advanceUntilIdle()
+        assertTrue(local.offlinePolicyLoaded.value)
+        val id = (local.state.value as AuthState.Authenticated).identity
         policy.unwritable = true
-        assertTrue(runCatching { repo.setManualOffline(false) }.exceptionOrNull() is IOException)
-        assertTrue(repo.manualOffline.value); assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
+        assertTrue(runCatching { local.setManualOffline(false) }.exceptionOrNull() is IOException)
+        assertTrue(local.manualOffline.value); assertTrue(local.isCurrent(id)); assertNull(local.onlineGrant.value)
     }
 
     @Test fun returnValidationRetainsLocalIdentityWithoutGrantButCurrent401PurgesIt() = runTest {
         val sessions = Sessions(stored(cookie = "spofify_session=x; Path=/; HttpOnly"))
-        val unavailable = Api().apply { sessionError = AuthFailure(AuthFailure.Kind.UNAVAILABLE) }
-        val revoked = Api().apply { sessionGate = CompletableDeferred(); sessionError = AuthFailure(AuthFailure.Kind.UNAUTHORIZED) }
+        val api = Api().apply { sessionError = transientUnavailable() }
         val policy = Policy(true)
-        val repo = repository(sessions, Logins(), unavailable, revoked, policy = policy)
+        val repo = repository(sessions, Logins(), api, policy = policy)
         repo.start(); advanceUntilIdle(); val id = (repo.state.value as AuthState.Authenticated).identity
         repo.setManualOffline(false); runCurrent()
         assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
         assertNull((repo.state.value as AuthState.Authenticated).notice)
-        advanceTimeBy(1_000); runCurrent() // Quiet automatic validation; no retry gesture.
+        api.sessionGate = CompletableDeferred()
+        api.sessionError = AuthFailure(AuthFailure.Kind.UNAUTHORIZED)
+        advanceTimeBy(1_000); runCurrent()
         assertTrue(repo.isCurrent(id)); assertNull(repo.onlineGrant.value)
-        revoked.sessionGate!!.complete(Unit); advanceUntilIdle()
+        api.sessionGate!!.complete(Unit); advanceUntilIdle()
+        assertEquals(2, api.sessionCalls)
         assertFalse(repo.isCurrent(id)); assertNull(sessions.record)
         assertEquals(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED), repo.state.value)
         repo.setManualOffline(true); advanceUntilIdle(); assertFalse(repo.isCurrent(id))
@@ -196,29 +214,205 @@ class SessionRepositoryTest {
         assertSame(login, logins.record)
     }
 
-    @Test fun transientRestoreRetainsBytesAndRetriesWithoutPasswordReplay() = runTest {
+    @Test fun coldRestoreCanScheduleRecoveryBeforeFirstForegroundWithoutDuplicateBootstrap() = runTest {
         val old = stored()
         val sessions = Sessions(old)
-        val failed = Api().apply { sessionError = AuthFailure(AuthFailure.Kind.UNAVAILABLE) }
-        val recovered = Api()
-        val repo = repository(sessions, Logins(), failed, recovered)
-        repo.start()
-        advanceUntilIdle()
-        assertTrue(repo.state.value is AuthState.Unavailable)
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val repo = repository(sessions, Logins(remembered()), api)
+        repo.start(); runCurrent()
+        assertEquals(1, api.sessionCalls)
+        assertEquals(AuthState.Starting, repo.state.value)
         assertSame(old, sessions.record)
         assertTrue(sessions.writes.isEmpty())
-        repo.retry()
-        advanceUntilIdle()
+        advanceTimeBy(500)
+        repo.setAppForeground(true); repo.start(); repo.refresh(); runCurrent()
+        assertEquals(1, api.sessionCalls)
+        api.sessionError = null
+        advanceTimeBy(500); runCurrent()
         assertTrue(repo.state.value is AuthState.Authenticated)
-        assertEquals(1, recovered.sessionCalls)
+        assertNotNull(repo.onlineGrant.value)
+        assertEquals(2, api.sessionCalls)
+        assertEquals(0, api.loginCalls)
+    }
+
+    @Test fun returnValidationIsBoundedAndTerminalFailureCannotStartAnotherLoop() = runTest {
+        val original = stored(cookie = "spofify_session=x; Path=/; HttpOnly")
+        val sessions = Sessions(original)
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val repo = repository(sessions, Logins(), api, policy = Policy(true))
+        repo.start(); advanceUntilIdle()
+        val id = (repo.state.value as AuthState.Authenticated).identity
+        repo.setManualOffline(false); runCurrent()
+        assertEquals(1, api.sessionCalls)
+        for ((index, wait) in listOf(1_000L, 2_000L, 4_000L).withIndex()) {
+            advanceTimeBy(wait - 1); runCurrent()
+            assertEquals(index + 1, api.sessionCalls)
+            assertEquals(AuthState.Authenticated(id), repo.state.value)
+            assertNull(repo.onlineGrant.value)
+            advanceTimeBy(1); runCurrent()
+            assertEquals(index + 2, api.sessionCalls)
+        }
+        assertEquals(AuthState.Authenticated(id, AuthNotice.CONNECTION_FAILED), repo.state.value)
+        repo.setAppForeground(false); repo.setAppForeground(true); repo.refresh()
+        advanceUntilIdle()
+        assertEquals(7_000L, currentTime)
+        assertEquals(4, api.sessionCalls)
+        assertSame(original, sessions.record)
+        assertTrue(sessions.writes.isEmpty())
+        assertNull(repo.onlineGrant.value)
+    }
+
+    @Test fun unclassifiedAndInvalidSessionFailuresNeverBackOff() = runTest {
+        for (error in listOf(AuthFailure(AuthFailure.Kind.UNAVAILABLE), AuthFailure(AuthFailure.Kind.INVALID_RESPONSE), IOException())) {
+            val original = stored()
+            val sessions = Sessions(original)
+            val api = Api().apply { sessionError = error }
+            val repo = repository(sessions, Logins(), api)
+            repo.start(); advanceUntilIdle()
+            assertEquals(0L, currentTime)
+            assertEquals(1, api.sessionCalls)
+            assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+            assertSame(original, sessions.record)
+            assertTrue(sessions.writes.isEmpty())
+        }
+    }
+
+    @Test fun explicitBackgroundPreventsSchedulingRecovery() = runTest {
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val repo = repository(Sessions(stored()), Logins(), api)
+        repo.setAppForeground(false)
+        repo.start(); advanceUntilIdle()
+        assertEquals(0L, currentTime)
+        assertEquals(1, api.sessionCalls)
+        assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+    }
+
+    @Test fun backgroundingCancelsBackoffEvenIfActivityImmediatelyReturns() = runTest {
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val repo = repository(Sessions(stored()), Logins(), api)
+        repo.setAppForeground(true)
+        repo.start(); runCurrent()
+        advanceTimeBy(500)
+        repo.setAppForeground(false); repo.setAppForeground(true); repo.refresh()
+        advanceUntilIdle()
+        assertEquals(500L, currentTime)
+        assertEquals(1, api.sessionCalls)
+        assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+    }
+
+    @Test fun backgroundedRetryCannotPromoteLateSuccess() = runTest {
+        val original = stored()
+        val sessions = Sessions(original)
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val repo = repository(sessions, Logins(), api)
+        repo.start(); runCurrent()
+        api.sessionError = null
+        api.sessionGate = CompletableDeferred()
+        advanceTimeBy(1_000); runCurrent()
+        assertEquals(2, api.sessionCalls)
+        repo.setAppForeground(false)
+        api.sessionGate!!.complete(Unit); advanceUntilIdle()
+        assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+        assertNull(repo.onlineGrant.value)
+        assertSame(original, sessions.record)
+        assertTrue(sessions.writes.isEmpty())
+    }
+
+    @Test fun completedRetryCannotPublishSuccessOrRevocationAfterForegroundEpochChanges() = runTest {
+        for (revoked in listOf(false, true)) {
+            val original = stored()
+            val sessions = Sessions(original)
+            val api = Api().apply { sessionError = transientUnavailable() }
+            val repo = repository(sessions, Logins(), api)
+            repo.setAppForeground(true)
+            repo.start(); runCurrent()
+            api.sessionError = if (revoked) AuthFailure(AuthFailure.Kind.UNAUTHORIZED) else null
+            api.beforeSessionReturn = {
+                // Already queued when the retry child completes, so this runs before await resumes.
+                launch { repo.setAppForeground(false); repo.setAppForeground(true) }
+            }
+            advanceTimeBy(1_000); runCurrent()
+            assertEquals(2, api.sessionCalls)
+            assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+            assertNull(repo.onlineGrant.value)
+            assertSame(original, sessions.record)
+            assertTrue(sessions.writes.isEmpty())
+        }
+    }
+
+    @Test fun cancellingRepositoryScopeRetiresPendingBackoffWithoutPublishingFailure() = runTest {
+        val original = stored()
+        val sessions = Sessions(original)
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val owner = SupervisorJob()
+        try {
+            val dispatcher = StandardTestDispatcher(testScheduler)
+            val repo = SessionRepository(sessions, Logins(), AuthApiFactory { api }, CoroutineScope(owner + dispatcher), dispatcher)
+            repo.setAppForeground(true)
+            repo.start(); runCurrent()
+            owner.cancelAndJoin(); advanceUntilIdle()
+            assertEquals(0L, currentTime)
+            assertEquals(1, api.sessionCalls)
+            assertEquals(AuthState.Starting, repo.state.value)
+            assertNull(repo.onlineGrant.value)
+            assertSame(original, sessions.record)
+            assertTrue(sessions.writes.isEmpty())
+        } finally { owner.cancel() }
+    }
+
+    @Test fun modeEntryCancelsPendingBackoffAndAllowsLocalRestore() = runTest {
+        val original = stored(cookie = "spofify_session=x; Path=/; HttpOnly")
+        val sessions = Sessions(original)
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val repo = repository(sessions, Logins(), api, policy = Policy())
+        repo.start(); runCurrent()
+        repo.setManualOffline(true); advanceUntilIdle()
+        assertEquals(0L, currentTime)
+        assertEquals(1, api.sessionCalls)
+        assertTrue(repo.state.value is AuthState.Authenticated)
+        assertTrue(repo.manualOffline.value)
+        assertNull(repo.onlineGrant.value)
+        assertSame(original, sessions.record)
+        assertTrue(sessions.writes.isEmpty())
+    }
+
+    @Test fun signOutRetiresBackoffAndLogoutWritesAreNotReplayed() = runTest {
+        val original = stored()
+        val sessions = Sessions(original)
+        val api = Api().apply { sessionError = transientUnavailable() }
+        val logout = Api().apply { logoutError = transientUnavailable() }
+        val repo = repository(sessions, Logins(), api, logout)
+        repo.start(); runCurrent()
+        repo.signOut(); advanceUntilIdle()
+        assertEquals(0L, currentTime)
+        assertEquals(1, api.sessionCalls)
+        assertEquals(1, logout.logoutCalls)
+        assertEquals(original.cookie, logout.logoutCookie)
+        assertNull(sessions.record)
+        assertEquals(AuthState.SignedOut(AuthNotice.REMOTE_LOGOUT_FAILED), repo.state.value)
+    }
+
+    @Test fun loginAndItsValidationAreNeverAutomaticallyReplayed() = runTest {
+        for (loginFails in listOf(true, false)) {
+            val api = Api().apply {
+                if (loginFails) loginError = transientUnavailable() else sessionError = transientUnavailable()
+            }
+            val repo = repository(Sessions(), Logins(), api)
+            repo.signIn(origin.value, "user", "fixture-password"); advanceUntilIdle()
+            assertEquals(0L, currentTime)
+            assertEquals(1, api.loginCalls)
+            assertEquals(if (loginFails) 0 else 1, api.sessionCalls)
+            assertEquals(AuthState.SignedOut(AuthNotice.CONNECTION_FAILED), repo.state.value)
+        }
     }
 
     @Test fun corruptStorageFailsClosedWithoutDeletionAndAllowsManualLogin() = runTest {
         val old = stored()
         val sessions = Sessions(old).apply { readFails = true }
-        val repo = repository(sessions, Logins())
+        val repo = repository(sessions, Logins(), policy = Policy())
         repo.start()
         advanceUntilIdle()
+        assertTrue(repo.offlinePolicyLoaded.value)
         assertEquals(AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE), repo.state.value)
         repo.useManualLogin()
         assertEquals(AuthState.SignedOut(), repo.state.value)

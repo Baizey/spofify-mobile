@@ -11,7 +11,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
@@ -23,8 +22,10 @@ class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
     init {
         viewModelScope.launch {
             var needsAutofill = true
-            combine(state, sessions.manualOffline) { auth, offline -> auth to offline }.collect { (auth, offline) ->
-                if (auth is AuthState.Authenticated || offline) { inputs.clearSecret(); needsAutofill = true }
+            combine(state, sessions.manualOffline, sessions.offlinePolicyLoaded) { auth, offline, loaded ->
+                auth to (loaded && !offline)
+            }.collect { (auth, loginAllowed) ->
+                if (auth is AuthState.Authenticated || !loginAllowed) { inputs.clearSecret(); needsAutofill = true }
                 else if (auth is AuthState.SignedOut && needsAutofill) { needsAutofill = false; loadRemembered() }
             }
         }
@@ -57,9 +58,7 @@ class AuthViewModel(private val sessions: SessionRepository) : ViewModel() {
         }
     }
     fun signOut() = sessions.signOut()
-    fun retry() = sessions.retry()
     fun manualLogin() = sessions.useManualLogin()
-    fun foreground() = sessions.refresh()
 
     override fun onCleared() { inputs.clearSecret() }
 
