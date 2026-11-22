@@ -98,7 +98,7 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
                             }.combinedClickable(onClick = onExpand, onLongClick = { actions = true }))
                     }
                 }
-                PlayerOutputButton(state, onDevices)
+                PlayerOutputButton(state.outputState(), onDevices)
                 IconButton({ controller.toggle() }, enabled = ready && track != null, modifier = Modifier.size(PlayerTouchTarget)) {
                     SpofifyIcon(if (state.wantsPause) SpofifyGlyph.Pause else SpofifyGlyph.Play,
                         if (state.wantsPause) "Pause" else "Play")
@@ -139,18 +139,24 @@ private fun MiniIdentity(track: PlaybackTrack, loader: ImageLoader, modifier: Mo
     }
 }
 
-@Composable
-internal fun PlayerOutputButton(state: PlayerPresentation, onClick: () -> Unit) {
-    val online = (state as? PlayerPresentation.Online)?.view
+internal data class PlayerOutputState(val enabled: Boolean, val remote: Boolean, val playing: Boolean, val name: String)
+
+internal fun PlayerPresentation.outputState(): PlayerOutputState {
+    val online = online
     val selected = online?.devices?.firstOrNull { it.deviceId == online.snapshot?.selectedDeviceId }
-    val remote = state.isPlaying && selected != null && selected.deviceId != online.deviceId
-    val output = selected?.name ?: if (state is PlayerPresentation.Local) "this phone" else "no output"
-    IconButton(onClick, enabled = online != null && state.ready, modifier = Modifier.size(PlayerTouchTarget)) {
+    val remote = isPlaying && selected != null && selected.deviceId != online.deviceId
+    val name = selected?.name ?: if (this is PlayerPresentation.Local) "this phone" else "no output"
+    return PlayerOutputState(online != null && ready, remote, isPlaying, name)
+}
+
+@Composable
+internal fun PlayerOutputButton(state: PlayerOutputState, onClick: () -> Unit) {
+    IconButton(onClick, enabled = state.enabled, modifier = Modifier.size(PlayerTouchTarget)) {
         Box(contentAlignment = Alignment.Center) {
             SpofifyIcon(SpofifyGlyph.Devices,
-                "Playback devices: ${if (state.isPlaying) "playing" else "paused"} on $output",
-                tint = if (remote) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
-            if (remote) Text("↗", Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp),
+                "Playback devices: ${if (state.playing) "playing" else "paused"} on ${state.name}",
+                tint = if (state.remote) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+            if (state.remote) Text("↗", Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp),
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
         }
     }

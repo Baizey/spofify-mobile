@@ -169,7 +169,7 @@ internal fun MusicRoot(
             composable("account") { currentAccount.value() }
         }
     }
-    val hasTrack = target?.observe()?.queue?.current != null
+    val hasTrack = target?.observeState()?.project { it.queue?.current != null }?.value == true
     LaunchedEffect(target, source) { devices = false; actions = null; rowPlaybackNotice = null }
     LaunchedEffect(hasTrack) { if (!hasTrack) expanded = false }
     Column(Modifier.fillMaxSize()) {

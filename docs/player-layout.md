@@ -37,13 +37,17 @@ Artwork is capped at 330dp (164dp for large text) and at available width. It
 can shrink toward 164dp to protect the controls and lyric viewport. The lyric
 viewport uses the residual gap, retaining at least one natively scaled line,
 24dp vertical text padding and an 8dp gap before identity.
-Its base minimum is 96dp before that final gap. Timed clearing lines retain
-this same space, without claiming an old line is still current.
+Its base minimum is 96dp before that final gap. Pending reads reserve the
+same space as timed lines, clearing lines, and unavailable lyrics, without
+showing a placeholder or retaining stale text. Arrival of metadata alone no
+longer changes the artwork size or controls layout.
 
 When that budget cannot fit, the body retains the readable viewport and
 artwork floor and scrolls as a whole. The bounded lyric scroller nests inside
 it, so controls and terminal content remain reachable on short/narrow screens
-or with large text. Non-lyric breathing space retains its 16dp minimum.
+or with large text. On these displays, scroll and Back remain available
+while lyrics load; the artwork's swipe-to-dismiss gesture is only enabled
+when the body fits without scrolling.
 
 Inline scroll resets by resource/occurrence binding, recording/source version,
 and timed line index/start/text—not by playback ticks or seeking within the

@@ -25,14 +25,13 @@ internal fun playerLayoutBudget(
     header: Float,
     controls: Float,
     largeText: Boolean,
-    reserveLyrics: Boolean,
     lyricLineHeight: Float,
 ): PlayerLayoutBudget {
     require(listOf(width, height, header, controls, lyricLineHeight).all { it.isFinite() && it >= 0f })
     val artCap = if (largeText) 164f else 330f
     val artFloor = min(width, 164f)
-    // Keep one full scaled line and its padding accessible in the fallback viewport.
-    val minimumGap = if (reserveLyrics) max(96f, lyricLineHeight + 24f) + 8f else 16f
+    // Reserve this space even before lyrics settle so a read cannot resize the artwork.
+    val minimumGap = max(96f, lyricLineHeight + 24f) + 8f
     val fixed = header + 8f + controls
     val artwork = min(min(width, artCap), max(artFloor, height - fixed - minimumGap))
     val gap = max(minimumGap, height - fixed - artwork)
@@ -45,7 +44,6 @@ internal fun playerLayoutBudget(
 internal fun PlayerBodyLayout(
     availableHeight: Dp,
     largeText: Boolean,
-    reserveLyrics: Boolean,
     modifier: Modifier = Modifier,
     header: @Composable () -> Unit,
     artwork: @Composable (Dp) -> Unit,
@@ -59,7 +57,7 @@ internal fun PlayerBodyLayout(
         val controlsPlaceable = subcompose("controls") { Box(Modifier.fillMaxWidth()) { controls() } }.single().measure(natural)
         val budget = playerLayoutBudget(width.toDp().value, availableHeight.value,
             headerPlaceable.height.toDp().value, controlsPlaceable.height.toDp().value,
-            largeText, reserveLyrics, playerSupportingTextStyle.lineHeight.toDp().value)
+            largeText, playerSupportingTextStyle.lineHeight.toDp().value)
         val artPixels = budget.artwork.dp.roundToPx()
         val headerGapPixels = 8.dp.roundToPx()
         // Use the exact pixel remainder in a fitted layout; rounding must not create a one-pixel scroll.

@@ -1,6 +1,11 @@
 package dev.spofify.mobile.playback
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.structuralEqualityPolicy
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.spofify.mobile.core.playback.*
 
@@ -17,6 +22,13 @@ internal sealed class AppPlayback(private val current: () -> Boolean) {
     @Composable fun observe(): PlayerPresentation = when (this) {
         is Online -> PlayerPresentation.Online(controller.state.collectAsStateWithLifecycle().value)
         is Local -> PlayerPresentation.Local(controller.state.collectAsStateWithLifecycle().value)
+    }
+
+    @Composable fun observeState(): State<PlayerPresentation> = key(this) {
+        when (this) {
+            is Online -> controller.state.collectAsStateWithLifecycle().project { PlayerPresentation.Online(it) }
+            is Local -> controller.state.collectAsStateWithLifecycle().project { PlayerPresentation.Local(it) }
+        }
     }
 
     private inline fun <R> dispatch(online: AccountChannel.() -> R, local: LocalPlaybackController.() -> R): R? =
@@ -46,6 +58,12 @@ internal sealed class AppPlayback(private val current: () -> Boolean) {
     fun cycleRepeat() { dispatch({ cycleRepeat() }, { cycleRepeat() }) }
     fun setShuffle(enabled: Boolean) { dispatch({ setShuffle(enabled) }, { setShuffle(enabled) }) }
     fun setRepeat(mode: String) { dispatch({ setRepeat(mode) }, { setRepeat(mode) }) }
+}
+
+/** Read a stable projection in the scope that renders it, not in the owning screen. */
+@Composable
+internal fun <T, R> State<T>.project(select: (T) -> R): State<R> = remember(this, select) {
+    derivedStateOf(structuralEqualityPolicy()) { select(value) }
 }
 
 /** Project sound separately from queue intent. Only the online variant has protocol state. */

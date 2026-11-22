@@ -21,12 +21,15 @@ import dev.spofify.mobile.feature.library.duration
 import kotlin.math.max
 import kotlin.math.roundToInt
 
+private data class SeekFrame(val elapsed: Double, val duration: Double, val ready: Boolean)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun PlaybackSeek(state: PlayerPresentation, binding: String, content: TrackContentState, onSeek: (Double) -> Unit) {
+internal fun PlaybackSeek(playback: State<PlayerPresentation>, binding: String, content: State<TrackContentState>, onSeek: (Double) -> Unit) {
+    val state by playback.project { SeekFrame(it.elapsed, it.duration, it.ready) }
     val seconds = state.elapsed
     val total = state.duration
-    val waveform = content.waveformForDuration(total)
+    val waveform = content.project { it.waveform }.value?.waveformForDuration(total)
     key(binding) {
         var preview by remember { mutableStateOf<Float?>(null) }
         var focused by remember { mutableStateOf(false) }

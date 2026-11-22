@@ -21,20 +21,28 @@ import dev.spofify.mobile.core.playback.PlaybackTrack
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.duration
 
+private data class LyricsFrame(val timed: Boolean, val index: Int?, val elapsedSecond: Long)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun PlayerLyricsSheet(
     track: PlaybackTrack,
-    content: TrackContentState,
-    elapsedMs: Long,
-    durationMs: Long,
+    content: State<TrackContentState>,
+    playback: State<PlayerPresentation>,
     onDismiss: () -> Unit,
 ) {
-    val lyrics = content.lyrics ?: return
-    val index = content.currentLineIndex(elapsedMs, durationMs)
-    val timed = lyrics.state == LyricsState.TIMED && lyrics.withinDuration(durationMs)
+    val boundContent = content.value
+    if (lyricEntry(boundContent) != LyricEntry.AVAILABLE) return
+    val lyrics = boundContent.lyrics ?: return
+    val frame by playback.project {
+        val elapsedMs = (it.elapsed * 1000).toLong()
+        val durationMs = (it.duration * 1000).toLong()
+        val timed = lyrics.state == LyricsState.TIMED && lyrics.withinDuration(durationMs)
+        LyricsFrame(timed, lyrics.currentLineIndex(elapsedMs, durationMs), if (timed) elapsedMs / 1000 else 0)
+    }
+    val (timed, index, elapsedSecond) = frame
     val list = rememberLazyListState()
-    var following by remember(content.binding, lyrics.recordingVersion) { mutableStateOf(true) }
+    var following by remember(boundContent.binding, lyrics.recordingVersion) { mutableStateOf(true) }
     val dragged by list.interactionSource.collectIsDraggedAsState()
     LaunchedEffect(dragged) { if (dragged) following = false }
     LaunchedEffect(index, following) {
@@ -46,7 +54,7 @@ internal fun PlayerLyricsSheet(
                 if (it.type == KeyEventType.KeyDown && it.key in listOf(Key.DirectionDown, Key.DirectionUp,
                         Key.PageDown, Key.PageUp, Key.MoveHome, Key.MoveEnd, Key.Spacebar)) following = false
                 false
-            }.pointerInput(content.binding) {
+            }.pointerInput(boundContent.binding) {
                 awaitPointerEventScope {
                     while (true) if (awaitPointerEvent().type == PointerEventType.Scroll) following = false
                 }
@@ -74,7 +82,7 @@ internal fun PlayerLyricsSheet(
         }
         if (timed) Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 22.dp),
             horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-            Text(duration(elapsedMs), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(duration(elapsedSecond * 1000), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedButton({ following = true }, shape = SpofifySurfaces.control) { Text(if (following) "Following" else "Current line") }
         }
     }

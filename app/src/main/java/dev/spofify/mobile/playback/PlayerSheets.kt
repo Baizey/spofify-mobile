@@ -30,16 +30,24 @@ import dev.spofify.mobile.core.playback.*
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
 
+private data class DevicesView(
+    val ready: Boolean, val devices: List<PlaybackDevice>, val deviceId: String,
+    val selectedDeviceId: String?, val transferring: Boolean,
+)
+
 @Composable
 internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
-    val state by controller.state.collectAsStateWithLifecycle()
-    val ready = state.connection == PlaybackConnectionState.READY
+    val state by controller.state.collectAsStateWithLifecycle().project {
+        DevicesView(it.connection == PlaybackConnectionState.READY, it.devices, it.deviceId,
+            it.snapshot?.selectedDeviceId, it.snapshot?.transfer != null)
+    }
+    val ready = state.ready
     var renaming by remember { mutableStateOf<PlaybackDevice?>(null) }
     SpofifySheet(onDismiss) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 22.dp)) {
             Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading("Playback devices") }
             state.devices.forEach { device ->
-                val active = device.deviceId == state.snapshot?.selectedDeviceId
+                val active = device.deviceId == state.selectedDeviceId
                 val available = ready && device.available && device.canPlay
                 ListRowIndication(onClick = { controller.selectDevice(device.deviceId); onDismiss() },
                     enabled = available, role = Role.Button) { target ->
@@ -70,7 +78,7 @@ internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
                 ListRowDivider()
             }
             if (state.devices.isEmpty()) Text("No connected devices", Modifier.padding(horizontal = 20.dp, vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (state.snapshot?.transfer != null) Text("Switching output", Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            if (state.transferring) Text("Switching output", Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -79,11 +87,12 @@ internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
 
 @Composable
 private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, onDismiss: () -> Unit) {
-    val state by controller.state.collectAsStateWithLifecycle()
+    val (ready, currentName) = controller.state.collectAsStateWithLifecycle().project {
+        (it.connection == PlaybackConnectionState.READY) to it.devices.firstOrNull { row -> row.deviceId == device.deviceId }?.name
+    }.value
     var name by remember(device.deviceId) { mutableStateOf(device.name) }
     var focused by remember { mutableStateOf(false) }
     val valid = isValidDeviceName(name)
-    val currentName = state.devices.firstOrNull { it.deviceId == device.deviceId }?.name
     SpofifySheet(onDismiss) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 22.dp)) {
             Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading("Rename device") }
@@ -100,28 +109,33 @@ private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, 
                     if (currentName != name.trim()) controller.renameDevice(name.trim(), device.deviceId)
                     onDismiss()
                 }, Modifier.weight(1f), shape = SpofifySurfaces.control,
-                    enabled = valid && state.connection == PlaybackConnectionState.READY) { Text("Save") }
+                    enabled = valid && ready) { Text("Save") }
             }
         }
     }
 }
 
+private data class QueueView(
+    val ready: Boolean, val tracks: List<PlaybackTrack>, val position: Int,
+    val sessionId: String?, val stateVersion: Long?,
+)
+
 @Composable
 internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss: () -> Unit) {
-    val state = controller.observe()
-    val online = (state as? PlayerPresentation.Online)?.view
+    val state by controller.observeState().project {
+        QueueView(it.ready, it.queue?.queue.orEmpty(), it.queue?.position ?: -1, it.online?.sessionId, it.online?.snapshot?.stateVersion)
+    }
     val ready = state.ready
-    val position = state.queue?.position ?: -1
-    val upcoming = state.queue?.queue.orEmpty().drop((position + 1).coerceAtLeast(0))
+    val upcoming = remember(state.tracks, state.position) { state.tracks.drop((state.position + 1).coerceAtLeast(0)) }
     val list = rememberLazyListState()
     var actions by remember(controller) { mutableStateOf<Long?>(null) }
-    fun editable(key: Long) = online == null || isPublishedQueueKey(key)
+    fun editable(key: Long) = controller is AppPlayback.Local || isPublishedQueueKey(key)
     val selected = upcoming.firstOrNull { it.key == actions && editable(it.key) }
     SpofifySheet(onDismiss) {
         LazyColumn(Modifier.weight(1f, fill = false).fillMaxWidth(), state = list,
             contentPadding = PaddingValues(bottom = 22.dp)) {
             item("heading") { Box(Modifier.padding(horizontal = 20.dp)) { SheetHeading("Queue") } }
-            state.queue?.current?.let { current -> item("current") {
+            state.tracks.getOrNull(state.position)?.let { current -> item("current") {
                 Box(Modifier.padding(horizontal = 20.dp)) { SheetGroup("Current song") }
                 QueueTrack(current, loader)
             } }
@@ -131,7 +145,7 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
                     // The outer layer paints the gutters; the inset face keeps its original
                     // divider, measured swipe width, action exclusion, and translation clip.
                     ListRowDivider(Modifier.align(Alignment.BottomCenter))
-                    SwipeActionSurface(binding = listOf(controller, online?.sessionId, online?.snapshot?.stateVersion ?: upcoming, track.key),
+                    SwipeActionSurface(binding = listOf(controller, state.sessionId, state.stateVersion ?: upcoming, track.key),
                         onRight = if (ready) ({ controller.queueTrack(PlaybackTrackReference(track.id)) }) else null,
                         modifier = Modifier.padding(horizontal = 20.dp),
                         onLeft = if (ready && editable(track.key)) ({ controller.remove(track.key) }) else null,

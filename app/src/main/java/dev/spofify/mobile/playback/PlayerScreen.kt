@@ -23,6 +23,7 @@ import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -40,6 +41,25 @@ import dev.spofify.mobile.feature.library.MusicArtwork
 import kotlin.math.abs
 import kotlin.math.max
 
+internal data class PlayerTrackSelection(val track: PlaybackTrack, val binding: String)
+
+internal fun PlayerPresentation.trackSelection(): PlayerTrackSelection? {
+    val track = queue?.current ?: return null
+    val snapshot = online?.snapshot
+    val binding = "${online?.sessionId}:${snapshot?.outputVersion}:${snapshot?.selectedDeviceId}:${snapshot?.state?.occurrence?.eventId}:${track.key}"
+    return PlayerTrackSelection(track, binding)
+}
+
+private data class TransportState(val ready: Boolean, val wantsPause: Boolean, val shuffle: Boolean, val repeat: String)
+
+private sealed interface PlayerOverlay {
+    data object Queue : PlayerOverlay
+    data object Devices : PlayerOverlay
+    data class Lyrics(val trackId: String, val binding: String) : PlayerOverlay {
+        fun matches(selection: PlayerTrackSelection) = trackId == selection.track.id && binding == selection.binding
+    }
+}
+
 @Composable
 internal fun FullPlayer(
     controller: AppPlayback,
@@ -48,25 +68,23 @@ internal fun FullPlayer(
     onNavigate: ((MusicKind, String) -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
-    val state = controller.observe()
-    val track = state.queue?.current ?: return
-    val online = (state as? PlayerPresentation.Online)?.view
+    val playback = controller.observeState()
+    val selection = playback.project { it.trackSelection() }.value ?: return
+    val track = selection.track
+    val binding = selection.binding
     val contentModel: TrackContentViewModel = viewModel(key = "track-content-${System.identityHashCode(contentApi)}",
         factory = viewModelFactory { initializer { TrackContentViewModel(contentApi, local = controller is AppPlayback.Local) } })
-    val content by contentModel.state.collectAsStateWithLifecycle()
-    val binding = "${online?.sessionId}:${online?.snapshot?.outputVersion}:${online?.snapshot?.selectedDeviceId}:${online?.snapshot?.state?.occurrence?.eventId}:${track.key}"
-    LaunchedEffect(binding, track.id) { contentModel.select(track.id, binding) }
+    val content = contentModel.state.collectAsStateWithLifecycle()
+    val currentContent = content.project {
+        it.takeIf { it.trackId == track.id && it.binding == binding } ?: TrackContentState()
+    }
+    LaunchedEffect(contentModel, binding, track.id) { contentModel.select(track.id, binding) }
     DisposableEffect(contentModel) { onDispose { contentModel.select(null, "") } }
-    val currentContent = content.takeIf { it.trackId == track.id && it.binding == binding } ?: TrackContentState()
-    val elapsedMs = (state.elapsed * 1000).toLong()
-    val durationMs = (state.duration * 1000).toLong()
-    val lyricsEntry = lyricEntry(currentContent)
-    val inlineLine = if (lyricsEntry == LyricEntry.AVAILABLE) lyricViewportKey(currentContent, elapsedMs, durationMs) else null
-    val ready = state.ready
-    var queue by remember { mutableStateOf(false) }
-    var devices by remember { mutableStateOf(false) }
-    var lyrics by remember { mutableStateOf(false) }
-    LaunchedEffect(binding) { lyrics = false }
+
+    var overlay by remember(controller, contentApi) { mutableStateOf<PlayerOverlay?>(null) }
+    LaunchedEffect(binding, track.id) {
+        if ((overlay as? PlayerOverlay.Lyrics)?.matches(selection) == false) overlay = null
+    }
     val scroll = rememberScrollState()
     val dismissWithoutScrolling by remember(scroll) {
         derivedStateOf { scroll.maxValue == 0 && scroll.value == 0 }
@@ -82,7 +100,6 @@ internal fun FullPlayer(
                 PlayerBodyLayout(
                     availableHeight = (maxHeight - 34.dp).coerceAtLeast(0.dp),
                     largeText = largeText,
-                    reserveLyrics = lyricsEntry != LyricEntry.HIDDEN,
                     modifier = Modifier.fillMaxWidth().verticalScroll(scroll)
                         .padding(start = horizontal, end = horizontal, top = 16.dp, bottom = 18.dp)
                         .semantics { customActions = listOf(CustomAccessibilityAction("Dismiss player") { onDismiss(); true }) },
@@ -91,7 +108,7 @@ internal fun FullPlayer(
                         val albumLabel = track.albumName.ifBlank { if (canOpenAlbum) "Open album" else "" }
                         Box(Modifier.fillMaxWidth().heightIn(min = 48.dp)
                             .then(if (canOpenAlbum) Modifier.clickable(role = Role.Button, onClickLabel = "Open album") {
-                                onNavigate?.invoke(MusicKind.ALBUM, track.albumId)
+                                onNavigate(MusicKind.ALBUM, track.albumId)
                             } else Modifier), contentAlignment = Alignment.CenterStart) {
                             if (albumLabel.isNotBlank()) Text(albumLabel,
                                 style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle),
@@ -104,20 +121,8 @@ internal fun FullPlayer(
                             Modifier.size(size).clip(RoundedCornerShape(7.dp)).then(dismissGesture))
                     },
                     gap = { height ->
-                        when {
-                            inlineLine != null -> Column(Modifier.fillMaxWidth().height(height)) {
-                                PlayerLyricViewport(inlineLine, (height - 8.dp).coerceAtLeast(0.dp)) { lyrics = true }
-                                Spacer(Modifier.height(8.dp))
-                            }
-                            lyricsEntry != LyricEntry.HIDDEN -> Box(Modifier.fillMaxWidth().height(height), contentAlignment = Alignment.Center) {
-                                if (lyricsEntry == LyricEntry.AVAILABLE) {
-                                    TextButton({ lyrics = true }) { Text("View lyrics") }
-                                } else {
-                                    Text("Lyrics unavailable", color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        style = MaterialTheme.typography.bodySmall)
-                                }
-                            }
-                            else -> Spacer(Modifier.fillMaxWidth().height(height).then(dismissGesture))
+                        FullPlayerLyricEntry(playback, currentContent, height, dismissGesture) {
+                            overlay = PlayerOverlay.Lyrics(track.id, binding)
                         }
                     },
                     controls = { Column(Modifier.fillMaxWidth()) {
@@ -134,45 +139,91 @@ internal fun FullPlayer(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle))
                         }
-                        PlaybackSeek(state, binding, currentContent) { controller.seek(it) }
-                        Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                            TransportSlot(Modifier.weight(1f), "Shuffle", SpofifyGlyph.Shuffle, ready,
-                                active = state.queue?.shuffle == true) { controller.toggleShuffle() }
-                            TransportSlot(Modifier.weight(1f), "Previous song", SpofifyGlyph.Previous, ready) { controller.previous() }
-                            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                                FilledIconButton({ controller.toggle() }, Modifier.size(64.dp), enabled = ready, shape = CircleShape) {
-                                    SpofifyIcon(if (state.wantsPause) SpofifyGlyph.Pause else SpofifyGlyph.Play,
-                                        if (state.wantsPause) "Pause" else "Play")
-                                }
-                            }
-                            TransportSlot(Modifier.weight(1f), "Next song", SpofifyGlyph.Next, ready) { controller.next() }
-                            val repeat = state.queue?.repeat ?: "off"
-                            TransportSlot(Modifier.weight(1f), "Repeat ${if (repeat == "all") "queue" else repeat}",
-                                if (repeat == "one") SpofifyGlyph.RepeatOne else SpofifyGlyph.Repeat, ready,
-                                active = repeat != "off") { controller.cycleRepeat() }
-                        }
+                        PlaybackSeek(playback, binding, currentContent) { controller.seek(it) }
+                        FullPlayerTransport(playback, controller)
                         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { PlayerOutputButton(state) { devices = true } }
+                            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                                FullPlayerOutput(playback) { overlay = PlayerOverlay.Devices }
+                            }
                             Spacer(Modifier.weight(3f))
                             Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                                IconButton({ queue = true }, Modifier.size(48.dp)) { SpofifyIcon(SpofifyGlyph.Queue, "See queue") }
+                                IconButton({ overlay = PlayerOverlay.Queue }, Modifier.size(48.dp)) { SpofifyIcon(SpofifyGlyph.Queue, "See queue") }
                             }
                         }
-                        state.error?.let { notice ->
-                            SelectionContainer {
-                                Text(notice, Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.error,
-                                    style = MaterialTheme.typography.bodySmall)
-                            }
-                        }
+                        FullPlayerNotice(playback)
                     }
                 })
             }
         }
-        if (queue) QueueSheet(controller, loader) { queue = false }
-        if (devices && controller is AppPlayback.Online) DevicesSheet(controller.controller) { devices = false }
-        if (lyrics && lyricsEntry == LyricEntry.AVAILABLE) {
-            PlayerLyricsSheet(track, currentContent, elapsedMs, durationMs) { lyrics = false }
+        when (val panel = overlay) {
+            PlayerOverlay.Queue -> QueueSheet(controller, loader) { overlay = null }
+            PlayerOverlay.Devices -> if (controller is AppPlayback.Online) DevicesSheet(controller.controller) { overlay = null }
+            is PlayerOverlay.Lyrics -> if (panel.matches(selection)) {
+                PlayerLyricsSheet(track, currentContent, playback) { overlay = null }
+            }
+            null -> Unit
         }
+    }
+}
+
+@Composable
+private fun FullPlayerLyricEntry(
+    playback: State<PlayerPresentation>, content: State<TrackContentState>, height: Dp,
+    dismissGesture: Modifier, onOpen: () -> Unit,
+) {
+    val entry by content.project(::lyricEntry)
+    val line by playback.project {
+        val current = content.value
+        if (lyricEntry(current) == LyricEntry.AVAILABLE) {
+            lyricViewportKey(current, (it.elapsed * 1000).toLong(), (it.duration * 1000).toLong())
+        } else null
+    }
+    val currentLine = line
+    when {
+        currentLine != null -> Column(Modifier.fillMaxWidth().height(height)) {
+            PlayerLyricViewport(currentLine, (height - 8.dp).coerceAtLeast(0.dp), onOpen)
+            Spacer(Modifier.height(8.dp))
+        }
+        entry == LyricEntry.HIDDEN -> Spacer(Modifier.fillMaxWidth().height(height).then(dismissGesture))
+        else -> Box(Modifier.fillMaxWidth().height(height), contentAlignment = Alignment.Center) {
+            if (entry == LyricEntry.AVAILABLE) TextButton(onOpen) { Text("View lyrics") }
+            else Text("Lyrics unavailable", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun FullPlayerTransport(playback: State<PlayerPresentation>, controller: AppPlayback) {
+    val state by playback.project { TransportState(it.ready, it.wantsPause, it.queue?.shuffle == true, it.queue?.repeat ?: "off") }
+    Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        TransportSlot(Modifier.weight(1f), "Shuffle", SpofifyGlyph.Shuffle, state.ready, active = state.shuffle) { controller.toggleShuffle() }
+        TransportSlot(Modifier.weight(1f), "Previous song", SpofifyGlyph.Previous, state.ready) { controller.previous() }
+        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+            FilledIconButton({ controller.toggle() }, Modifier.size(64.dp), enabled = state.ready, shape = CircleShape) {
+                SpofifyIcon(if (state.wantsPause) SpofifyGlyph.Pause else SpofifyGlyph.Play,
+                    if (state.wantsPause) "Pause" else "Play")
+            }
+        }
+        TransportSlot(Modifier.weight(1f), "Next song", SpofifyGlyph.Next, state.ready) { controller.next() }
+        val repeat = state.repeat
+        TransportSlot(Modifier.weight(1f), "Repeat ${if (repeat == "all") "queue" else repeat}",
+            if (repeat == "one") SpofifyGlyph.RepeatOne else SpofifyGlyph.Repeat, state.ready,
+            active = repeat != "off") { controller.cycleRepeat() }
+    }
+}
+
+@Composable
+private fun FullPlayerOutput(playback: State<PlayerPresentation>, onOpen: () -> Unit) {
+    val output by playback.project { it.outputState() }
+    PlayerOutputButton(output, onOpen)
+}
+
+@Composable
+private fun FullPlayerNotice(playback: State<PlayerPresentation>) {
+    val notice = playback.project { it.error }.value ?: return
+    SelectionContainer {
+        Text(notice, Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall)
     }
 }
 

@@ -65,15 +65,6 @@ class PlayerLayoutTest {
         assertEquals(48f + 8f + 120f + layout.gap + 240f, layout.contentHeight, .01f)
     }
 
-    @Test fun noTimedLyricsNeedsOnlyBreathingSpaceButTimedSilentGapsKeepTheSameBudget() {
-        val without = budget(height = 680f, reserveLyrics = false)
-        assertEquals(330f, without.artwork, .01f)
-        assertEquals(54f, without.gap, .01f)
-        val timedLine = budget(height = 680f, reserveLyrics = true)
-        val timedSilentGap = budget(height = 680f, reserveLyrics = true)
-        assertEquals(timedLine, timedSilentGap)
-    }
-
     @Test fun accessibleOverflowDescriptionReflectsActualScrollRangeIncludingBothEnds() {
         assertEquals(LyricOverflow(false, false), lyricOverflow(0, 0))
         assertEquals(LyricOverflow(false, true), lyricOverflow(0, 400))
@@ -177,9 +168,8 @@ class PlayerLayoutTest {
     }
 
     private fun budget(width: Float = 360f, height: Float, header: Float = 48f, controls: Float = 240f,
-        largeText: Boolean = false, reserveLyrics: Boolean = true,
-        lineHeight: Float = playerSupportingTextStyle.lineHeight.value) =
-        playerLayoutBudget(width, height, header, controls, largeText, reserveLyrics, lineHeight)
+        largeText: Boolean = false, lineHeight: Float = playerSupportingTextStyle.lineHeight.value) =
+        playerLayoutBudget(width, height, header, controls, largeText, lineHeight)
 
     private fun timedContent() = TrackContentState(trackId = "track", binding = "occurrence:output", lyrics = TrackLyrics(
         "track", LyricsState.TIMED, "recording", "source", lines = listOf(
