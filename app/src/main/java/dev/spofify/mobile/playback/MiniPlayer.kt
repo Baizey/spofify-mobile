@@ -100,9 +100,8 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
                 }
                 PlayerOutputButton(state, onDevices)
                 IconButton({ controller.toggle() }, enabled = ready && track != null, modifier = Modifier.size(PlayerTouchTarget)) {
-                    val wantsPlay = queue?.desiredPlaying == true
-                    SpofifyIcon(if (wantsPlay) SpofifyGlyph.Pause else SpofifyGlyph.Play,
-                        if (wantsPlay) "Pause" else "Play")
+                    SpofifyIcon(if (state.wantsPause) SpofifyGlyph.Pause else SpofifyGlyph.Play,
+                        if (state.wantsPause) "Pause" else "Play")
                 }
             }
         }

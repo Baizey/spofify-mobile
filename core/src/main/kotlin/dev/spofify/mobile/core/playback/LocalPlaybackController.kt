@@ -42,6 +42,7 @@ class LocalPlaybackController(
     private val random: Random = Random.Default,
     private val onNaturalEnd: ((PlaybackQueueState, AudioFacts) -> Unit)? = null,
     private val onObserved: ((AudioFacts) -> Unit)? = null,
+    private val onFailure: ((String, AudioFacts?) -> Unit)? = null,
     private val allowPreview: (PlaybackTrack) -> Boolean = { true },
 ) {
     private val mutableState = MutableStateFlow(PlaybackQueueState())
@@ -328,11 +329,13 @@ class LocalPlaybackController(
         val previous = state.value
         val duration = duration(facts, previous)
         val elapsed = facts.elapsed.takeIf { it.isFinite() && it >= 0 } ?: previous.elapsed
+        if (facts.error.isNotEmpty()) {
+            fail(op, facts.error, facts)
+            return
+        }
         // Local IO may have native buffering but we do not publish request/spinner state.
-        mutableState.value = previous.copy(elapsed = boundedElapsed(elapsed, duration), duration = duration,
-            isPlaying = facts.isPlaying && facts.error.isEmpty())
-        if (facts.error.isNotEmpty()) fail(op, facts.error, facts)
-        else if (!facts.ended) onObserved?.invoke(facts)
+        mutableState.value = previous.copy(elapsed = boundedElapsed(elapsed, duration), duration = duration, isPlaying = facts.isPlaying)
+        if (!facts.ended) onObserved?.invoke(facts)
     }
 
     private fun ended(op: Operation, facts: AudioFacts) {
@@ -346,13 +349,19 @@ class LocalPlaybackController(
 
     private fun fail(op: Operation, error: String, native: AudioFacts = audio.facts()) {
         if (active !== op) return
-        val refusal = native.takeIf { error == "blocked" && it.binding == op.binding && it.error == "blocked" && !it.isPlaying }
-        invalidate(pauseNative = refusal?.stoppedByRefusal != true)
-        refusal?.let { onObserved?.invoke(it) }
-        mutableState.value = state.value.copy(desiredPlaying = false, isPlaying = false, error = when (error) {
+        val observed = native.takeIf { it.binding == op.binding }
+        val stoppedByRefusal = observed?.let { error == "blocked" && it.error == "blocked" && it.stoppedByRefusal } == true
+        val failure = when (error) {
             "unavailable", "blocked" -> error
             else -> "media"
-        })
+        }
+        invalidate(pauseNative = !stoppedByRefusal)
+        val previous = state.value
+        val duration = observed?.let { duration(it, previous) } ?: previous.duration
+        val elapsed = observed?.elapsed?.takeIf(::safeSeconds) ?: previous.elapsed
+        mutableState.value = previous.copy(desiredPlaying = false, isPlaying = false, error = failure,
+            elapsed = boundedElapsed(elapsed, duration), duration = duration)
+        onFailure?.invoke(failure, observed)
     }
 
     private fun duration(facts: AudioFacts, previous: PlaybackQueueState): Double =

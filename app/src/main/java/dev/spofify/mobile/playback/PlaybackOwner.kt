@@ -192,8 +192,14 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
 
     private suspend fun admitPlaybackStart(identity: AccountIdentity): Boolean {
         val session = current?.takeIf { it.identity == identity }?.mediaSession ?: return false
-        if (eligiblePlayer(session) == null) return false
-        val request = attachment?.takeIf { it.session === session } ?: bindService(session) ?: return false
+        if (eligiblePlayer(session) == null) {
+            Log.w("SpofifyPlayer", "Playback admission failed: output is no longer eligible")
+            return false
+        }
+        val request = attachment?.takeIf { it.session === session } ?: bindService(session) ?: run {
+            Log.w("SpofifyPlayer", "Playback admission failed: local binding refused")
+            return false
+        }
         // A new native execute supersedes recovery of the outgoing operation, not its binding.
         request.recoveryTimeout?.cancel()
         request.recoveryTimeout = null
@@ -213,6 +219,16 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
                 // different play may not consume the old success, even on the same MediaSession.
                 attachment?.let { live -> live.session === session && live.admission === pending &&
                     live.service?.hasMediaForeground() == true && eligiblePlayer(session) != null } == true
+            }
+            if (!admitted) {
+                val live = attachment?.takeIf { it.admission === pending }
+                val stage = when {
+                    live == null -> "retired-binding"
+                    pending.isCompleted -> "promotion-refused-or-lost"
+                    live.service == null -> "bind-timeout"
+                    else -> "promotion-timeout"
+                }
+                Log.w("SpofifyPlayer", "Playback admission failed: $stage api=${Build.VERSION.SDK_INT}")
             }
             return admitted
         } finally {
@@ -269,7 +285,7 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
                 request, Context.BIND_AUTO_CREATE)
         } catch (e: RuntimeException) {
             if (e !is IllegalStateException && e !is SecurityException) throw e
-            Log.w("SpofifyPlayer", "Local playback service binding refused", e)
+            Log.w("SpofifyPlayer", "Local playback service binding refused: ${e.javaClass.simpleName}")
             false
         }
         if (!bound) {

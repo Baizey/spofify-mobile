@@ -59,10 +59,18 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
     private var owner = false
     private var state: AccountState? = null
     private var published: AccountState? = null
+    private data class Failure(val cursor: AccountCursor, val error: String)
+    private var failure: Failure? = null
+    private var execution = 0L
+
     private val engine = LocalPlaybackController(audio, object : LocalPlaybackLibrary {
         override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = null
         override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
-    }, scope, { owner && allowed() }, onNaturalEnd = ::ended, onObserved = ::observed, allowPreview = ::confirmedSuccessor)
+    }, scope, { owner && allowed() }, onNaturalEnd = ::ended, onObserved = ::observed,
+        onFailure = ::failed, allowPreview = ::confirmedSuccessor)
+
+    private fun Failure.matches(cursor: AccountCursor): Boolean = this.cursor.sameRun(cursor) && this.cursor.desired == cursor.desired
+    fun playbackError(cursor: AccountCursor): String? = failure?.takeIf { owner && it.matches(cursor) }?.error
 
     // No preview on a speculative Play/Add/Shuffle or a locally predicted visit awaiting its echo.
     // The ordinary EOF path is unchanged; preloading never emits a command or fact.
@@ -111,13 +119,26 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
         terminalEnd: Boolean = false) {
         val old = state
         val start = !owner || old == null || !old.cursor.sameRun(next.cursor) || old.cursor.desired != next.cursor.desired
+        if (start || !output) execution++
+        val revision = execution
         if (owner && !output) engine.stop()
+        failure = failure?.takeIf { output }?.let { stopped ->
+            when {
+                stopped.matches(next.cursor) -> stopped
+                // The exact speculative selection was confirmed without starting another decoder.
+                confirm && old != null && stopped.matches(old.cursor) -> stopped.copy(cursor = next.cursor)
+                else -> null
+            }
+        }
         owner = output
         state = next
         publish(next)
-        if (owner) {
-            if (terminalEnd) engine.finishNaturalEnd(next.presentation())
-            else engine.adopt(next.presentation(), start && !confirm, natural)
+        // StateFlow publication can run collectors inline. Never execute a superseded run;
+        // a same-run queue edit may update the rows while this operation still owns the start.
+        if (owner && execution == revision) {
+            val queue = requireNotNull(state).presentation()
+            if (terminalEnd) engine.finishNaturalEnd(queue)
+            else if (failure == null) engine.adopt(queue, start && !confirm, natural)
         }
     }
     private var preview = 0L
@@ -189,14 +210,36 @@ internal class AccountPlayer(audio: AudioExecutor, scope: CoroutineScope, privat
         adopt(old.copy(cursor = cursor), true, natural = next != null && confirmedSuccessor(old.queue[next]), terminalEnd = next == null)
     }
     private fun observed(facts: AudioFacts) {
-        val c = state?.cursor ?: return
-        val refused = facts.error == "blocked" && !facts.isPlaying
-        if (owner && allowed() && (!facts.ended || refused) && (facts.error.isEmpty() || refused) && safeSeconds(facts.elapsed)) {
-            state = state?.copy(cursor = c.copy(elapsed = facts.elapsed, playing = facts.isPlaying))
-            state?.let(publish)
-            if (c.key < (1L shl 52) && !c.chain.startsWith("local:")) report(fact(c, facts, null))
+        val s = state ?: return
+        val c = s.cursor
+        if (owner && allowed() && !facts.ended && facts.error.isEmpty() && safeSeconds(facts.elapsed)) {
+            val next = s.copy(cursor = c.copy(elapsed = facts.elapsed, playing = facts.isPlaying))
+            state = next
+            publish(next)
+            if (c.key < FIRST_PREVIEW_KEY && !c.chain.startsWith("local:")) report(fact(c, facts, null))
         }
     }
+
+    private fun failed(error: String, facts: AudioFacts?) {
+        val s = state ?: return
+        if (!owner || !allowed() || s.cursor.key == 0L) return
+        val c = s.cursor
+        val elapsed = facts?.elapsed?.takeIf(::safeSeconds) ?: c.elapsed
+        val refusal = error == "blocked" && facts?.error == "blocked" && !facts.isPlaying && !facts.ended
+        val next = s.copy(cursor = c.copy(elapsed = elapsed, playing = false))
+        // Keep canonical desired intent unchanged. The failure belongs to this exact run on
+        // this output only; a same-run server echo or lease renewal is not another Play.
+        val stopped = Failure(next.cursor, error)
+        failure = stopped
+        state = next
+        publish(next)
+        if (failure === stopped && published?.cursor?.sameRun(c) == true && (refusal || c.playing)) {
+            // The protocol accepts observed output refusal, but never a fabricated media error
+            // or EOF. An ordinary stopped sample clears any previously published playing fact.
+            report(fact(c, AudioFacts(elapsed = elapsed, error = if (refusal) "blocked" else ""), null))
+        }
+    }
+
     private fun fact(c: AccountCursor, f: AudioFacts, landed: Long?) = AccountFact(key = c.key, chain = c.chain,
         visit = c.visit, run = c.run, elapsed = f.elapsed, playing = !f.ended && f.isPlaying, buffering = f.isBuffering,
         ended = landed != null, landed = landed, error = f.error.takeIf { it == "blocked" })

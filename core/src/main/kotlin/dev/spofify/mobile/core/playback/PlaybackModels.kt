@@ -128,6 +128,8 @@ data class PlaybackView(
     val current: PlaybackTrack? get() = snapshot?.state?.current
     val queue: List<PlaybackTrack> get() = snapshot?.state?.queue.orEmpty()
     val desiredPlaying: Boolean get() = snapshot?.state?.desiredPlaying == true
+    /** Preparation remains cancellable; a terminal output failure makes the next action Play. */
+    val wantsPause: Boolean get() = desiredPlaying && playback?.error.isNullOrEmpty()
     val devices: List<PlaybackDevice> get() = snapshot?.devices.orEmpty()
     // Never use desiredPlaying, acceptance or an ACK as evidence of sound.
     val isPlaying: Boolean get() = playback?.hasReportedPlayback == true && playback.isPlaying

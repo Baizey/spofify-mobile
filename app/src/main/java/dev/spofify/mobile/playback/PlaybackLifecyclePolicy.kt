@@ -37,7 +37,7 @@ internal fun retainLocalPlaybackService(
     val pendingNativePlay = localPlayWhenReady && !facts.ended
     val nativeWork = facts.isPlaying || facts.isBuffering || facts.isLoading || pendingNativePlay
     if (view.isLocalTransferTarget()) return true
-    if (view.isLocalSelectedConnection()) return view.desiredPlaying || nativeWork
+    if (view.isLocalSelectedConnection()) return view.wantsPause || nativeWork
     return view.snapshot?.transfer?.sourceConnectionId == view.connectionId && nativeWork
 }
 

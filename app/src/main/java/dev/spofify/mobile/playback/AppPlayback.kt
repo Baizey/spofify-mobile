@@ -56,22 +56,25 @@ internal sealed class PlayerPresentation {
         override val elapsed get() = actual?.elapsed ?: 0.0
         override val duration get() = actual?.duration ?: 0.0
         override val isPlaying get() = view.isPlaying
+        override val wantsPause get() = view.wantsPause
         override val ready get() = view.connection == PlaybackConnectionState.READY
     }
     data class Local(override val queue: PlaybackQueueState) : PlayerPresentation() {
         override val elapsed get() = queue.elapsed
         override val duration get() = queue.duration
         override val isPlaying get() = queue.isPlaying
+        override val wantsPause get() = queue.desiredPlaying
         override val ready get() = true
     }
     val online: PlaybackView? get() = (this as? Online)?.view
     val error: String? get() = when (this) {
-        is Online -> view.error
-        is Local -> queue.error.takeIf { it.isNotEmpty() }
+        is Online -> playbackFailureNotice(view.playback?.error)
+        is Local -> playbackFailureNotice(queue.error)
     }
     abstract val queue: PlaybackQueueState?
     abstract val elapsed: Double
     abstract val duration: Double
     abstract val isPlaying: Boolean
+    abstract val wantsPause: Boolean
     abstract val ready: Boolean
 }

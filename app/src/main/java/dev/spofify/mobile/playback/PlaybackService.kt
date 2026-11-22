@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
@@ -125,8 +126,12 @@ class PlaybackService : MediaSessionService() {
 
             override fun onFailure(t: Throwable) {
                 if (admission != null) {
-                    if (owner.notificationAdmission(this@PlaybackService, session) === admission) admission.complete(false)
+                    if (owner.notificationAdmission(this@PlaybackService, session) === admission) {
+                        Log.w("SpofifyPlayer", "Media3 admission notification failed: ${t.javaClass.simpleName}")
+                        admission.complete(false)
+                    }
                 } else if (foreground) {
+                    Log.w("SpofifyPlayer", "Media3 foreground notification failed: ${t.javaClass.simpleName}")
                     // The exact failed update owns the refusal; Media3's listener is posted
                     // separately and no longer knows which operation attempted promotion.
                     mainHandler.post { onLoss?.invoke(false) }

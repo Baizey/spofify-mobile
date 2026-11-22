@@ -142,13 +142,20 @@ class AudioLoadRecoveryTest {
         assertEquals(4_000L, testScheduler.currentTime)
     }
 
-    @Test fun ordinaryPreparationWithoutRetryDoesNotAcquireANewTimeout() = runTest {
+    @Test fun ordinaryPreparationHasMoreTimeThanTheShortRetryWindow() = runTest {
         val ready = CompletableDeferred<AudioResult>()
         val waiting = async { scope.awaitPreparation(ready) }
         delay(5_000)
         assertTrue(waiting.isActive)
         ready.complete(AudioResult.OK)
         assertEquals(AudioResult.OK, waiting.await())
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun neverReadyWithoutARetryStillTerminates() = runTest {
+        val waiting = async { scope.awaitPreparation(CompletableDeferred()) }
+        assertEquals(AudioResult.MEDIA, waiting.await())
+        assertEquals(AUDIO_PREPARATION_TIMEOUT_MS, testScheduler.currentTime)
     }
 
     @Test fun terminalErrorsAreNotRetried() {

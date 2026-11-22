@@ -49,10 +49,12 @@ internal class Media3AudioExecutor(
     private var binding: AudioBinding? = null
     private var generation = 0L
     private var preparation: NativePreparation? = null
+    private var admittingStart: Long? = null
+    private var confirmingStart: Long? = null
     private var endedBinding: AudioBinding? = null
     // A late EOF after stopped setup is not a new traversal, even after its readiness waiter completes.
     private var traversalBinding: AudioBinding? = null
-    private var blocked = false
+    private var terminalError = ""
     private var released = false
     private var playbackAuthority: (() -> Boolean)? = null
 
@@ -79,8 +81,8 @@ internal class Media3AudioExecutor(
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             if (released || binding == null || !hasPlaybackAuthority() || player.playWhenReady) return
-            if (!playWhenReady && reason in setOf(Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY,
-                    Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS)) onSystemPause()
+            if (!playWhenReady && (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY ||
+                    reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS && confirmingStart != generation)) onSystemPause()
         }
     }
 
@@ -123,40 +125,60 @@ internal class Media3AudioExecutor(
         val result = load(binding, track, elapsed, playRequested = desiredPlaying, localOnly = localOnly, isAuthorized = isAuthorized)
         if (result != AudioResult.OK) return result
         if (this.binding != binding) return AudioResult.REJECTED
-        if (!isAuthorized()) { pause(); return AudioResult.REJECTED }
+        if (!isAuthorized()) { pause(retireMedia = true); return AudioResult.REJECTED }
         // A known terminal position cannot start sound or justify foreground admission.
         if (track != null && desiredPlaying && player.playbackState != Player.STATE_ENDED) {
             val nativeGeneration = generation
             playbackAuthority = {
                 !released && this.binding == binding && generation == nativeGeneration && isAuthorized()
             }
+            admittingStart = nativeGeneration
             val admitted = try {
                 requestPlaybackStart()
             } catch (cancelled: CancellationException) {
-                if (!released && generation == nativeGeneration) pause()
+                if (!released && generation == nativeGeneration) pause(retireMedia = true)
                 throw cancelled
+            } finally {
+                if (admittingStart == nativeGeneration) admittingStart = null
             }
             // Admission may suspend while Media3 connects and publishes the notification. A pause,
             // newer execute or retired grant must not be turned into a blocked successor or sound.
-            if (released || this.binding != binding || generation != nativeGeneration) return AudioResult.REJECTED
-            if (!hasPlaybackAuthority()) { pause(); return AudioResult.REJECTED }
-            if (player.playerError != null || player.playbackState == Player.STATE_IDLE) { pause(); return AudioResult.MEDIA }
+            val current = { !released && this.binding == binding && generation == nativeGeneration }
+            if (!current()) return AudioResult.REJECTED
+            if (!hasPlaybackAuthority()) { pause(retireMedia = true); return AudioResult.REJECTED }
+            if (player.playerError != null || player.playbackState == Player.STATE_IDLE) return stopFailedStart(AudioResult.MEDIA, "admission-player")
             if (player.playbackState == Player.STATE_ENDED) {
                 mutableObservations.tryEmit(AudioObservation(binding, facts()))
                 return AudioResult.OK
             }
-            if (!admitted) {
-                pause()
-                blocked = true
-                return AudioResult.BLOCKED
+            if (!admitted || !canContinuePlayback()) return stopFailedStart(AudioResult.BLOCKED, "admission")
+            val positionBeforePlay = player.currentPosition
+            confirmingStart = nativeGeneration
+            val start = try {
+                audioLoadScope?.playing = true
+                player.play()
+                awaitNativePlaybackStart({ current() && hasPlaybackAuthority() }) {
+                    when {
+                        player.playerError != null || player.playbackState == Player.STATE_IDLE -> NativeStartStatus.FAILED
+                        endedBinding == binding -> NativeStartStatus.ENDED
+                        !player.playWhenReady -> NativeStartStatus.REFUSED
+                        player.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE -> NativeStartStatus.SUPPRESSED
+                        player.isPlaying && player.currentPosition > positionBeforePlay -> NativeStartStatus.ADVANCING
+                        else -> NativeStartStatus.WAITING
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                if (current()) pause()
+                throw cancelled
+            } finally {
+                if (confirmingStart == nativeGeneration) confirmingStart = null
             }
-            audioLoadScope?.playing = true
-            player.play()
-            if (!player.playWhenReady) {
-                pause()
-                blocked = true
-                return AudioResult.BLOCKED
+            if (!current()) return AudioResult.REJECTED
+            if (start == AudioResult.REJECTED || !hasPlaybackAuthority()) {
+                pause(retireMedia = true)
+                return AudioResult.REJECTED
             }
+            if (start != AudioResult.OK) return stopFailedStart(start, "native-start")
         }
         mutableObservations.tryEmit(AudioObservation(binding, facts()))
         return AudioResult.OK
@@ -171,7 +193,7 @@ internal class Media3AudioExecutor(
         binding = next
         traversalBinding = next.takeIf { playRequested }
         endedBinding = null
-        blocked = false
+        terminalError = ""
         val token = generation
         try {
             if (track == null) {
@@ -203,14 +225,12 @@ internal class Media3AudioExecutor(
             wait.outcome(player.playbackState, player.playerError != null, player.duration)?.let(wait.result::complete)
             val outcome = owner.awaitPreparation(wait.result)
             if (token != generation || binding != next) return AudioResult.REJECTED
-            if (outcome != AudioResult.OK) pause()
-            return outcome
+            return if (outcome == AudioResult.MEDIA) stopFailedStart(outcome, "prepare") else outcome
         } catch (cancelled: CancellationException) {
             if (!released && token == generation) pause()
             throw cancelled
         } catch (_: Exception) {
-            if (!released && token == generation) pause()
-            return AudioResult.MEDIA
+            return if (!released && token == generation) stopFailedStart(AudioResult.MEDIA, "prepare-exception") else AudioResult.REJECTED
         } finally {
             if (token == generation) preparation = null
         }
@@ -385,18 +405,30 @@ internal class Media3AudioExecutor(
         old?.job?.cancel()
     }
 
-    override fun pause() {
+    override fun pause() = pause(retireMedia = false)
+
+    private fun pause(retireMedia: Boolean) {
         checkThread()
+        val pending = preparation
+        val starting = pending != null || admittingStart != null || confirmingStart != null
+        // Revoke callbacks before any synchronous Player listener can sample the old start.
+        preparation = null
+        admittingStart = null
+        confirmingStart = null
+        playbackAuthority = null
+        traversalBinding = null
+        generation++
         player.pause()
         disarm()
-        generation++
         source?.unbind()
         audioLoadScope?.job?.cancel()
         audioLoadScope = null
-        playbackAuthority = null
-        traversalBinding = null
-        val pending = preparation
-        preparation = null
+        if (starting || retireMedia) {
+            // Ordinary prepare I/O is tied to the installed source, not the retry scope.
+            // Keep reusable buffers only after the operation has left startup.
+            retireSource()
+            player.stop()
+        }
         pending?.result?.cancel()
     }
 
@@ -406,7 +438,7 @@ internal class Media3AudioExecutor(
         pause()
         binding = null
         endedBinding = null
-        blocked = false
+        terminalError = ""
         retireSource()
         player.stop()
         player.clearMediaItems()
@@ -423,17 +455,24 @@ internal class Media3AudioExecutor(
         checkThread()
         val duration = player.duration.takeIf { it != C.TIME_UNSET && it > 0 }?.div(1000.0) ?: 0.0
         return AudioFacts(binding = binding, elapsed = player.currentPosition.coerceAtLeast(0) / 1000.0,
-            duration = duration, isPlaying = player.isPlaying,
+            duration = duration, isPlaying = player.isPlaying && confirmingStart != generation,
             isBuffering = player.playbackState == Player.STATE_BUFFERING, isLoading = player.isLoading,
-            error = if (blocked) "blocked" else if (player.playerError != null) "media" else "",
+            error = terminalError.ifEmpty { if (player.playerError != null) "media" else "" },
             ended = binding != null && endedBinding == binding,
-            stoppedByRefusal = blocked && playbackAuthority == null && !player.playWhenReady && !player.isPlaying)
+            stoppedByRefusal = terminalError == "blocked" && playbackAuthority == null && !player.playWhenReady && !player.isPlaying)
     }
 
-    /** The service calls this only after an actual platform background-start refusal. */
+    private fun stopFailedStart(result: AudioResult, stage: String): AudioResult {
+        Log.w("SpofifyPlayer", "Playback $stage failed: result=$result state=${player.playbackState} " +
+            "playWhenReady=${player.playWhenReady} suppression=${player.playbackSuppressionReason} " +
+            "mediaErrorCode=${player.playerError?.errorCode ?: 0}")
+        pause(retireMedia = true)
+        terminalError = if (result == AudioResult.BLOCKED) "blocked" else "media"
+        return result
+    }
+
     fun backgroundStartBlocked() {
-        pause()
-        blocked = true
+        stopFailedStart(AudioResult.BLOCKED, "service-recovery")
         binding?.let { mutableObservations.tryEmit(AudioObservation(it, facts())) }
     }
 

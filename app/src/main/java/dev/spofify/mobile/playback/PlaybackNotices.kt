@@ -7,5 +7,11 @@ internal fun playbackNotice(view: PlaybackView): String? = when (view.connection
     PlaybackConnectionState.CONNECTING -> "Connecting playback"
     PlaybackConnectionState.DISCONNECTED -> "Reconnecting playback"
     PlaybackConnectionState.CLOSED -> "Playback unavailable"
-    PlaybackConnectionState.READY -> view.error
+    PlaybackConnectionState.READY -> playbackFailureNotice(view.playback?.error) ?: view.error
+}
+
+internal fun playbackFailureNotice(error: String?): String? = when (error) {
+    "blocked" -> "Audio output unavailable"
+    "media", "unavailable" -> "Audio unavailable"
+    else -> null
 }

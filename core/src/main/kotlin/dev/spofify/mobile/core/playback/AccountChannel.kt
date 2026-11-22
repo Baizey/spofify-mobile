@@ -38,7 +38,11 @@ class AccountChannel(private val transport: PlaybackTransport, audio: AudioExecu
     }
     private fun publish(s:AccountState){
         if(actual?.queue!==s.queue||actual?.cursor?.sameRun(s.cursor)!=true) n++
-        actual=s;val q=s.presentation();val c=s.cursor;val p=PlaybackStatus(0,n,0,"${c.chain}:${c.visit}",true,c.elapsed,q.duration,c.playing,false,false,"")
+        actual = s
+        val c = s.cursor
+        val error = replica.playbackError(c).takeIf { owner == own && own.isNotEmpty() }
+        val q = s.presentation().let { if (error == null) it else it.copy(isPlaying = false) }
+        val p = PlaybackStatus(0,n,0,"${c.chain}:${c.visit}",true,c.elapsed,q.duration,q.isPlaying,false,false,error.orEmpty())
         view.value=view.value.copy(connectionId=own,snapshot=PlaybackSnapshot(view.value.sessionId,n,0,q,p,devices.distinctBy{it.deviceId}.map{PlaybackDevice(it.deviceId,it.name,true,it.canPlay)},devices.find{it.id==owner}?.deviceId.orEmpty(),owner,null,0),playback=p)
     }
     private fun loseOutput(){handle="";deadline=0;detached=null;awaitingAttach=false;expired?.cancel();replica.output(false)}
@@ -81,7 +85,7 @@ class AccountChannel(private val transport: PlaybackTransport, audio: AudioExecu
         return send(v)
     }
     private fun action(type:String)=issue(fields("type" to type))
-    fun pause()=action("pause");fun resume()=action("resume");fun toggle()=if(actual?.cursor?.desired==true)pause()else resume()
+    fun pause()=action("pause");fun resume()=action("resume");fun toggle()=if(state.value.wantsPause)pause()else resume()
     fun next()=action("next");fun previous()=action("previous");fun stop()=action("close")
     fun seek(seconds:Double)=issue(fields("type" to "seek","value" to seconds));fun jump(key:Long)=issue(fields("type" to "jump","key" to key));fun remove(key:Long)=issue(fields("type" to "remove","key" to key));fun moveUpcoming(key:Long,after:Long?)=issue(fields("type" to "move","key" to key,"after" to (after?:0)))
     fun clearUpcoming()=action("clear");fun setShuffle(enabled:Boolean)=issue(fields("type" to "shuffle","shuffle" to enabled));fun toggleShuffle()=setShuffle(actual?.shuffle!=true);fun setRepeat(mode:String)=issue(fields("type" to "repeat","repeat" to mode));fun cycleRepeat()=setRepeat(LocalPlaybackQueue.nextRepeat(actual?.repeat))

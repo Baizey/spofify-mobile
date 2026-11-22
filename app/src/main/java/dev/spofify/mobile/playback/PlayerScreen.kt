@@ -141,9 +141,8 @@ internal fun FullPlayer(
                             TransportSlot(Modifier.weight(1f), "Previous song", SpofifyGlyph.Previous, ready) { controller.previous() }
                             Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
                                 FilledIconButton({ controller.toggle() }, Modifier.size(64.dp), enabled = ready, shape = CircleShape) {
-                                    val wantsPlay = state.queue?.desiredPlaying == true
-                                    SpofifyIcon(if (wantsPlay) SpofifyGlyph.Pause else SpofifyGlyph.Play,
-                                        if (wantsPlay) "Pause" else "Play")
+                                    SpofifyIcon(if (state.wantsPause) SpofifyGlyph.Pause else SpofifyGlyph.Play,
+                                        if (state.wantsPause) "Pause" else "Play")
                                 }
                             }
                             TransportSlot(Modifier.weight(1f), "Next song", SpofifyGlyph.Next, ready) { controller.next() }
@@ -159,7 +158,7 @@ internal fun FullPlayer(
                                 IconButton({ queue = true }, Modifier.size(48.dp)) { SpofifyIcon(SpofifyGlyph.Queue, "See queue") }
                             }
                         }
-                        state.queue?.error?.takeIf { it.isNotEmpty() && online == null }?.let { notice ->
+                        state.error?.let { notice ->
                             SelectionContainer {
                                 Text(notice, Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.error,
                                     style = MaterialTheme.typography.bodySmall)

@@ -27,17 +27,22 @@ internal class AudioLoadScope(
 
     val retryStarted = CompletableDeferred<Unit>()
 
-    // A prompt header response followed by a stalled body is still a stalled preparation.
-    // The first, ordinary load retains its existing Media3/HTTP timeouts.
-    suspend fun awaitPreparation(ready: Deferred<AudioResult>): AudioResult = select<AudioResult?> {
-        ready.onAwait { it }
-        retryStarted.onAwait { null }
-    } ?: withTimeoutOrNull(remainingPrepareRetryMs() ?: error("Still preparing")) { ready.await() } ?: AudioResult.MEDIA
+    // A sequence of successful reads can still fail to produce a playable sample. Bound the
+    // whole preparation as well as the shorter, existing deadline for retry/reopen work.
+    suspend fun awaitPreparation(ready: Deferred<AudioResult>): AudioResult =
+        withTimeoutOrNull(AUDIO_PREPARATION_TIMEOUT_MS) {
+            select<AudioResult?> {
+                ready.onAwait { it }
+                retryStarted.onAwait { null }
+            } ?: withTimeoutOrNull(remainingPrepareRetryMs() ?: error("Still preparing")) { ready.await() }
+        } ?: AudioResult.MEDIA
 
     // Never grant a new window per reopen, or change Core's authority deadline.
     fun remainingPrepareRetryMs(): Long? = if (playing) null else
         4_000L - (nowNanos() - startedNanos) / 1_000_000
 }
+
+internal const val AUDIO_PREPARATION_TIMEOUT_MS = 20_000L
 
 /** One installed progressive source. Ordinary buffered work survives healthy in-place seeks;
  * once an interruption belongs to a binding, never hand its period/task to another binding. */
