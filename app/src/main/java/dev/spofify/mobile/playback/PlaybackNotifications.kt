@@ -30,7 +30,25 @@ internal class PlaybackNotifications(
         mediaButtonPreferences: ImmutableList<CommandButton>,
         actionFactory: MediaNotification.ActionFactory,
         callback: MediaNotification.Provider.Callback,
-    ): MediaNotification = delegate.createNotification(session, mediaButtonPreferences, object : MediaNotification.ActionFactory by actionFactory {
+    ): MediaNotification = build(session, mediaButtonPreferences, actionFactory).also { notificationBuilt() }
+
+    // The default provider builds a real MediaStyle notification with the platform session token,
+    // reading the session's player directly (no notification controller or timeline mirror).
+    fun buildForBoundForeground(session: MediaSession): MediaNotification = build(session, ImmutableList.of(), null)
+
+    private fun build(
+        session: MediaSession,
+        mediaButtonPreferences: ImmutableList<CommandButton>,
+        fallback: MediaNotification.ActionFactory?,
+    ): MediaNotification = delegate.createNotification(session, mediaButtonPreferences, object : MediaNotification.ActionFactory {
+        override fun createCustomAction(
+            mediaSession: MediaSession, icon: IconCompat, title: CharSequence, customAction: String, extras: Bundle,
+        ): NotificationCompat.Action = checkNotNull(fallback).createCustomAction(mediaSession, icon, title, customAction, extras)
+
+        override fun createCustomActionFromCustomCommandButton(
+            mediaSession: MediaSession, customCommandButton: CommandButton,
+        ): NotificationCompat.Action = checkNotNull(fallback).createCustomActionFromCustomCommandButton(mediaSession, customCommandButton)
+
         override fun createMediaAction(
             mediaSession: MediaSession, icon: IconCompat, title: CharSequence, command: Int,
         ): NotificationCompat.Action = NotificationCompat.Action(icon, title, createMediaActionPendingIntent(mediaSession, command))
@@ -44,7 +62,7 @@ internal class PlaybackNotifications(
         // Media3's late artwork callback bypasses onUpdateNotificationAsync's authority/admission
         // gate. Refresh instead: the default provider now has the loaded bitmap in its cache.
         artworkLoaded(session)
-    }.also { notificationBuilt() }
+    }
 
     private fun controlIntent(session: MediaSession, command: Int, dismissal: Boolean = false): PendingIntent {
         val token = controlToken(session)

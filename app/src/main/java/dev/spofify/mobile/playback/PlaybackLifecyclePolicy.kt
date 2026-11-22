@@ -82,6 +82,19 @@ internal fun hasPendingNativePlayback(facts: AudioFacts, localPlayWhenReady: Boo
 
 internal const val PLAYBACK_SERVICE_ADMISSION_TIMEOUT_MS = 5_000L
 
+/** The mirrored notification controller cannot be allowed to remove the focus prerequisite. */
+internal fun usesBoundPlaybackNotification(api: Int, hasAdmission: Boolean, foregroundRequired: Boolean): Boolean =
+    api >= 35 && (hasAdmission || foregroundRequired)
+
+/** A rejected control cannot stop the started lifetime used for task-removal cleanup. */
+internal fun shouldStopRejectedPlaybackStart(foreground: Boolean, ownsStartedLifetime: Boolean): Boolean =
+    !foreground && !ownsStartedLifetime
+
+/** Retire dormant legacy FGS starts without demoting an already owned replacement. */
+internal fun shouldDelegateLegacyPlaybackSelfStart(
+    api: Int, matchesInstance: Boolean, foreground: Boolean, ownsStartedLifetime: Boolean,
+): Boolean = (matchesInstance || !foreground) && !(api >= 35 && ownsStartedLifetime)
+
 /** The platform can acknowledge promotion before a suspended play consumes it. Recheck the live lease. */
 internal suspend fun awaitPlaybackServiceAdmission(promoted: Deferred<Boolean>, stillAdmitted: () -> Boolean): Boolean =
     withTimeoutOrNull(PLAYBACK_SERVICE_ADMISSION_TIMEOUT_MS) { promoted.await() } == true && stillAdmitted()

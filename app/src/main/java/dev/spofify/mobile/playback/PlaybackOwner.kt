@@ -48,9 +48,16 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
             service = instance
             instance.attach(session)
             reconcileServiceFor(p)
-            // A trusted controller may already have registered this MediaSession with Media3.
-            // In that case attach() won't cause a fresh notification-controller callback.
-            if (attachment === this) instance.triggerNotificationUpdate()
+            if (attachment !== this) return
+            if (Build.VERSION.SDK_INT >= 35) {
+                // First play and one-shot playing recovery cannot depend on the state of Media3's
+                // asynchronous notification controller for this newly attached player.
+                instance.promoteBoundPlayback(session)
+            } else {
+                // A trusted controller may already have registered this MediaSession with Media3.
+                // In that case attach() won't cause a fresh notification-controller callback.
+                instance.triggerNotificationUpdate()
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName) = loseAttachment(this)
@@ -206,14 +213,14 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         request.recoveryUsed = false
         // Android 15+ may deny ExoPlayer's focus request unless the app is top or already an FGS.
         // Do not optimistically set playWhenReady just to coax Media3 into foreground.
-        if (Build.VERSION.SDK_INT < 35 || request.service?.hasMediaForeground() == true) return true
+        if (Build.VERSION.SDK_INT < 35) return true
         val pending = CompletableDeferred<Boolean>()
         val previous = request.admission
         request.admission = pending
         previous?.complete(false)
         var admitted = false
         try {
-            request.service?.triggerNotificationUpdate()
+            request.service?.promoteBoundPlayback(session)
             admitted = awaitPlaybackServiceAdmission(pending) {
                 // A recovery may move this exact ticket to a new instance. A retired request or a
                 // different play may not consume the old success, even on the same MediaSession.
@@ -278,8 +285,8 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         attachment?.let(::retireAttachment)
         val request = Attachment(session, afterLoss, admission)
         attachment = request
-        // Binding creates no Android foreground-start obligation. Media3 requests its own FGS
-        // only once it has a real media notification and promotes synchronously with that request.
+        // Binding creates no Android foreground-start obligation. On Android 15+ we promote
+        // the bound instance immediately with a real notification, before requesting audio focus.
         val bound = try {
             app.bindService(Intent(app, PlaybackService::class.java).setAction(PlaybackService.ATTACH_LOCAL),
                 request, Context.BIND_AUTO_CREATE)
@@ -319,6 +326,7 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
             p.music.observeQueue(view.view)
             if (shouldStopPlaybackService(view.view, facts, p.audio.player.playWhenReady)) stopServiceFor(p)
         } else if (facts.error.isNotEmpty() && !facts.isPlaying && !p.audio.player.playWhenReady) stopServiceFor(p)
+        attachment?.takeIf { it.session === p.mediaSession }?.let { it.service?.reconcileBoundPlayer(it.session) }
     }
     private fun stopServiceFor(player: NativePlayer) {
         attachment?.takeIf { it.session === player.mediaSession }?.let(::retireAttachment)

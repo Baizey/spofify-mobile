@@ -12,6 +12,27 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackServiceAdmissionTest {
+    @Test fun modernAdmissionPinsTheNotificationWithoutAnObserverForegroundRequest() {
+        assertTrue(usesBoundPlaybackNotification(api = 35, hasAdmission = true, foregroundRequired = false))
+        assertTrue(usesBoundPlaybackNotification(api = 36, hasAdmission = true, foregroundRequired = false))
+        assertTrue(usesBoundPlaybackNotification(api = 36, hasAdmission = false, foregroundRequired = true))
+        assertFalse(usesBoundPlaybackNotification(api = 36, hasAdmission = false, foregroundRequired = false))
+        assertFalse(usesBoundPlaybackNotification(api = 34, hasAdmission = false, foregroundRequired = true))
+    }
+
+    @Test fun rejectingStaleControlsDoesNotStopThePausedAttachmentsStartedLifetime() {
+        assertFalse(shouldStopRejectedPlaybackStart(foreground = false, ownsStartedLifetime = true))
+        assertFalse(shouldStopRejectedPlaybackStart(foreground = true, ownsStartedLifetime = false))
+        assertTrue(shouldStopRejectedPlaybackStart(foreground = false, ownsStartedLifetime = false))
+    }
+
+    @Test fun legacyStaleStartCleanupCannotDemoteTheReplacement() {
+        assertTrue(shouldDelegateLegacyPlaybackSelfStart(34, matchesInstance = false, foreground = false, ownsStartedLifetime = false))
+        assertFalse(shouldDelegateLegacyPlaybackSelfStart(34, matchesInstance = false, foreground = true, ownsStartedLifetime = false))
+        assertTrue(shouldDelegateLegacyPlaybackSelfStart(34, matchesInstance = true, foreground = true, ownsStartedLifetime = false))
+        assertFalse(shouldDelegateLegacyPlaybackSelfStart(36, matchesInstance = false, foreground = false, ownsStartedLifetime = true))
+    }
+
     @Test fun initialPlayWaitsForPromotionNotJustServiceAttachment() = runTest {
         val promotion = CompletableDeferred<Boolean>()
         val play = async { awaitPlaybackServiceAdmission(promotion) { true } }
