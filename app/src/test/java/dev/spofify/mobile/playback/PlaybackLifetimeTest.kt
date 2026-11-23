@@ -148,7 +148,7 @@ class PlaybackLifetimeTest {
             assertTrue(h.controller.state.value.offline)
             assertFalse(h.controller.state.value.isPlaying)
             assertFalse(h.controller.state.value.desiredPlaying)
-            assertNull(h.controller.state.value.current)
+            assertEquals("track", h.controller.state.value.current?.id)
             assertEquals(0, h.audio.executions)
             assertTrue(h.transport.sockets.single().commands().isEmpty())
         }

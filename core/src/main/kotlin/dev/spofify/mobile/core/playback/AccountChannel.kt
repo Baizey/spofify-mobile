@@ -249,6 +249,13 @@ class AccountChannel(
     }
 
     private fun detach(replaced: Boolean) {
+        val fallback = if (!replaced && online && !isOwner()) {
+            // One queue per account: a controller keeps the latest confirmed shared
+            // traversal, never its old isolated queue or an optimistic prediction.
+            val measured = actual?.takeIf { it.matches(confirmed.cursor) }
+            confirmed.presentation(elapsedMs = measured?.positionMs ?: confirmed.cursor.positionMs)
+                .copy(desiredPlaying = false)
+        } else null
         if (isOwner() && !replaced && !nativeAhead()) detached = Detached(sessionId, owner.generation, revision, confirmed.cursor.occurrence)
         // Do not smuggle an unconfirmed/rejected online transition back as detached progress.
         if (replaced || nativeAhead()) detached = null
@@ -267,6 +274,7 @@ class AccountChannel(
         error = null
         connectionId = ""
         connection = PlaybackConnectionState.DISCONNECTED
+        fallback?.let { engine.adopt(it, execute = false) }
         publish()
         listeners.toList().forEach { it(null) }
     }

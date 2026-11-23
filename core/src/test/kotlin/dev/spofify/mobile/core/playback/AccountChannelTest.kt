@@ -146,7 +146,40 @@ class AccountChannelTest {
         f.disconnect()
         advanceTimeBy(11_000); runCurrent()
         assertTrue(f.view.offline)
-        assertNull(f.view.current)
+        assertEquals(1L, f.view.current?.key)
+        assertFalse(f.view.isPlaying)
+    }
+
+    @Test fun followerKeepsConfirmedSharedQueuePausedOnLossOrExplicitOffline() = runTest {
+        for (manual in listOf(false, true)) {
+            val f = Fixture(this)
+            f.channel.playTrack(PlaybackTrackReference("duplicate")); runCurrent()
+            val isolated = f.audio.starts.single()
+            f.connect()
+            val b = rows.first().copy(id = "shared-b", key = 71)
+            val c = rows.last().copy(id = "shared-c", key = 72)
+            val cursor = AccountCursor(71, "shared-visit", 4_000, true)
+            f.snapshot(AccountState(listOf(b, c), cursor, "one", true), owner = "other",
+                observation = AccountObservation(71, "shared-visit", 6_500, f.clock.wallTimeMs(), "playing"))
+            assertFalse(f.audio.facts.isPlaying)
+            assertEquals(isolated, f.audio.starts.single())
+            f.channel.jump(72)
+            assertEquals("shared-c", f.view.current?.id)
+            if (manual) { f.channel.setOffline(true); runCurrent() } else f.disconnect()
+            assertEquals("shared-b", f.view.current?.id)
+            assertEquals(listOf(b, c), f.view.queue)
+            assertEquals("one", f.view.snapshot?.state?.repeat)
+            assertTrue(f.view.snapshot?.state?.shuffle == true)
+            assertEquals(6.5, f.view.playback?.elapsed ?: -1.0, 0.0001)
+            assertFalse(f.view.desiredPlaying)
+            assertFalse(f.view.isPlaying)
+            assertEquals(1, f.audio.starts.size)
+            assertTrue(f.channel.resume()); runCurrent()
+            assertEquals(listOf(0.0, 6.5), f.audio.seeks)
+            assertEquals("shared-b", f.audio.starts.last().trackId)
+            assertTrue(f.view.isPlaying)
+            f.channel.close()
+        }
     }
 
     @Test fun sameDeviceReconnectDoesNotRestartOrStopPlayingAndRefreshIsBoundToNewSocket() = runTest {
