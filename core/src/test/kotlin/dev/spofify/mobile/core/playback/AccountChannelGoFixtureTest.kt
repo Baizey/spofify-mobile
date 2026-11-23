@@ -71,9 +71,12 @@ class AccountChannelGoFixtureTest {
                 assertEquals(following.snapshot!!.outputVersion + 1, local.snapshot?.outputVersion)
                 assertEquals(remote.snapshot?.state?.occurrence?.eventId, local.snapshot?.state?.occurrence?.eventId)
                 assertEquals(1, audio.starts)
-                // Keep the real binding alive through several report samples so the peer can
-                // verify follower sound is remote. The runner also asserts the wire evidence.
-                delay(1_000)
+                // The paired Rust peer writes this only after checking demotion, Android
+                // Playing, and silence of its own PCM output. Keep reporting until it does.
+                val control = Path.of(requireNotNull(System.getenv("CROSS_NATIVE_CONTROL")))
+                withTimeout(8_000) {
+                    while (!Files.isRegularFile(control.resolve("cross-rust-asserted"))) delay(25)
+                }
                 return@runBlocking
             }
             val (owner, ownerAudio) = phone("Fixture phone A", first)

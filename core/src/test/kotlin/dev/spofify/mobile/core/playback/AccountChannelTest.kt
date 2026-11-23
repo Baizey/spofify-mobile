@@ -369,6 +369,21 @@ class AccountChannelTest {
         assertEquals(first.occurrence, f.view.snapshot?.state?.occurrence?.eventId)
     }
 
+    @Test fun seekBeyondFractionalDurationRoundsToServerMillisecondAndExecutesOnce() = runTest {
+        val f = Fixture(this)
+        val short = rows.first().copy(duration = 1.001)
+        f.connect(); f.snapshot(AccountState(listOf(short), first, "off", false))
+        f.channel.seek(5.0); val seek = f.socket.commands().single()
+        f.execute(seek)
+        val applied = f.socket.sent.flatMap { it["settlements"]?.jsonArray.orEmpty() }.single().jsonObject
+        val sought = playbackJson.decodeFromJsonElement<AccountCursor>(applied.getValue("cursor"))
+        assertEquals(1_001L, sought.positionMs)
+        assertEquals(1_001L, playbackPositionMs(f.audio.seeks.last())) // Also used by Media3.
+        f.delta(2, AccountDelta(cursor = sought), seek)
+        f.result(seek, "applied", 2)
+        assertEquals(listOf(0.0, 1.001), f.audio.seeks)
+    }
+
     @Test fun eofSeenBeforeSeekDispatchIsReportedBeforeStaleWithoutReloadingEndedRecording() = runTest {
         val f = Fixture(this)
         f.connect(); f.snapshot()

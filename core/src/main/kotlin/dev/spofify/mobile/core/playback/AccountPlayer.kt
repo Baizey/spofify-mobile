@@ -1,5 +1,6 @@
 package dev.spofify.mobile.core.playback
 
+import kotlin.math.roundToLong
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 
@@ -17,7 +18,10 @@ internal fun addressableAccountChoice(action: JsonObject): Boolean {
 internal val JsonObject.kind get() = getValue("type").jsonPrimitive.content
 internal fun JsonObject.long(name: String) = getValue(name).jsonPrimitive.long
 internal fun JsonObject.string(name: String) = getValue(name).jsonPrimitive.content
-internal fun secondsMs(seconds: Double): Long = (seconds * 1_000).toLong().coerceIn(0L, MAX_SAFE_INTEGER)
+/** Canonical nonnegative playback position used by v3 and the native seek API. */
+fun playbackPositionMs(seconds: Double): Long = if (seconds.isNaN()) 0L
+    else (seconds * 1_000).roundToLong().coerceIn(0L, MAX_SAFE_INTEGER)
+internal fun secondsMs(seconds: Double): Long = playbackPositionMs(seconds)
 internal fun Long.seconds() = this / 1_000.0
 
 @Serializable internal data class AccountOwner(val generation: Long, val deviceId: String? = null)

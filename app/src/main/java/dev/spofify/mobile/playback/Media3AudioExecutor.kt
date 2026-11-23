@@ -208,7 +208,7 @@ internal class Media3AudioExecutor(
             require(elapsed.isFinite() && elapsed >= 0)
             val owner = AudioLoadScope(track.id, authorized = isAuthorized)
             audioLoadScope = owner
-            val position = (elapsed * 1000).toLong()
+            val position = playbackPositionMs(elapsed)
             val wait = NativePreparation(token, next, track.id, position, playRequested)
             preparation = wait
             val replaceNetwork = source?.usingNetwork == true &&
