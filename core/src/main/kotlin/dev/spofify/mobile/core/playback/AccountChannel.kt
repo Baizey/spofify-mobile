@@ -36,6 +36,7 @@ class AccountChannel(
     private var confirmed = AccountState.Empty
     private var actual: AccountObservation? = null
     private var nativeCursor = AccountCursor.Empty
+    private var exhaustedVisit: Pair<String, Long>? = null
     private var nativeFact: AccountObservation? = null
     private var nativeRevision = 0L
     private var execution = 0L
@@ -47,7 +48,6 @@ class AccountChannel(
     private var transportCommit: ConditionalExecution? = null
     private data class ClaimReconciliation(val id: String, val cursor: AccountCursor, val sentAt: Long)
     private var claimReconciliation: ClaimReconciliation? = null
-    private var executeAfterClaim: JsonObject? = null
     private var localAction = 0L
     private val handledExecutions = linkedSetOf<String>()
     private fun nativeAhead() = advancing != null || transportCommit != null || claimReconciliation != null
@@ -288,15 +288,16 @@ class AccountChannel(
         val previouslyOwner = isOwner()
         val old = confirmed
         val awaitingClaim = claimReconciliation
-        val deferredExecute = executeAfterClaim
-        executeAfterClaim = null
         val reconciledClaim = awaitingClaim?.cursor == next.cursor
         val generationChanged = nextSession != sessionId || nextOwner.generation != owner.generation
         val local = localQueue()
         // The matching snapshot, not the hello alone, proves what was accepted. An operation
         // started after hello (e.g. an isolated seek) isn't covered by that acknowledgement.
         val acceptedClaim = nextOwner.deviceId == deviceId && !previouslyOnline && localAtHello?.state?.cursor == next.cursor
-        val retained = acceptedClaim && local.cursor.key != 0L && local.cursor.sameVisit(next.cursor) &&
+        val localFailure = engine.state.value.error
+        val retainedFailure = acceptedClaim && localFailure.isNotEmpty() && local.cursor.sameVisit(next.cursor) &&
+            localAction == localAtHello.action
+        val retained = retainedFailure || acceptedClaim && local.cursor.key != 0L && local.cursor.sameVisit(next.cursor) &&
             local.cursor.desiredPlaying == next.cursor.desiredPlaying &&
             (local.cursor == next.cursor || localAtHello.binding == engine.operationBinding() && localAction == localAtHello.action)
         // Intentionally compare row identity and order, not server-rebuilt display metadata.
@@ -313,6 +314,7 @@ class AccountChannel(
             }
             clearExecution()
             handledExecutions.clear()
+            exhaustedVisit = null
             if (nextSession != sessionId) projection.resetCollections()
         }
         devices = roster
@@ -375,11 +377,11 @@ class AccountChannel(
             if (execution != operation || !isOwner()) return
             if (buffered.isNotEmpty()) { sendAdvance(); return }
             engine.adopt(next.presentation().let { if (keep) it.copy(elapsed = local.cursor.positionMs.seconds(),
-                isPlaying = engine.state.value.isPlaying, error = engine.state.value.error) else it }, !keep)
+                isPlaying = engine.state.value.isPlaying, error = localFailure,
+                desiredPlaying = it.desiredPlaying && localFailure.isEmpty()) else it }, !keep)
             if (keep) syncLocalMeasurements()
         }
         publish()
-        deferredExecute?.let(::conditionalTransport)
     }
 
     private fun syncLocalMeasurements() {
@@ -419,39 +421,47 @@ class AccountChannel(
         if (!isOwner() || desynced || m.long("generation") != owner.generation) return
         val orderedAt = m.long("revision")
         if (orderedAt > revision) { requestSync(); return }
-        if (claimReconciliation != null) {
-            // The corrective/committed snapshot is the only authority on whether our
-            // local run survived. Never evaluate or report an execute against it early.
-            if (executeAfterClaim == null) executeAfterClaim = m
-            return
-        }
         val c = m.decode<AccountCommand>("command")
         val action = c.action.kind
         if (action !in CONDITIONAL_ACTIONS || c.id in handledExecutions) return
         handledExecutions += c.id
         if (handledExecutions.size > MAX_PENDING) handledExecutions.remove(handledExecutions.first())
-        // EOF notifications and wire commands share this looper, but the native facts can
-        // indicate EOF before its observation collector has resumed. Settle against reality.
-        engine.consumeNativeEnd()
-        if (!isOwner() || desynced) return
+        // Go's in-flight execute wins this conflict and its claim repair is held until
+        // execution settles. Do not report or use the provisional claim's measurements.
+        val outgoingClaim = claimReconciliation
+        val displacedClaim = outgoingClaim != null
+        if (displacedClaim) {
+            claimReconciliation = null
+            advances.clear()
+            nativeFact = null
+        } else {
+            // Native facts can indicate EOF before the observation collector has resumed.
+            engine.consumeNativeEnd()
+            if (!isOwner() || desynced) return
+        }
         val old = nativeCursor
-        val q = engine.state.value
+        val q = if (displacedClaim) confirmed.presentation() else engine.state.value
         val row = if (action == "next") LocalPlaybackQueue.successor(q, naturalEnd = false)?.let(q.queue::get) else null
         if (old.key == 0L || c.basis.occurrence != old.occurrence || c.basis.key?.let { it != old.key } == true || nativeAhead() ||
+            displacedClaim && !old.sameVisit(confirmed.cursor) ||
+            exhaustedVisit?.let { (visit, at) -> visit == old.occurrence && orderedAt < at } == true ||
             action == "next" && c.basis.successorKey != (row?.key ?: 0L)) {
             queueSettlement(c.id, "stale")
-            report(nativeFact ?: newObservation(old, AudioFacts(elapsed = q.elapsed, isLoading = old.desiredPlaying)),
+            if (displacedClaim) claimReconciliation = outgoingClaim
+            val reportedCursor = if (displacedClaim) confirmed.cursor else old
+            report(nativeFact ?: newObservation(reportedCursor, AudioFacts(elapsed = q.elapsed, isLoading = reportedCursor.desiredPlaying)),
                 reflectedRevision = revision, settlementOnly = true)
             return
         }
-        val elapsed = engine.sampleCurrent()?.elapsed ?: q.elapsed
+        val elapsed = if (displacedClaim) q.elapsed else engine.sampleCurrent()?.elapsed ?: q.elapsed
+        val sourceCursor = if (displacedClaim) confirmed.cursor else old
         val to = when {
             action == "seek" -> {
                 val duration = q.current?.duration?.takeIf { it > 0 }?.let(::secondsMs)
                 val requested = c.action.long("positionMs")
-                old.copy(positionMs = duration?.let { minOf(requested, it) } ?: requested)
+                sourceCursor.copy(positionMs = duration?.let { minOf(requested, it) } ?: requested)
             }
-            row == null -> old.copy(positionMs = secondsMs(elapsed), desiredPlaying = false)
+            row == null -> sourceCursor.copy(positionMs = secondsMs(elapsed), desiredPlaying = false)
             else -> AccountCursor(row.key, UUID.randomUUID().toString(), 0, true)
         }
         transportCommit = ConditionalExecution(c.id, to)
@@ -497,6 +507,7 @@ class AccountChannel(
         val stale = command != null && action in setOf("previous", "pause", "resume") && source != nativeCursor.occurrence
         if (matchingAdvance) {
             advances.removeFirst()
+            if (predicted?.toKey == 0L) exhaustedVisit = predicted.fromOccurrence to revision
             nativeRevision = revision
             if (command != null && stale) queueSettlement(command.id, "stale")
             if (advances.isEmpty()) {
@@ -531,7 +542,6 @@ class AccountChannel(
         advances.clear()
         transportCommit = null
         claimReconciliation = null
-        executeAfterClaim = null
         nativeFact = null
         nativeRevision = revision
         nativeCursor = next
@@ -585,7 +595,6 @@ class AccountChannel(
         executing = null
         transportCommit = null
         claimReconciliation = null
-        executeAfterClaim = null
         settlements.clear()
         ++execution
     }

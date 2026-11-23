@@ -525,7 +525,7 @@ class AccountChannelTest {
         assertTrue(f.socket.sent.none { it.kind == "reconcileClaim" })
     }
 
-    @Test fun queuedExecuteWaitsForClaimCorrectionAndCannotPublishUnacceptedPosition() = runTest {
+    @Test fun queuedExecuteSettlesBeforeClaimCorrectionWithoutPublishingUnacceptedPosition() = runTest {
         val f = Fixture(this)
         f.channel.playTrack(PlaybackTrackReference("duplicate")); runCurrent()
         f.connect()
@@ -535,15 +535,35 @@ class AccountChannelTest {
         val remote = AccountCommand("other:1", WALL, AccountBasis("room", 1, 1,
             submitted.cursor.occurrence, submitted.cursor.key, 2), fields("type" to "next"))
         f.execute(remote)
-        assertTrue(f.socket.sent.none { it.kind == "report" })
-        f.snapshot(submitted)
         assertEquals(listOf(0.0, 11.0, 0.0), f.audio.seeks)
         assertTrue(f.socket.sent.filter { it.kind == "report" }.all {
             it.getValue("observation").jsonObject.long("positionMs") != 11_000L
         })
         val applied = f.socket.sent.flatMap { it["settlements"]?.jsonArray.orEmpty() }.single().jsonObject
         assertEquals("applied", applied.string("status"))
-        assertEquals(2L, applied.getValue("cursor").jsonObject.long("key"))
+        val cursor = playbackJson.decodeFromJsonElement<AccountCursor>(applied.getValue("cursor"))
+        assertEquals(2L, cursor.key)
+        f.delta(2, AccountDelta(cursor = cursor), remote)
+        f.snapshot(submitted.copy(cursor = cursor), revision = 2)
+        assertEquals(listOf(0.0, 11.0, 0.0), f.audio.seeks)
+        assertEquals(2L, f.view.current?.key)
+    }
+
+    @Test fun failureAfterHelloDoesNotAutomaticallyRetryTheGrantedVisit() = runTest {
+        val f = Fixture(this)
+        val gate = CompletableDeferred<Unit>()
+        f.audio.readyGate = gate
+        f.audio.refusal = true
+        f.channel.playTrack(PlaybackTrackReference("duplicate")); runCurrent()
+        f.connect()
+        val submitted = requireNotNull(f.claims.last())
+        gate.complete(Unit); runCurrent()
+        f.snapshot(submitted)
+        assertEquals(1, f.audio.starts.size)
+        assertTrue(f.view.localOutput)
+        assertFalse(f.view.isPlaying)
+        assertEquals("failed", f.socket.report().getValue("observation").jsonObject.string("status"))
+        assertTrue(f.socket.sent.none { it.kind == "reconcileClaim" })
     }
 
     @Test fun staleCursorReconciliationRevertsOnlyToCanonicalSnapshotWithoutRetry() = runTest {
