@@ -582,6 +582,28 @@ class AccountChannelTest {
         assertEquals(2L, f.view.current?.key)
     }
 
+    @Test fun claimRepairAfterNextEchoDoesNotReloadNativeSuccessorAlreadyStartedByEof() = runTest {
+        val f = Fixture(this)
+        f.channel.playTrack(PlaybackTrackReference("duplicate")); runCurrent()
+        f.connect()
+        val submitted = requireNotNull(f.claims.last())
+        f.channel.seek(11.0); runCurrent()
+        f.snapshot(submitted)
+        val remote = AccountCommand("other:1", WALL, AccountBasis("room", 1, 1,
+            submitted.cursor.occurrence, submitted.cursor.key, 2), fields("type" to "next"))
+        f.execute(remote)
+        val cursor = playbackJson.decodeFromJsonElement<AccountCursor>(
+            f.socket.report().getValue("settlements").jsonArray.single().jsonObject.getValue("cursor"))
+        f.audio.eof(42.0); runCurrent() // B stops at the tail before its Next echo arrives.
+        assertTrue(f.socket.sent.none { it.containsKey("advance") })
+        f.delta(2, AccountDelta(cursor = cursor), remote)
+        f.snapshot(submitted.copy(cursor = cursor), revision = 2) // Claim repair immediately follows echo.
+        f.delta(3, AccountDelta(cursor = cursor.copy(desiredPlaying = false)))
+        assertEquals(listOf(0.0, 11.0, 0.0), f.audio.seeks)
+        assertFalse(f.view.isPlaying)
+        assertEquals(1, f.socket.sent.count { it.containsKey("advance") })
+    }
+
     @Test fun failureAfterHelloDoesNotAutomaticallyRetryTheGrantedVisit() = runTest {
         val f = Fixture(this)
         val gate = CompletableDeferred<Unit>()

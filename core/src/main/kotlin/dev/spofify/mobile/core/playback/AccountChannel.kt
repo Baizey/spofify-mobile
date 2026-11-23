@@ -48,6 +48,7 @@ class AccountChannel(
     private var transportCommit: ConditionalExecution? = null
     private data class ClaimReconciliation(val id: String, val cursor: AccountCursor, val sentAt: Long)
     private var claimReconciliation: ClaimReconciliation? = null
+    private var claimRepairFollowsCommit = false
     private var localAction = 0L
     private val handledExecutions = linkedSetOf<String>()
     private fun nativeAhead() = advancing != null || transportCommit != null || claimReconciliation != null
@@ -298,6 +299,12 @@ class AccountChannel(
         val awaitingClaim = claimReconciliation
         val reconciledClaim = awaitingClaim?.cursor == next.cursor
         val generationChanged = nextSession != sessionId || nextOwner.generation != owner.generation
+        // Go orders this repair after the conditional echo, before any held commands.
+        // It reaffirms the just-committed visit, not a rejection of the successor EOF
+        // that this client could only report after receiving that echo.
+        val reaffirmedCommit = claimRepairFollowsCommit && transportCommit == null && !generationChanged &&
+            nextRevision == revision && next.cursor == old.cursor
+        claimRepairFollowsCommit = false
         val local = localQueue()
         // The matching snapshot, not the hello alone, proves what was accepted. An operation
         // started after hello (e.g. an isolated seek) isn't covered by that acknowledgement.
@@ -343,7 +350,7 @@ class AccountChannel(
         val existingVisit = nativeCursor
         val awaitingTransport = transportCommit
         val committedTransport = awaitingTransport?.cursor == next.cursor
-        val buffered = if (reconciledClaim) advances.toList() else emptyList()
+        val buffered = if (reconciledClaim || reaffirmedCommit) advances.toList() else emptyList()
         advances.clear()
         advances.addAll(buffered)
         transportCommit = null
@@ -473,6 +480,7 @@ class AccountChannel(
             else -> AccountCursor(row.key, UUID.randomUUID().toString(), 0, true)
         }
         transportCommit = ConditionalExecution(c.id, to)
+        claimRepairFollowsCommit = displacedClaim
         nativeCursor = to
         nativeRevision = revision
         nativeFact = null
@@ -603,6 +611,7 @@ class AccountChannel(
         executing = null
         transportCommit = null
         claimReconciliation = null
+        claimRepairFollowsCommit = false
         settlements.clear()
         ++execution
     }
@@ -692,6 +701,7 @@ class AccountChannel(
     }
     private fun sendAdvance() {
         val head = advances.firstOrNull() ?: return
+        if (head.sentAt != null) return
         head.observation?.let {
             head.sentAt = clock.monotonicMs()
             report(it, head.advance)
