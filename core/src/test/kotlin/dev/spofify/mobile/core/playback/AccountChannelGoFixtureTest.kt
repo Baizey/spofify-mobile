@@ -87,8 +87,8 @@ class AccountChannelGoFixtureTest {
             controller.await { it.snapshot?.state?.occurrence?.eventId == visit && it.isPlaying }
             val oldBinding = requireNotNull(ownerAudio.facts().binding)
             assertTrue(controller.seek(8.0))
-            owner.await { it.isPlaying && it.playback?.let { p -> p.elapsed >= 8 && p.eventId == visit } == true }
-            controller.await { it.isPlaying && it.playback?.let { p -> p.elapsed >= 8 && p.eventId == visit } == true }
+            owner.await("owner applied Seek") { it.isPlaying && it.playback?.let { p -> p.elapsed >= 8 && p.eventId == visit } == true }
+            controller.await("follower observed Seek") { it.isPlaying && it.playback?.let { p -> p.elapsed >= 8 && p.eventId == visit } == true }
             assertEquals(2, ownerAudio.starts)
             ownerAudio.lateEof(oldBinding) // A callback from the invalidated pre-Seek binding.
             yield()
@@ -104,13 +104,15 @@ class AccountChannelGoFixtureTest {
                     assertTrue(controller.seek(14.0))
                     withTimeout(4_000) { while (!Files.exists(entered)) delay(5) }
                     ownerAudio.finish() // Repeat the same row before its original visit can receive execute.
-                    owner.await { it.isPlaying && it.snapshot?.state?.occurrence?.eventId != visit }
-                    val repeated = controller.await { it.isPlaying && it.snapshot?.state?.occurrence?.eventId != visit }
+                    owner.await("owner naturally repeated before held Seek") { it.isPlaying && it.snapshot?.state?.occurrence?.eventId != visit }
+                    val repeated = controller.await("follower saw authoritative repeat before held Seek") {
+                        it.snapshot?.state?.occurrence?.eventId != visit && it.current?.key?.let(::isPublishedQueueKey) == true
+                    }
                     val newVisit = requireNotNull(repeated.snapshot?.state?.occurrence).eventId
                     assertEquals(3, ownerAudio.starts)
                     assertTrue(requireNotNull(repeated.playback).elapsed < 14.0)
                     Files.delete(entered)
-                    owner.await { it.isPlaying && it.snapshot?.state?.occurrence?.eventId == newVisit }
+                    owner.await("owner kept repeated visit after late Seek") { it.isPlaying && it.snapshot?.state?.occurrence?.eventId == newVisit }
                     visit = newVisit
                 } finally {
                     Files.deleteIfExists(entered)
@@ -154,7 +156,8 @@ class AccountChannelGoFixtureTest {
         }
     }
 
-    private suspend fun AccountChannel.await(predicate: (PlaybackView) -> Boolean) = withTimeout(10_000) { state.first(predicate) }
+    private suspend fun AccountChannel.await(label: String = "expected playback state", predicate: (PlaybackView) -> Boolean): PlaybackView =
+        withTimeoutOrNull(10_000) { state.first(predicate) } ?: error("Timed out: $label (${state.value.connection})")
 
     private class FixtureAudio : AudioExecutor {
         override val observations = MutableSharedFlow<AudioObservation>(extraBufferCapacity = 16)
