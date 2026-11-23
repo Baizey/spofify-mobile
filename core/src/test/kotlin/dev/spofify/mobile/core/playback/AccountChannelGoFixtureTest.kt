@@ -83,8 +83,44 @@ class AccountChannelGoFixtureTest {
             controller.await { !it.localOutput && it.snapshot?.selectedDeviceId == first }
             assertTrue(controller.playTrack(reference))
             val playing = owner.await { it.current?.id == track && it.isPlaying }
-            val visit = requireNotNull(playing.snapshot?.state?.occurrence).eventId
+            var visit = requireNotNull(playing.snapshot?.state?.occurrence).eventId
             controller.await { it.snapshot?.state?.occurrence?.eventId == visit && it.isPlaying }
+            val oldBinding = requireNotNull(ownerAudio.facts().binding)
+            assertTrue(controller.seek(8.0))
+            owner.await { it.isPlaying && it.playback?.let { p -> p.elapsed >= 8 && p.eventId == visit } == true }
+            controller.await { it.isPlaying && it.playback?.let { p -> p.elapsed >= 8 && p.eventId == visit } == true }
+            assertEquals(2, ownerAudio.starts)
+            ownerAudio.lateEof(oldBinding) // A callback from the invalidated pre-Seek binding.
+            yield()
+            assertEquals(2, ownerAudio.starts)
+
+            System.getenv("CROSS_NATIVE_CONTROL")?.let { control ->
+                assertTrue(controller.setRepeat("one"))
+                owner.await { it.snapshot?.state?.repeat == "one" }
+                val hold = Path.of(control, "hold.out.$first.execute")
+                val entered = Path.of(control, "entered.out.$first.execute")
+                Files.createFile(hold)
+                try {
+                    assertTrue(controller.seek(14.0))
+                    withTimeout(4_000) { while (!Files.exists(entered)) delay(5) }
+                    ownerAudio.finish() // Repeat the same row before its original visit can receive execute.
+                    owner.await { it.isPlaying && it.snapshot?.state?.occurrence?.eventId != visit }
+                    val repeated = controller.await { it.isPlaying && it.snapshot?.state?.occurrence?.eventId != visit }
+                    val newVisit = requireNotNull(repeated.snapshot?.state?.occurrence).eventId
+                    assertEquals(3, ownerAudio.starts)
+                    assertTrue(requireNotNull(repeated.playback).elapsed < 14.0)
+                    Files.delete(entered)
+                    owner.await { it.isPlaying && it.snapshot?.state?.occurrence?.eventId == newVisit }
+                    visit = newVisit
+                } finally {
+                    Files.deleteIfExists(entered)
+                    Files.deleteIfExists(hold)
+                }
+                assertTrue(controller.setRepeat("off"))
+                owner.await { it.snapshot?.state?.repeat == "off" }
+                assertEquals(3, ownerAudio.starts)
+            }
+            val startsBeforeNext = ownerAudio.starts
             assertTrue(controller.queueTrack(reference))
             controller.await { it.queue.size == 2 && it.queue.all { row -> isPublishedQueueKey(row.key) } }
             assertTrue(controller.next())
@@ -92,7 +128,7 @@ class AccountChannelGoFixtureTest {
             val nextVisit = requireNotNull(next.snapshot?.state?.occurrence).eventId
             assertNotEquals(visit, nextVisit)
             controller.await { it.snapshot?.state?.occurrence?.eventId == nextVisit && it.isPlaying }
-            assertEquals(2, ownerAudio.starts)
+            assertEquals(startsBeforeNext + 1, ownerAudio.starts)
             assertEquals(0, controllerAudio.starts)
             assertTrue(controller.selectDevice(second))
             val selected = controller.await { it.snapshot?.selectedDeviceId == second && it.localOutput && it.isPlaying }
@@ -134,6 +170,9 @@ class AccountChannelGoFixtureTest {
             if (desiredPlaying) starts++
             latest = AudioFacts(binding, elapsed, duration = track?.duration ?: 0.0, isPlaying = desiredPlaying)
             return AudioResult.OK
+        }
+        fun lateEof(binding: AudioBinding) {
+            check(observations.tryEmit(AudioObservation(binding, AudioFacts(binding, 42.0, ended = true))))
         }
         fun finish() {
             val binding = requireNotNull(latest.binding)

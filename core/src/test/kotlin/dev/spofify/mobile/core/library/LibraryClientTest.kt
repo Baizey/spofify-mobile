@@ -390,7 +390,8 @@ class LibraryClientTest {
 
     @Test fun largeLocalPlayerIsSentWholeButNormalSendRemainsBounded() = runBlocking { fixture { server, sessions, identity ->
         val hello = CompletableDeferred<JsonObject>()
-        server.enqueue(json("""{"ticket":"fixture"}"""))
+        val ticket = "ab".repeat(32)
+        server.enqueue(json("""{"ticket":"$ticket"}"""))
         server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
             override fun onMessage(socket: okhttp3.WebSocket, text: String) {
                 hello.complete(kotlinx.serialization.json.Json.parseToJsonElement(text) as JsonObject)
@@ -402,22 +403,23 @@ class LibraryClientTest {
                 put("key", 1); put("occurrence", "visit"); put("positionMs", 123); put("desiredPlaying", true)
             }
             putJsonArray("queue") {
-                repeat(1500) { row ->
+                repeat(5500) { row ->
                     add(buildJsonObject {
                         put("id", "track-$row"); put("name", "Fixture track $row ${"😀".repeat(20)}")
                         putJsonArray("artists") { add(buildJsonObject { put("id", "artist"); put("name", "Fixture artist") }) }
                         put("albumName", "Fixture album"); put("albumId", "album"); put("duration", 120.0)
-                        put("key", row + 1); put("order", row + 1); put("intent", "play")
+                        put("key", row + 1); put("order", row + 1); put("intent", "low")
                     })
                 }
             }
         }
-        assertTrue(player.toString().toByteArray().size > 64 * 1024)
+        assertTrue(player.toString().toByteArray().size in (1024 * 1024)..(2 * 1024 * 1024))
         val basis = buildJsonObject {
             put("sessionId", "session"); put("generation", 4); put("revision", 7); put("occurrence", "visit")
         }
         sessions.playbackTransport(identity).connect("phone", "device", player, basis).use { connection ->
             val frame = withTimeout(3000) { hello.await() }
+            assertEquals(JsonPrimitive(ticket), frame["ticket"])
             assertEquals(player, frame["local"])
             assertEquals(basis, frame["reattachBasis"])
             assertFalse(connection.send("😀".repeat(16385)))
