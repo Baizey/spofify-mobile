@@ -5,6 +5,7 @@ import dev.spofify.mobile.core.cache.MusicBlobStore
 import dev.spofify.mobile.core.cache.MusicOwner
 import dev.spofify.mobile.core.cache.SongKey
 import dev.spofify.mobile.core.http.AudioStream
+import dev.spofify.mobile.core.offline.OfflineDiagnosticStage.*
 import java.io.InputStream
 import kotlinx.coroutines.*
 
@@ -28,40 +29,58 @@ class OfflinePlaylistRepository(
     suspend fun retainedIds(): Set<String> = withContext(Dispatchers.IO) { store.retainedPlaylistIds(owner) }
 
     suspend fun refresh(id: String, cap: Int, onProgress: (OfflinePlaylistProgress) -> Unit = {},
-        current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
+        trace: OfflineAttemptTrace? = null, current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
         val ref = OfflineCollectionRef(OfflineCollectionKind.PLAYLIST, id)
         require(cap in CacheOptions.caps && OfflineParser.validReference(ref))
         val job = currentCoroutineContext().job
         fun live() = job.isActive && current()
         fun checkCurrent() { if (!live()) throw CancellationException("Playlist work retired") }
-        store.attemptPlaylist(owner, id) {
+        store.attemptPlaylist(owner, id, trace) {
             try {
                 checkCurrent()
-                val result = transient(::checkCurrent) {
-                    store.readPlaylistManifest(owner) { checkCurrent(); manifest(ref) }
+                val result = transient(::checkCurrent, trace) {
+                    store.readPlaylistManifest(owner, trace) {
+                        checkCurrent()
+                        trace?.step(MANIFEST_REQUEST)
+                        manifest(ref)
+                    }
                 }
                 checkCurrent()
+                trace?.step(MANIFEST_VALIDATION)
                 validatePlaylist(id, result)
                 val remaining = result.items.groupingBy { it.track.id }.eachCount().toMutableMap()
-                val ready = store.resumePlaylist(owner, id, trackKeys(owner, result), ::checkCurrent)
+                val keys = trackKeys(owner, result)
+                trace?.step(RESUME)
+                val ready = store.resumePlaylist(owner, id, keys, trace, ::checkCurrent)
                 var verified = ready.sumOf { remaining.remove(it.id) ?: 0 }
                 checkCurrent()
+                trace?.step(RESUMED, verified, result.items.size)
+                trace?.step(PROGRESS, verified, result.items.size)
                 onProgress(OfflinePlaylistProgress(verified, result.items.size))
                 for (item in result.items) {
                     val track = item.track
                     val occurrences = remaining.remove(track.id) ?: continue
                     checkCurrent()
-                    store.stage(id, SongKey(owner, track.id), track.name, cap, ::live,
-                        { transient(::checkCurrent) { prepare(track.id) } }) { media, consume ->
+                    trace?.beginMedia()
+                    store.stage(id, SongKey(owner, track.id), track.name, cap, ::live, prepare = {
+                        transient(::checkCurrent, trace) {
+                            trace?.step(MEDIA_PREPARE)
+                            prepare(track.id)
+                        }
+                    }, trace = trace) { media, consume ->
                         checkCurrent()
+                        trace?.step(MEDIA_OPEN)
                         open(media).consumeBody(::checkCurrent, consume)
                     }
                     checkCurrent()
                     verified += occurrences
+                    trace?.step(PROGRESS, verified, result.items.size)
                     onProgress(OfflinePlaylistProgress(verified, result.items.size))
                 }
                 checkCurrent()
-                store.commit(owner, result, cap, ::checkCurrent)
+                trace?.step(COMMIT)
+                store.commit(owner, result, cap, trace, ::checkCurrent)
+                trace?.step(COMMITTED)
                 checkCurrent()
                 result
             } catch (e: Exception) {
@@ -84,12 +103,14 @@ class OfflinePlaylistRepository(
     /** Only retry classified transient metadata reads once. No retry of auth, stale membership,
      * storage, or an interrupted body within this attempt. The caller owns retry policy.
      */
-    private suspend fun <T> transient(checkCurrent: () -> Unit, read: suspend () -> T): T {
+    private suspend fun <T> transient(checkCurrent: () -> Unit, trace: OfflineAttemptTrace?, read: suspend () -> T): T {
+        val waitMs = 250L
         checkCurrent()
         try { return read() } catch (e: OfflineException) {
             if (e.failure !in setOf(OfflineFailure.UNAVAILABLE, OfflineFailure.BUSY, OfflineFailure.TIMEOUT)) throw e
+            trace?.metadataRetry(e, waitMs)
         }
-        delay(250)
+        delay(waitMs)
         checkCurrent()
         return read()
     }

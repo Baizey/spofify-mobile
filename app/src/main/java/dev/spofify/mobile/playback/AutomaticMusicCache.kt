@@ -10,6 +10,7 @@ import dev.spofify.mobile.core.auth.AccountIdentity
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.cache.*
 import dev.spofify.mobile.core.offline.OfflineClient
+import dev.spofify.mobile.core.offline.OfflineDiagnosticEvent
 import dev.spofify.mobile.core.playback.AudioFacts
 import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.PlaybackView
@@ -24,7 +25,19 @@ internal class MusicStorage(app: Application, private val scope: CoroutineScope)
     val initialized = CompletableDeferred<MusicBlobStore?>()
     fun release(pin: PinnedSong) { scope.launch(Dispatchers.IO) { pin.close() } }
     init { scope.launch(Dispatchers.IO) {
-        ready.value = try { MusicBlobStore(File(app.noBackupFilesDir, "music-blobs")) } catch (_: Exception) { null }
+        val diagnostics = playlistDownloadDiagnostics
+        val start = diagnostics?.let { SystemClock.elapsedRealtime() }
+        diagnostics?.event(OfflineDiagnosticEvent.CACHE_RECOVERY_START)
+        ready.value = try { MusicBlobStore(File(app.noBackupFilesDir, "music-blobs")) }
+        catch (e: Exception) {
+            diagnostics?.event(OfflineDiagnosticEvent.CACHE_RECOVERY_UNAVAILABLE,
+                elapsedMs = start?.let { SystemClock.elapsedRealtime() - it }, error = e)
+            null
+        }
+        if (diagnostics != null) ready.value?.let { store ->
+            diagnostics.event(OfflineDiagnosticEvent.CACHE_RECOVERY_READY,
+                elapsedMs = start?.let { SystemClock.elapsedRealtime() - it }, count = store.songs.value.size)
+        }
         initialized.complete(ready.value)
     } }
 }

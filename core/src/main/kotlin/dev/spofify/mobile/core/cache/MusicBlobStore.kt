@@ -1,5 +1,7 @@
 package dev.spofify.mobile.core.cache
 
+import dev.spofify.mobile.core.offline.OfflineAttemptTrace
+import dev.spofify.mobile.core.offline.OfflineDiagnosticStage.*
 import dev.spofify.mobile.core.offline.OfflineManifest
 import dev.spofify.mobile.core.offline.OfflineMediaDescriptor
 import dev.spofify.mobile.core.offline.PlaylistFiles
@@ -276,8 +278,16 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             .thenBy { it.last }).take(budget.size - cap).forEach(::removeAuto)
     }
 
-    internal suspend fun <T> attemptPlaylist(owner: MusicOwner, id: String, write: suspend () -> T): T =
-        writePlaylist(owner, id) { playlistAttempts.withPermit { write() } }
+    internal suspend fun <T> attemptPlaylist(owner: MusicOwner, id: String, trace: OfflineAttemptTrace?, write: suspend () -> T): T {
+        trace?.step(PLAYLIST_LOCK)
+        return writePlaylist(owner, id) {
+            trace?.step(ATTEMPT_SLOT)
+            playlistAttempts.withPermit {
+                trace?.step(ATTEMPT_ADMITTED)
+                write()
+            }
+        }
+    }
 
     // Keep same-playlist refresh/removal serialized, including across account facade lifetimes.
     internal suspend fun <T> writePlaylist(owner: MusicOwner, id: String, write: suspend () -> T): T =
@@ -285,8 +295,10 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
 
     // The server admits one playlist evaluation per account. Keep the whole paginated
     // read together, but allow other manifests to load while this playlist transfers audio.
-    internal suspend fun <T> readPlaylistManifest(owner: MusicOwner, read: suspend () -> T): T =
-        manifestReaders.run(owner, read)
+    internal suspend fun <T> readPlaylistManifest(owner: MusicOwner, trace: OfflineAttemptTrace?, read: suspend () -> T): T {
+        trace?.step(MANIFEST_LOCK)
+        return manifestReaders.run(owner, read)
+    }
 
     private class KeyedMutex<K> {
         private class Entry(val mutex: Mutex = Mutex(), var users: Int = 0)
@@ -311,7 +323,9 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             entries.values.filter { it.row.key.owner == owner }.forEach { addAll(it.row.drafts) }
         }
     }
-    internal fun resumePlaylist(owner: MusicOwner, id: String, keys: Set<SongKey>, checkCurrent: () -> Unit): Set<SongKey> = lock.withLock {
+    internal fun resumePlaylist(owner: MusicOwner, id: String, keys: Set<SongKey>,
+        trace: OfflineAttemptTrace? = null, checkCurrent: () -> Unit): Set<SongKey> = lock.withLock {
+        trace?.step(RESUME_SCAN)
         checkCurrent()
         clearDraft(owner, id, keys, checkCurrent)
         keys.filterTo(hashSetOf()) { key ->
@@ -341,13 +355,20 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         try { trim(owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
         finally { refresh(playlists.committedIds()) }
     }
-    internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
+    internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int,
+        trace: OfflineAttemptTrace? = null, checkCurrent: () -> Unit) = lock.withLock {
+        trace?.step(COMMIT_INDEX)
         val keys = trackKeys(owner, manifest)
         val id = manifest.collection.reference.id
         check(keys.all { key -> entries.getValue(key).let { e ->
             (id in e.row.drafts || playlists.contains(owner, id, key)) && e.file.length() == e.row.size
         } })
-        val old = diskWrites.withLock { playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, checkCurrent) }
+        trace?.step(COMMIT_DISK_WAIT)
+        val old = diskWrites.withLock {
+            trace?.step(COMMIT_WRITE)
+            playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, checkCurrent)
+        }
+        trace?.step(COMMIT_CLEANUP)
         afterCommit(owner, cap, old)
         // Keep the hold until the complete manifest rename is durable. A failed cleanup
         // is harmless; the tracks are already published and cleanup can run on retry.
@@ -364,14 +385,15 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     /** Network and digest never hold the index lock. The ticket also fences clear during descriptor lookup. */
     suspend fun fill(key: SongKey, title: String, cap: Int, priority: List<String>, current: () -> Boolean,
         prepare: suspend () -> OfflineMediaDescriptor, download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
-        fillShared(key, title, cap, priority, null, current, prepare, download)
+        fillShared(key, title, cap, priority, null, current, prepare, null, download)
 
     internal suspend fun stage(playlistId: String, key: SongKey, title: String, cap: Int, current: () -> Boolean,
-        prepare: suspend () -> OfflineMediaDescriptor, download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
-        fillShared(key, title, cap, emptyList(), playlistId, current, prepare, download)
+        prepare: suspend () -> OfflineMediaDescriptor, trace: OfflineAttemptTrace? = null,
+        download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
+        fillShared(key, title, cap, emptyList(), playlistId, current, prepare, trace, download)
 
     private suspend fun fillShared(key: SongKey, title: String, cap: Int, priority: List<String>, playlistId: String?,
-        current: () -> Boolean, prepare: suspend () -> OfflineMediaDescriptor,
+        current: () -> Boolean, prepare: suspend () -> OfflineMediaDescriptor, trace: OfflineAttemptTrace?,
         download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) {
         require(cap in CacheOptions.caps)
         val auto = playlistId == null
@@ -379,9 +401,11 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         fun live() = (!auto || !ticket.cleared) && current()
         var joined = false
         while (true) {
+            trace?.step(MEDIA_LOOKUP)
             val existing = lock.withLock {
                 if (!current()) return
                 entries[key]?.let {
+                    trace?.step(MEDIA_REUSE)
                     if (it.file.length() != it.row.size) throw IOException("Verified media unavailable")
                     if (playlistId != null) {
                         if (playlistId !in it.row.drafts && !playlists.contains(key.owner, playlistId, key)) {
@@ -411,6 +435,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 } finally { lock.withLock { autoJoining.remove(key, ticket) } }
                 return
             }
+            trace?.step(MEDIA_JOIN)
             if (joined) throw IOException("Concurrent fill superseded")
             existing.finished.await()
             joined = true
@@ -418,11 +443,13 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         var stage: File? = null
         try {
             val media = prepare()
+            trace?.step(MEDIA_SETUP)
             require(media.trackId == key.id && media.byteLength in 1..MAX_BLOB && media.byteLength <= freeBytes() - RESERVE)
             if (!live()) return
             var verified = false
             val tmp = File.createTempFile("fill", ".tmp", dir).also { stage = it }
             download(media) { input ->
+                trace?.step(MEDIA_BODY)
                 val hash = MessageDigest.getInstance("SHA-256")
                 tmp.outputStream().use { out ->
                     val buffer = ByteArray(64 * 1024)
@@ -433,19 +460,28 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                         if (n <= 0) throw IOException("Incomplete media")
                         // Parallel transfers must not both spend the same free space. Never
                         // hold this lock across a network read or a full audio download.
+                        val firstWriteTrace = trace?.takeIf { left == media.byteLength }
+                        firstWriteTrace?.step(MEDIA_WRITE_WAIT)
                         diskWrites.withLock {
+                            firstWriteTrace?.step(MEDIA_WRITE)
                             if (!live() || n > freeBytes() - RESERVE) throw IOException("Fill interrupted")
                             out.write(buffer, 0, n)
                         }
+                        firstWriteTrace?.step(MEDIA_BODY)
                         hash.update(buffer, 0, n); left -= n
                     }
-                    require(input.read() == -1 && hash.digest().hex() == media.sha256)
+                    // The final EOF check can still block on the response body.
+                    val eof = input.read() == -1
+                    trace?.step(MEDIA_VERIFY)
+                    require(eof && hash.digest().hex() == media.sha256)
                     out.fd.sync()
                     verified = true
                 }
             }
             require(verified)
+            trace?.step(MEDIA_PUBLISH)
             lock.withLock {
+                trace?.step(MEDIA_RETAIN)
                 // Linearization point: session/window cancellation before admission cannot publish;
                 // clears after admission serialize here and release AUTO before returning.
                 if (!live()) return

@@ -17,25 +17,32 @@ class PlaylistOfflinePreferenceTest {
             val ref = OfflineCollectionRef(OfflineCollectionKind.PLAYLIST, id)
             manifests[id] = OfflineManifest(OfflineCollection(ref, id), "fence", emptyList(), 0, 0)
         }
-        fun owner(scope: CoroutineScope) = PlaylistOfflinePreference(scope, { wanted }, { wanted = it },
-            { manifests.values.toList() }, { id, current -> if (current()) { removals++; manifests.remove(id) } })
+        fun owner(scope: CoroutineScope, diagnostics: OfflineDiagnostics? = null) =
+            PlaylistOfflinePreference(scope, { wanted }, { wanted = it }, { manifests.values.toList() },
+                { id, current -> if (current()) { removals++; manifests.remove(id) } }, diagnostics = diagnostics)
     }
 
     @Test fun switchRemainsOnWhileAnInterruptedDownloadRetriesWithoutAnotherTap() = runTest {
         val disk = Disk()
-        val worker = disk.owner(backgroundScope)
+        val lines = mutableListOf<String>()
+        val worker = disk.owner(backgroundScope, OfflineDiagnostics(lines::add))
+        val id = "private-playlist-id"
         var attempts = 0
         backgroundScope.launch {
-            worker.download { id, current ->
+            worker.download { playlist, current, trace ->
                 assertTrue(current())
-                if (++attempts < 3) throw IOException("temporary")
-                disk.save(id)
+                trace?.step(OfflineDiagnosticStage.MEDIA_BODY)
+                when (++attempts) {
+                    1 -> throw IOException("private-cookie and https://private.example/private/path")
+                    2 -> throw OfflineException(OfflineFailure.UNAVAILABLE, 503)
+                    else -> disk.save(playlist)
+                }
             }
         }
         runCurrent()
-        worker.set("playlist", true); runCurrent()
-        assertEquals(setOf("playlist"), disk.wanted)
-        assertEquals(setOf("playlist"), worker.wanted.value)
+        worker.set(id, true); runCurrent()
+        assertEquals(setOf(id), disk.wanted)
+        assertEquals(setOf(id), worker.wanted.value)
         assertTrue(worker.complete().isEmpty())
         advanceTimeBy(2_000); runCurrent()
         assertEquals(2, attempts)
@@ -43,6 +50,62 @@ class PlaylistOfflinePreferenceTest {
         advanceTimeBy(4_000); runCurrent()
         assertEquals(3, attempts)
         assertEquals(disk.manifests.values.toList(), worker.complete())
+
+        val intent = lines.single { it.startsWith("event=WORKER_INTENT ") }.substringAfter(' ')
+        val attemptsLog = lines.filter { " $intent " in it }
+        assertEquals(listOf("ATTEMPT", "STEP", "FAILED", "BACKOFF", "ATTEMPT", "STEP", "FAILED", "BACKOFF",
+            "ATTEMPT", "STEP", "FINISHED"), attemptsLog.map { it.substringBefore(' ').substringAfter('=') })
+        assertTrue(attemptsLog.any { "attempt=1 stage=MEDIA_BODY" in it && "failure=IO" in it })
+        assertTrue(attemptsLog.any { "attempt=2 stage=MEDIA_BODY" in it && "failure=UNAVAILABLE http=503" in it })
+        assertEquals(listOf("2000", "4000"), attemptsLog.filter { "wait_ms=" in it }.map { it.substringAfter("wait_ms=") })
+        assertFalse(lines.any { "private" in it })
+    }
+
+    @Test fun cancellingBackoffDoesNotRetryAndDiagnosticSinkCannotCancelWorker() = runTest {
+        val disk = Disk()
+        val lines = mutableListOf<String>()
+        val worker = disk.owner(backgroundScope, OfflineDiagnostics {
+            lines += it
+            throw CancellationException("from diagnostic sink only")
+        })
+        var calls = 0
+        backgroundScope.launch {
+            worker.download { _, current, _ ->
+                assertTrue(current())
+                calls++
+                throw IOException("synthetic")
+            }
+        }
+        runCurrent()
+        worker.set("wanted", true); runCurrent()
+        assertEquals(1, calls)
+        worker.set("wanted", false); runCurrent()
+        advanceTimeBy(10_000); runCurrent()
+        assertEquals(1, calls)
+        assertTrue(lines.any { it.startsWith("event=CANCELLED ") && "stage=BACKOFF" in it })
+        assertTrue(lines.none { "from diagnostic sink" in it })
+        assertTrue(worker.wanted.value!!.isEmpty())
+    }
+
+    @Test fun intentPublicationIsDistinguishedFromBlockedPreferenceWrite() = runTest {
+        val lines = mutableListOf<String>()
+        val release = CompletableDeferred<Unit>()
+        val worker = PlaylistOfflinePreference(backgroundScope, { emptySet() }, { release.await() },
+            { emptyList() }, { _, _ -> }, diagnostics = OfflineDiagnostics(lines::add))
+        var calls = 0
+        backgroundScope.launch { worker.download { _, _, _ -> calls++ } }
+        runCurrent()
+        worker.set("synthetic-id", true); runCurrent()
+        fun writeEvents() = lines.filter { it.startsWith("event=INTENT_WRITE") || it.startsWith("event=INTENT_PUBLISHED") }
+            .map { it.substringBefore(' ') }
+        assertEquals(listOf("event=INTENT_WRITE_WAIT", "event=INTENT_WRITE"), writeEvents())
+        assertEquals(emptySet<String>(), worker.wanted.value)
+        assertEquals(0, calls)
+        release.complete(Unit); runCurrent()
+        assertEquals(listOf("event=INTENT_WRITE_WAIT", "event=INTENT_WRITE", "event=INTENT_PUBLISHED"), writeEvents())
+        assertEquals(setOf("synthetic-id"), worker.wanted.value)
+        assertEquals(1, calls)
+        assertTrue(lines.none { "synthetic-id" in it })
     }
 
     @Test fun bothPlaylistIntentsRelaunchAfterRestartWithoutAnyCompletedDownload() = runTest {
@@ -52,7 +115,7 @@ class PlaylistOfflinePreferenceTest {
         val first = disk.owner(firstScope)
         val started = mutableSetOf<String>()
         firstScope.launch {
-            first.download { id, _ ->
+            first.download { id, _, _ ->
                 assertTrue(started.add(id))
                 awaitCancellation()
             }
@@ -69,7 +132,7 @@ class PlaylistOfflinePreferenceTest {
         val next = disk.owner(backgroundScope)
         val relaunched = mutableSetOf<String>()
         backgroundScope.launch {
-            next.download { id, current ->
+            next.download { id, current, _ ->
                 assertTrue(current())
                 assertTrue(relaunched.add(id))
                 disk.save(id)
@@ -87,7 +150,7 @@ class PlaylistOfflinePreferenceTest {
         val attempts = mutableListOf<String>()
         var manualCurrentOnCancellation: Boolean? = null
         backgroundScope.launch {
-            worker.download { id, current ->
+            worker.download { id, current, _ ->
                 attempts += id
                 assertTrue(current())
                 if (id == "manual") {

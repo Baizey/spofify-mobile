@@ -37,6 +37,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         readComplete = { repository.await()?.complete().orEmpty() },
         remove = { id, current -> repository.await()?.remove(id, cache.options.value.cap, current) },
         readRetainedIds = { repository.await()?.retainedIds().orEmpty() },
+        diagnostics = playlistDownloadDiagnostics,
     )
     private val committedPlaylistIds: Flow<Set<String>> = flow {
         emitAll(repository.await()?.completeIds() ?: flowOf(emptySet()))
@@ -120,23 +121,48 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
                 }
         }
         scope.launch {
+            val diagnostics = playlistDownloadDiagnostics
+            var lastPolicy: OfflineDiagnosticEvent? = null
+            fun policy(event: OfflineDiagnosticEvent) {
+                if (diagnostics != null && event != lastPolicy) {
+                    lastPolicy = event
+                    diagnostics.event(event)
+                }
+            }
             combine(sessions.onlineGrant, cache.link) { grant, link -> grant to link }.collectLatest { (grant, link) ->
-                if (grant?.identity != identity || link == null) return@collectLatest
-                val repo = repository.await() ?: return@collectLatest
-                offlinePlaylists.download { id, wanted ->
-                    sessions.withOnlineGrant(grant) {
+                if (grant?.identity != identity) {
+                    policy(OfflineDiagnosticEvent.POLICY_NO_GRANT)
+                    return@collectLatest
+                }
+                if (link == null) {
+                    policy(OfflineDiagnosticEvent.POLICY_NO_LINK)
+                    return@collectLatest
+                }
+                if (diagnostics != null && !repository.isCompleted) policy(OfflineDiagnosticEvent.POLICY_WAIT_STORAGE)
+                val repo = repository.await() ?: run {
+                    policy(OfflineDiagnosticEvent.POLICY_NO_STORAGE)
+                    return@collectLatest
+                }
+                policy(if (link.metered) OfflineDiagnosticEvent.POLICY_ELIGIBLE_METERED else OfflineDiagnosticEvent.POLICY_ELIGIBLE)
+                offlinePlaylists.download { id, wanted, trace ->
+                    trace?.step(OfflineDiagnosticStage.GRANT)
+                    sessions.withOnlineGrant<Unit>(grant) {
                         // Explicit downloads may use metered data; background updates to an
                         // already saved playlist still wait for an unmetered link.
+                        if (link.metered) trace?.step(OfflineDiagnosticStage.METERED_LOOKUP)
                         if (!link.metered || repo.select(id) == null) {
                             val manifest = try {
                                 repo.refresh(id, cache.options.value.cap, onProgress = { progress ->
                                     playlistProgress.update { it + (id to progress) }
-                                }) { wanted() && sessions.onlineGrant.value === grant && cache.link.value == link }
+                                }, trace = trace) { wanted() && sessions.onlineGrant.value === grant && cache.link.value == link }
                             } finally {
                                 playlistProgress.update { it - id }
                             }
+                            trace?.step(OfflineDiagnosticStage.CATALOG)
                             remember(manifest)
                             metadataVersion.value++
+                        } else {
+                            trace?.step(OfflineDiagnosticStage.METERED_SKIP)
                         }
                     }
                 }
