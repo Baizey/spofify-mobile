@@ -62,7 +62,7 @@ class ManualOfflineBoundaryTest {
                         override fun onMessage(webSocket: WebSocket, text: String) {
                             if (text == "handoff") handoffFrame.complete(Unit) else webSocket.send("queued-event")
                         }
-                    }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v1"))
+                    }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v3"))
                     val socket = repo.playbackTransport(id).connect("phone", "device")
                     assertEquals("/api/me/player/connect", path()); assertEquals("/api/me/player/socket", path())
                     server.enqueue(MockResponse().setResponseCode(206).setHeader("Content-Range", "bytes 2-4/6").setBody("234"))

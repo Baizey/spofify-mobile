@@ -339,7 +339,7 @@ class PersonalLibraryClientTest {
             server.enqueue(json("""{"accountId":"account","username":"fixture-user","role":"$role","csrfToken":"fixture-csrf"}"""))
             try {
                 sessions.start()
-                val identity = (withTimeout(3000) { sessions.state.first { it is AuthState.Authenticated } } as AuthState.Authenticated).identity
+                val identity = withTimeout(3000) { sessions.onlineGrant.first { it != null } }!!.identity
                 server.request()
                 block(server, PersonalLibraryClient(sessions, identity), sessions, identity)
             } finally {

@@ -69,7 +69,52 @@ class SessionSocketTest {
         } finally { socket.close() }
     }
 
-    private fun opened(transport: FakeSocket) = SessionSocket(FeatureAuthority(Any()) { true }) {}.also {
+    @Test fun helloUsesExactlyOneSnapshotBudgetMeasuredInUtf8Bytes() {
+        val transport = FakeSocket()
+        val socket = opened(transport)
+        try {
+            val hello = "😀".repeat(5 * 1024 * 1024 / 4)
+            assertFalse(socket.send("before hello"))
+            assertFalse(socket.sendHello(hello + "x"))
+            assertTrue(socket.sendHello(hello))
+            assertFalse(socket.sendHello("second hello"))
+            assertFalse(socket.send("😀".repeat(16_385)))
+            assertTrue(socket.send("😀".repeat(16_384)))
+            assertEquals(2, transport.sends)
+        } finally { socket.close() }
+    }
+
+    @Test fun supersessionIsExactAndVisibleBeforeTheCollectorWakes() = runTest {
+        for ((code, reason) in listOf(4001 to "superseded", 4001 to "other", 1000 to "superseded")) {
+            val transport = FakeSocket()
+            val socket = opened(transport)
+            var observed: Boolean? = null
+            val consumer = launch {
+                try { socket.messages.collect {} } finally { observed = socket.superseded }
+            }
+            runCurrent()
+            socket.peerClosed(code, reason)
+            consumer.join()
+            assertEquals(code == 4001 && reason == "superseded", observed)
+            assertFalse(socket.isOpen)
+            assertTrue(transport.cancelled)
+        }
+    }
+
+    @Test fun lateSupersessionCannotOverwriteLocalOrAuthorityRetirement() {
+        val alreadyClosed = opened(FakeSocket())
+        alreadyClosed.close()
+        alreadyClosed.peerClosed(4001, "superseded")
+        assertFalse(alreadyClosed.superseded)
+        var current = true
+        val stale = opened(FakeSocket()) { current }
+        current = false
+        stale.peerClosed(4001, "superseded")
+        assertFalse(stale.superseded)
+        assertFalse(stale.isOpen)
+    }
+
+    private fun opened(transport: FakeSocket, current: () -> Boolean = { true }) = SessionSocket(FeatureAuthority(Any(), current)) {}.also {
         it.attach(transport)
         it.opened()
     }
@@ -80,7 +125,8 @@ class SessionSocketTest {
         var cancelled = false
         override fun request() = Request.Builder().url("http://localhost/").build()
         override fun queueSize() = 0L
-        override fun send(text: String) = !cancelled
+        var sends = 0
+        override fun send(text: String) = (!cancelled).also { if (it) sends++ }
         override fun send(bytes: ByteString) = !cancelled
         override fun close(code: Int, reason: String?) = true
         override fun cancel() { cancelled = true }

@@ -7,10 +7,12 @@ import dev.spofify.mobile.core.playback.PlaybackConnection
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.*
 import okio.ByteString
+import okio.utf8Size
 
 /** Owns long-lived resources; retiring the originating authenticated API closes every resource. */
 internal class OriginMediaTransport(
@@ -19,7 +21,7 @@ internal class OriginMediaTransport(
     private val cookieHeader: (String) -> String,
     private val renewedCookie: (Response) -> String?,
 ) {
-    private val socketClient = client
+    private val socketClient = client.newBuilder().retryOnConnectionFailure(false).build()
     // Media3 owns the bounded retry budget; don't replay a failed audio GET underneath it.
     private val fillClient = client.newBuilder().callTimeout(0, TimeUnit.MILLISECONDS).build()
     private val audioClient = fillClient.newBuilder().retryOnConnectionFailure(false).build()
@@ -37,26 +39,32 @@ internal class OriginMediaTransport(
 
     suspend fun socket(
         cookie: String, hello: String, authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
-    ): PlaybackConnection = suspendCancellableCoroutine { continuation ->
-        var pendingHello: String? = hello
-        val connection = SessionSocket(authority) { sockets.remove(it) }
-        sockets.add(connection)
-        continuation.invokeOnCancellation { pendingHello = null; connection.close() }
+    ): PlaybackConnection {
+        require(hello.utf8Size() <= SessionSocket.MAX_HELLO_BYTES)
         val request = request(listOf("api", "me", "player", "socket"), cookie)
             .header("Sec-WebSocket-Protocol", PROTOCOL).build()
+        return upgrade(request, hello, authority, onHeaders)
+    }
+
+    private suspend fun upgrade(
+        request: Request, hello: String, authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
+    ): PlaybackConnection = suspendCancellableCoroutine { continuation ->
+        val pendingHello = AtomicReference<String?>(hello)
+        val connection = SessionSocket(authority) { sockets.remove(it) }
+        sockets.add(connection)
+        continuation.invokeOnCancellation { pendingHello.set(null); connection.close() }
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 connection.attach(webSocket)
-                if (!continuation.isActive || !authority.isCurrent ||
+                val firstFrame = pendingHello.getAndSet(null)
+                if (firstFrame == null || !continuation.isActive || !authority.isCurrent ||
                     response.headers.values("Sec-WebSocket-Protocol") != listOf(PROTOCOL)) {
                     connection.close()
                     if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
                     return
                 }
                 connection.opened()
-                val firstFrame = pendingHello
-                pendingHello = null
-                if (firstFrame == null || !connection.send(firstFrame)) {
+                if (!connection.sendHello(firstFrame)) {
                     connection.close()
                     if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
                     return
@@ -66,10 +74,10 @@ internal class OriginMediaTransport(
 
             override fun onMessage(webSocket: WebSocket, text: String) = connection.receive(text)
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) = connection.close()
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) = connection.close()
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = connection.close()
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) = connection.peerClosed(code, reason)
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = connection.peerClosed(code, reason)
             override fun onFailure(webSocket: WebSocket, error: Throwable, response: Response?) {
-                pendingHello = null
+                pendingHello.set(null)
                 connection.close()
                 response?.let {
                     runCatching { onHeaders(it.code, null) }
@@ -203,7 +211,7 @@ internal class OriginMediaTransport(
     }
 
     private companion object {
-        const val PROTOCOL = "spofify.account-state.v1"
+        const val PROTOCOL = "spofify.account-state.v3"
         val SHA = Regex("[0-9a-f]{64}")
         val EVIDENCE_HEADERS = listOf("Content-Range", "Content-Length", "Content-Type", "Content-Encoding", "ETag", "Last-Modified")
         val STRONG_ETAG = Regex("\"[!#-~\\x80-\\xff]*\"")

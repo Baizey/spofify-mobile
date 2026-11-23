@@ -22,7 +22,8 @@ import org.junit.Test
 class SessionRepositoryTest {
     private val origin = ServerOrigin.parse("http://fixture.test:6030")
     private fun summary(id: String = "fixture-id") = SessionSummary(id, "fixture-user", "user", "fixture-csrf")
-    private fun stored(id: String = "fixture-id", cookie: String = UUID.randomUUID().toString()) =
+    private fun cookie() = "spofify_session=${UUID.randomUUID()}; Path=/; HttpOnly"
+    private fun stored(id: String = "fixture-id", cookie: String = cookie()) =
         StoredSession(origin.value, cookie, summary(id), "rolling-v1")
     private fun remembered() = RememberedLogin(origin.value, "fixture-user", UUID.randomUUID().toString())
 
@@ -50,7 +51,7 @@ class SessionRepositoryTest {
     }
     private inner class Api : AuthApi {
         override val origin = this@SessionRepositoryTest.origin
-        var loginReply = AuthReply(summary(), UUID.randomUUID().toString(), "rolling-v1")
+        var loginReply = AuthReply(summary(), cookie(), "rolling-v1")
         var sessionReply = AuthReply(summary(), null, null)
         var sessionError: Exception? = null
         var loginError: Exception? = null
@@ -174,26 +175,41 @@ class SessionRepositoryTest {
         repo.setManualOffline(true); advanceUntilIdle(); assertEquals(AuthState.SignedOut(), repo.state.value)
     }
 
-    @Test fun restore200ValidatesBeforeGrantingAndKeepsLogicalIdentityOnRenewal() = runTest {
+    @Test fun coldRestorePublishesLocalIdentityWhileHttpBlockedAndGrantsOnlyOnValidation() = runTest {
         val old = stored()
         val sessions = Sessions(old)
-        val first = Api()
-        val second = Api().apply { sessionReply = AuthReply(summary(), UUID.randomUUID().toString(), "rolling-v1") }
+        val first = Api().apply { sessionGate = CompletableDeferred() }
+        val second = Api().apply {
+            sessionReply = AuthReply(SessionSummary("fixture-id", "new-name", "admin", "new-csrf"), cookie(), "rolling-v1")
+        }
         val repo = repository(sessions, Logins(), first, second)
         repo.start()
         assertEquals(AuthState.Starting, repo.state.value)
-        advanceUntilIdle()
+        runCurrent()
         val identity = (repo.state.value as AuthState.Authenticated).identity
+        assertEquals(1, first.sessionCalls)
+        assertEquals(OnlineValidation.VALIDATING, repo.onlineValidation.value)
+        assertNull(repo.onlineGrant.value)
+        assertTrue(repo.isCurrent(identity))
+        assertTrue(runCatching { repo.get(identity, listOf("api", "library")) }.exceptionOrNull() is CancellationException)
+        assertTrue(sessions.writes.isEmpty())
+        first.sessionGate!!.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(OnlineValidation.VALIDATED, repo.onlineValidation.value)
+        assertEquals(identity, repo.onlineGrant.value?.identity)
         assertEquals(old.cookie, sessions.record!!.cookie)
         repo.refresh()
-        assertFalse(repo.isCurrent(identity))
+        assertTrue(repo.isCurrent(identity))
+        assertNull(repo.onlineGrant.value)
         advanceUntilIdle()
         assertEquals(identity, (repo.state.value as AuthState.Authenticated).identity)
         assertEquals(second.sessionReply.cookie, sessions.record!!.cookie)
+        assertEquals("new-csrf", sessions.record!!.session.csrfToken)
+        assertTrue(repo.isAdministrator(identity))
     }
 
     @Test fun restoredIdentityUsesCanonicalOriginNotLegacySpelling() = runTest {
-        val legacy = StoredSession("HTTP://FIXTURE.test:6030/", UUID.randomUUID().toString(), summary())
+        val legacy = StoredSession("HTTP://FIXTURE.test:6030/", cookie(), summary())
         val sessions = Sessions(legacy)
         val repo = repository(sessions, Logins(), Api())
         repo.start()
@@ -221,7 +237,9 @@ class SessionRepositoryTest {
         val repo = repository(sessions, Logins(remembered()), api)
         repo.start(); runCurrent()
         assertEquals(1, api.sessionCalls)
-        assertEquals(AuthState.Starting, repo.state.value)
+        assertTrue(repo.state.value is AuthState.Authenticated)
+        assertEquals(OnlineValidation.VALIDATING, repo.onlineValidation.value)
+        assertNull(repo.onlineGrant.value)
         assertSame(old, sessions.record)
         assertTrue(sessions.writes.isEmpty())
         advanceTimeBy(500)
@@ -262,6 +280,97 @@ class SessionRepositoryTest {
         assertNull(repo.onlineGrant.value)
     }
 
+    @Test fun goOnlineStartsFreshValidationAndOnlyCurrentGrantCanPersistFallback() = runTest {
+        val original = stored()
+        val sessions = Sessions(original)
+        val policy = Policy()
+        val first = Api().apply { sessionReply = AuthReply(summary("different-account"), cookie(), "rolling-v1") }
+        val second = Api().apply { sessionGate = CompletableDeferred() }
+        val third = Api()
+        val repo = repository(sessions, Logins(), first, second, third, policy = policy)
+        repo.start(); advanceUntilIdle()
+        val id = (repo.state.value as AuthState.Authenticated).identity
+        assertEquals(original.session.accountId, id.accountId)
+        assertLocalConnectionFailure(repo)
+        assertSame(original, sessions.record)
+        assertTrue(sessions.writes.isEmpty())
+        repo.setManualOffline(false); runCurrent()
+        assertEquals(OnlineValidation.VALIDATING, repo.onlineValidation.value)
+        assertTrue(repo.isCurrent(id))
+        repo.setManualOffline(false); runCurrent()
+        assertEquals(1, second.sessionCalls)
+        second.sessionGate!!.complete(Unit); advanceUntilIdle()
+        val retired = requireNotNull(repo.onlineGrant.value)
+        repo.refresh(); advanceUntilIdle()
+        val current = requireNotNull(repo.onlineGrant.value)
+        assertFalse(repo.fallbackToManualOffline(retired)); assertFalse(policy.offline)
+        assertTrue(repo.fallbackToManualOffline(current)); assertTrue(policy.offline)
+        assertEquals(OnlineValidation.IDLE, repo.onlineValidation.value)
+        assertNull(repo.onlineGrant.value); assertTrue(repo.isCurrent(id))
+        assertFalse(repo.fallbackToManualOffline(current))
+        assertEquals(0, third.logoutCalls)
+    }
+
+    @Test fun staleFallbackAfterBlockedPolicyWriteDoesNotRetireSuccessor() = runBlocking {
+        val policyWriteStarted = CompletableDeferred<Unit>()
+        val releasePolicyWrite = CountDownLatch(1)
+        val policy = object : ManualOfflineStore {
+            val stored = AtomicBoolean(false)
+            override fun read() = stored.get()
+            override fun write(enabled: Boolean) {
+                if (enabled) {
+                    policyWriteStarted.complete(Unit)
+                    check(releasePolicyWrite.await(5, TimeUnit.SECONDS)) { "Blocked write was not released" }
+                }
+                stored.set(enabled)
+            }
+        }
+        val first = Api()
+        val successor = Api().apply {
+            loginReply = AuthReply(summary("successor"), cookie(), "rolling-v1")
+            sessionReply = AuthReply(summary("successor"), null, null)
+        }
+        val logout = Api()
+        val logoutCreated = CompletableDeferred<Unit>()
+        val clients = ConcurrentLinkedQueue(listOf(first, logout, successor))
+        val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val repo = SessionRepository(Sessions(stored()), Logins(), AuthApiFactory {
+            clients.remove().also { if (it === logout) logoutCreated.complete(Unit) }
+        }, owner, manualOfflineStore = policy)
+        try {
+            withTimeout(5_000) {
+                repo.start()
+                val firstGrant = repo.onlineGrant.first { it != null }!!
+                val staleFallback = owner.async { repo.fallbackToManualOffline(firstGrant) }
+                policyWriteStarted.await()
+                repo.signOut()
+                logoutCreated.await()
+                repo.signIn(origin.value, "successor", "fixture-password")
+                val next = repo.onlineGrant.first { it?.identity?.accountId == "successor" }!!
+                releasePolicyWrite.countDown()
+                assertFalse(staleFallback.await())
+                assertSame(next, repo.onlineGrant.value)
+                assertTrue(repo.isCurrent(next.identity))
+                assertFalse(repo.manualOffline.value)
+                assertFalse(policy.stored.get())
+            }
+        } finally {
+            releasePolicyWrite.countDown()
+            owner.coroutineContext.job.cancelAndJoin()
+        }
+    }
+
+    @Test fun structurallyInvalidStoredCookieCannotGrantLocalOrNetworkAuthority() = runTest {
+        val original = stored(cookie = "spofify_session=x; Domain=fixture.test; Path=/; HttpOnly")
+        val sessions = Sessions(original)
+        val repo = repository(sessions, Logins()) // No transport factory call is allowed.
+        repo.start(); advanceUntilIdle()
+        assertEquals(AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE), repo.state.value)
+        assertNull(repo.onlineGrant.value)
+        assertSame(original, sessions.record)
+        assertTrue(sessions.writes.isEmpty())
+    }
+
     @Test fun unclassifiedAndInvalidSessionFailuresNeverBackOff() = runTest {
         for (error in listOf(AuthFailure(AuthFailure.Kind.UNAVAILABLE), AuthFailure(AuthFailure.Kind.INVALID_RESPONSE), IOException())) {
             val original = stored()
@@ -271,10 +380,16 @@ class SessionRepositoryTest {
             repo.start(); advanceUntilIdle()
             assertEquals(0L, currentTime)
             assertEquals(1, api.sessionCalls)
-            assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+            assertLocalConnectionFailure(repo)
             assertSame(original, sessions.record)
             assertTrue(sessions.writes.isEmpty())
         }
+    }
+
+    private fun assertLocalConnectionFailure(repo: SessionRepository) {
+        assertEquals(AuthNotice.CONNECTION_FAILED, (repo.state.value as AuthState.Authenticated).notice)
+        assertEquals(OnlineValidation.UNAVAILABLE, repo.onlineValidation.value)
+        assertNull(repo.onlineGrant.value)
     }
 
     @Test fun explicitBackgroundPreventsSchedulingRecovery() = runTest {
@@ -284,7 +399,7 @@ class SessionRepositoryTest {
         repo.start(); advanceUntilIdle()
         assertEquals(0L, currentTime)
         assertEquals(1, api.sessionCalls)
-        assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+        assertLocalConnectionFailure(repo)
     }
 
     @Test fun backgroundingCancelsBackoffEvenIfActivityImmediatelyReturns() = runTest {
@@ -297,7 +412,7 @@ class SessionRepositoryTest {
         advanceUntilIdle()
         assertEquals(500L, currentTime)
         assertEquals(1, api.sessionCalls)
-        assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
+        assertLocalConnectionFailure(repo)
     }
 
     @Test fun backgroundedRetryCannotPromoteLateSuccess() = runTest {
@@ -312,8 +427,7 @@ class SessionRepositoryTest {
         assertEquals(2, api.sessionCalls)
         repo.setAppForeground(false)
         api.sessionGate!!.complete(Unit); advanceUntilIdle()
-        assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
-        assertNull(repo.onlineGrant.value)
+        assertLocalConnectionFailure(repo)
         assertSame(original, sessions.record)
         assertTrue(sessions.writes.isEmpty())
     }
@@ -333,8 +447,7 @@ class SessionRepositoryTest {
             }
             advanceTimeBy(1_000); runCurrent()
             assertEquals(2, api.sessionCalls)
-            assertEquals(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED), repo.state.value)
-            assertNull(repo.onlineGrant.value)
+            assertLocalConnectionFailure(repo)
             assertSame(original, sessions.record)
             assertTrue(sessions.writes.isEmpty())
         }
@@ -353,7 +466,7 @@ class SessionRepositoryTest {
             owner.cancelAndJoin(); advanceUntilIdle()
             assertEquals(0L, currentTime)
             assertEquals(1, api.sessionCalls)
-            assertEquals(AuthState.Starting, repo.state.value)
+            assertTrue(repo.state.value is AuthState.Authenticated)
             assertNull(repo.onlineGrant.value)
             assertSame(original, sessions.record)
             assertTrue(sessions.writes.isEmpty())

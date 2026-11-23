@@ -1,5 +1,6 @@
 package dev.spofify.mobile.core.playback
 
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
@@ -44,6 +45,7 @@ class LocalPlaybackController(
     private val onObserved: ((AudioFacts) -> Unit)? = null,
     private val onFailure: ((String, AudioFacts?) -> Unit)? = null,
     private val allowPreview: (PlaybackTrack) -> Boolean = { true },
+    private val outputVersion: (() -> Long)? = null,
 ) {
     private val mutableState = MutableStateFlow(PlaybackQueueState())
     val state: StateFlow<PlaybackQueueState> = mutableState.asStateFlow()
@@ -177,7 +179,7 @@ class LocalPlaybackController(
         val order = if (shuffle) allocated.shuffled(random)
             else allocated.drop(rows.selectedIndex) + allocated.take(rows.selectedIndex)
         val next = PlaybackQueueState(queue = order, context = context, shuffle = shuffle, repeat = state.value.repeat)
-        start(LocalPlaybackQueue.select(next, 0))
+        start(newVisit(next, 0))
         return true
     }
 
@@ -186,14 +188,17 @@ class LocalPlaybackController(
         val items = if (track != null) listOf(rows.tracks[rows.selectedIndex]) else rows.tracks
         val previous = state.value
         val updated = LocalPlaybackQueue.insert(previous, allocate(items, context, if (next) "next" else "low"), next)
-        if (previous.current == null) start(LocalPlaybackQueue.select(updated.copy(context = context), 0))
+        if (previous.current == null) start(newVisit(updated.copy(context = context), 0))
         else publishEdit(updated)
         return true
     }
 
-    private fun allocate(tracks: List<PlaybackTrack>, context: PlaybackContext?, intent: String) = tracks.map { track ->
-        val key = ++nextKey
-        track.copy(key = key, order = key, intent = intent, playbackContext = track.playbackContext ?: context)
+    private fun allocate(tracks: List<PlaybackTrack>, context: PlaybackContext?, intent: String): List<PlaybackTrack> {
+        nextKey = maxOf(nextKey, state.value.queue.maxOfOrNull { it.key } ?: 0)
+        return tracks.map { track ->
+            val key = ++nextKey
+            track.copy(key = key, order = key, intent = intent, playbackContext = track.playbackContext ?: context)
+        }
     }
 
     private inline fun edit(change: (PlaybackQueueState) -> PlaybackQueueState) {
@@ -223,7 +228,40 @@ class LocalPlaybackController(
         mutableState.value = next.copy(desiredPlaying = false, isPlaying = false, elapsed = 0.0)
     }
 
-    private fun select(position: Int) = start(LocalPlaybackQueue.select(state.value, position))
+    private fun select(position: Int) = start(newVisit(state.value, position))
+
+    private fun newVisit(state: PlaybackQueueState, index: Int): PlaybackQueueState =
+        LocalPlaybackQueue.select(state, index).let { next ->
+            val row = next.queue[index]
+            next.copy(occurrence = PlaybackOccurrence(row.key, row.id, UUID.randomUUID().toString(), 0.0, false))
+        }
+
+    internal fun resetOutput() {
+        invalidate()
+        mutableState.value = PlaybackQueueState()
+    }
+    internal fun operationBinding(): AudioBinding? = active?.binding
+    internal fun operationIsCurrent(binding: AudioBinding) = operationBinding() == binding
+
+    internal fun sampleCurrent(): AudioFacts? = active?.let { op ->
+        audio.facts().takeIf { op.ready && authorized(op) && it.binding == op.binding }
+    }
+
+    /** Read an already delivered native EOF before another action invalidates its binding.
+     * AudioFacts.ended comes from an actual callback, never an elapsed-time comparison. */
+    internal fun consumeNativeEnd() {
+        val op = active?.takeIf(::authorized) ?: return
+        val facts = op.earlyEnd ?: audio.facts()
+        if (facts.binding == op.binding && facts.ended) {
+            op.earlyEnd = null
+            ended(op, facts)
+        }
+    }
+
+    internal fun pauseAt(next: PlaybackQueueState) {
+        invalidate()
+        mutableState.value = next.copy(isPlaying = false, isBuffering = false, isLoading = false)
+    }
 
     private fun allowed(): Boolean = !retired && scope.isActive && isOutputAllowed()
     private fun authorized(op: Operation): Boolean = active === op && allowed()
@@ -259,7 +297,7 @@ class LocalPlaybackController(
         if (outgoing == null) invalidate()
         val serial = ++generation
         val id = "local-$owner-$serial"
-        val op = Operation(AudioBinding(id, serial, id, track.id))
+        val op = Operation(AudioBinding(id, outputVersion?.invoke() ?: serial, next.occurrence?.eventId ?: id, track.id))
         promotingFrom = outgoing
         active = op
         if (outgoing != null) {
@@ -344,7 +382,7 @@ class LocalPlaybackController(
         if (!keep(op) || !previous.desiredPlaying || facts.error.isNotEmpty()) return
         if (onNaturalEnd != null) onNaturalEnd.invoke(previous, facts)
         else LocalPlaybackQueue.successor(previous, naturalEnd = true)
-            ?.let { start(LocalPlaybackQueue.select(previous, it), natural = true) } ?: finishNaturalEnd(previous)
+            ?.let { start(newVisit(previous, it), natural = true) } ?: finishNaturalEnd(previous)
     }
 
     private fun fail(op: Operation, error: String, native: AudioFacts = audio.facts()) {

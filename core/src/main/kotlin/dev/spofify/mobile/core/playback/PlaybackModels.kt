@@ -124,6 +124,14 @@ data class PlaybackView(
     val snapshot: PlaybackSnapshot? = null,
     val playback: PlaybackStatus? = null,
     val error: String? = null,
+    /** Actual execution authority on this device, online or isolated. */
+    val localOutput: Boolean = false,
+    /** Independent local playback is available even during admission. */
+    val offline: Boolean = false,
+    val superseded: Boolean = false,
+    /** Increases on each completed handshake, even if READY and loss coalesce for observers. */
+    val established: Long = 0,
+    val transferPending: Boolean = false,
 ) {
     val current: PlaybackTrack? get() = snapshot?.state?.current
     val queue: List<PlaybackTrack> get() = snapshot?.state?.queue.orEmpty()

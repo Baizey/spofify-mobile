@@ -10,6 +10,8 @@ import dev.spofify.mobile.core.playback.isValidDeviceName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -23,6 +25,9 @@ enum class AuthNotice {
     INVALID_ORIGIN, INVALID_CREDENTIALS, CONNECTION_FAILED, STORAGE_UNAVAILABLE,
     SAVE_FAILED, SESSION_EXPIRED, REMOTE_LOGOUT_FAILED, LOCAL_LOGOUT_FAILED,
 }
+
+/** HTTP session validation only; it neither proves nor monitors player connectivity. */
+enum class OnlineValidation { IDLE, VALIDATING, VALIDATED, UNAVAILABLE }
 
 sealed interface AuthState {
     data object Starting : AuthState
@@ -56,6 +61,8 @@ class SessionRepository(
     val manualOffline = mutableOffline.asStateFlow()
     private val mutableGrant = MutableStateFlow<OnlineGrant?>(null)
     val onlineGrant = mutableGrant.asStateFlow()
+    private val mutableValidation = MutableStateFlow(OnlineValidation.IDLE)
+    val onlineValidation = mutableValidation.asStateFlow()
     private val mutablePolicyLoaded = MutableStateFlow(manualOfflineStore == null)
     val offlinePolicyLoaded = mutablePolicyLoaded.asStateFlow()
     private var handingOff = false
@@ -83,11 +90,14 @@ class SessionRepository(
     @Serializable private class Admission(val ticket: String)
     @Serializable private class Hello(
         val type: String, val ticket: String, val name: String, val deviceId: String, val canPlay: Boolean,
+        val local: JsonObject? = null,
+        val reattachBasis: JsonObject? = null,
     )
 
-    fun playbackTransport(expected: AccountIdentity): PlaybackTransport = PlaybackTransport { name, deviceId ->
+    fun playbackTransport(expected: AccountIdentity): PlaybackTransport = PlaybackTransport { name, deviceId, local, reattachBasis ->
         require(isValidDeviceName(name))
         require(deviceId.isNotBlank() && deviceId.toByteArray().size <= 128 && deviceId.none(Char::isISOControl))
+        val claim = local?.takeIf { requireNotNull(it["queue"] as? JsonArray) { "Local player has no queue" }.isNotEmpty() }
         featureExchange(expected) { client, record, headers, authority ->
             val transport = featureTransport(client)
             val response = transport.post(listOf("api", "me", "player", "connect"), "{}",
@@ -101,7 +111,7 @@ class SessionRepository(
                 if (!authority.isCurrent || !sameCredential(saved, record))
                     throw CancellationException("Session retired")
             }
-            val hello = featureJson.encodeToString(Hello("hello", admission.ticket, name, deviceId, true))
+            val hello = featureJson.encodeToString(Hello("hello", admission.ticket, name, deviceId, true, claim, reattachBasis))
             transport.socket(record.cookie, hello, authority, headers)
         }
     }
@@ -153,7 +163,10 @@ class SessionRepository(
             }
             if (reply.session.accountId != expected.accountId) {
                 synchronized(lock) {
-                    if (authority.isCurrent) advance(AuthState.Unavailable(AuthNotice.CONNECTION_FAILED))
+                    if (authority.isCurrent && sameCredential(saved, record)) {
+                        advance(AuthState.Authenticated(expected, AuthNotice.CONNECTION_FAILED))
+                        mutableValidation.value = OnlineValidation.UNAVAILABLE
+                    }
                 }
                 throw AuthFailure(AuthFailure.Kind.INVALID_RESPONSE)
             }
@@ -284,13 +297,33 @@ class SessionRepository(
     }
 
     private suspend fun restoreStored(token: Long) {
-        val record = try { readSession() } catch (cancelled: CancellationException) {
+        val record = try {
+            readSession()?.let { stored ->
+                val origin = ServerOrigin.parse(stored.server)
+                // Local authority comes from installed authenticated storage, never a saved password.
+                // Check structure without constructing a transport or treating the cookie's age as revocation.
+                parseSessionCookie(origin, stored.cookie)
+                stored.session.validated()
+                require(stored.sessionMode == null || stored.sessionMode == "rolling-v1")
+                StoredSession(origin.value, stored.cookie, stored.session, stored.sessionMode)
+            }
+        } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
             publish(token, AuthState.Unavailable(AuthNotice.STORAGE_UNAVAILABLE))
             return
         }
-        if (record == null) publish(token, AuthState.SignedOut()) else restore(token, record, null)
+        if (record == null) {
+            publish(token, AuthState.SignedOut())
+            return
+        }
+        currentCoroutineContext().ensureActive()
+        val validate = synchronized(lock) {
+            if (token != generation || handingOff) return
+            installLocalLocked(record, token)
+            bootstrapAllowed.also { if (it) mutableValidation.value = OnlineValidation.VALIDATING }
+        }
+        if (validate) validateInstalled(token, record)
     }
 
     /**
@@ -300,27 +333,64 @@ class SessionRepository(
      * use an existing socket only; it must check actual playback ownership itself.
      */
     suspend fun setManualOffline(enabled: Boolean, beforeDisconnect: suspend (AccountIdentity) -> Unit = {}) {
-        modeChanges.withLock {
-            synchronized(lock) {
-                check(mutablePolicyLoaded.value) { "Session policy not loaded" }
-                if (mutableOffline.value == enabled) return
-            }
-            withContext(io + NonCancellable) {
-                checkNotNull(manualOfflineStore) { "No durable manual mode store" }.write(enabled)
-                val owner = synchronized(lock) {
-                    handingOff = true
-                    mutableGrant.value?.identity
+        changeManualMode(enabled, null, beforeDisconnect)
+    }
+
+    /** Call outside grant-owned work after exhausting the current socket handshake batch. */
+    suspend fun fallbackToManualOffline(grant: OnlineGrant): Boolean = changeManualMode(true, grant) {}
+
+    private suspend fun changeManualMode(
+        enabled: Boolean, required: OnlineGrant?, beforeDisconnect: suspend (AccountIdentity) -> Unit,
+    ): Boolean = modeChanges.withLock {
+        val alreadySet = synchronized(lock) {
+            check(mutablePolicyLoaded.value) { "Session policy not loaded" }
+            mutableOffline.value == enabled
+        }
+        if (alreadySet) {
+            // Explicit Go online also starts a fresh batch after a terminal HTTP failure in auto mode.
+            if (!enabled) synchronized(lock) {
+                if (bootstrapAllowed && mutableGrant.value == null && mutableValidation.value != OnlineValidation.VALIDATING)
+                    validateLocalLocked() else null
+            }?.start()
+            return@withLock required == null
+        }
+        withContext(io + NonCancellable) {
+            // Accept fallback only while the failing socket batch still owns the current grant.
+            if (required != null && synchronized(lock) { mutableGrant.value !== required }) return@withContext false
+            val store = checkNotNull(manualOfflineStore) { "No durable manual mode store" }
+            store.write(enabled)
+            if (required != null) {
+                // The preference write may have been blocked while sign-out or validation
+                // installed a successor. Commit the in-memory transition only if still current.
+                val transition = synchronized(lock) {
+                    if (mutableGrant.value === required) switchModeLocked(enabled) else null
                 }
-                try {
-                    if (enabled && owner != null) withTimeoutOrNull(1_000) { beforeDisconnect(owner) }
-                } finally {
-                    val transition = synchronized(lock) { switchModeLocked(enabled) }
-                    try { transition.transport?.closeRetiredStreams() } finally {
-                        transition.retired.joinAll()
-                        transition.next?.start()
-                    }
+                if (transition == null) {
+                    // modeChanges is still held: restore the unchanged policy before any
+                    // newer explicit mode command can write to the store.
+                    store.write(!enabled)
+                    return@withContext false
                 }
+                completeModeSwitch(transition)
+                return@withContext true
             }
+            val owner = synchronized(lock) {
+                handingOff = true
+                mutableGrant.value?.identity
+            }
+            try {
+                if (enabled && owner != null) withTimeoutOrNull(1_000) { beforeDisconnect(owner) }
+            } finally {
+                completeModeSwitch(synchronized(lock) { switchModeLocked(enabled) })
+            }
+            true
+        }
+    }
+
+    private suspend fun completeModeSwitch(transition: Transition) {
+        try { transition.transport?.closeRetiredStreams() } finally {
+            transition.retired.joinAll()
+            transition.next?.start()
         }
     }
 
@@ -341,11 +411,8 @@ class SessionRepository(
         retired.forEach { it.cancel() } // includes independent remote logouts
         mutableOffline.value = enabled
         handingOff = false
-        val record = saved
-        val previous = identity
         val next = when {
-            enabled && current is AuthState.Authenticated -> null // retain exact identity and verified record
-            record != null && (current is AuthState.Authenticated || recovering) -> operationLocked { restore(token, record, previous) }
+            current is AuthState.Authenticated -> if (enabled) null else validationLocked(token, requireNotNull(saved))
             recovering -> operationLocked { restoreStored(token) }
             else -> null
         }
@@ -419,12 +486,20 @@ class SessionRepository(
     fun refresh() {
         val job = synchronized(lock) {
             if (!bootstrapAllowed || mutableGrant.value == null) return
-            val record = saved ?: return
-            val previous = identity
-            val token = advance(AuthState.Validating)
-            operationLocked { restore(token, record, previous) }
+            validateLocalLocked()
         }
-        job.start()
+        job?.start()
+    }
+
+    private fun validateLocalLocked(): Job? {
+        val current = state.value as? AuthState.Authenticated ?: return null
+        val record = saved ?: return null
+        return validationLocked(advance(current.copy(notice = saveNotice())), record)
+    }
+
+    private fun validationLocked(token: Long, record: StoredSession): Job {
+        mutableValidation.value = OnlineValidation.VALIDATING
+        return operationLocked { validateInstalled(token, record) }
     }
 
     fun signOut() {
@@ -452,31 +527,18 @@ class SessionRepository(
         job.start()
     }
 
-    private suspend fun restore(token: Long, record: StoredSession, previous: AccountIdentity?) {
+    private suspend fun validateInstalled(token: Long, record: StoredSession) {
         var retryEpoch: Long? = null
         try {
+            synchronized(lock) { if (token != generation || !bootstrapAllowed) return }
             val origin = ServerOrigin.parse(record.server)
-            record.session.validated()
-            val localOnly = synchronized(lock) { if (token != generation || handingOff) return; mutableOffline.value }
-            if (localOnly) {
-                // Only the installed authenticated SessionStore, never the remembered-login
-                // record. Validate its structure without constructing ANY transport.
-                parseSessionCookie(origin, record.cookie)
-                require(record.sessionMode == null || record.sessionMode == "rolling-v1")
-                currentCoroutineContext().ensureActive()
-                synchronized(lock) {
-                    if (token == generation) promote(StoredSession(origin.value, record.cookie, record.session,
-                        record.sessionMode), previous?.incarnation ?: token)
-                }
-                return
-            }
             val client = apis.create(origin)
-            client.validateCookie(record.cookie)
             synchronized(lock) {
                 if (token != generation || !bootstrapAllowed) { client.cancel(); return }
-                saved = record
                 api = client
             }
+            require(client.origin == origin)
+            client.validateCookie(record.cookie)
             val validation = validateStoredSession(token, client, record.cookie)
             retryEpoch = validation.retryEpoch
             val response = validation.result.getOrThrow()
@@ -486,7 +548,7 @@ class SessionRepository(
             val write = synchronized(lock) {
                 if (token != generation || !bootstrapAllowed) return
                 if (retryEpoch != null && retryEpoch != foregroundEpoch) throw AuthFailure(AuthFailure.Kind.UNAVAILABLE)
-                promote(updated, previous?.incarnation ?: token)
+                promote(updated, requireNotNull(identity).incarnation)
                 persistLocked(updated)
             }
             write.start()
@@ -495,21 +557,21 @@ class SessionRepository(
         } catch (error: Exception) {
             currentCoroutineContext().ensureActive()
             val clear = synchronized(lock) {
-                if (token != generation) return
+                if (token != generation || !bootstrapAllowed) return
                 // A child can finish before onStop yet have its result dispatched afterward.
                 val retiredRetry = retryEpoch != null && retryEpoch != foregroundEpoch
                 if (!retiredRetry && error is AuthFailure && error.kind == AuthFailure.Kind.UNAUTHORIZED) {
+                    advance(AuthState.SignedOut(AuthNotice.SESSION_EXPIRED))
                     saved = null
                     identity = null
-                    mutableState.value = signedOutState(AuthNotice.SESSION_EXPIRED)
                     persistLocked(null)
                 } else {
-                    // Unavailability is not revocation: preserve all recovery material.
-                    val active = (state.value as? AuthState.Authenticated)?.takeIf {
-                        retiredRetry || error is AuthFailure && error.kind == AuthFailure.Kind.UNAVAILABLE
-                    }
-                    mutableState.value = active?.copy(notice = AuthNotice.CONNECTION_FAILED)
-                        ?: AuthState.Unavailable(AuthNotice.CONNECTION_FAILED)
+                    // Even invalid/mismatched server responses do not invalidate installed local authority.
+                    // Never expose a network grant for them, and do not overwrite the local record.
+                    api?.cancel()
+                    api = null
+                    mutableState.value = AuthState.Authenticated(requireNotNull(identity), AuthNotice.CONNECTION_FAILED)
+                    mutableValidation.value = OnlineValidation.UNAVAILABLE
                     null
                 }
             }
@@ -618,6 +680,7 @@ class SessionRepository(
     private fun advance(state: AuthState): Long {
         generation++
         mutableGrant.value = null
+        mutableValidation.value = OnlineValidation.IDLE
         operation?.cancel()
         featureJobs.toList().forEach { it.cancel() }
         api?.cancel()
@@ -628,11 +691,21 @@ class SessionRepository(
 
     private fun saveNotice(): AuthNotice? = if (sessionSaveFailed || profileSaveFailed) AuthNotice.SAVE_FAILED else null
 
-    private fun promote(record: StoredSession, incarnation: Long) {
+    private fun installLocalLocked(record: StoredSession, incarnation: Long) {
         saved = record
-        identity = AccountIdentity(record.server, record.session.accountId, record.session.username, incarnation)
-        mutableState.value = AuthState.Authenticated(requireNotNull(identity), saveNotice())
-        if (!mutableOffline.value) mutableGrant.value = OnlineGrant(requireNotNull(identity), generation)
+        // Keep native/cache ownership stable if the server updated mutable session metadata.
+        val current = identity?.takeIf { it.incarnation == incarnation && it.origin == record.server && it.accountId == record.session.accountId }
+        val installed = current ?: AccountIdentity(record.server, record.session.accountId, record.session.username, incarnation)
+        identity = installed
+        mutableState.value = AuthState.Authenticated(installed, saveNotice())
+    }
+
+    private fun promote(record: StoredSession, incarnation: Long) {
+        installLocalLocked(record, incarnation)
+        if (bootstrapAllowed) {
+            mutableGrant.value = OnlineGrant(requireNotNull(identity), generation)
+            mutableValidation.value = OnlineValidation.VALIDATED
+        }
     }
 
     private fun signedOutState(notice: AuthNotice?) = AuthState.SignedOut(

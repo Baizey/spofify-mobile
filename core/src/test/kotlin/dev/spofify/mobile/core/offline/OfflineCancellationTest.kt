@@ -83,7 +83,7 @@ class OfflineCancellationTest {
     private fun TestScope.fixture(): Fixture {
         val transport = Transport()
         val store = object : SessionStore {
-            var value: StoredSession? = StoredSession(transport.origin.value, "fixture-cookie", transport.summary)
+            var value: StoredSession? = StoredSession(transport.origin.value, "spofify_session=fixture-cookie; Path=/; HttpOnly", transport.summary)
             override fun read() = value
             override fun write(value: StoredSession?) { this.value = value }
         }
@@ -103,7 +103,7 @@ class OfflineCancellationTest {
         val summary = SessionSummary("account", "fixture-user", "user", "fixture-csrf")
         val reads = AtomicInteger()
         var exchange: suspend () -> FeatureResponse = { error("Unexpected request") }
-        override suspend fun login(username: String, password: String) = AuthReply(summary, "fixture-cookie", null)
+        override suspend fun login(username: String, password: String) = AuthReply(summary, "spofify_session=fixture-cookie; Path=/; HttpOnly", null)
         override suspend fun session(cookie: String) = AuthReply(summary, null, null)
         override suspend fun logout(cookie: String, csrfToken: String) = Unit
         override fun validateCookie(cookie: String) = Unit

@@ -40,9 +40,9 @@ class LibraryClientTest {
             server.enqueue(json("""{"accountId":"account","username":"fixture-user","role":"$role","csrfToken":"fixture-csrf"}"""))
             try {
                 sessions.start()
-                val state = withTimeout(3000) { sessions.state.first { it is AuthState.Authenticated } } as AuthState.Authenticated
+                val grant = withTimeout(3000) { sessions.onlineGrant.first { it != null } }!!
                 server.takeRequest(2, TimeUnit.SECONDS)
-                block(server, sessions, state.identity)
+                block(server, sessions, grant.identity)
             } finally {
                 scope.cancel()
                 scope.coroutineContext.job.join()
@@ -362,7 +362,7 @@ class LibraryClientTest {
                 hello.complete(text)
                 socket.send("""{"type":"snapshot"}""")
             }
-        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v1"))
+        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v3"))
         val deviceName = "😀".repeat(64)
         val connection = sessions.playbackTransport(identity).connect(deviceName, "fixture-device")
         try {
@@ -382,10 +382,60 @@ class LibraryClientTest {
             val upgrade = server.takeRequest(2, TimeUnit.SECONDS)!!
             assertEquals("/api/me/player/socket", upgrade.path)
             assertNull(upgrade.requestUrl!!.query)
-            assertEquals("spofify.account-state.v1", upgrade.getHeader("Sec-WebSocket-Protocol"))
+            assertEquals("spofify.account-state.v3", upgrade.getHeader("Sec-WebSocket-Protocol"))
             assertEquals(identity.origin, upgrade.getHeader("Origin"))
             assertFalse(upgrade.path!!.contains("fixture-ticket"))
         } finally { connection.close() }
+    } }
+
+    @Test fun largeLocalPlayerIsSentWholeButNormalSendRemainsBounded() = runBlocking { fixture { server, sessions, identity ->
+        val hello = CompletableDeferred<JsonObject>()
+        server.enqueue(json("""{"ticket":"fixture"}"""))
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+            override fun onMessage(socket: okhttp3.WebSocket, text: String) {
+                hello.complete(kotlinx.serialization.json.Json.parseToJsonElement(text) as JsonObject)
+            }
+        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v3"))
+        val player = buildJsonObject {
+            put("repeat", "one"); put("shuffle", false)
+            putJsonObject("cursor") {
+                put("key", 1); put("occurrence", "visit"); put("positionMs", 123); put("desiredPlaying", true)
+            }
+            putJsonArray("queue") {
+                repeat(1500) { row ->
+                    add(buildJsonObject {
+                        put("id", "track-$row"); put("name", "Fixture track $row ${"😀".repeat(20)}")
+                        putJsonArray("artists") { add(buildJsonObject { put("id", "artist"); put("name", "Fixture artist") }) }
+                        put("albumName", "Fixture album"); put("albumId", "album"); put("duration", 120.0)
+                        put("key", row + 1); put("order", row + 1); put("intent", "play")
+                    })
+                }
+            }
+        }
+        assertTrue(player.toString().toByteArray().size > 64 * 1024)
+        val basis = buildJsonObject {
+            put("sessionId", "session"); put("generation", 4); put("revision", 7); put("occurrence", "visit")
+        }
+        sessions.playbackTransport(identity).connect("phone", "device", player, basis).use { connection ->
+            val frame = withTimeout(3000) { hello.await() }
+            assertEquals(player, frame["local"])
+            assertEquals(basis, frame["reattachBasis"])
+            assertFalse(connection.send("😀".repeat(16385)))
+            assertTrue(connection.send("😀".repeat(16384)))
+            assertTrue(connection.isOpen)
+        }
+    } }
+
+    @Test fun socketRejectsLegacySubprotocolBeforeSendingHello() = runBlocking { fixture { server, sessions, identity ->
+        server.enqueue(json("""{"ticket":"fixture"}"""))
+        val hello = CompletableDeferred<String>()
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+            override fun onMessage(socket: okhttp3.WebSocket, text: String) { hello.complete(text) }
+        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v1"))
+        assertTrue(runCatching { sessions.playbackTransport(identity).connect("phone", "device") }
+            .exceptionOrNull() is AuthFailure)
+        assertNull(withTimeoutOrNull(100) { hello.await() })
+        assertTrue(sessions.isCurrent(identity))
     } }
 
     @Test fun invalidDeviceNamesDoNotRequestAdmission() = runBlocking { fixture { server, sessions, identity ->

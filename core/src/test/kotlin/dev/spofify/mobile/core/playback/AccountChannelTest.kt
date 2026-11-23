@@ -2,204 +2,502 @@ package dev.spofify.mobile.core.playback
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.test.*
 import kotlinx.serialization.json.*
-import org.junit.Test
 import org.junit.Assert.*
+import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AccountChannelTest {
     private class Socket : PlaybackConnection {
-        val input=Channel<String>(32);override val messages=input.receiveAsFlow();override var isOpen=true
-        val sent=mutableListOf<JsonObject>()
-        override fun send(text:String):Boolean {if(!isOpen)return false;sent+=playbackJson.parseToJsonElement(text).jsonObject;return true}
-        override fun close(){isOpen=false;input.close()}
-        fun frame(s:String){check(input.trySend(s).isSuccess)}
+        var open = true
+        var replaced = false
+        override val isOpen get() = open
+        override val superseded get() = replaced
+        private val frames = Channel<String>(Channel.UNLIMITED)
+        override val messages = frames.receiveAsFlow()
+        val sent = mutableListOf<JsonObject>()
+        override fun send(text: String): Boolean {
+            if (!open) return false
+            sent += playbackJson.parseToJsonElement(text).jsonObject
+            return true
+        }
+        fun frame(vararg values: Pair<String, Any?>) { check(frames.trySend(fields(*values).toString()).isSuccess) }
+        fun report() = sent.last { it.kind == "report" }
+        fun commands() = sent.filter { it.kind == "command" }.map { playbackJson.decodeFromJsonElement<AccountCommand>(JsonObject(it - "type")) }
+        override fun close() { open = false; frames.close() }
     }
-    private class Audio:AudioExecutor {
-        override val observations=MutableSharedFlow<AudioObservation>(extraBufferCapacity=16)
-        var facts=AudioFacts();val operations=mutableListOf<AudioBinding>();var authorized:()->Boolean={false}
-        var nextResult = AudioResult.OK
-        var preparing: CompletableDeferred<Unit>? = null
-        override fun pause(){facts=facts.copy(isPlaying=false)}
-        override fun facts()=facts
-        override suspend fun prepare(binding:AudioBinding,track:PlaybackTrack?,elapsed:Double):AudioResult=error("unused")
-        override suspend fun execute(binding:AudioBinding,track:PlaybackTrack?,elapsed:Double,desiredPlaying:Boolean,isAuthorized:()->Boolean):AudioResult {
-            operations += binding
-            authorized = isAuthorized
-            val result = nextResult.also { nextResult = AudioResult.OK }
-            facts = AudioFacts(binding, elapsed, 32.0)
-            preparing?.await()
-            facts = facts.copy(isPlaying = result == AudioResult.OK && desiredPlaying,
-                error = when (result) { AudioResult.BLOCKED -> "blocked"; AudioResult.MEDIA -> "media"; else -> "" })
-            return result
+
+    private class Audio : AudioExecutor {
+        override val observations = MutableSharedFlow<AudioObservation>(extraBufferCapacity = 16)
+        var facts = AudioFacts()
+        var refusal = false
+        var readyGate: CompletableDeferred<Unit>? = null
+        var pauses = 0
+        val starts = mutableListOf<AudioBinding>()
+        val seeks = mutableListOf<Double>()
+        val guards = mutableListOf<() -> Boolean>()
+        override fun facts() = facts
+        override fun pause() { pauses++; facts = facts.copy(isPlaying = false) }
+        override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double) = error("unused")
+        override suspend fun execute(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
+            desiredPlaying: Boolean, isAuthorized: () -> Boolean): AudioResult {
+            if (!isAuthorized()) return AudioResult.REJECTED
+            starts += binding
+            seeks += elapsed
+            guards += isAuthorized
+            facts = AudioFacts(binding, elapsed, duration = 48.0, isPlaying = desiredPlaying && !refusal)
+            readyGate?.await()
+            return if (refusal) AudioResult.BLOCKED else AudioResult.OK
+        }
+        fun eof(elapsed: Double, signal: Boolean = true) {
+            val b = requireNotNull(facts.binding)
+            facts = facts.copy(elapsed = elapsed, ended = true, isPlaying = false)
+            if (signal) check(observations.tryEmit(AudioObservation(b, facts)))
         }
     }
-    private fun snapshot(id:String,owner:String,second:Long=2):String {
-        fun row(key:Long)=PlaybackTrack("duplicate","same", emptyList(),"","",32.0,key,key,"low")
-        val s=AccountState(listOf(row(1),row(second)),AccountCursor(1,"root",desired=true),"off",false)
-        return fields("type" to "snapshot","connectionId" to id,"owner" to owner,"devices" to JsonArray(emptyList()),"player" to playbackJson.encodeToJsonElement(s)).toString()
-    }
-    @Test fun previewIsReadOnlyUntilPublicationAndDoesNotLockStableRows()=runTest {
-        val socket=Socket();val audio=Audio();val c=AccountChannel(PlaybackTransport{_,_->socket},audio,backgroundScope,object:PlaybackClock{override fun monotonicMs()=0L;override fun wallTimeMs()=0L})
-        val stable=FIRST_PREVIEW_KEY-2;c.connect("Phone","here");runCurrent();socket.frame(snapshot("owner","owner",stable));runCurrent();socket.frame("""{"type":"grant","basis":0,"ms":8000,"handle":"owner"}""");runCurrent()
-        repeat(2){assertTrue(c.queueTrack(PlaybackTrackReference("duplicate")))}
-        val before=c.state.value;val keys=before.queue.map { it.key };val n=socket.sent.size;val starts=audio.operations.size
-        assertEquals(4,keys.distinct().size);assertTrue(keys.take(2).all(::isPublishedQueueKey));assertTrue(keys.drop(2).none(::isPublishedQueueKey));assertFalse(c.jump(keys[2]));assertFalse(c.remove(keys[2]));assertFalse(c.moveUpcoming(keys[3],null));assertFalse(c.moveUpcoming(stable,keys[2]));runCurrent();assertSame(before,c.state.value);assertEquals(n,socket.sent.size);assertEquals(starts,audio.operations.size)
-        assertTrue(c.remove(stable));assertFalse(c.state.value.queue.any {it.key==stable});assertEquals(stable,socket.sent.last().getValue("key").jsonPrimitive.long)
-        val lastPublic=FIRST_PREVIEW_KEY-1;assertFalse(lastPublic in keys);val newRow=before.queue.first().copy(key=lastPublic,order=3)
-        val update=AccountDelta(queue=AccountQueueEdit("insert",rows=listOf(newRow)),source="owner");socket.frame(fields("type" to "player","player" to playbackJson.encodeToJsonElement(update)).toString());runCurrent();assertTrue(c.jump(lastPublic));assertEquals(lastPublic,c.state.value.current!!.key);c.close()
-    }
-    @Test fun pauseSamplesPhysicalTailOnStillLiveRunBeforeSendingChoice()=runTest {
-        for (scenario in listOf("playing","buffering","wrong binding","stopped")) {
-            val socket=Socket();val audio=Audio();val c=AccountChannel(PlaybackTransport{_,_->socket},audio,backgroundScope,object:PlaybackClock{override fun monotonicMs()=0L;override fun wallTimeMs()=0L})
-            c.connect("Phone","here");runCurrent();socket.frame(snapshot("owner","owner"));runCurrent();socket.frame("""{"type":"grant","basis":0,"ms":8000,"handle":"owner"}""");runCurrent()
-            val binding=audio.operations.single();audio.facts=AudioFacts(binding,30.0,32.0,isPlaying=true);audio.observations.tryEmit(AudioObservation(binding,audio.facts));runCurrent()
-            val n=socket.sent.size;audio.facts=audio.facts.copy(binding=if(scenario=="wrong binding")binding.copy(instructionId="stale")else binding,elapsed=30.4,isPlaying=scenario!="stopped",isBuffering=scenario=="buffering");assertTrue(c.pause())
-            val sent=socket.sent.drop(n);assertEquals("pause",sent.last().getValue("type").jsonPrimitive.content)
-            if(scenario=="playing" || scenario=="stopped") {val f=sent.dropLast(1).single();assertEquals("fact",f.getValue("type").jsonPrimitive.content);assertEquals("root",f.getValue("chain").jsonPrimitive.content);assertEquals(0L,f.getValue("run").jsonPrimitive.long);assertEquals(30.4,f.getValue("elapsed").jsonPrimitive.double,0.0);assertEquals(scenario=="playing",f.getValue("playing").jsonPrimitive.boolean)} else assertEquals(1,sent.size)
-            runCurrent();c.close()
-        }
-    }
-    private fun Socket.grant() = frame("""{"type":"grant","basis":0,"ms":8000,"handle":"owner"}""")
-    private fun Socket.update(delta: AccountDelta) = frame(fields("type" to "player", "player" to playbackJson.encodeToJsonElement(delta)).toString())
-    private fun Socket.facts() = sent.filter { it["type"]?.jsonPrimitive?.content == "fact" }
-    private fun TestScope.connect(socket: Socket, audio: Audio, owner: String = "owner"): AccountChannel {
+
+    private class Fixture(val test: TestScope) {
+        val audio = Audio()
+        var socket = Socket()
+        val claims = mutableListOf<AccountState?>()
+        val reattach = mutableListOf<JsonObject?>()
+        var wallShift = 0L
+        var upgradeDelay = 0L
         val clock = object : PlaybackClock {
-            override fun monotonicMs() = testScheduler.currentTime
-            override fun wallTimeMs() = 0L
+            override fun monotonicMs() = test.testScheduler.currentTime
+            override fun wallTimeMs() = WALL + monotonicMs() + wallShift
         }
-        return AccountChannel(PlaybackTransport { _, _ -> socket }, audio, backgroundScope, clock).also {
-            it.connect("Phone", "here"); runCurrent()
-            socket.frame(snapshot("owner", owner)); runCurrent()
-            if (owner == "owner") { socket.grant(); runCurrent() }
+        val channel = AccountChannel(PlaybackTransport { _, _, local, basis ->
+            claims += local?.let { playbackJson.decodeFromJsonElement<AccountState>(it) }
+            reattach += basis
+            delay(upgradeDelay)
+            socket
+        }, audio, test.backgroundScope, clock, library = object : LocalPlaybackLibrary {
+            override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
+            override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = LocalPlaybackRows(rows)
+        })
+        val view get() = channel.state.value
+        fun connect() { channel.connect("Phone", "self"); test.runCurrent() }
+        fun snapshot(owner: String? = "self", generation: Long = 1, revision: Long = 1,
+            cursor: AccountCursor = first, observation: AccountObservation? = null, connection: String = "socket-1") {
+            snapshot(AccountState(rows, cursor, "off", false), owner, generation, revision, observation, connection)
         }
+        fun snapshot(player: AccountState, owner: String? = "self", generation: Long = 1, revision: Long = 1,
+            observation: AccountObservation? = null, connection: String = "socket-1") {
+            val optional = observation?.let { arrayOf("observation" to encode(it)) } ?: emptyArray()
+            socket.frame("type" to "snapshot", "sessionId" to "room", "connectionId" to connection,
+                "revision" to revision, "owner" to encode(AccountOwner(generation, owner)),
+                "devices" to encode(listOf(AccountDevice("self", "Phone", true), AccountDevice("other", "Other", true))),
+                "player" to encode(player), "serverTimeMs" to WALL + clock.monotonicMs(), *optional)
+            test.runCurrent()
+        }
+        fun delta(revision: Long, delta: AccountDelta, command: AccountCommand? = null, generation: Long = 1) {
+            val optional = command?.let { arrayOf("command" to commandWire(it)) } ?: emptyArray()
+            socket.frame("type" to "state", "generation" to generation, "revision" to revision, "delta" to encode(delta), *optional)
+            test.runCurrent()
+        }
+        fun execute(command: AccountCommand, revision: Long = 1, generation: Long = 1) {
+            socket.frame("type" to "execute", "generation" to generation, "revision" to revision, "command" to commandWire(command))
+            test.runCurrent()
+        }
+        fun result(command: AccountCommand, status: String, revision: Long) {
+            socket.frame("type" to "result", "id" to command.id, "status" to status, "revision" to revision)
+            test.runCurrent()
+        }
+        fun disconnect() { socket.close(); test.runCurrent(); socket = Socket() }
     }
 
-    @Test fun preparingIsNotPlayingButCanBePaused() = runTest {
-        val audio = Audio().apply { preparing = CompletableDeferred() }
-        val socket = Socket()
-        val channel = connect(socket, audio)
-        assertFalse(channel.state.value.isPlaying)
-        assertTrue(channel.state.value.wantsPause)
-        assertTrue(channel.toggle())
-        assertEquals("pause", socket.sent.last()["type"]?.jsonPrimitive?.content)
-        channel.close()
+    @Test fun followerProjectsRapidRepeatAcrossWatermarkedResultsWithoutNativeCommands() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot(owner = "other")
+        f.channel.cycleRepeat(); f.channel.cycleRepeat()
+        val (first, second) = f.socket.commands()
+        assertEquals(listOf("socket-1:1", "socket-1:2"), listOf(first.id, second.id))
+        assertEquals(listOf("all", "one"), listOf(first.action.string("repeat"), second.action.string("repeat")))
+        assertEquals("one", f.view.snapshot?.state?.repeat)
+        f.result(second, "accepted", 2)
+        f.result(second, "applied", 3)
+        f.delta(2, AccountDelta(repeat = "all"), first)
+        f.result(first, "applied", 2)
+        assertEquals("one", f.view.snapshot?.state?.repeat)
+        f.delta(3, AccountDelta(repeat = "one"), second)
+        assertEquals("one", f.view.snapshot?.state?.repeat)
+        assertTrue(f.audio.starts.isEmpty())
+        assertFalse(f.view.isPlaying)
     }
 
-    @Test fun localRefusalSurvivesSameRunEchoAndOnePlayStartsANewRun() = runTest {
-        val audio = Audio().apply { nextResult = AudioResult.BLOCKED }
-        val socket = Socket()
-        val channel = connect(socket, audio)
-        val refused = audio.operations.single()
-        val view = channel.state.value
-        assertTrue(view.desiredPlaying)
-        assertFalse(view.isPlaying)
-        assertFalse(view.wantsPause)
-        assertEquals("blocked", view.playback?.error)
-        assertEquals("blocked", socket.facts().single()["error"]?.jsonPrimitive?.content)
-        socket.update(AccountDelta(cursor = AccountCursor(1, "root", elapsed = 0.2, desired = true, playing = true), observed = true))
-        socket.grant(); runCurrent()
-        assertFalse(channel.state.value.isPlaying)
-        assertFalse(channel.state.value.wantsPause)
-        assertEquals(1, audio.operations.size)
-        assertTrue(channel.toggle())
-        assertEquals("resume", socket.sent.last()["type"]?.jsonPrimitive?.content)
+    @Test fun isolatedQueueClaimsEvenAfterTenSecondsAndLosingClaimPausesBeforeAdopting() = runTest {
+        val f = Fixture(this)
+        assertTrue(f.channel.playTrack(PlaybackTrackReference("duplicate"))); runCurrent()
+        advanceTimeBy(11_000); runCurrent()
+        assertTrue(f.audio.facts.isPlaying)
+        f.connect()
+        assertEquals(2, f.claims.single()?.queue?.size)
+        f.snapshot(owner = "other", observation = AccountObservation(1, "first", 1_000, f.clock.wallTimeMs(), "playing"))
+        assertFalse(f.audio.facts.isPlaying)
+        assertFalse(f.audio.guards.single()())
+        assertEquals("first", f.view.snapshot?.state?.occurrence?.eventId)
+        assertTrue(f.view.isPlaying) // Remote report is not local native work.
+        f.disconnect()
+        advanceTimeBy(11_000); runCurrent()
+        assertTrue(f.view.offline)
+        assertNull(f.view.current)
+    }
+
+    @Test fun sameDeviceReconnectDoesNotRestartOrStopPlayingAndRefreshIsBoundToNewSocket() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        val b = f.audio.starts.single()
+        f.audio.facts = f.audio.facts.copy(elapsed = 7.0)
+        advanceTimeBy(251)
+        f.disconnect()
+        assertTrue(f.view.offline)
+        advanceTimeBy(2_000)
+        assertTrue(f.audio.facts.isPlaying)
+        assertEquals(0, f.audio.pauses)
+        f.connect(); f.snapshot(revision = 2, cursor = first.copy(positionMs = 7_000), connection = "socket-2")
+        assertEquals(listOf(b), f.audio.starts)
+        assertEquals(0, f.audio.pauses)
+        assertEquals(1L, f.socket.report().long("sequence"))
+        assertEquals(7_000L, f.socket.report().getValue("observation").jsonObject.long("positionMs"))
+        assertTrue(f.socket.sent.any { it.kind == "refresh" && it.long("generation") == 1L })
+    }
+
+    @Test fun naturalAdvanceThroughDuplicateStartsImmediatelyAndEchoDoesNotRestart() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        f.audio.eof(42.0); runCurrent()
+        val advance = playbackJson.decodeFromJsonElement<AccountAdvance>(f.socket.report().getValue("advance"))
+        assertEquals(1L, advance.fromKey)
+        assertEquals(2L, advance.toKey)
+        assertEquals(42_000L, advance.endedPositionMs)
+        val successorFact = f.socket.report().getValue("observation").jsonObject
+        assertEquals(advance.toOccurrence, successorFact.string("occurrence"))
+        assertEquals("loading", successorFact.string("status"))
+        assertEquals(2, f.audio.starts.size)
+        val successor = AccountCursor(2, advance.toOccurrence, 0, true)
+        f.delta(2, AccountDelta(cursor = successor))
+        assertEquals(2, f.audio.starts.size)
+        assertEquals(2L, f.view.current?.key)
+        assertEquals(advance.toOccurrence, f.view.snapshot?.state?.occurrence?.eventId)
+        f.audio.eof(42.0); runCurrent()
+        val tail = f.socket.report().getValue("advance").jsonObject
+        assertEquals(0L, tail.long("toKey"))
+        f.delta(3, AccountDelta(cursor = successor.copy(desiredPlaying = false)))
+        assertFalse(f.view.desiredPlaying)
+        assertEquals(0.0, f.view.playback?.elapsed)
+        assertEquals(2, f.audio.starts.size)
+    }
+
+    @Test fun eofFirstSettlesNextStaleAndLateSeekCannotTouchNewVisit() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        f.channel.seek(12.5); f.channel.next()
+        val (seek, next) = f.socket.commands()
+        assertEquals("first", seek.basis.occurrence)
+        assertEquals(12_500L, seek.action.long("positionMs"))
+        assertEquals(2L, next.basis.successorKey)
+        f.audio.eof(44.0); runCurrent()
+        val advance = f.socket.report().getValue("advance").jsonObject
+        f.execute(next)
+        val staleNext = f.socket.report().getValue("settlements").jsonArray.single().jsonObject
+        assertEquals("stale", staleNext.string("status")); assertFalse(staleNext.containsKey("cursor"))
+        f.delta(2, AccountDelta(cursor = AccountCursor(2, advance.string("toOccurrence"), 0, true)))
+        f.result(next, "stale", 2)
+        f.delta(3, AccountDelta(cursor = first.copy(positionMs = 12_500)), seek)
+        assertEquals(2, f.audio.starts.size)
+        assertEquals(listOf(0.0, 0.0), f.audio.seeks)
+        assertEquals("stale", f.socket.report().getValue("settlements").jsonArray.single().jsonObject.string("status"))
+        val settlements = f.socket.sent.flatMap { it["settlements"]?.jsonArray.orEmpty() }.map { it.jsonObject }
+        assertTrue(settlements.any { it.string("id") == next.id && it.string("status") == "stale" })
+    }
+
+    @Test fun executeFirstAppliesNextOnceAndFencesNativeEofFromOutgoingBinding() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        val outgoing = f.audio.facts
+        f.channel.next()
+        val next = f.socket.commands().single()
+        f.execute(next)
+        val settlement = f.socket.sent.flatMap { it["settlements"]?.jsonArray.orEmpty() }.map { it.jsonObject }.single()
+        assertEquals("applied", settlement.string("status"))
+        val newCursor = playbackJson.decodeFromJsonElement<AccountCursor>(settlement.getValue("cursor"))
+        assertEquals(2L, newCursor.key)
+        assertNotEquals(first.occurrence, newCursor.occurrence)
+        val facts = outgoing.copy(ended = true, isPlaying = false, elapsed = 42.0)
+        f.audio.observations.tryEmit(AudioObservation(requireNotNull(facts.binding), facts)); runCurrent()
+        f.execute(next) // Duplicate delivery must not apply or settle again.
+        assertTrue(f.socket.sent.none { it.containsKey("advance") })
+        f.delta(2, AccountDelta(cursor = newCursor), next)
+        f.result(next, "applied", 2)
+        assertEquals(listOf(0.0, 0.0), f.audio.seeks)
+        assertEquals(newCursor.occurrence, f.view.snapshot?.state?.occurrence?.eventId)
+    }
+
+    @Test fun nativeEofSeenDuringSuspendedExecuteWinsBeforeNextWithoutFlowCallback() = runTest {
+        val f = Fixture(this)
+        f.audio.readyGate = CompletableDeferred()
+        f.connect(); f.snapshot(AccountState(rows, first, "one", false))
+        f.channel.next()
+        val next = f.socket.commands().single()
+        f.audio.eof(43.0, signal = false) // Native callback happened, its shared-flow work has not run.
+        f.audio.readyGate = null
+        f.execute(next)
+        val packets = f.socket.sent.filter { it.kind == "report" }
+        val eof = packets.indexOfFirst { it.containsKey("advance") }
+        val stale = packets.indexOfFirst { it["settlements"]?.jsonArray?.any { item -> item.jsonObject.string("id") == next.id } == true }
+        assertTrue(eof >= 0 && stale > eof)
+        val advance = packets[eof].getValue("advance").jsonObject
+        assertEquals(first.key, advance.long("toKey"))
+        assertNotEquals(first.occurrence, advance.string("toOccurrence"))
+        assertEquals("stale", packets[stale].getValue("settlements").jsonArray.single().jsonObject.string("status"))
+    }
+
+    @Test fun timedOutTailNextRestoresSoundBeforeHeldRepeat() = runTest {
+        val f = Fixture(this)
+        val tail = AccountCursor(2, "tail", 0, true)
+        f.connect(); f.snapshot(cursor = tail)
+        f.audio.facts = f.audio.facts.copy(elapsed = 7.5)
+        f.channel.next(); val next = f.socket.commands().single()
+        f.execute(next)
+        val paused = f.socket.report().getValue("settlements").jsonArray.single().jsonObject.getValue("cursor").jsonObject
+        assertEquals(7_500L, paused.long("positionMs"))
+        assertFalse(f.audio.facts.isPlaying)
+        f.snapshot(cursor = tail) // Exact owner/session/revision, but rejected execution did pause audio.
+        assertTrue(f.audio.facts.isPlaying)
+        assertEquals(2, f.audio.starts.size)
+        f.result(next, "failed", 1)
+        f.delta(2, AccountDelta(repeat = "all"), AccountCommand("other:1", WALL, next.basis, fields("type" to "repeat", "repeat" to "all")))
+        assertEquals("all", f.view.snapshot?.state?.repeat)
+        assertTrue(f.socket.sent.last { it.kind == "report" }.getValue("observation").jsonObject.string("status") == "playing")
+    }
+
+    @Test fun successorEofWaitsForNextCommitAndRejectedAdvanceReconcilesAfterTraversalEdit() = runTest {
+        val f = Fixture(this)
+        val three = rows + rows.last().copy(key = 3, order = 3)
+        val original = AccountState(three, first, "off", false)
+        f.connect(); f.snapshot(original)
+        f.channel.next(); val next = f.socket.commands().single()
+        f.execute(next)
+        val second = playbackJson.decodeFromJsonElement<AccountCursor>(
+            f.socket.report().getValue("settlements").jsonArray.single().jsonObject.getValue("cursor"))
+        f.audio.eof(42.0); runCurrent()
+        assertEquals(3, f.audio.starts.size)
+        assertTrue(f.socket.sent.none { it.containsKey("advance") })
+        f.delta(2, AccountDelta(cursor = second), next)
+        val eof = f.socket.sent.single { it.containsKey("advance") }
+        assertEquals(2L, eof.long("revision"))
+        assertEquals(second.occurrence, eof.getValue("advance").jsonObject.string("fromOccurrence"))
+        f.delta(3, AccountDelta(queue = AccountQueueEdit("remove", keys = listOf(3))))
+        assertEquals(PlaybackConnectionState.READY, f.view.connection)
+        f.snapshot(original.copy(queue = rows, cursor = second), revision = 3)
+        assertEquals(4, f.audio.starts.size)
+        assertEquals(second.occurrence, f.view.snapshot?.state?.occurrence?.eventId)
+    }
+
+    @Test fun reorderedSuccessorSilentlyDropsOptimisticNextWhileSourceVisitStillMatches() = runTest {
+        val f = Fixture(this)
+        val third = rows.last().copy(key = 3, order = 3)
+        f.connect(); f.snapshot(AccountState(rows + third, first, "off", false), owner = "other")
+        f.channel.next()
+        val next = f.socket.commands().single()
+        assertEquals(2L, next.basis.successorKey)
+        assertEquals(2L, f.view.current?.key)
+        f.delta(2, AccountDelta(queue = AccountQueueEdit("order", keys = listOf(1, 3, 2))))
+        assertEquals(1L, f.view.current?.key)
+        f.result(next, "stale", 2)
+        assertNull(f.view.error)
+        assertTrue(f.audio.starts.isEmpty())
+    }
+
+    @Test fun ownerRefusesNextWhenQueueEditChangedSuccessorButNotOccurrence() = runTest {
+        val f = Fixture(this)
+        val third = rows.last().copy(key = 3, order = 3)
+        f.connect(); f.snapshot(AccountState(rows + third, first, "off", false))
+        f.channel.next()
+        val next = f.socket.commands().single()
+        f.delta(2, AccountDelta(queue = AccountQueueEdit("order", keys = listOf(1, 3, 2))))
+        f.execute(next, revision = 2)
+        val settlement = f.socket.report().getValue("settlements").jsonArray.single().jsonObject
+        assertEquals("stale", settlement.string("status"))
+        assertFalse(settlement.containsKey("cursor"))
+        assertEquals(1, f.audio.starts.size)
+        assertEquals("first", f.view.snapshot?.state?.occurrence?.eventId)
+    }
+
+    @Test fun repeatOneMakesNewVisitAndOldNextAndSeekNeverApplyToIt() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot(AccountState(rows, first, "one", false))
+        f.channel.seek(13.0); f.channel.next()
+        val (seek, next) = f.socket.commands()
+        f.audio.eof(44.0); runCurrent()
+        val advance = f.socket.report().getValue("advance").jsonObject
+        assertEquals(first.key, advance.long("toKey"))
+        val sameRowNewVisit = first.copy(occurrence = advance.string("toOccurrence"))
+        assertNotEquals(first.occurrence, sameRowNewVisit.occurrence)
+        f.execute(next)
+        assertEquals("stale", f.socket.report().getValue("settlements").jsonArray.single().jsonObject.string("status"))
+        f.delta(2, AccountDelta(cursor = sameRowNewVisit))
+        f.result(next, "stale", 2)
+        f.result(seek, "stale", 2)
+        assertEquals(listOf(0.0, 0.0), f.audio.seeks)
+        assertEquals(sameRowNewVisit.occurrence, f.view.snapshot?.state?.occurrence?.eventId)
+    }
+
+    @Test fun handoffPreservesAcceptedSelectionProjectionAndRoutesLateResolutionToNewOwner() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot(owner = "other")
+        f.channel.playTrack(PlaybackTrackReference("new"))
+        val play = f.socket.commands().single()
+        f.result(play, "accepted", 1)
+        f.snapshot(generation = 2)
+        assertEquals("new", f.view.current?.id)
+        assertEquals(1, f.audio.starts.size) // Handoff begins with the latest confirmed state.
+        val catalog = rows.first().copy(id = "new", key = 3)
+        f.delta(2, AccountDelta(queue = AccountQueueEdit("replace", rows = listOf(catalog)),
+            cursor = AccountCursor(3, "new-visit", 0, true)), play, generation = 2)
+        assertEquals(2, f.audio.starts.size)
+        assertEquals("new", f.audio.starts.last().trackId)
+        assertEquals(1, f.socket.commands().size) // No replay on the new owner.
+        f.result(play, "applied", 2)
+        assertEquals(3L, f.view.current?.key)
+    }
+
+    @Test fun detachedEofReattachesWithOriginalSharedBasisAndDoesNotRestartSuccessor() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        f.disconnect()
+        f.audio.eof(44.0); runCurrent()
+        assertEquals(2, f.audio.starts.size)
+        f.connect()
+        val local = requireNotNull(f.claims.last())
+        assertEquals(2L, local.cursor.key)
+        assertEquals("first", f.reattach.last()?.string("occurrence"))
+        assertEquals(1L, f.reattach.last()?.long("revision"))
+        f.snapshot(local, revision = 2, connection = "socket-2")
+        assertEquals(2, f.audio.starts.size)
+        assertEquals(local.cursor.occurrence, f.view.snapshot?.state?.occurrence?.eventId)
+        assertEquals(1L, f.socket.report().long("sequence"))
+    }
+
+    @Test fun rejectedReattachReconcilesChangedSharedPositionAndDoesNotReportDetachedProgress() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        f.audio.facts = f.audio.facts.copy(elapsed = 8.0)
+        advanceTimeBy(251); runCurrent()
+        f.disconnect()
+        f.connect()
+        assertEquals(8_000L, f.claims.last()?.cursor?.positionMs)
+        f.snapshot(revision = 2, cursor = first.copy(positionMs = 3_000), connection = "socket-2")
+        assertEquals(listOf(0.0, 3.0), f.audio.seeks)
+        assertEquals(3_000L, f.socket.report().getValue("observation").jsonObject.long("positionMs"))
+    }
+
+    @Test fun detachedPauseAtMeasuredPositionIsRetainedWhenServerAdoptsIt() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        f.disconnect()
+        f.audio.facts = f.audio.facts.copy(elapsed = 8.0)
+        f.channel.pause(); runCurrent()
+        f.connect()
+        val local = requireNotNull(f.claims.last())
+        assertFalse(local.cursor.desiredPlaying)
+        assertEquals(8_000L, local.cursor.positionMs)
+        f.snapshot(local, revision = 2, connection = "socket-2")
+        assertEquals(listOf(0.0), f.audio.seeks)
+        assertEquals("paused", f.socket.report().getValue("observation").jsonObject.string("status"))
+    }
+
+    @Test fun offerCannotStartAudioAndRefusedStartLeavesTargetSelected() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot(owner = "other")
+        f.socket.frame("type" to "offer", "id" to "transfer", "generation" to 1L); runCurrent()
+        assertEquals("transfer", f.socket.sent.last { it.kind == "accept" }.string("id"))
+        assertTrue(f.audio.starts.isEmpty())
+        f.audio.refusal = true
+        f.snapshot(generation = 2, revision = 2, cursor = first.copy(positionMs = 3_000))
+        assertEquals("self", f.view.snapshot?.selectedDeviceId)
+        assertTrue(f.view.localOutput)
+        assertFalse(f.view.isPlaying)
+        assertEquals("failed", f.socket.report().getValue("observation").jsonObject.string("status"))
+        assertEquals(1, f.audio.starts.size)
+    }
+
+    @Test fun observationUsesClockOffsetBoundAndCannotOverrideSeekOrStaleGeneration() = runTest {
+        val f = Fixture(this)
+        f.wallShift = 60_000
+        f.connect(); f.snapshot(owner = "other")
+        val ping = f.socket.sent.last { it.kind == "ping" }
+        advanceTimeBy(100)
+        f.socket.frame("type" to "pong", "clientTimeMs" to ping.long("clientTimeMs"), "serverTimeMs" to WALL + 50); runCurrent()
+        fun sample(revision: Long, generation: Long = 1) {
+            f.socket.frame("type" to "observation", "generation" to generation, "revision" to revision,
+                "observation" to encode(AccountObservation(1, "first", 47_000, WALL, "playing"))); runCurrent()
+        }
+        sample(1)
+        advanceTimeBy(2_000); runCurrent()
+        assertEquals(48.0, f.view.playback?.elapsed)
+        assertTrue(f.view.isPlaying)
+        advanceTimeBy(9_000); runCurrent()
+        assertFalse(f.view.isPlaying)
+        f.channel.seek(12.0)
+        assertFalse(f.view.isPlaying)
+        f.delta(2, AccountDelta(cursor = first.copy(positionMs = 12_000)), f.socket.commands().last())
+        sample(1)
+        sample(2, generation = 0)
+        assertEquals(12.0, f.view.playback?.elapsed)
+        assertFalse(f.view.isPlaying)
+    }
+
+    @Test fun malformedFirstSnapshotIsNotCountedAsSuccessfulBinding() = runTest {
+        val f = Fixture(this)
+        f.connect()
+        f.socket.frame("type" to "snapshot", "sessionId" to "room", "connectionId" to "socket-1", "revision" to 1L,
+            "owner" to encode(AccountOwner(1, "self")), "devices" to encode(emptyList<AccountDevice>()),
+            "player" to encode(AccountState(rows, first, "off", false))) // No required serverTimeMs.
         runCurrent()
-        assertTrue(channel.state.value.isPlaying)
-        assertEquals("", channel.state.value.playback?.error)
-        assertEquals(2, audio.operations.size)
-        audio.observations.tryEmit(AudioObservation(refused, AudioFacts(binding = refused, error = "blocked")))
-        runCurrent()
-        assertTrue(channel.state.value.isPlaying)
-        channel.close()
+        assertEquals(0L, f.view.established)
+        assertEquals(PlaybackConnectionState.DISCONNECTED, f.view.connection)
+        assertTrue(f.audio.starts.isEmpty())
     }
 
-    @Test fun failedSpeculativeSelectionIsNotRestartedOnItsMatchingConfirmation() = runTest {
-        val audio = Audio()
-        val socket = Socket()
-        val channel = connect(socket, audio)
-        val track = channel.state.value.current!!.copy(key = 3, order = 3)
-        audio.nextResult = AudioResult.MEDIA
-        assertTrue(channel.playTrack(PlaybackTrackReference(track.id)))
-        runCurrent()
-        assertEquals("media", channel.state.value.playback?.error)
-        socket.update(AccountDelta(queue = AccountQueueEdit("replace", rows = listOf(track)),
-            cursor = AccountCursor(3, "confirmed", desired = true), source = "owner"))
-        runCurrent()
-        assertEquals(3L, channel.state.value.current?.key)
-        assertEquals("media", channel.state.value.playback?.error)
-        assertFalse(channel.state.value.wantsPause)
-        assertEquals(2, audio.operations.size)
-        channel.close()
+    @Test fun socketAndFirstSnapshotShareOneAttemptDeadline() = runTest {
+        val f = Fixture(this)
+        f.upgradeDelay = 7_500
+        f.connect()
+        advanceTimeBy(9_999); runCurrent()
+        assertEquals(PlaybackConnectionState.CONNECTING, f.view.connection)
+        assertTrue(f.socket.isOpen)
+        advanceTimeBy(1); runCurrent()
+        assertFalse(f.socket.isOpen)
+        assertEquals(PlaybackConnectionState.DISCONNECTED, f.view.connection)
+        assertEquals(0L, f.view.established)
+        assertTrue(f.view.offline)
     }
 
-    @Test fun terminalMediaFailureAfterPlayingPublishesAnOrdinaryStoppedFact() = runTest {
-        val audio = Audio()
-        val socket = Socket()
-        val channel = connect(socket, audio)
-        assertTrue(channel.state.value.isPlaying)
-        val binding = audio.operations.single()
-        audio.facts = AudioFacts(binding, elapsed = 6.0, duration = 32.0, error = "media")
-        audio.observations.tryEmit(AudioObservation(binding, audio.facts))
-        runCurrent()
-        assertFalse(channel.state.value.isPlaying)
-        assertFalse(channel.state.value.wantsPause)
-        assertEquals("media", channel.state.value.playback?.error)
-        val stopped = socket.facts().last()
-        assertFalse(stopped.getValue("playing").jsonPrimitive.boolean)
-        assertFalse(stopped.getValue("ended").jsonPrimitive.boolean)
-        assertNull(stopped["error"])
-        assertEquals(6.0, stopped.getValue("elapsed").jsonPrimitive.double, 0.0)
-        channel.close()
+    @Test fun supersededOwnerStopsAndDoesNotReopenOrStartLocalAudio() = runTest {
+        val f = Fixture(this)
+        f.connect(); f.snapshot()
+        f.socket.replaced = true
+        f.disconnect()
+        assertTrue(f.view.superseded)
+        assertFalse(f.view.localOutput)
+        assertFalse(f.audio.facts.isPlaying)
+        f.connect()
+        assertEquals(1, f.claims.size)
+        assertFalse(f.channel.playTrack(PlaybackTrackReference("duplicate")))
     }
 
-    @Test fun reentrantNewerRunWinsBeforeNativeExecution() = runTest {
-        lateinit var player: AccountPlayer
-        val audio = Audio()
-        val rows = listOf(
-            PlaybackTrack("first", "First", emptyList(), "", "", 32.0, 1, 1, "low"),
-            PlaybackTrack("second", "Second", emptyList(), "", "", 32.0, 2, 2, "low"),
-        )
-        var supersede = true
-        player = AccountPlayer(audio, backgroundScope, { true }, publish = { state ->
-            if (state.cursor.key == 1L && supersede) {
-                supersede = false
-                player.update(AccountDelta(cursor = AccountCursor(2, "chain", visit = 1, desired = true)))
-            }
-        }, report = {})
-        player.snapshot(AccountState(rows, AccountCursor(1, "chain", desired = true), "off", false), output = true)
-        runCurrent()
-        assertEquals(listOf("second"), audio.operations.map { it.trackId })
-        player.close()
-    }
-
-    @Test fun remoteDesiredWithoutReportedSoundDoesNotBecomeALocalFailure() = runTest {
-        val audio = Audio()
-        val socket = Socket()
-        val channel = connect(socket, audio, owner = "desktop")
-        assertFalse(channel.state.value.isPlaying)
-        assertTrue(channel.state.value.wantsPause)
-        assertTrue(audio.operations.isEmpty())
-        assertTrue(channel.toggle())
-        assertEquals("pause", socket.sent.last()["type"]?.jsonPrimitive?.content)
-        channel.close()
-    }
-
-    @Test fun noAckNoReplayReattachesLocallyAdvancedOccurrence()=runTest {
-        val audio=Audio();var socket=Socket();val clock=object:PlaybackClock {override fun monotonicMs()=testScheduler.currentTime;override fun wallTimeMs()=0L}
-        val c=AccountChannel(PlaybackTransport{_,_->socket},audio,backgroundScope,clock)
-        c.connect("Phone","here");runCurrent();socket.frame(snapshot("old","old"));runCurrent();socket.frame("""{"type":"grant","basis":0,"ms":15000,"handle":"private"}""");runCurrent()
-        assertEquals(1,audio.operations.size);assertTrue(c.queueTrack(PlaybackTrackReference("duplicate")));assertEquals(setOf("type","placement","selection"),socket.sent.last().keys)
-        socket.close();runCurrent();assertTrue(audio.authorized());val src=audio.operations.single();val end=AudioFacts(src,32.0,32.0,ended=true);audio.observations.tryEmit(AudioObservation(src,end));runCurrent()
-        assertEquals(2,audio.operations.size);assertEquals(2L,c.state.value.current!!.key)
-        advanceTimeBy(9_000);runCurrent();assertTrue(audio.authorized())
-        socket=Socket();c.connect("Phone","here");runCurrent();socket.frame(snapshot("fresh","old"));runCurrent();val present=socket.sent.single();assertEquals("private",present["handle"]!!.jsonPrimitive.content);assertEquals(2L,present["actual"]!!.jsonObject["key"]!!.jsonPrimitive.long)
-        socket.frame(fields("type" to "player","player" to fields("cursor" to present["actual"])).toString());socket.frame("""{"type":"outputs","owner":"fresh","devices":[]}""");socket.frame("""{"type":"grant","basis":9000,"ms":15000,"handle":"new"}""");runCurrent();assertEquals(2,audio.operations.size);assertFalse(socket.sent.any{it["type"]?.jsonPrimitive?.content=="add"})
-        socket.close();runCurrent();advanceTimeBy(14_999);runCurrent();assertTrue(audio.authorized())
-        advanceTimeBy(1);runCurrent();assertFalse(audio.authorized());c.close()
+    private companion object {
+        const val WALL = 1_700_000_000_000L
+        val rows = (1L..2L).map { PlaybackTrack("duplicate", "Same", emptyList(), "", "", 48.0, it, it, "low") }
+        val first = AccountCursor(1, "first", 0, true)
+        inline fun <reified T> encode(value: T) = playbackJson.encodeToJsonElement(value)
+        fun commandWire(value: AccountCommand) = JsonObject(encode(value).jsonObject + fields("type" to "command"))
     }
 }

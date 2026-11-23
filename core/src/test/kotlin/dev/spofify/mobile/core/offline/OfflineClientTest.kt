@@ -34,9 +34,9 @@ class OfflineClientTest {
             server.enqueue(json("""{"accountId":"account","username":"fixture-user","role":"user","csrfToken":"fixture-csrf"}"""))
             try {
                 sessions.start()
-                val state = withTimeout(3000) { sessions.state.first { it is AuthState.Authenticated } } as AuthState.Authenticated
+                val grant = withTimeout(3000) { sessions.onlineGrant.first { it != null } }!!
                 server.takeRequest(2, TimeUnit.SECONDS)
-                block(server, sessions, state.identity)
+                block(server, sessions, grant.identity)
             } finally {
                 scope.cancel(); scope.coroutineContext.job.join()
                 transport.connectionPool.evictAll(); transport.dispatcher.executorService.shutdownNow()

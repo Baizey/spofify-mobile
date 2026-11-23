@@ -2,16 +2,20 @@ package dev.spofify.mobile.core.playback
 
 import java.io.Closeable
 import kotlinx.coroutines.flow.Flow
+import kotlinx.serialization.json.JsonObject
 
 /** Admission (including the credential-private hello) belongs to the transport. */
 fun interface PlaybackTransport {
-    suspend fun connect(name: String, deviceId: String): PlaybackConnection
+    suspend fun connect(name: String, deviceId: String, local: JsonObject?, reattachBasis: JsonObject?): PlaybackConnection
+    suspend fun connect(name: String, deviceId: String) = connect(name, deviceId, null, null)
 }
 
 /** messages completes or fails immediately on socket/auth loss. Never replay frames. */
 interface PlaybackConnection : Closeable {
     val messages: Flow<String>
     val isOpen: Boolean
+    /** True only when the server retired this exact binding in favor of the same device. */
+    val superseded: Boolean get() = false
     fun send(text: String): Boolean
     /** Flush a final exact-output relinquish before normal close. Never wait for a receipt. */
     fun finish() = close()
