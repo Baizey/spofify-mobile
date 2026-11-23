@@ -83,7 +83,8 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
                         requestPlaybackStart = { admitPlaybackStart(identity) },
                         canContinuePlayback = { canContinuePlayback(identity) }, acceptsNotificationControl = ::acceptsNotificationControl,
                         reconcile = { current?.let(::reconcileServiceFor) },
-                        detachService = { current?.let(::stopServiceFor) })
+                        detachService = { current?.let(::stopServiceFor) },
+                        onExhausted = ::persistFallback)
                     mutable.value = player
                     player.start()
                 }
@@ -95,13 +96,33 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
     internal suspend fun switch(identity: AccountIdentity, enabled: Boolean) = withContext(Dispatchers.Main.immediate) {
         modeChanges.withLock {
             val player = current?.takeIf { it.identity == identity } ?: return@withLock
-            if (sessions.manualOffline.value == enabled) return@withLock
-            if (!enabled) player.retireSource() // no sound, prepared media or queue survives return validation
+            val isolated = player.view?.let { it.offline || it.superseded } == true
+            if (sessions.manualOffline.value == enabled && (enabled || !isolated)) return@withLock
+            setMode(player, enabled)
+        }
+    }
+
+    private suspend fun persistFallback(grant: OnlineGrant, stillCurrent: () -> Boolean) {
+        modeChanges.withLock {
+            val player = current?.takeIf { it.identity == grant.identity && stillCurrent() } ?: return
             try {
-                sessions.setManualOffline(enabled) { old ->
-                    withContext(Dispatchers.Main.immediate) { if (current === player && old == identity) player.retireSource() }
+                withContext(NonCancellable) {
+                    if (sessions.fallbackToManualOffline(grant) && current === player) player.applyMode(manual = true)
                 }
-            } finally { if (current === player) player.synchronize() }
+            } catch (_: Exception) { Log.w("SpofifyPlayer", "Could not persist offline playback mode") }
+        }
+    }
+
+    private suspend fun setMode(player: NativePlayer, enabled: Boolean) {
+        // Failure leaves the previous durable policy intact. A committed change must publish
+        // even if the screen's caller went away while persistence was running.
+        withContext(NonCancellable) {
+            sessions.setManualOffline(enabled) { owner ->
+                withContext(Dispatchers.Main.immediate) {
+                    if (current === player && owner == player.identity) player.applyMode(manual = true)
+                }
+            }
+            if (current === player) player.applyMode(enabled)
         }
     }
 
@@ -110,11 +131,7 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
     internal fun retainServiceAfterTaskRemoval(): Boolean {
         val p = current ?: return false
         val view = p.view ?: return false
-        return when (view) {
-            is PlayerPresentation.Online -> retainLocalPlaybackService(view.view, p.audio.facts(), p.audio.player.playWhenReady)
-            is PlayerPresentation.Local -> (p.target.value as? AppPlayback.Local)?.controller?.hasPendingStart == true ||
-                view.queue.desiredPlaying && p.audio.hasPlaybackAuthority() && !p.audio.facts().ended
-        }
+        return retainLocalPlaybackService(view, p.audio.facts(), p.audio.player.playWhenReady)
     }
     internal fun onTaskRemoved(service: PlaybackService) {
         val request = attachment?.takeIf { it.service === service }
@@ -142,13 +159,9 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         val p = current?.takeIf { it.mediaSession === request.session } ?: return
         val view = p.view ?: return
         val facts = p.audio.facts()
-        if (view is PlayerPresentation.Online) handlePlaybackServiceLoss(view.view, facts, p.audio.player.playWhenReady,
+        handlePlaybackServiceLoss(view, facts, p.audio.player.playWhenReady,
             p.audio.hasPlaybackAuthority(), { canRecover && recoverPlayingSession(request.session) },
             p.audio::pause, p.audio::backgroundStartBlocked)
-        else if (p.hasPendingNativePlayback()) {
-            if (!p.audio.hasPlaybackAuthority()) p.audio.pause()
-            else if (!canRecover || !recoverPlayingSession(request.session)) p.audio.backgroundStartBlocked()
-        }
     }
 
     private fun recoverPlayingSession(session: MediaSession): Boolean {
@@ -178,14 +191,8 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
     private fun NativePlayer.hasPendingNativePlayback(): Boolean =
         hasPendingNativePlayback(audio.facts(), audio.player.playWhenReady)
 
-    private fun localPlayer(session: MediaSession): NativePlayer? {
-        val p = current?.takeIf { it.mediaSession === session && it.hasCurrentOutput() } ?: return null
-        return when (val view = p.view) {
-            is PlayerPresentation.Online -> p.takeIf { view.view.isLocalOutputConnection() }
-            is PlayerPresentation.Local -> p
-            null -> null
-        }
-    }
+    private fun localPlayer(session: MediaSession): NativePlayer? =
+        current?.takeIf { it.mediaSession === session && it.view?.localOutput == true }
 
     private fun eligiblePlayer(session: MediaSession): NativePlayer? = localPlayer(session)?.takeIf { it.audio.hasPlaybackAuthority() }
 
@@ -273,10 +280,7 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
             hasPendingNativePlayback(facts, playWhenReady)) return true
         // Media3 owns the grace period on an already foreground output between tracks or after pause.
         if (!media3Requested || !service.hasMediaForeground()) return false
-        return when (view) {
-            is PlayerPresentation.Online -> !shouldStopPlaybackService(view.view, facts, playWhenReady)
-            is PlayerPresentation.Local -> facts.error.isEmpty() || hasPendingNativePlayback(facts, playWhenReady)
-        }
+        return !shouldStopPlaybackService(view, facts, playWhenReady)
     }
 
     private fun bindService(
@@ -321,11 +325,8 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
     private fun reconcileServiceFor(p: NativePlayer) {
         val view = p.view ?: return
         val facts = p.audio.facts()
-        if (view is PlayerPresentation.Online) {
-            p.cache.observe(view.view, facts, p.audio.hasPlaybackAuthority())
-            p.music.observeQueue(view.view)
-            if (shouldStopPlaybackService(view.view, facts, p.audio.player.playWhenReady)) stopServiceFor(p)
-        } else if (facts.error.isNotEmpty() && !facts.isPlaying && !p.audio.player.playWhenReady) stopServiceFor(p)
+        p.cache.observe(view, facts, p.ownsNativeAudio(facts))
+        if (shouldStopPlaybackService(view, facts, p.audio.player.playWhenReady)) stopServiceFor(p)
         attachment?.takeIf { it.session === p.mediaSession }?.let { it.service?.reconcileBoundPlayer(it.session) }
     }
     private fun stopServiceFor(player: NativePlayer) {

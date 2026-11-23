@@ -26,7 +26,8 @@ internal class SessionMusicSourceFactory(private val sessions: SessionRepository
 
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
         val grant = sessions.onlineGrant.value?.takeIf { it.identity == identity }
-        val allowed = { grant != null && sessions.onlineGrant.value === grant }
+        // Retiring an HTTP grant must not revoke an already pinned on-device period.
+        val allowed = { sessions.isCurrent(identity) }
         var ranges = cache.onlineRanges(allowed)
         val factory = ProgressiveMediaSource.Factory(DataSource.Factory { SessionAudioDataSource(sessions, grant, ranges, currentSource) })
         drm?.let(factory::setDrmSessionManagerProvider)

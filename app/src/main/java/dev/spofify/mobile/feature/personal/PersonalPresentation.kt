@@ -22,10 +22,13 @@ internal data class PersonalGestureBinding(
     val sessionId: String?,
     val stateVersion: Long?,
     val outputVersion: Long?,
+    val connectionId: String?,
+    val offline: Boolean?,
 )
 
 internal fun personalGestureBinding(source: Any, context: PlaybackContext?, view: PlaybackView?) = PersonalGestureBinding(
     source, context, view?.sessionId, view?.snapshot?.stateVersion, view?.snapshot?.outputVersion,
+    view?.connectionId, view?.offline,
 )
 
 internal data class PlaylistSong(

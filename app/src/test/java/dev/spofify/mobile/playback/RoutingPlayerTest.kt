@@ -6,6 +6,7 @@ import dev.spofify.mobile.core.playback.*
 import java.lang.reflect.Proxy
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.test.TestScope
@@ -33,7 +34,7 @@ class RoutingPlayerTest {
             assertTrue(h.nativeCalls.isEmpty())
             assertTrue(h.controller.state.value.desiredPlaying)
             assertTrue(h.controller.state.value.isPlaying)
-            assertEquals("remote-connection", h.controller.state.value.snapshot?.selectedConnectionId)
+            assertEquals("remote", h.controller.state.value.snapshot?.selectedDeviceId)
         }
     }
 
@@ -48,8 +49,8 @@ class RoutingPlayerTest {
             h.player.setPlayWhenReady(false)
             assertEquals(listOf("pause", "resume", "next"), h.commands)
             assertTrue(h.nativeCalls.isEmpty())
-            // Dispatching an intention does not optimistically rewrite authoritative playback.
-            assertTrue(h.controller.state.value.desiredPlaying)
+            // Pending transport intents can't present actual playback as proven.
+            assertFalse(h.controller.state.value.isPlaying)
         }
     }
 
@@ -81,14 +82,14 @@ class RoutingPlayerTest {
             h.controllerRequest = true
             currentDeck = true
             old.seekToNext()
-            replacement.seekToNext()
-            replacement.seekToNextMediaItem()
-            replacement.seekToPrevious()
-            replacement.seekToPreviousMediaItem()
-            replacement.seekForward()
-            replacement.seekBack()
-            replacement.pause()
-            replacement.play()
+            replacement.seekToNext(); h.settleLastCommand()
+            replacement.seekToNextMediaItem(); h.settleLastCommand()
+            replacement.seekToPrevious(); h.settleLastCommand()
+            replacement.seekToPreviousMediaItem(); h.settleLastCommand()
+            replacement.seekForward(); h.settleLastCommand()
+            replacement.seekBack(); h.settleLastCommand()
+            replacement.pause(); h.settleLastCommand()
+            replacement.play(); h.settleLastCommand()
             replacement.stop()
             assertEquals(listOf("next", "next", "previous", "previous", "seek", "seek", "pause", "resume", "pause"), h.commands)
             assertEquals(listOf(10.0, 0.0), h.seeks)
@@ -105,11 +106,41 @@ class RoutingPlayerTest {
             h.player.seekTo(Long.MAX_VALUE)
             h.player.seekTo(-1L)
             assertEquals(listOf("seek", "seek"), h.commands)
-            // The server owns clamping to the recording duration; local facts are unchanged.
-            assertEquals(0.0, h.controller.state.value.playback!!.elapsed, 0.0)
+            assertEquals(listOf(9_007_199_254_740_991L, 0L), h.seekPositionsMs)
             h.controllerRequest = false
             h.player.pause()
             assertEquals(listOf("seek", "seek"), h.commands)
+        }
+    }
+
+    @Test fun desktopOrTouchSeekCannotCommitAgainstAnotherVisitOfTheSameSong() = runTest {
+        Harness(this).use { h ->
+            h.remotePlaying()
+            val oldContext = h.target.presentation.gestureContext
+            h.repeatVisit()
+            h.target.seek(oldContext, 19.0)
+            assertTrue(h.commands.isEmpty())
+            h.target.seek(h.target.presentation.gestureContext, 19.0)
+            assertEquals(listOf(19_000L), h.seekPositionsMs)
+        }
+    }
+
+    @Test fun cachedCatalogCommandsWaitForTheIndexWithoutBlockingOnlineOrExistingTransport() = runTest {
+        Harness(this).use { h ->
+            h.indexReady.value = false
+            val track = PlaybackTrackReference("track")
+            assertTrue(h.target.presentation.ready)
+            assertFalse(h.target.presentation.canLoadTrack)
+            assertFalse(h.target.playTrack(track))
+            assertFalse(h.target.queueTrack(track))
+            h.indexReady.value = true
+            assertTrue(h.target.playTrack(track))
+            runCurrent()
+            assertEquals("track", h.target.presentation.queue?.current?.id)
+            h.indexReady.value = false
+            h.remotePlaying()
+            assertTrue(h.target.presentation.canLoadTrack)
+            assertTrue(h.target.queueTrack(track))
         }
     }
 
@@ -128,39 +159,36 @@ class RoutingPlayerTest {
 
     @Test fun localRequestsControlOnlyRealLocalQueueAndCannotCrossRetirement() = runTest {
         Harness(this).use { h ->
-            h.remotePlaying()
-            val song = h.controller.state.value.current!!
-            val library = object : LocalPlaybackLibrary {
-                override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = LocalPlaybackRows(listOf(song))
-                override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
-            }
-            val local = LocalPlaybackController(h.audio, library, backgroundScope, { h.current })
-            val target = AppPlayback.Local(local) { h.current }
-            val player = RoutingPlayer(h.native, target) { h.controllerRequest }
-            assertTrue(target.queueTrack(PlaybackTrackReference(song.id)))
+            h.controller.setOffline(manual = true)
+            val target = h.target
+            val player = h.player
+            assertTrue(target.playTrack(PlaybackTrackReference("track")))
             runCurrent()
-            val view = target.presentation as PlayerPresentation.Local
-            assertSame(local.state.value, view.queue)
-            assertTrue(view.queue.desiredPlaying)
-            assertFalse(view.isPlaying) // no native observation of sound
+            assertTrue(target.presentation.ready)
+            assertTrue(target.presentation.view.desiredPlaying)
+            assertFalse(target.presentation.isPlaying) // no native observation of sound
             player.pause() // not a controller request
-            assertTrue(local.state.value.desiredPlaying)
+            runCurrent()
+            assertTrue(target.presentation.view.desiredPlaying)
             h.controllerRequest = true
             player.pause()
-            assertFalse(local.state.value.desiredPlaying)
+            runCurrent()
+            assertFalse(target.presentation.view.desiredPlaying)
             player.seekForward()
-            assertEquals(10.0, local.state.value.elapsed, 0.0)
+            runCurrent()
+            assertEquals(10.0, target.presentation.elapsed, 0.0)
             player.seekBack()
-            assertEquals(0.0, local.state.value.elapsed, 0.0)
+            runCurrent()
+            assertEquals(0.0, target.presentation.elapsed, 0.0)
             player.play()
-            assertTrue(local.state.value.desiredPlaying)
+            runCurrent()
+            assertTrue(target.presentation.view.desiredPlaying)
             player.stop()
-            assertFalse(local.state.value.desiredPlaying)
-            local.retire()
+            runCurrent()
+            assertFalse(target.presentation.view.desiredPlaying)
             h.current = false
             player.play()
-            assertFalse(target.queueTrack(PlaybackTrackReference(song.id)))
-            assertNull(local.state.value.current)
+            assertFalse(target.queueTrack(PlaybackTrackReference("track")))
             assertTrue(h.commands.isEmpty())
             assertTrue(h.nativeCalls.isEmpty())
         }
@@ -177,15 +205,29 @@ class RoutingPlayerTest {
             override fun send(text: String): Boolean { sent.add(text); return isOpen }
             override fun close() { isOpen = false; incoming.close() }
         }
-        val audio = object : AudioExecutor {
+        private val audio = object : AudioExecutor {
+            private var facts = AudioFacts()
             override val observations = emptyFlow<AudioObservation>()
             override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double) = AudioResult.OK
             override suspend fun execute(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
-                desiredPlaying: Boolean, isAuthorized: () -> Boolean) = AudioResult.OK
+                desiredPlaying: Boolean, isAuthorized: () -> Boolean): AudioResult {
+                if (!isAuthorized()) return AudioResult.REJECTED
+                facts = AudioFacts(binding, elapsed, track?.duration ?: 0.0)
+                return AudioResult.OK
+            }
             override fun pause() = Unit
-            override fun facts() = AudioFacts()
+            override fun facts() = facts
         }
-        val controller = AccountChannel(PlaybackTransport { _, _ -> connection }, audio, scope.backgroundScope)
+        private val library = object : LocalPlaybackLibrary {
+            override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = LocalPlaybackRows(listOf(
+                PlaybackTrack("track", "Song", emptyList(), "Album", "album", 120.0, 1, 1, "low")))
+            override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
+        }
+        private val clock = object : PlaybackClock {
+            override fun monotonicMs() = scope.testScheduler.currentTime
+            override fun wallTimeMs() = 1_700_000_000_000L + monotonicMs()
+        }
+        val controller = AccountChannel(PlaybackTransport { _, _, _, _ -> connection }, audio, scope.backgroundScope, clock, library = library)
         val native = Proxy.newProxyInstance(Player::class.java.classLoader, arrayOf(Player::class.java)) { _, method, _ ->
             nativeCalls.add(method.name)
             when (method.returnType) {
@@ -197,17 +239,33 @@ class RoutingPlayerTest {
             }
         } as Player
         var current = true
-        val target = AppPlayback.Online(controller) { current }
+        val indexReady = MutableStateFlow(true)
+        val target = AppPlayback(controller, indexReady) { current }
         val player = RoutingPlayer(native, target) { controllerRequest }
-        private val frames get() = sent.map { Json.parseToJsonElement(it).jsonObject }
-        val commands: List<String> get() = frames.map { it.getValue("type").jsonPrimitive.content }.filterNot { it == "presence" }
-        val seeks: List<Double> get() = frames.filter { it.getValue("type").jsonPrimitive.content == "seek" }
-            .map { it.getValue("value").jsonPrimitive.content.toDouble() }
+        private val envelopes get() = sent.map { Json.parseToJsonElement(it).jsonObject }
+            .filter { it.getValue("type").jsonPrimitive.content == "command" }
+        private val actions get() = envelopes.map { it.getValue("action").jsonObject }
+        val commands: List<String> get() = actions.map { it.getValue("type").jsonPrimitive.content }
+        val seekPositionsMs: List<Long> get() = actions.filter { it.getValue("type").jsonPrimitive.content == "seek" }
+            .map { it.getValue("positionMs").jsonPrimitive.content.toLong() }
+        val seeks: List<Double> get() = seekPositionsMs.map { it / 1000.0 }
+
+        suspend fun settleLastCommand() {
+            val id = envelopes.last().getValue("id")
+            // No speculative visit should leak into the next independent hardware command.
+            incoming.send("""{"type":"result","id":$id,"status":"stale","revision":1}""")
+            scope.runCurrent()
+        }
+
+        suspend fun repeatVisit() {
+            incoming.send(accountSnapshot("phone-connection", local = false, nowMs = clock.wallTimeMs(), revision = 2, occurrence = "repeat"))
+            scope.runCurrent()
+        }
 
         suspend fun remotePlaying() {
             controller.connect("Phone", "phone")
             scope.runCurrent()
-            incoming.send(accountSnapshot("phone-connection", local = false))
+            incoming.send(accountSnapshot("phone-connection", local = false, nowMs = clock.wallTimeMs()))
             scope.runCurrent()
             assertEquals(PlaybackConnectionState.READY, controller.state.value.connection)
         }

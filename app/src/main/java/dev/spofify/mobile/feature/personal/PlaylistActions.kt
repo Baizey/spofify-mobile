@@ -99,7 +99,7 @@ internal fun PlaylistSummaryActions(
     val state by model.state.collectAsStateWithLifecycle()
     val player = playback?.observe()
     val context = state.context
-    val playable = player?.ready == true && context != null &&
+    val playable = player?.canLoadTrack == true && context != null &&
         !state.loading && !state.writing && !state.needsRefresh && state.rows.isNotEmpty() && state.summary?.capabilities?.play == true
     var editing by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var deleting by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }

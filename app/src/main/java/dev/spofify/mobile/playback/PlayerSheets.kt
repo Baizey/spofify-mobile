@@ -32,14 +32,14 @@ import dev.spofify.mobile.feature.library.MusicArtwork
 
 private data class DevicesView(
     val ready: Boolean, val devices: List<PlaybackDevice>, val deviceId: String,
-    val selectedDeviceId: String?, val transferring: Boolean,
+    val selectedDeviceId: String?, val transferring: Boolean, val notice: String?,
 )
 
 @Composable
 internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
     val state by controller.state.collectAsStateWithLifecycle().project {
-        DevicesView(it.connection == PlaybackConnectionState.READY, it.devices, it.deviceId,
-            it.snapshot?.selectedDeviceId, it.snapshot?.transfer != null)
+        DevicesView(!it.offline && it.connection == PlaybackConnectionState.READY, it.devices, it.deviceId,
+            it.snapshot?.selectedDeviceId, it.transferPending, playbackNotice(it))
     }
     val ready = state.ready
     var renaming by remember { mutableStateOf<PlaybackDevice?>(null) }
@@ -49,7 +49,7 @@ internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
             state.devices.forEach { device ->
                 val active = device.deviceId == state.selectedDeviceId
                 val available = ready && device.available && device.canPlay
-                ListRowIndication(onClick = { controller.selectDevice(device.deviceId); onDismiss() },
+                ListRowIndication(onClick = { controller.selectDevice(device.deviceId) },
                     enabled = available, role = Role.Button) { target ->
                     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -77,8 +77,13 @@ internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
                 }
                 ListRowDivider()
             }
-            if (state.devices.isEmpty()) Text("No connected devices", Modifier.padding(horizontal = 20.dp, vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (state.transferring) Text("Switching output", Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            val notice = when {
+                state.transferring -> "Switching output"
+                state.notice != null -> state.notice
+                state.devices.isEmpty() -> "No connected devices"
+                else -> null
+            }
+            if (notice != null) Text(notice, Modifier.padding(horizontal = 20.dp, vertical = if (state.devices.isEmpty()) 24.dp else 12.dp),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
@@ -88,7 +93,7 @@ internal fun DevicesSheet(controller: AccountChannel, onDismiss: () -> Unit) {
 @Composable
 private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, onDismiss: () -> Unit) {
     val (ready, currentName) = controller.state.collectAsStateWithLifecycle().project {
-        (it.connection == PlaybackConnectionState.READY) to it.devices.firstOrNull { row -> row.deviceId == device.deviceId }?.name
+        (!it.offline && it.connection == PlaybackConnectionState.READY) to it.devices.firstOrNull { row -> row.deviceId == device.deviceId }?.name
     }.value
     var name by remember(device.deviceId) { mutableStateOf(device.name) }
     var focused by remember { mutableStateOf(false) }
@@ -116,21 +121,24 @@ private fun DeviceNameSheet(controller: AccountChannel, device: PlaybackDevice, 
 }
 
 private data class QueueView(
-    val ready: Boolean, val tracks: List<PlaybackTrack>, val position: Int,
-    val sessionId: String?, val stateVersion: Long?,
+    val ready: Boolean, val canLoadTrack: Boolean, val tracks: List<PlaybackTrack>, val position: Int,
+    val context: PlaybackGestureContext, val stateVersion: Long?,
 )
 
 @Composable
 internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss: () -> Unit) {
-    val state by controller.observeState().project {
-        QueueView(it.ready, it.queue?.queue.orEmpty(), it.queue?.position ?: -1, it.online?.sessionId, it.online?.snapshot?.stateVersion)
-    }
+    val state = controller.observeState().project {
+        QueueView(it.ready, it.canLoadTrack, it.queue?.queue.orEmpty(), it.queue?.position ?: -1, it.gestureContext, it.view.snapshot?.stateVersion)
+    }.value
     val ready = state.ready
     val upcoming = remember(state.tracks, state.position) { state.tracks.drop((state.position + 1).coerceAtLeast(0)) }
     val list = rememberLazyListState()
     var actions by remember(controller) { mutableStateOf<Long?>(null) }
-    fun editable(key: Long) = controller is AppPlayback.Local || isPublishedQueueKey(key)
+    fun editable(key: Long) = state.context.offline || isPublishedQueueKey(key)
+    fun current() = controller.presentation.let { it.ready && it.gestureContext == state.context &&
+        it.view.snapshot?.stateVersion == state.stateVersion && it.queue?.queue == state.tracks }
     val selected = upcoming.firstOrNull { it.key == actions && editable(it.key) }
+    LaunchedEffect(state.context) { actions = null }
     SpofifySheet(onDismiss) {
         LazyColumn(Modifier.weight(1f, fill = false).fillMaxWidth(), state = list,
             contentPadding = PaddingValues(bottom = 22.dp)) {
@@ -141,14 +149,14 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
             } }
             item("up-next") { Box(Modifier.padding(horizontal = 20.dp)) { SheetGroup("Up next") } }
             itemsIndexed(upcoming, key = { _, track -> track.key }) { _, track ->
-                ListRowIndication(onClick = if (ready && editable(track.key)) ({ controller.jump(track.key) }) else null) { target ->
+                ListRowIndication(onClick = if (ready && editable(track.key)) ({ if (current()) controller.jump(track.key) }) else null) { target ->
                     // The outer layer paints the gutters; the inset face keeps its original
                     // divider, measured swipe width, action exclusion, and translation clip.
                     ListRowDivider(Modifier.align(Alignment.BottomCenter))
-                    SwipeActionSurface(binding = listOf(controller, state.sessionId, state.stateVersion ?: upcoming, track.key),
-                        onRight = if (ready) ({ controller.queueTrack(PlaybackTrackReference(track.id)) }) else null,
+                    SwipeActionSurface(binding = listOf(controller, state.context, state.stateVersion, upcoming, track.key),
+                        onRight = if (state.canLoadTrack) ({ if (current()) controller.queueTrack(PlaybackTrackReference(track.id)) }) else null,
                         modifier = Modifier.padding(horizontal = 20.dp),
-                        onLeft = if (ready && editable(track.key)) ({ controller.remove(track.key) }) else null,
+                        onLeft = if (ready && editable(track.key)) ({ if (current()) controller.remove(track.key) }) else null,
                         slideOutOnLeft = true) {
                         QueueTrack(track, loader, target = target,
                             onMore = if (editable(track.key)) ({ actions = track.key }) else null,
@@ -167,19 +175,19 @@ internal fun QueueSheet(controller: AppPlayback, loader: ImageLoader, onDismiss:
             SheetHeading(selected.name)
             SheetAction("Move up", SpofifyGlyph.Up, ready && index > 0 && upcoming.getOrNull(index - 2)?.let { editable(it.key) } != false) {
                 actions = null
-                controller.moveUpcoming(selected.key, upcoming.getOrNull(index - 2)?.key)
+                if (current()) controller.moveUpcoming(selected.key, upcoming.getOrNull(index - 2)?.key)
             }
             SheetAction("Move down", SpofifyGlyph.Down, ready && index >= 0 && upcoming.getOrNull(index + 1)?.let { editable(it.key) } == true) {
                 actions = null
-                controller.moveUpcoming(selected.key, upcoming[index + 1].key)
+                if (current()) controller.moveUpcoming(selected.key, upcoming[index + 1].key)
             }
-            SheetAction("Queue", SpofifyGlyph.Queue, ready) {
+            SheetAction("Queue", SpofifyGlyph.Queue, state.canLoadTrack) {
                 actions = null
-                controller.queueTrack(PlaybackTrackReference(selected.id))
+                if (current()) controller.queueTrack(PlaybackTrackReference(selected.id))
             }
             SheetAction("Remove from queue", SpofifyGlyph.Trash, ready) {
                 actions = null
-                controller.remove(selected.key)
+                if (current()) controller.remove(selected.key)
             }
         }
     }

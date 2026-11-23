@@ -43,7 +43,7 @@ internal fun PlaylistDetailScreen(
         factory = viewModelFactory { initializer { PlaylistDetailViewModel(api, id) } })
     val state by model.state.collectAsStateWithLifecycle()
     val player = playback?.observe()
-    val ready = player?.ready == true
+    val ready = player?.canLoadTrack == true
     val context = state.context
     val summary = state.summary
     val playable = ready && context != null && !state.loading && !state.writing && !state.needsRefresh &&
@@ -59,6 +59,7 @@ internal fun PlaylistDetailScreen(
     val playRow: (PlaylistSong) -> Unit = { row ->
         val reference = row.takeIf { it in state.rows }?.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)
         if (playable && reference != null) send { playback?.playTrack(reference, context) }
+        else if (!ready && row in state.rows) onNavigate(MusicKind.TRACK, row.track.id)
         else actionError = "This song isn't available to play."
     }
     val queueRow: (PlaylistSong) -> Unit = { row ->
@@ -106,7 +107,7 @@ internal fun PlaylistDetailScreen(
                 items(visibleRows.asReversed(), key = { it.identity }) { row ->
                     PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
                         onQueue = if (playable && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null) ({ queueRow(row) }) else null,
-                        gestureBinding = playback to personalGestureBinding(row, context, player?.online))
+                        gestureBinding = playback to personalGestureBinding(row, context, player?.view))
                 }
             }
         }

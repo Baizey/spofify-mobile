@@ -25,7 +25,7 @@ private data class SeekFrame(val elapsed: Double, val duration: Double, val read
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun PlaybackSeek(playback: State<PlayerPresentation>, binding: String, content: State<TrackContentState>, onSeek: (Double) -> Unit) {
+internal fun PlaybackSeek(playback: State<PlayerPresentation>, binding: PlaybackGestureContext, content: State<TrackContentState>, onSeek: (Double) -> Unit) {
     val state by playback.project { SeekFrame(it.elapsed, it.duration, it.ready) }
     val seconds = state.elapsed
     val total = state.duration

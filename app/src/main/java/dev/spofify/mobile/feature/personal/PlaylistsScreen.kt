@@ -51,7 +51,7 @@ internal fun PlaylistsScreen(
     val state by model.state.collectAsStateWithLifecycle()
     val offlineStatuses = music?.offlinePlaylistStatuses?.collectAsStateWithLifecycle()?.value.orEmpty()
     val player = playback?.observe()
-    val ready = player?.ready == true
+    val ready = player?.canLoadTrack == true
     val scope = rememberCoroutineScope()
     var queueJob by remember { mutableStateOf<Job?>(null) }
     var queueError by remember { mutableStateOf<String?>(null) }
@@ -60,13 +60,13 @@ internal fun PlaylistsScreen(
     val queue: (PersonalPlaylistSummary) -> Unit = { summary ->
         if (queueJob?.isActive != true) {
             queueError = null
-            val captured = personalGestureBinding(summary, null, playback?.presentation?.online)
+            val captured = personalGestureBinding(summary, null, playback?.presentation?.view)
             queueJob = scope.launch {
                 try {
                     val context = if (api is dev.spofify.mobile.playback.LivePersonal) playlistContext(summary)
                         else freshPlaylistContext(api, summary.id)
                     val current = playback?.presentation
-                    if (current?.ready == true && captured == personalGestureBinding(summary, null, current.online) &&
+                    if (current?.canLoadTrack == true && captured == personalGestureBinding(summary, null, current.view) &&
                         model.state.value.items.any { it.id == summary.id }) playback.queueCollection(context)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -106,7 +106,7 @@ internal fun PlaylistsScreen(
                     PlaylistSummaryRow(summary,
                         offlineStatus = offlineStatuses[summary.id],
                         onQueue = if (ready && summary.capabilities.play && summary.trackCount?.let { it > 0 } == true) ({ queue(summary) }) else null,
-                        onMore = { more = summary }, gestureBinding = playback to personalGestureBinding(summary, null, player?.online)) { onOpenPlaylist(summary.id) }
+                        onMore = { more = summary }, gestureBinding = playback to personalGestureBinding(summary, null, player?.view)) { onOpenPlaylist(summary.id) }
                 }
             }
         }

@@ -1,25 +1,9 @@
 package dev.spofify.mobile.playback
 
 import dev.spofify.mobile.core.playback.AudioFacts
-import dev.spofify.mobile.core.playback.PlaybackConnectionState
-import dev.spofify.mobile.core.playback.AccountChannel
 import dev.spofify.mobile.core.playback.PlaybackView
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.withTimeoutOrNull
-
-/** Logical device grouping is not executor identity; only this exact live socket may own local sound. */
-internal fun PlaybackView.isLocalSelectedConnection(): Boolean =
-    connection == PlaybackConnectionState.READY && connectionId.isNotEmpty() &&
-        snapshot?.selectedConnectionId == connectionId
-
-internal fun AccountChannel.isLocalSelectedConnection(): Boolean = state.value.isLocalSelectedConnection()
-
-internal fun PlaybackView.isLocalTransferTarget(): Boolean =
-    connection == PlaybackConnectionState.READY && connectionId.isNotEmpty() &&
-        snapshot?.transfer?.targetConnectionId == connectionId
-
-/** Pending target execution may legitimately arrive before the selected-connection publication. */
-internal fun PlaybackView.isLocalOutputConnection(): Boolean = isLocalSelectedConnection() || isLocalTransferTarget()
 
 /** A terminal native failure cannot keep an unpromotable FGS alive on stale server intent. */
 private fun nativePlaybackFailedWithoutWork(facts: AudioFacts, localPlayWhenReady: Boolean): Boolean =
@@ -32,13 +16,9 @@ internal fun retainLocalPlaybackService(
     facts: AudioFacts,
     localPlayWhenReady: Boolean = false,
 ): Boolean {
-    if (view.connection != PlaybackConnectionState.READY || view.connectionId.isEmpty()) return false
-    if (nativePlaybackFailedWithoutWork(facts, localPlayWhenReady)) return false
+    if (!view.localOutput || nativePlaybackFailedWithoutWork(facts, localPlayWhenReady)) return false
     val pendingNativePlay = localPlayWhenReady && !facts.ended
-    val nativeWork = facts.isPlaying || facts.isBuffering || facts.isLoading || pendingNativePlay
-    if (view.isLocalTransferTarget()) return true
-    if (view.isLocalSelectedConnection()) return view.wantsPause || nativeWork
-    return view.snapshot?.transfer?.sourceConnectionId == view.connectionId && nativeWork
+    return view.wantsPause || facts.isPlaying || facts.isBuffering || facts.isLoading || pendingNativePlay
 }
 
 /**
@@ -50,7 +30,7 @@ internal fun shouldStopPlaybackService(
     facts: AudioFacts,
     localPlayWhenReady: Boolean = false,
 ): Boolean = !retainLocalPlaybackService(view, facts, localPlayWhenReady) &&
-    (!view.isLocalOutputConnection() || nativePlaybackFailedWithoutWork(facts, localPlayWhenReady))
+    (!view.localOutput || nativePlaybackFailedWithoutWork(facts, localPlayWhenReady))
 
 /**
  * Reattach a genuinely playing/pending local executor without pausing it. A
@@ -66,7 +46,7 @@ internal fun handlePlaybackServiceLoss(
     pauseNative: () -> Unit,
     reportLocalBlocked: () -> Unit,
 ) {
-    if (!view.isLocalOutputConnection()) return
+    if (!view.localOutput) return
     // ExoPlayer can retain PWR after natural end. That is not pending sound or
     // a reason to launch an FGS that has nothing to promote into foreground.
     val nativePlaybackPending = hasPendingNativePlayback(facts, localPlayWhenReady)

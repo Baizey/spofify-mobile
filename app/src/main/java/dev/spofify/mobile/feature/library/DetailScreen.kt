@@ -49,7 +49,7 @@ internal fun DetailScreen(
     onMore: ((MusicItem, PlaybackContext?) -> Unit)? = null,
 ) {
     val state by key(model) { model.state.collectAsStateWithLifecycle() }
-    val ready = playback?.observe()?.ready == true
+    val ready = playback?.observe()?.canLoadTrack == true
     var menuItem by remember(model) { mutableStateOf<MusicItem?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
     val item = state.item
@@ -61,7 +61,7 @@ internal fun DetailScreen(
         when {
             playback == null -> onOpen(row)
             !row.hasAudio -> actionError = "Audio unavailable for this song."
-            !ready -> actionError = "Connect playback to listen."
+            !ready -> onOpen(row)
             // The server selects/rotates the complete album, not a local page or subset.
             else -> send { playback.playTrack(PlaybackTrackReference(row.id), context) }
         }

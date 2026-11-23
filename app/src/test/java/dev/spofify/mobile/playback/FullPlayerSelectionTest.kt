@@ -13,22 +13,49 @@ class FullPlayerSelectionTest {
         val changed = state.copy(elapsed = 15.5, desiredPlaying = true, shuffle = true, repeat = "all")
         val updated = view.copy(snapshot = snapshot.copy(stateVersion = 2, state = changed, playback = clock), playback = clock)
 
-        assertEquals(PlayerPresentation.Online(view).trackSelection(), PlayerPresentation.Online(updated).trackSelection())
-        assertEquals(PlayerPresentation.Local(state).trackSelection(), PlayerPresentation.Local(changed).trackSelection())
+        assertEquals(PlayerPresentation(view).trackSelection(), PlayerPresentation(updated).trackSelection())
+        assertEquals(PlayerPresentation(view).gestureContext, PlayerPresentation(updated).gestureContext)
     }
 
     @Test fun sameSongOnANewOccurrenceOrOutputGetsNewMetadataBinding() {
         val view = view()
         val snapshot = requireNotNull(view.snapshot)
         val state = snapshot.state
-        val initial = PlayerPresentation.Online(view).trackSelection()
-        fun withSnapshot(changed: PlaybackSnapshot) = PlayerPresentation.Online(view.copy(snapshot = changed)).trackSelection()
+        val initial = PlayerPresentation(view).trackSelection()
+        fun withSnapshot(changed: PlaybackSnapshot) = PlayerPresentation(view.copy(snapshot = changed)).trackSelection()
 
         val rerun = state.copy(occurrence = requireNotNull(state.occurrence).copy(eventId = "another visit"))
         assertNotEquals(initial?.binding, withSnapshot(snapshot.copy(state = rerun))?.binding)
         assertNotEquals(initial?.binding, withSnapshot(snapshot.copy(outputVersion = 2))?.binding)
         assertNotEquals(initial?.binding, withSnapshot(snapshot.copy(selectedDeviceId = "other device"))?.binding)
         assertNull(withSnapshot(snapshot.copy(state = PlaybackQueueState())))
+    }
+
+    @Test fun oldSeekContextCannotCrossRebindModeOrRepeatedVisit() {
+        val online = view()
+        val context = PlayerPresentation(online).gestureContext
+        assertNotEquals(context, PlayerPresentation(online.copy(connectionId = "rebound")).gestureContext)
+        assertNotEquals(context, PlayerPresentation(online.copy(offline = true, localOutput = true)).gestureContext)
+        val snapshot = requireNotNull(online.snapshot)
+        val visit = requireNotNull(snapshot.state.occurrence)
+        assertNotEquals(context, PlayerPresentation(online.copy(snapshot = snapshot.copy(
+            state = snapshot.state.copy(occurrence = visit.copy(eventId = "repeat"))))).gestureContext)
+    }
+
+    @Test fun miniPlayerProofAndProgressAreScopedToGenerationAndOccurrence() {
+        val view = view()
+        val snapshot = requireNotNull(view.snapshot)
+        val playing = snapshot.playback.copy(isPlaying = true, elapsed = 72.0)
+        val confirmed = PlayerPresentation(view.copy(playback = playing))
+        assertTrue(confirmed.isPlaying)
+        assertEquals(60.0, confirmed.elapsed, 0.0)
+        assertFalse(PlayerPresentation(view.copy(playback = playing.copy(outputVersion = 0))).isPlaying)
+        assertFalse(PlayerPresentation(view.copy(playback = playing.copy(eventId = "first visit"))).isPlaying)
+        val pending = PlayerPresentation(view.copy(snapshot = snapshot.copy(state = snapshot.state.copy(elapsed = 14.0)),
+            playback = playing.copy(hasReportedPlayback = false)))
+        assertFalse(pending.isPlaying)
+        assertEquals(14.0, pending.elapsed, 0.0)
+        assertEquals(60.0, pending.duration, 0.0)
     }
 
     private fun view(): PlaybackView {

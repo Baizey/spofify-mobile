@@ -291,7 +291,7 @@ class PlaybackService : MediaSessionService() {
         if (!controllerInfo.isTrusted && controllerInfo.uid != android.os.Process.myUid()) return null
         // A trusted controller may connect remotely, but only the app's local attachment
         // owns the local media notification (or the lifetime of an active foreground start).
-        return owner.current?.takeIf(NativePlayer::hasCurrentOutput)?.mediaSession
+        return owner.current?.mediaSession
     }
 
     internal fun attach(session: MediaSession) {

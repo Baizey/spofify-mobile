@@ -55,7 +55,7 @@ internal fun SearchScreen(
     var editing by remember { mutableStateOf(false) }
     val illumination by animateFloatAsState(if (editing) 1f else 0f, tween(240), label = "Search focus illumination")
     val player = playback?.observe()
-    val ready = player?.ready == true
+    val ready = player?.canLoadTrack == true
     val imeVisible = WindowInsets.isImeVisible
     var imeWasVisible by remember { mutableStateOf(false) }
     LaunchedEffect(imeVisible) {
@@ -110,7 +110,7 @@ internal fun SearchScreen(
                 MusicRow(item, loader,
                     onQueue = if (playable) ({ queue(item, false) }) else null,
                     onMore = onMore?.let { more -> { more(item) } },
-                    gestureBinding = listOf(item.key, state.query, playback, player?.online?.snapshot?.stateVersion)) { onOpen(item) }
+                    gestureBinding = listOf(item.key, state.query, playback, player?.gestureContext, player?.view?.snapshot?.stateVersion)) { onOpen(item) }
             }
             if (state.query.isNotBlank()) {
                 item("search-status") {

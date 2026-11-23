@@ -395,7 +395,7 @@ class DetailViewModelTest {
     private fun TestScope.onlineSessions(): SessionRepository {
         val account = SessionSummary("account", "user", "user", "csrf")
         val sessions = object : SessionStore {
-            var saved: StoredSession? = StoredSession("https://music.example", "session=fixture", account)
+            var saved: StoredSession? = StoredSession("https://music.example", "__Host-spofify_session=fixture; Secure; Path=/; HttpOnly", account)
             override fun read() = saved
             override fun write(value: StoredSession?) { saved = value }
         }

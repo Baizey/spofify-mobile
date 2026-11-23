@@ -34,7 +34,7 @@ internal fun MusicActionsSheet(
     onDismiss: () -> Unit,
 ) {
     val item = selection.item
-    val ready = controller?.observe()?.ready == true
+    val ready = controller?.observe()?.canLoadTrack == true
     val playable = ready && if (item.kind == MusicKind.TRACK) item.hasAudio else item.availableTracks > 0
     val collection = selection.context ?: item.takeIf { it.kind != MusicKind.TRACK }?.let {
         PlaybackContext(it.kind.name.lowercase(Locale.ROOT), it.id, it.name)

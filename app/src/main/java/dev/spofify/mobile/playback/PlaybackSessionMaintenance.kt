@@ -37,7 +37,7 @@ internal class PlaybackSessionMaintenance(
     }
 
     fun refreshNow() {
-        if (retired || renewing || !isSessionCurrent()) return
+        if (retired || renewing || !isSessionCurrent() || !isConnected()) return
         renewing = true
         val life = generation
         request = scope.launch {

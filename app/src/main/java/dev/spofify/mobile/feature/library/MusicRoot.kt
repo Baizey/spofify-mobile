@@ -106,7 +106,7 @@ internal fun MusicRoot(
         { item ->
             focus.clearFocus()
             keyboard?.hide()
-            if (item.kind == MusicKind.TRACK) activateTrackRow(item.id, item.hasAudio,
+            if (item.kind == MusicKind.TRACK) activateTrackRow(item.id, item.hasAudio && target?.presentation?.canLoadTrack == true,
                 play = { target?.playTrack(it) },
                 openDetails = { navigate(item.kind, item.id) },
                 notice = { text -> rowPlaybackNotice = text?.let { message ->
@@ -218,13 +218,13 @@ internal fun MusicRoot(
     }
     stores.Content {
       target?.let { active ->
-        if (expanded) FullPlayer(active, loader, source.content, onNavigate = { kind, id ->
+        if (expanded) FullPlayer(active, loader, source.content, source.local, onNavigate = { kind, id ->
             val occurrence = active.presentation.queue?.occurrence?.eventId
             expanded = false
             navigate(kind, id)
             navigation.currentBackStackEntry?.savedStateHandle?.set("returnPlayerOccurrence", occurrence)
         }) { expanded = false }
-        if (devices && active is AppPlayback.Online) DevicesSheet(active.controller) { devices = false }
+        if (devices) DevicesSheet(active.controller) { devices = false }
       }
       actions?.let { selection ->
           MusicActionsSheet(selection, currentController.value, source.personal, loader, navigate) { actions = null }
@@ -234,8 +234,8 @@ internal fun MusicRoot(
 
 @Composable
 private fun PlayerConnectionStatus(player: AppPlayback?, rowNotice: String?) {
-    if (player !is AppPlayback.Online) return
-    val notice = rowNotice.orEmpty()
+    val modeNotice = player?.observeState()?.project { playbackNotice(it.view) }?.value
+    val notice = (rowNotice ?: modeNotice).orEmpty()
     if (notice.isNotEmpty()) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             SelectionContainer(Modifier.weight(1f)) {

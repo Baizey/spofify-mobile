@@ -8,6 +8,7 @@ import androidx.media3.common.*
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import dev.spofify.mobile.core.auth.AccountIdentity
+import dev.spofify.mobile.core.auth.OnlineGrant
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.playback.*
 import java.io.Closeable
@@ -32,6 +33,8 @@ internal class Media3AudioExecutor(
     private val attrs = AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build()
     private inner class Deck(focus: Boolean) {
         @Volatile var source: AudioSourceOwner? = null
+        var sourceGrant: OnlineGrant? = null
+        var localSource = false
         val player = ExoPlayer.Builder(context)
             .setMediaSourceFactory(SessionMusicSourceFactory(sessions, identity, cache) { source }
                 .setLoadErrorHandlingPolicy(AudioLoadRecovery()))
@@ -98,15 +101,15 @@ internal class Media3AudioExecutor(
         return executeOn(binding, track, elapsed, desiredPlaying, false, isAuthorized)
     }
 
-    /** Both ports share this output; local callers cannot request HTTP-capable installations. */
-    fun port(localOnly: Boolean, current: () -> Boolean): AudioExecutor = object : AudioExecutor {
+    /** Choose the source for new work, without invalidating the currently prepared media. */
+    fun port(localOnly: () -> Boolean, current: () -> Boolean): AudioExecutor = object : AudioExecutor {
         override val observations get() = this@Media3AudioExecutor.observations
         override fun facts() = this@Media3AudioExecutor.facts()
         override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double) =
-            if (localOnly || !current()) AudioResult.REJECTED else load(binding, track, elapsed, isAuthorized = current)
+            if (!current()) AudioResult.REJECTED else load(binding, track, elapsed, localOnly = localOnly(), isAuthorized = current)
         override suspend fun execute(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
             desiredPlaying: Boolean, isAuthorized: () -> Boolean) =
-            executeOn(binding, track, elapsed, desiredPlaying, localOnly) { current() && isAuthorized() }
+            executeOn(binding, track, elapsed, desiredPlaying, localOnly()) { current() && isAuthorized() }
         override fun pause() { if (current()) this@Media3AudioExecutor.pause() }
         override fun armCrossfade(binding: AudioBinding, successor: () -> PlaybackTrack?) {
             if (current() && this@Media3AudioExecutor.binding == binding) arm(localOnly, successor)
@@ -208,8 +211,10 @@ internal class Media3AudioExecutor(
             val position = (elapsed * 1000).toLong()
             val wait = NativePreparation(token, next, track.id, position, playRequested)
             preparation = wait
-            val preferSaved = source?.usingNetwork == true && cache.hasStoredAudio(track.id)
-            if (localOnly || preferSaved || player.currentMediaItem?.mediaId != track.id ||
+            val replaceNetwork = source?.usingNetwork == true &&
+                (cache.hasStoredAudio(track.id) || primary.sourceGrant !== sessions.onlineGrant.value)
+            // Local ranges also capture the previous operation's storage pin authority.
+            if (localOnly || primary.localSource || replaceNetwork || player.currentMediaItem?.mediaId != track.id ||
                 player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED) ||
                 player.playerError != null || source?.bind(owner) != true) {
                 retireSource()
@@ -243,6 +248,8 @@ internal class Media3AudioExecutor(
         val uri = Uri.Builder().scheme("spofify").authority("audio").appendPath(track.id).build()
         val item = MediaItem.Builder().setMediaId(track.id).setUri(uri).setCustomCacheKey(installed.key)
             .setMimeType("application/octet-stream").setMediaMetadata(metadata).build()
+        deck.sourceGrant = if (localOnly) null else sessions.onlineGrant.value
+        deck.localSource = localOnly
         if (localOnly) deck.player.setMediaSource(localMusicSource(item,
             LocalMusicRanges(installed, owner::isCurrent, cache::sourceChoice)), position)
         else deck.player.setMediaItem(item, position)
@@ -255,13 +262,13 @@ internal class Media3AudioExecutor(
         @Synchronized fun allows() = authorized()
         @Synchronized fun bind(next: () -> Boolean) { authorized = next }
     }
-    private inner class Preview(val deck: Deck, val row: PlaybackTrack, val gate: Gate, val load: AudioLoadScope) {
+    private inner class Preview(val deck: Deck, val row: PlaybackTrack, val gate: Gate, val load: AudioLoadScope, val local: Boolean) {
         var span = 0L
     }
     private val handler = android.os.Handler(player.applicationLooper)
     private var enabled = false
     private var successor: (() -> PlaybackTrack?)? = null
-    private var localPreview = false
+    private var localPreview: () -> Boolean = { false }
     private var preview: Preview? = null
     private var attempted: Long? = null
     private val tick = Runnable { updateFade() }
@@ -274,7 +281,7 @@ internal class Media3AudioExecutor(
         if (!value) discardPreview() else if (successor != null) handler.post(tick)
     }
 
-    private fun arm(local: Boolean, resolve: () -> PlaybackTrack?) {
+    private fun arm(local: () -> Boolean, resolve: () -> PlaybackTrack?) {
         disarm()
         localPreview = local
         successor = resolve
@@ -287,6 +294,15 @@ internal class Media3AudioExecutor(
         successor = null
         attempted = null
         discardPreview()
+    }
+
+    fun recheckSourceMode() {
+        if (preview?.let { !it.local && localPreview() } == true) {
+            // An isolated advance must use verified storage, even if a network-backed deck
+            // was being prepared before the socket fell. Never disturb the primary period.
+            discardPreview()
+            attempted = null
+        }
     }
 
     private fun discardPreview() {
@@ -304,6 +320,7 @@ internal class Media3AudioExecutor(
     private fun updateFade() {
         val resolve = successor ?: return
         if (!enabled || !hasPlaybackAuthority()) { disarm(); return }
+        recheckSourceMode()
         val left = if (player.duration > 0) player.duration - player.currentPosition else Long.MAX_VALUE
         if (left > CrossfadeWindow.PREPARE_MS) {
             discardPreview()
@@ -322,12 +339,13 @@ internal class Media3AudioExecutor(
             val load = AudioLoadScope(row.id, authorized = gate::allows)
             try {
                 val deck = Deck(false)
-                preview = Preview(deck, row, gate, load)
+                val local = localPreview()
+                preview = Preview(deck, row, gate, load, local)
                 deck.player.volume = 0f
                 val installed = AudioSourceOwner("fade-$generation-${row.key}", row.id)
                 check(installed.bind(load))
                 deck.source = installed
-                install(deck, row, installed, load, localPreview, 0)
+                install(deck, row, installed, load, local, 0)
             } catch (_: Exception) { discardPreview(); load.job.cancel() }
         }
         preview?.let { p ->
@@ -364,7 +382,7 @@ internal class Media3AudioExecutor(
 
     private fun promote(from: AudioBinding, next: AudioBinding, row: PlaybackTrack, authorized: () -> Boolean): Boolean {
         val p = preview ?: return false
-        if (!enabled || !authorized() || endedBinding != from || binding != from || row.key != p.row.key ||
+        if (!enabled || !authorized() || !p.local && localPreview() || endedBinding != from || binding != from || row.key != p.row.key ||
             row.id != p.row.id || p.span <= 0 || !p.deck.player.isPlaying ||
             !player.playWhenReady || player.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE ||
             !canContinuePlayback()) return false

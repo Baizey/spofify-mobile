@@ -45,8 +45,7 @@ internal data class PlayerTrackSelection(val track: PlaybackTrack, val binding: 
 
 internal fun PlayerPresentation.trackSelection(): PlayerTrackSelection? {
     val track = queue?.current ?: return null
-    val snapshot = online?.snapshot
-    val binding = "${online?.sessionId}:${snapshot?.outputVersion}:${snapshot?.selectedDeviceId}:${snapshot?.state?.occurrence?.eventId}:${track.key}"
+    val binding = "${view.sessionId}:${view.snapshot?.outputVersion}:${view.snapshot?.selectedDeviceId}:${queue?.occurrence?.eventId}:${track.key}"
     return PlayerTrackSelection(track, binding)
 }
 
@@ -65,6 +64,7 @@ internal fun FullPlayer(
     controller: AppPlayback,
     loader: ImageLoader,
     contentApi: TrackContentApi,
+    localContent: Boolean,
     onNavigate: ((MusicKind, String) -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
@@ -73,7 +73,7 @@ internal fun FullPlayer(
     val track = selection.track
     val binding = selection.binding
     val contentModel: TrackContentViewModel = viewModel(key = "track-content-${System.identityHashCode(contentApi)}",
-        factory = viewModelFactory { initializer { TrackContentViewModel(contentApi, local = controller is AppPlayback.Local) } })
+        factory = viewModelFactory { initializer { TrackContentViewModel(contentApi, local = localContent) } })
     val content = contentModel.state.collectAsStateWithLifecycle()
     val currentContent = content.project {
         it.takeIf { it.trackId == track.id && it.binding == binding } ?: TrackContentState()
@@ -139,7 +139,8 @@ internal fun FullPlayer(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodyLarge.merge(playerSupportingTextStyle))
                         }
-                        PlaybackSeek(playback, binding, currentContent) { controller.seek(it) }
+                        val seekContext = playback.project { it.gestureContext }.value
+                        PlaybackSeek(playback, seekContext, currentContent) { controller.seek(seekContext, it) }
                         FullPlayerTransport(playback, controller)
                         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
                             Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
@@ -157,7 +158,7 @@ internal fun FullPlayer(
         }
         when (val panel = overlay) {
             PlayerOverlay.Queue -> QueueSheet(controller, loader) { overlay = null }
-            PlayerOverlay.Devices -> if (controller is AppPlayback.Online) DevicesSheet(controller.controller) { overlay = null }
+            PlayerOverlay.Devices -> DevicesSheet(controller.controller) { overlay = null }
             is PlayerOverlay.Lyrics -> if (panel.matches(selection)) {
                 PlayerLyricsSheet(track, currentContent, playback) { overlay = null }
             }

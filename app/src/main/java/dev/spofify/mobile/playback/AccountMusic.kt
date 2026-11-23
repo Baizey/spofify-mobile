@@ -51,22 +51,26 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         if (!preferences.edit().putStringSet(preferenceKey, ids).commit()) throw IOException("Offline preference unavailable")
     }
 
-    private fun localSources() = MusicSources(catalog, catalog,
+    private val localSources = MusicSources(catalog, catalog,
         DevicePersonalLibrary(catalog, offlinePlaylists::complete), catalog.trackContent(ownerActive), true)
     val personal = AccountPersonalSource()
-    private var dataGrant = sessions.onlineGrant.value?.takeIf { it.identity == identity }
-    private fun dataFor(grant: OnlineGrant?) = grant?.let { onlineMusicSources(sessions, it, catalog, personal) } ?: localSources()
-    private val mutableSources = MutableStateFlow(dataFor(dataGrant))
+    private val onlinePlayback = MutableStateFlow(false)
+    private val mutableSources = MutableStateFlow(localSources)
     val sources = mutableSources.asStateFlow()
     private val metadataVersion = MutableStateFlow(0L)
     private var deviceIndex: DeviceMusicLibrary? = null
+    private val mutableIndexReady = MutableStateFlow(false)
+    val indexReady = mutableIndexReady.asStateFlow()
     val library = object : LocalPlaybackLibrary {
         override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = deviceIndex?.resolve(track, context)
         override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized() && track.id in ids.value
     }
 
     private val queue = MutableStateFlow<List<PlaybackTrack>>(emptyList())
-    fun observeQueue(view: PlaybackView) { queue.value = view.snapshot?.state?.queue.orEmpty() }
+    fun observePlayback(view: PlaybackView) {
+        queue.value = view.queue
+        onlinePlayback.value = PlayerPresentation(view).onlineReady
+    }
 
     init {
         scope.launch {
@@ -77,10 +81,10 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
             }
         }
         scope.launch {
-            sessions.onlineGrant.collect { current ->
-                val newGrant = current?.takeIf { it.identity == identity }
-                if (dataGrant !== newGrant) { dataGrant = newGrant; mutableSources.value = dataFor(newGrant) }
-            }
+            combine(sessions.onlineGrant, onlinePlayback) { grant, online -> grant?.takeIf { online && it.identity == identity } }
+                .distinctUntilChanged().collect { grant ->
+                    mutableSources.value = if (grant == null) localSources else onlineMusicSources(sessions, grant, catalog, personal)
+                }
         }
         scope.launch {
             val store = storage.initialized.await() ?: return@launch
@@ -105,15 +109,14 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
             metadataVersion.value++
         }
         scope.launch {
-            combine(ids, offlinePlaylists.wanted, metadataVersion, sessions.manualOffline) { _, _, _, offline -> offline }
-                .collectLatest { offline ->
-                    deviceIndex = null
-                    if (offline) {
-                        val complete = offlinePlaylists.complete()
-                        deviceIndex = withContext(Dispatchers.Default) {
-                            DeviceMusicLibrary(catalog.availableTracks(), complete) { it in ids.value }
-                        }
+            // Keep this ready before an online owner detaches; a mode change needn't await reindexing.
+            combine(ids, offlinePlaylists.wanted, metadataVersion) { _, _, version -> version }
+                .collectLatest {
+                    val complete = offlinePlaylists.complete()
+                    deviceIndex = withContext(Dispatchers.Default) {
+                        DeviceMusicLibrary(catalog.availableTracks(), complete) { it in ids.value }
                     }
+                    mutableIndexReady.value = true
                 }
         }
         scope.launch {

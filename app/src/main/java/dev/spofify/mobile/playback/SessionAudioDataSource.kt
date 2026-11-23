@@ -91,7 +91,7 @@ internal class SessionAudioDataSource(
         val job = pending?.job ?: retry.source.job
         val length = dataSpec.length.takeIf { it != C.LENGTH_UNSET.toLong() }
         fun checkOwner() {
-            if (!retry.source.job.isActive || sessions.onlineGrant.value !== grant || pending != null && !pending.isCurrent()) {
+            if (sessions.manualOffline.value || !retry.source.job.isActive || sessions.onlineGrant.value !== grant || pending != null && !pending.isCurrent()) {
                 throw InterruptedIOException("Audio load retired")
             }
         }
@@ -123,7 +123,7 @@ internal class SessionAudioDataSource(
 
     private fun TransientAudioLoadFailure.forLoader(): IOException {
         val owner = retry.source.interrupted(retry)
-        return if (owner != null && grant != null && sessions.onlineGrant.value === grant && representation?.canContinue != false) {
+        return if (owner != null && grant != null && !sessions.manualOffline.value && sessions.onlineGrant.value === grant && representation?.canContinue != false) {
             RetryableAudioLoad(owner, retry, this)
         } else this
     }
@@ -131,6 +131,7 @@ internal class SessionAudioDataSource(
     override fun addTransferListener(listener: TransferListener) { disk.addTransferListener(listener); network.addTransferListener(listener) }
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         val source = requireNotNull(active)
+        if (source === network && sessions.manualOffline.value) throw InterruptedIOException("Manual offline")
         return try { source.read(buffer, offset, length) } catch (failure: TransientAudioLoadFailure) {
             throw if (source === network) failure.forLoader() else failure
         }

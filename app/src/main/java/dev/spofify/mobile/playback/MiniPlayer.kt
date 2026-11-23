@@ -32,7 +32,7 @@ private val PlayerTouchTarget = 48.dp
 @Composable
 internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: () -> Unit, onDevices: () -> Unit) {
     val state = controller.observe()
-    val online = state.online
+    val actionContext = state.gestureContext
     val queue = state.queue
     val track = queue?.current
     val ready = state.ready
@@ -42,15 +42,16 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
     fun swipe(neighbour: PlaybackTrack?, step: Int): (() -> Unit)? {
         if (!ready || neighbour == null) return null
         return {
-            val latest = controller.presentation.queue
-            if (latest?.current?.key == track?.key && latest?.queue?.getOrNull(position + step)?.key == neighbour.key) {
+            val latest = controller.presentation
+            if (latest.ready && latest.gestureContext == actionContext &&
+                latest.queue?.queue?.getOrNull(position + step)?.key == neighbour.key) {
                 if (step < 0) controller.previous() else controller.next()
             }
         }
     }
     val previousSwipe = swipe(previous, -1)
     val nextSwipe = swipe(next, 1)
-    val binding = listOf(controller, online?.connectionId, track?.key, previous?.key, next?.key)
+    val binding = listOf(controller, actionContext, previous?.key, next?.key)
     var actions by remember(controller) { mutableStateOf(false) }
     LaunchedEffect(binding) { actions = false }
     val colors = MaterialTheme.colorScheme
@@ -91,8 +92,8 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
                             .onPreviewKeyEvent {
                                 if (it.type != KeyEventType.KeyDown) false
                                 else when (it.key) {
-                                    Key.DirectionLeft -> if (ready && next != null) { controller.next(); true } else false
-                                    Key.DirectionRight -> if (ready && previous != null) { controller.previous(); true } else false
+                                    Key.DirectionLeft -> nextSwipe?.let { it(); true } ?: false
+                                    Key.DirectionRight -> previousSwipe?.let { it(); true } ?: false
                                     else -> false
                                 }
                             }.combinedClickable(onClick = onExpand, onLongClick = { actions = true }))
@@ -109,8 +110,8 @@ internal fun MiniPlayer(controller: AppPlayback, loader: ImageLoader, onExpand: 
     if (actions && track != null) SpofifySheet({ actions = false }) {
         Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             SheetHeading(track.name)
-            SheetAction("Next", SpofifyGlyph.Next, ready && next != null) { actions = false; controller.next() }
-            SheetAction("Previous", SpofifyGlyph.Previous, ready && previous != null) { actions = false; controller.previous() }
+            SheetAction("Next", SpofifyGlyph.Next, nextSwipe != null) { actions = false; nextSwipe?.invoke() }
+            SheetAction("Previous", SpofifyGlyph.Previous, previousSwipe != null) { actions = false; previousSwipe?.invoke() }
         }
     }
 }
@@ -142,11 +143,14 @@ private fun MiniIdentity(track: PlaybackTrack, loader: ImageLoader, modifier: Mo
 internal data class PlayerOutputState(val enabled: Boolean, val remote: Boolean, val playing: Boolean, val name: String)
 
 internal fun PlayerPresentation.outputState(): PlayerOutputState {
-    val online = online
-    val selected = online?.devices?.firstOrNull { it.deviceId == online.snapshot?.selectedDeviceId }
-    val remote = isPlaying && selected != null && selected.deviceId != online.deviceId
-    val name = selected?.name ?: if (this is PlayerPresentation.Local) "this phone" else "no output"
-    return PlayerOutputState(online != null && ready, remote, isPlaying, name)
+    val selected = view.devices.firstOrNull { onlineReady && it.deviceId == view.snapshot?.selectedDeviceId }
+    val remote = isPlaying && onlineReady && !view.localOutput
+    val name = selected?.name ?: when {
+        view.localOutput -> "this phone"
+        onlineReady && !view.snapshot?.selectedDeviceId.isNullOrEmpty() -> "another device"
+        else -> "no output"
+    }
+    return PlayerOutputState(onlineReady, remote, isPlaying, name)
 }
 
 @Composable

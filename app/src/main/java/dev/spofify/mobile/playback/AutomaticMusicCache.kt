@@ -11,6 +11,7 @@ import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.cache.*
 import dev.spofify.mobile.core.offline.OfflineClient
 import dev.spofify.mobile.core.playback.AudioFacts
+import dev.spofify.mobile.core.playback.PlaybackConnectionState
 import dev.spofify.mobile.core.playback.PlaybackView
 import java.io.File
 import kotlinx.coroutines.*
@@ -31,10 +32,13 @@ internal class MusicStorage(app: Application, private val scope: CoroutineScope)
 internal fun PlaybackView.readyForMusicCache(facts: AudioFacts, authorized: Boolean): Boolean {
     val binding = facts.binding ?: return false
     val snap = snapshot ?: return false
-    return authorized && isLocalSelectedConnection() && snap.transfer == null && desiredPlaying &&
+    return authorized && onlineLocalOutput() && desiredPlaying &&
         facts.isPlaying && !facts.isLoading && !facts.isBuffering && binding.trackId == current?.id &&
-        binding.eventId == snap.state.occurrence?.eventId && binding.outputVersion == snap.outputVersion
+        binding.eventId == snap.state.occurrence?.eventId
 }
+
+private fun PlaybackView.onlineLocalOutput() =
+    localOutput && !offline && !superseded && connection == PlaybackConnectionState.READY
 
 private fun network(app: Application) = callbackFlow {
     val cm = app.getSystemService(ConnectivityManager::class.java)
@@ -96,7 +100,7 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
     }
 
     fun observe(view: PlaybackView, facts: AudioFacts, authorized: Boolean) {
-        val queue = view.snapshot?.state?.takeIf { view.isLocalSelectedConnection() && view.snapshot?.transfer == null }
+        val queue = view.snapshot?.state?.takeIf { view.onlineLocalOutput() }
         val old = lastQueue
         val changed = old?.queue !== queue?.queue || old?.position != queue?.position || old?.repeat != queue?.repeat ||
             old?.occurrence?.eventId != queue?.occurrence?.eventId

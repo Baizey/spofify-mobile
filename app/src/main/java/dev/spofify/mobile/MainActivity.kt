@@ -24,7 +24,6 @@ import dev.spofify.mobile.core.auth.AuthState
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.feature.library.MusicRoot
 import dev.spofify.mobile.playback.PlaybackOwner
-import dev.spofify.mobile.designsystem.Spacing
 import dev.spofify.mobile.designsystem.SpofifySurfaces
 import dev.spofify.mobile.designsystem.SpofifyTheme
 import dev.spofify.mobile.feature.auth.*
@@ -51,7 +50,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         val app = application as SpofifyApplication
         app.sessions.setAppForeground(true)
-        if (app.playback.current != null) app.playback.foreground() else app.sessions.refresh()
+        app.playback.foreground()
     }
 
     override fun onStop() {
@@ -91,19 +90,8 @@ private fun AuthRoot(
                 is AuthState.Authenticated -> {
                     pages.SaveableStateProvider(requireNotNull(pageKey)) {
                         var credits by rememberSaveable { mutableStateOf(false) }
-                        val connectionFailed = current.notice == AuthNotice.CONNECTION_FAILED
-                        Column(Modifier.fillMaxSize()) {
-                            if (connectionFailed) {
-                                Box(Modifier.padding(horizontal = Spacing.page).padding(top = Spacing.fieldGap)) {
-                                    Notice(current.notice)
-                                }
-                            }
-                            Box(Modifier.weight(1f)) {
-                                MusicRoot(current.identity, sessions, playback) {
-                                    val account = if (connectionFailed) current.copy(notice = null) else current
-                                    AccountScreen(account, model::signOut) { credits = true }
-                                }
-                            }
+                        MusicRoot(current.identity, sessions, playback) {
+                            AccountScreen(current, model::signOut) { credits = true }
                         }
                         if (credits) FontCredits { credits = false }
                     }
