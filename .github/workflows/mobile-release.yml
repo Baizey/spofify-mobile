@@ -2,14 +2,15 @@ name: Publish Mobile Release
 on:
   workflow_dispatch:
     inputs:
-      version_code:
-        description: Android versionCode (strictly above all existing mobile tags and releases)
-        type: string
+      release:
+        description: Publish a release with this version change
+        type: choice
         required: true
-      version_name:
-        description: Android versionName (for example 1.2.3)
-        type: string
-        required: true
+        default: patch
+        options:
+          - major
+          - minor
+          - patch
 
 permissions:
   contents: read
@@ -17,22 +18,43 @@ concurrency:
   group: spofify-mobile-release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  VERSION_CODE: ${{ inputs.version_code }}
-  VERSION_NAME: ${{ inputs.version_name }}
-
 jobs:
-  package:
+  plan:
     if: github.repository == 'Baizey/spofify-mobile' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
+    # GitHub only lists drafts for callers with push access. This job only reads history.
+    permissions:
+      contents: write
+    outputs:
+      version_code: ${{ steps.version.outputs.version_code }}
+      version_name: ${{ steps.version.outputs.version_name }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Validate explicit version and public certificate anchor
-        run: python3 scripts/mobile_release.py validate-inputs --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
+      - name: Resolve release versions from canonical GitHub history
+        id: version
+        env:
+          RELEASE: ${{ inputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          versions=$(python3 scripts/mobile_release.py resolve --bump "$RELEASE")
+          printf '%s\n' "$versions" | tee -a "$GITHUB_OUTPUT"
+
+  package:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION_CODE: ${{ needs.plan.outputs.version_code }}
+      VERSION_NAME: ${{ needs.plan.outputs.version_name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       # Bootstrap JVM for SDK tools/wrapper; Gradle provisions JetBrains Runtime 25 via Foojay.
       - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.7.1
         with:
@@ -63,12 +85,16 @@ jobs:
 
   publish:
     if: github.repository == 'Baizey/spofify-mobile' && github.ref == 'refs/heads/main' && github.run_attempt == '1'
-    needs: package
+    needs: [plan, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: mobile-release
     permissions:
       contents: write
+    env:
+      RELEASE: ${{ inputs.release }}
+      VERSION_CODE: ${{ needs.plan.outputs.version_code }}
+      VERSION_NAME: ${{ needs.plan.outputs.version_name }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -80,6 +106,12 @@ jobs:
           path: ${{ runner.temp }}/mobile-unsigned
       - name: Install Android build-tools
         run: sdkmanager --install 'build-tools;36.0.0'
+      - name: Revalidate the packaged release plan before signing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/mobile_release.py check-plan --bump "$RELEASE" \
+            --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
       - name: Sign and verify against the public certificate anchor
         env:
           MOBILE_KEYSTORE_B64: ${{ secrets.MOBILE_KEYSTORE_B64 }}
@@ -93,5 +125,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/mobile_release.py publish --version-code "$VERSION_CODE" --version-name "$VERSION_NAME" \
+          python3 scripts/mobile_release.py publish --bump "$RELEASE" \
+            --version-code "$VERSION_CODE" --version-name "$VERSION_NAME" \
             --commit "$GITHUB_SHA" "$RUNNER_TEMP/spofify-mobile-release.apk"

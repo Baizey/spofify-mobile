@@ -27,6 +27,9 @@ UPLOADS = f"https://uploads.github.com/repos/{REPO}"
 ASSET = "spofify-mobile-release.apk"
 RELEASE_ID = "dev.spofify.mobile.release"
 MAX_CODE = 2_100_000_000
+MAX_VERSION_COMPONENT = 2**32 - 1
+BUMPS = ("major", "minor", "patch")
+TITLE_PREFIX = "Spofify Mobile "
 MAX_BYTES = 150 * 1024 * 1024
 MAX_LATEST_BYTES = 128 * 1024
 ASSET_CDN = "release-assets.githubusercontent.com"
@@ -59,6 +62,14 @@ def version_name(text):
     need(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,79}", text),
          "Version name must be 1–80 ASCII letters/digits or .+_-, starting with a letter or digit.")
     return text
+
+
+def stable_version(text):
+    need(isinstance(text, str) and re.fullmatch(r"(?:0|[1-9][0-9]{0,9})(?:\.(?:0|[1-9][0-9]{0,9})){2}", text),
+         "Expected a stable X.Y.Z version without leading zeroes.")
+    parts = tuple(map(int, text.split(".")))
+    need(all(part <= MAX_VERSION_COMPONENT for part in parts), "Version component outside supported range.")
+    return parts
 
 
 def tag_code(tag):
@@ -199,7 +210,7 @@ class GitHub:
         self.token = token
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def request(self, path, *, method="GET", payload=None, upload=None, missing=False):
+    def request(self, path, *, method="GET", payload=None, upload=None, missing=False, paginated=False):
         headers = {"Accept": "application/vnd.github+json", "Accept-Encoding": "identity",
                    "User-Agent": "spofify-mobile-release", "X-GitHub-Api-Version": "2022-11-28"}
         if self.token:
@@ -226,7 +237,13 @@ class GitHub:
                 need(length is None or len(body) == length, "Invalid GitHub API response length.")
                 if latest:
                     return json.loads(body.decode("utf-8"), object_pairs_hook=unique_json_object)
-                return json.loads(body)
+                result = json.loads(body)
+                if paginated:
+                    # Follow the continuation signal, not the header's URL: keep the token on the fixed API route.
+                    has_next = any(re.search(r'<[^<>]*>\s*;\s*rel="next"\s*(?:,|$)', link)
+                                   for link in header_values(response.headers, "Link"))
+                    return result, has_next
+                return result
         except urllib.error.HTTPError as exc:
             if missing and exc.code == 404:
                 return None
@@ -236,11 +253,11 @@ class GitHub:
 
     def all(self, path):
         for page in range(1, 1001):
-            items = self.request(f"{path}?per_page=100&page={page}")
+            items, has_next = self.request(f"{path}?per_page=100&page={page}", paginated=True)
             need(isinstance(items, list) and all(isinstance(item, dict) for item in items),
                  "GitHub API returned invalid list data.")
             yield from items
-            if len(items) < 100:
+            if not has_next:
                 return
         raise InvalidRelease("GitHub API pagination limit reached; cannot verify complete history.")
 
@@ -259,21 +276,77 @@ def git_commit(ref, name):
     return sha
 
 
-def gate_history(auth, public, code, *, own_draft=None):
+def stable_release_version(release, code):
+    title = release.get("name")
+    try:
+        need(isinstance(title, str) and title.startswith(TITLE_PREFIX), "Expected a canonical title.")
+        return stable_version(title.removeprefix(TITLE_PREFIX))
+    except InvalidRelease as exc:
+        raise InvalidRelease(f"Stable mobile-v{code} must have the exact title '{TITLE_PREFIX}X.Y.Z': {exc}") from exc
+
+
+def release_history(auth, public, *, own_draft=None, own_tag=None):
     highest = 0
     for tag in auth.all("/tags"):
-        highest = max(highest, tag_code(tag.get("name")) or 0)
+        name = tag.get("name")
+        code = tag_code(name)
+        if name != own_tag:
+            highest = max(highest, code or 0)
+
+    stable = set()
+    found_own_draft = False
     for release in auth.all("/releases"):
-        published_code = tag_code(release.get("tag_name"))
-        if own_draft is not None and release.get("id") == own_draft:
-            need(published_code == code and release.get("draft") is True and release.get("prerelease") is False,
+        code = tag_code(release.get("tag_name"))
+        if own_draft is not None and release.get("id") == own_draft[0]:
+            need(not found_own_draft and code == own_draft[1] and release.get("name") == own_draft[2]
+                 and release.get("draft") is True and release.get("prerelease") is False,
                  "The reserved draft changed during publication.")
+            found_own_draft = True
             continue
-        highest = max(highest, published_code or 0)
+        if code is None:
+            continue
+        highest = max(highest, code)
+        draft, prerelease = release.get("draft"), release.get("prerelease")
+        need(type(draft) is bool and type(prerelease) is bool, f"Missing release status for mobile-v{code}.")
+        if not draft and not prerelease:
+            stable.add((release_id(release), code, stable_release_version(release, code)))
+    need(own_draft is None or found_own_draft, "The reserved draft is missing from authenticated history.")
+
+    # Anonymous latest is an independent consistency check, not a substitute for the full history.
     latest = public.request("/releases/latest", missing=True)
     if latest is not None:
-        highest = max(highest, tag_code(latest.get("tag_name")) or 0)
-    need(code > highest, f"Version code {code} must exceed all existing mobile release/tag codes (max {highest}).")
+        code = tag_code(latest.get("tag_name"))
+        if code is not None:
+            need(latest.get("draft") is False and latest.get("prerelease") is False
+                 and (release_id(latest), code, stable_release_version(latest, code)) in stable,
+                 "Anonymous latest disagrees with authenticated Mobile release history.")
+    return highest, stable
+
+
+def resolve_versions(auth, public, bump, *, own_draft=None, own_tag=None):
+    need(bump in BUMPS, "Choose major, minor, or patch.")
+    highest, stable = release_history(auth, public, own_draft=own_draft, own_tag=own_tag)
+    need(highest < MAX_CODE, f"No Android version codes remain above {highest}.")
+    previous = max((version for _, _, version in stable), default=(0, 0, 0))
+    i = BUMPS.index(bump)
+    bumped = previous[:i] + (previous[i] + 1,) + (0,) * (2 - i)
+    need(bumped[i] <= MAX_VERSION_COMPONENT, "Version component outside supported range; choose a larger bump.")
+    return highest + 1, ".".join(map(str, bumped))
+
+
+def check_plan(auth, public, bump, code, name, *, draft_id=None, commit=None):
+    title = TITLE_PREFIX + name
+    own_draft = None if draft_id is None else (draft_id, code, title)
+    own_tag = None
+    if commit is not None:
+        # Only exclude the exact tag this attempt created, after checking that it still targets the build.
+        own_tag = f"mobile-v{code}"
+        ref = f"refs/tags/{own_tag}"
+        need(git_commit(auth.request(f"/git/ref/tags/{own_tag}"), ref) == commit,
+             "Reserved tag no longer points to the packaged commit.")
+    planned_code, planned_name = resolve_versions(auth, public, bump, own_draft=own_draft, own_tag=own_tag)
+    need((code, name) == (planned_code, planned_name),
+         f"Packaged version ({code}, {name}) no longer matches the {bump} plan ({planned_code}, {planned_name}).")
 
 
 def browser_url(tag):
@@ -338,10 +411,11 @@ def release_id(release):
     return identifier
 
 
-def require_shape(release, identifier, tag, size, digest, *, draft, pending_digest=False):
+def require_shape(release, identifier, tag, title, size, digest, *, draft, pending_digest=False):
     need(release_id(release) == identifier and release.get("tag_name") == tag
          and release.get("draft") is draft and release.get("prerelease") is False,
          "Release is not the expected stable draft/public release.")
+    need(release.get("name") == title, "Release title does not match the packaged versionName.")
     assets = release.get("assets")
     need(isinstance(assets, list), "Missing release assets list.")
     if pending_digest and not assets:
@@ -363,24 +437,26 @@ def require_shape(release, identifier, tag, size, digest, *, draft, pending_dige
     return True
 
 
-def publish(auth, public, apk, code, commit):
+def publish(auth, public, apk, bump, code, name, commit):
     need(re.fullmatch(r"[0-9a-f]{40}", commit), "Expected the exact packaged commit SHA.")
     tag = f"mobile-v{code}"
+    title = TITLE_PREFIX + name
     need(apk.name == ASSET, f"Expected the signed APK to be named {ASSET}.")
+    verify_apk(apk, code, name, signing_anchor(CERT_FILE))
     size = apk.stat().st_size
     need(0 < size <= MAX_BYTES, "Signed APK missing, empty or over 150 MiB.")
     with apk.open("rb") as stream:
         digest = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
 
     require_public_repo(public)
-    gate_history(auth, public, code)
+    check_plan(auth, public, bump, code, name)
     draft = auth.request("/releases", method="POST", payload={
-        "tag_name": tag, "name": tag, "target_commitish": commit, "body": "", "draft": True,
+        "tag_name": tag, "name": title, "target_commitish": commit, "body": "", "draft": True,
         "prerelease": False, "generate_release_notes": False, "make_latest": "false",
     })
     identifier = release_id(draft)
     path = f"/releases/{identifier}"
-    need(draft.get("tag_name") == tag and draft.get("target_commitish") == commit
+    need(draft.get("tag_name") == tag and draft.get("name") == title and draft.get("target_commitish") == commit
          and draft.get("draft") is True and draft.get("prerelease") is False and draft.get("assets") == [],
          "GitHub did not reserve the expected empty draft targeting the packaged commit.")
     with apk.open("rb") as stream:
@@ -389,19 +465,20 @@ def publish(auth, public, apk, code, commit):
         time.sleep(delay)
         draft = auth.request(path)
         need(draft.get("target_commitish") == commit, "Draft no longer targets the packaged commit.")
-        if require_shape(draft, identifier, tag, size, digest, draft=True, pending_digest=True):
+        if require_shape(draft, identifier, tag, title, size, digest, draft=True, pending_digest=True):
             break
     else:
         raise InvalidRelease("GitHub did not supply the APK digest before timeout; release remains a draft.")
 
-    gate_history(auth, public, code, own_draft=identifier)
-    draft = auth.request(path)
-    need(draft.get("target_commitish") == commit, "Draft no longer targets the packaged commit.")
-    require_shape(draft, identifier, tag, size, digest, draft=True)
+    check_plan(auth, public, bump, code, name, draft_id=identifier)
     # Create-only, as on Desktop. Never reuse an existing tag, even if it has the same SHA.
     ref = f"refs/tags/{tag}"
     created = auth.request("/git/refs", method="POST", payload={"ref": ref, "sha": commit})
     need(git_commit(created, ref) == commit, "Release tag does not match the packaged commit.")
+    check_plan(auth, public, bump, code, name, draft_id=identifier, commit=commit)
+    draft = auth.request(path)
+    need(draft.get("target_commitish") == commit, "Draft no longer targets the packaged commit.")
+    require_shape(draft, identifier, tag, title, size, digest, draft=True)
     try:
         auth.request(path, method="PATCH", payload={"draft": False, "prerelease": False, "make_latest": "true"})
         last_error = None
@@ -409,9 +486,14 @@ def publish(auth, public, apk, code, commit):
             time.sleep(delay)
             try:
                 latest = public.request("/releases/latest")
-                require_shape(latest, identifier, tag, size, digest, draft=False)
+                require_shape(latest, identifier, tag, title, size, digest, draft=False)
                 need(git_commit(public.request(f"/git/ref/tags/{tag}"), ref) == commit,
                      "Published tag does not point to the packaged commit.")
+                _, stable = release_history(auth, public)
+                current = (identifier, code, stable_version(name))
+                need(current in stable and all(record == current or (record[1] < code and record[2] < current[2])
+                                               for record in stable),
+                     "Published release is not ahead of all other stable Mobile releases; inspect for a race.")
                 verify_public_download(tag, size, digest)
                 print(f"Verified public latest: {tag}, {ASSET}, {size} bytes, {digest}")
                 return
@@ -427,11 +509,14 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     debug = sub.add_parser("verify-debug")
     debug.add_argument("apk", type=Path)
-    for command in ("validate-inputs", "stage-unsigned", "sign", "verify-apk", "publish"):
+    sub.add_parser("resolve").add_argument("--bump", required=True, choices=BUMPS)
+    for command in ("check-plan", "stage-unsigned", "sign", "verify-apk", "publish"):
         options = sub.add_parser(command)
         options.add_argument("--version-code", required=True)
         options.add_argument("--version-name", required=True)
-        if command in ("validate-inputs", "sign", "verify-apk"):
+        if command in ("check-plan", "publish"):
+            options.add_argument("--bump", required=True, choices=BUMPS)
+        if command in ("sign", "verify-apk"):
             options.add_argument("--cert-file", type=Path, default=CERT_FILE,
                                  help="Override for disposable-key tests only")
         if command == "stage-unsigned":
@@ -447,15 +532,27 @@ def main():
         if args.command == "verify-debug":
             require_apk(args.apk, "dev.spofify.mobile", 1, "0.1.0", debug=True)
             tool("apksigner", "verify", args.apk)
+        elif args.command in ("resolve", "check-plan", "publish"):
+            token = os.environ.get(TOKEN_ENV)
+            need(token, "Missing GitHub Actions token (GH_TOKEN).")
+            auth, public = GitHub(token), GitHub()
+            if args.command == "resolve":
+                signing_anchor(CERT_FILE)
+                require_public_repo(public)
+                code, name = resolve_versions(auth, public, args.bump)
+                print(f"version_code={code}\nversion_name={name}")
+            else:
+                code, name = version_code(args.version_code), args.version_name
+                stable_version(name)
+                if args.command == "check-plan":
+                    require_public_repo(public)
+                    check_plan(auth, public, args.bump, code, name)
+                else:
+                    publish(auth, public, args.apk, args.bump, code, name, args.commit)
         else:
             code, name = version_code(args.version_code), version_name(args.version_name)
             if args.command == "stage-unsigned":
                 stage_unsigned(args.directory, args.apk, code, name)
-            elif args.command == "publish":
-                token = os.environ.get(TOKEN_ENV)
-                need(token, "Missing GitHub Actions token (GH_TOKEN).")
-                verify_apk(args.apk, code, name, signing_anchor(CERT_FILE))
-                publish(GitHub(token), GitHub(), args.apk, code, args.commit)
             else:
                 expected = signing_anchor(args.cert_file)
                 if args.command == "sign":

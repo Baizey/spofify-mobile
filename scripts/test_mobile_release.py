@@ -34,49 +34,84 @@ class VersionTest(unittest.TestCase):
                 release.cert_hash(bad)
         self.assertEqual(release.cert_hash("AB" * 32), "ab" * 32)
 
-    def test_history_checks_all_sources_not_only_latest(self):
-        auth = Mock()
-        public = Mock()
-        tags = [{"name": "unrelated"}, {"name": "mobile-v20"}]
-        releases = [{"id": 1, "tag_name": "mobile-v30", "draft": True},
-                    {"id": 2, "tag_name": "mobile-v40", "prerelease": True}]
-        for existing_tags, existing_releases, latest, maximum in (
-            (tags, [], None, 20), (tags, releases[:1], None, 30),
-            (tags, releases, {"tag_name": "mobile-v10"}, 40), ([], [], {"tag_name": "mobile-v50"}, 50),
-        ):
-            public.request.return_value = latest
-            for trial in (maximum - 1, maximum, maximum + 1):
-                auth.all.side_effect = [iter(existing_tags), iter(existing_releases)]
-                with self.subTest(trial=trial, maximum=maximum):
-                    if trial <= maximum:
-                        with self.assertRaisesRegex(release.InvalidRelease, f"max {maximum}"):
-                            release.gate_history(auth, public, trial)
-                    else:
-                        release.gate_history(auth, public, trial)
+def mobile_release(code, name, *, draft=False, prerelease=False):
+    return {"id": code, "tag_name": f"mobile-v{code}", "name": name, "draft": draft, "prerelease": prerelease}
 
-    def test_unreserved_historical_release_does_not_reserve_a_version_code(self):
-        tag = "ci-broker-b6eb54f"
-        auth = Mock()
-        public = Mock()
-        current = {"tag_name": tag, "draft": False, "prerelease": False, "assets": []}
-        auth.all.side_effect = [[{"name": tag}], [current]]
-        public.request.return_value = current
-        release.gate_history(auth, public, 1)
 
-    def test_malformed_reserved_tag_does_not_get_bypassed(self):
-        auth = Mock()
-        public = Mock()
-        auth.all.return_value = [{"name": "mobile-v0004"}]
-        with self.assertRaises(release.InvalidRelease):
-            release.gate_history(auth, public, 50)
+class PlanTest(unittest.TestCase):
+    def history(self, tags=(), releases=(), latest=None):
+        auth, public = Mock(), Mock()
+        auth.all.side_effect = {"/tags": [{"name": tag} for tag in tags], "/releases": releases}.__getitem__
+        public.request.return_value = latest
+        return auth, public
 
-    def test_pagination_checks_beyond_first_page(self):
-        github = release.GitHub()
-        amounts = [{"name": "unrelated"}] * 100, [{"name": "mobile-v101"}]
-        github.request = Mock(side_effect=amounts)
-        self.assertIn({"name": "mobile-v101"}, list(github.all("/tags")))
-        self.assertEqual([c.args[0] for c in github.request.call_args_list],
-                         ["/tags?per_page=100&page=1", "/tags?per_page=100&page=2"])
+    def test_first_release_and_ignored_broker(self):
+        broker = {"tag_name": "ci-broker-b6eb54f", "draft": False, "prerelease": False, "assets": []}
+        for history in (self.history(), self.history((broker["tag_name"],), [broker], broker)):
+            for bump, name in (("major", "1.0.0"), ("minor", "0.1.0"), ("patch", "0.0.1")):
+                with self.subTest(bump=bump, history=history):
+                    self.assertEqual(release.resolve_versions(*history, bump), (1, name))
+
+    def test_uses_numerically_highest_stable_semver_and_separate_code_maximum(self):
+        lower = mobile_release(20, "Spofify Mobile 2.9.49")
+        higher = mobile_release(17, "Spofify Mobile 2.10.3")
+        draft = mobile_release(30, "Spofify Mobile 10.0.0", draft=True)
+        prerelease = mobile_release(40, "legacy prerelease title", prerelease=True)
+        for stable_releases in ([lower, higher], [higher, lower]):
+            for tags, extras, expected_code in (
+                ((), [], 21), ((), [draft], 31), ((), [draft, prerelease], 41),
+                (("mobile-v50",), [draft, prerelease], 51),
+            ):
+                for bump, name in (("major", "3.0.0"), ("minor", "2.11.0"), ("patch", "2.10.4")):
+                    history = self.history(tags, stable_releases + extras, lower)
+                    self.assertEqual(release.resolve_versions(*history, bump), (expected_code, name))
+
+    def test_malformed_reserved_metadata_does_not_get_bypassed(self):
+        for tag in ("mobile-v0004", "mobile-v", "mobile-v4-rc1", "mobile-v2100000001"):
+            with self.subTest(tag=tag), self.assertRaisesRegex(release.InvalidRelease, "Version code"):
+                release.resolve_versions(*self.history((tag,)), "patch")
+        for title in (None, "mobile-v4", "Spofify Mobile 01.2.3", "Spofify Mobile 1.2.3-alpha",
+                      "Spofify Mobile 1.2.3 ", "Spofify Mobile 1.2.3\n", "Spofify Mobile 4294967296.0.0"):
+            with self.subTest(title=title), self.assertRaisesRegex(release.InvalidRelease, "exact title"):
+                release.resolve_versions(*self.history(releases=[mobile_release(4, title)]), "patch")
+        invalid = mobile_release(4, "Spofify Mobile 1.2.3")
+        invalid.pop("draft")
+        with self.assertRaisesRegex(release.InvalidRelease, "Missing release status"):
+            release.resolve_versions(*self.history(releases=[invalid]), "patch")
+
+    def test_fails_closed_if_public_latest_disagrees(self):
+        record = mobile_release(4, "Spofify Mobile 1.2.3")
+        for history in (self.history(latest=record),
+                        self.history(releases=[dict(record, name="Spofify Mobile 1.2.4")], latest=record)):
+            with self.assertRaisesRegex(release.InvalidRelease, "Anonymous latest disagrees"):
+                release.resolve_versions(*history, "patch")
+
+    def test_version_limits(self):
+        with self.assertRaisesRegex(release.InvalidRelease, "No Android version codes remain"):
+            release.resolve_versions(*self.history((f"mobile-v{release.MAX_CODE}",)), "patch")
+        history = self.history(releases=[mobile_release(5, "Spofify Mobile 0.0.4294967295")])
+        with self.assertRaisesRegex(release.InvalidRelease, "outside supported range"):
+            release.resolve_versions(*history, "patch")
+        self.assertEqual(release.resolve_versions(*history, "minor"), (6, "0.1.0"))
+
+    def test_requires_the_exact_planned_pair(self):
+        for code, name in ((0, "0.0.1"), (2, "0.0.1"), (1, "0.1.0")):
+            with self.subTest(code=code, name=name), self.assertRaisesRegex(release.InvalidRelease, "no longer matches"):
+                release.check_plan(*self.history(), "patch", code, name)
+        release.check_plan(*self.history(), "patch", 1, "0.0.1")
+
+    def test_resolution_uses_tags_and_releases_beyond_first_page(self):
+        github, public = release.GitHub(), Mock()
+        github.request = Mock(side_effect=[
+            ([{"name": "unrelated"}] * 100, True), ([{"name": "mobile-v101"}], False),
+            ([{"tag_name": "unrelated"}] * 100, True), ([mobile_release(7, "Spofify Mobile 1.10.0")], False),
+        ])
+        public.request.return_value = None
+        self.assertEqual(release.resolve_versions(github, public, "patch"), (102, "1.10.1"))
+        self.assertEqual([c.args[0] for c in github.request.call_args_list], [
+            "/tags?per_page=100&page=1", "/tags?per_page=100&page=2",
+            "/releases?per_page=100&page=1", "/releases?per_page=100&page=2",
+        ])
 
 
 class ApkMetadataTest(unittest.TestCase):
@@ -93,6 +128,19 @@ class ApkMetadataTest(unittest.TestCase):
 
 
 class TransportTest(unittest.TestCase):
+    def test_short_page_with_continuation_stays_on_canonical_api_route(self):
+        github = release.GitHub("disposable-token-fixture")
+        github.opener = MagicMock()
+        first, second = MagicMock(), MagicMock()
+        first.__enter__.return_value.read.return_value = b'[{"tag_name":"unrelated"}]'
+        first.__enter__.return_value.headers = {"Link": '<https://example.invalid/api?page=2>; rel="next"'}
+        second.__enter__.return_value.read.return_value = b'[{"tag_name":"mobile-v4"}]'
+        second.__enter__.return_value.headers = {"Link": '<https://example.invalid/api?page=1>; rel="prev"'}
+        github.opener.open.side_effect = [first, second]
+        self.assertEqual(list(github.all("/releases")), [{"tag_name": "unrelated"}, {"tag_name": "mobile-v4"}])
+        self.assertEqual([c.args[0].full_url for c in github.opener.open.call_args_list],
+                         [f"{release.API}/releases?per_page=100&page={p}" for p in (1, 2)])
+
     def test_fixed_upload_origin_and_streamed_length(self):
         github = release.GitHub("disposable-token-fixture")
         github.opener = MagicMock()
@@ -216,7 +264,9 @@ class DownloadTest(unittest.TestCase):
 
 class PublicationFixture:
     code = 21
+    name = "0.1.1"
     tag = "mobile-v21"
+    title = "Spofify Mobile 0.1.1"
     commit = "a" * 40
     release_id = 7
 
@@ -228,10 +278,11 @@ class PublicationFixture:
         self.auth.all.side_effect = self.auth_list
         self.repo = {"full_name": release.REPO, "private": False, "visibility": "public"}
         self.tags = [{"name": "mobile-v19"}]
-        self.history = [{"tag_name": "mobile-v20", "id": 4, "draft": False, "prerelease": False}]
+        self.history = [mobile_release(20, "Spofify Mobile 0.1.0")]
         self.created = self.uploaded = self.patched = False
         self.tagged = self.tag_exists = self.bad_created_ref = False
-        self.race = self.hide_latest = self.bad_tag_target = False
+        self.race = self.late_semver_race = self.promotion_race = self.hide_latest = self.bad_tag_target = False
+        self.bad_draft_title = self.bad_public_title = self.missing_draft = False
         self.apk_digest = hashlib.sha256(apk_bytes).hexdigest()
         self.expected_asset = {
             "name": release.ASSET, "state": "uploaded", "size": len(apk_bytes),
@@ -247,14 +298,20 @@ class PublicationFixture:
         assets = [asset] if self.uploaded else []
         if self.extra_asset and self.uploaded:
             assets += [asset]
-        return {"id": self.release_id, "tag_name": self.tag, "target_commitish": self.commit, "draft": draft,
-                "prerelease": False, "assets": assets}
+        title = self.title
+        if (draft and self.uploaded and self.bad_draft_title) or (not draft and self.bad_public_title):
+            title = "Spofify Mobile 9.9.9"
+        return {"id": self.release_id, "tag_name": self.tag, "name": title, "target_commitish": self.commit,
+                "draft": draft, "prerelease": False, "assets": assets}
 
     def auth_list(self, path):
         if path == "/tags":
-            return self.tags + ([{"name": "mobile-v99"}] if self.race and self.created else [])
+            return self.tags + ([{"name": "mobile-v99"}] if self.race and self.created else []) + (
+                [{"name": self.tag}] if self.tagged else [])
         if path == "/releases":
-            return self.history + ([self.record(draft=True)] if self.created else [])
+            return self.history + ([self.record(draft=not self.patched)] if self.created and not self.missing_draft else []) + (
+                [mobile_release(17, "Spofify Mobile 0.2.0")] if self.late_semver_race and self.tagged else []) + (
+                [mobile_release(22, "Spofify Mobile 0.2.0")] if self.promotion_race and self.patched else [])
         raise AssertionError(f"Unexpected list: {path}")
 
     def public_request(self, path, *, missing=False):
@@ -270,7 +327,7 @@ class PublicationFixture:
 
     def auth_request(self, path, *, method="GET", payload=None, upload=None):
         if method == "POST" and path == "/releases":
-            assert payload == {"tag_name": self.tag, "name": self.tag, "target_commitish": self.commit, "body": "",
+            assert payload == {"tag_name": self.tag, "name": self.title, "target_commitish": self.commit, "body": "",
                                "draft": True, "prerelease": False, "generate_release_notes": False,
                                "make_latest": "false"}, payload
             self.created = True
@@ -288,6 +345,9 @@ class PublicationFixture:
                 raise release.InvalidRelease("Reference already exists")
             self.tagged = True
             return {"ref": ref, "object": {"type": "commit", "sha": "d" * 40 if self.bad_created_ref else self.commit}}
+        if path == f"/git/ref/tags/{self.tag}":
+            assert self.tagged
+            return {"ref": f"refs/tags/{self.tag}", "object": {"type": "commit", "sha": self.commit}}
         if path == f"/releases/{self.release_id}":
             if method == "PATCH":
                 assert self.tagged
@@ -305,6 +365,9 @@ class PublicationTest(unittest.TestCase):
         self.fixture = PublicationFixture(self.apk.read_bytes())
         self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.enterContext(patch.object(release, "WAITS", (0, 0)))
+        self.anchor = "a" * 64
+        self.enterContext(patch.object(release, "signing_anchor", return_value=self.anchor))
+        self.verify_apk = self.enterContext(patch.object(release, "verify_apk"))
         self.download = self.enterContext(patch.object(release, "verify_public_download"))
         self.download.side_effect = self.verify_download_after_promotion
 
@@ -314,7 +377,8 @@ class PublicationTest(unittest.TestCase):
                                                "sha256:" + self.fixture.apk_digest))
 
     def publish(self):
-        release.publish(self.fixture.auth, self.fixture.public, self.apk, self.fixture.code, self.fixture.commit)
+        release.publish(self.fixture.auth, self.fixture.public, self.apk, "patch",
+                        self.fixture.code, self.fixture.name, self.fixture.commit)
 
     def rejected(self, reason, *, draft_created, patched=False):
         with self.assertRaisesRegex(release.InvalidRelease, reason):
@@ -327,6 +391,7 @@ class PublicationTest(unittest.TestCase):
         self.publish()
         self.assertTrue(self.fixture.tagged)
         self.assertTrue(self.fixture.patched)
+        self.verify_apk.assert_called_once_with(self.apk, self.fixture.code, self.fixture.name, self.anchor)
         self.download.assert_called_once()
         self.assertIn("Verified public latest: mobile-v21", self.output.getvalue())
 
@@ -341,7 +406,7 @@ class PublicationTest(unittest.TestCase):
 
     def test_existing_tag_rejected_before_mutation(self):
         self.fixture.tags = [{"name": self.fixture.tag}]
-        self.rejected("must exceed", draft_created=False)
+        self.rejected(r"no longer matches.*\(22, 0\.1\.1\)", draft_created=False)
 
     def test_absent_draft_digest_never_publishes(self):
         self.fixture.draft_asset.pop("digest")
@@ -361,9 +426,39 @@ class PublicationTest(unittest.TestCase):
         self.fixture.extra_asset = True
         self.rejected("exactly one asset", draft_created=True)
 
-    def test_version_race_is_checked_again(self):
+    def test_code_race_is_checked_again(self):
         self.fixture.race = True
-        self.rejected("max 99", draft_created=True)
+        self.rejected(r"no longer matches.*\(100, 0\.1\.1\)", draft_created=True)
+        self.assertFalse(self.fixture.tagged)
+
+    def test_semver_race_after_tag_creation_prevents_promotion(self):
+        self.fixture.late_semver_race = True
+        self.rejected(r"no longer matches.*\(21, 0\.2\.1\)", draft_created=True)
+        self.assertTrue(self.fixture.tagged)
+
+    def test_release_overtaken_during_promotion_is_not_reported_as_success(self):
+        self.fixture.promotion_race = True
+        self.rejected("Published release is not ahead", draft_created=True, patched=True)
+        self.download.assert_not_called()
+
+    def test_draft_title_must_match_version_name(self):
+        self.fixture.bad_draft_title = True
+        self.rejected("Release title does not match", draft_created=True)
+        self.assertFalse(self.fixture.tagged)
+
+    def test_missing_reservation_prevents_tag_creation(self):
+        self.fixture.missing_draft = True
+        self.rejected("reserved draft is missing", draft_created=True)
+        self.assertFalse(self.fixture.tagged)
+
+    def test_unsigned_or_wrongly_signed_apk_never_mutates_github(self):
+        self.verify_apk.side_effect = release.InvalidRelease("apksigner failed")
+        self.rejected("apksigner failed", draft_created=False)
+        self.fixture.auth.request.assert_not_called()
+
+    def test_wrong_public_title_is_not_reported_as_success(self):
+        self.fixture.bad_public_title = True
+        self.rejected("Release title does not match", draft_created=True, patched=True)
 
     def test_tag_created_concurrently_is_not_reused(self):
         self.fixture.tag_exists = True
