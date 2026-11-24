@@ -2,6 +2,8 @@
 
 **Applies to:** Spofify Desktop and Mobile. This is the target client behavior, not a description of what has shipped. It does not change the server's offline v1 API or require both clients to use the same storage or networking implementation.
 
+Offline Mode v2 replaces the previous client offline mode. Backward compatibility with its behavior or stored state is not required.
+
 ## 1. Connectivity and mode
 
 | State | Local behavior | Network behavior |
