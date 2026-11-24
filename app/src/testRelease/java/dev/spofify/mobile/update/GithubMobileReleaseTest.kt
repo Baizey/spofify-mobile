@@ -11,7 +11,7 @@ internal val fixtureDigest = MessageDigest.getInstance("SHA-256").digest(fixture
 internal val fixtureHex = fixtureDigest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
 private const val ASSET_NAME = "spofify-mobile-release.apk"
 internal fun fixtureUrl(tag: String) =
-    "https://github.com/Baizey/spofify-mobile-releases/releases/download/$tag/$ASSET_NAME"
+    "https://github.com/Baizey/spofify-mobile/releases/download/$tag/$ASSET_NAME"
 
 internal fun metadata(
     tag: String = "mobile-v2",
@@ -35,7 +35,11 @@ class GithubMobileReleaseTest {
         assertEquals(150L * 1024 * 1024, result.size)
         assertArrayEquals(fixtureDigest, result.sha256)
         assertEquals(fixtureUrl("mobile-v2100000000"), result.download.toString())
-        assertEquals("https://api.github.com/repos/Baizey/spofify-mobile-releases/releases/latest", LATEST_RELEASE.toString())
+        assertEquals("https://api.github.com/repos/Baizey/spofify-mobile/releases/latest", LATEST_RELEASE.toString())
+    }
+
+    @Test fun rejectsHistoricalBrokerRelease() {
+        rejects("""{"tag_name":"ci-broker-b6eb54f","draft":false,"prerelease":false,"assets":[]}""")
     }
 
     @Test fun rejectsNoncanonicalTagAndSize() {
@@ -73,7 +77,7 @@ class GithubMobileReleaseTest {
             canonical.replace("github.com", "github.com:443"),
             canonical.replace("github.com", "github.com.invalid"),
             canonical.replace("Baizey", "baizey"),
-            canonical.replace("spofify-mobile-releases", "spofify-mobile"),
+            canonical.replace("/spofify-mobile/", "/spofify-mobile-releases/"),
             canonical.replace("mobile-v2", "mobile-v3"),
             "$canonical?query=1",
             "$canonical#fragment",

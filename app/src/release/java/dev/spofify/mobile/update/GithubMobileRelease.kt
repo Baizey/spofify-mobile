@@ -7,7 +7,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
-private const val REPOSITORY = "Baizey/spofify-mobile-releases"
+private const val REPOSITORY = "Baizey/spofify-mobile"
 private const val APK_NAME = "spofify-mobile-release.apk"
 internal val LATEST_RELEASE = URI("https://api.github.com/repos/$REPOSITORY/releases/latest")
 internal const val MAX_METADATA_BYTES = 128 * 1024

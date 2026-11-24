@@ -26,7 +26,7 @@ android {
         release {
             applicationIdSuffix = ".release"
             isMinifyEnabled = false
-            vcsInfo.include = false // The APK is public; the source revision is private.
+            vcsInfo.include = false // The canonical GitHub release tag records the source revision.
             // Keep Gradle release APKs unsigned. The protected workflow signs the one universal APK.
         }
     }

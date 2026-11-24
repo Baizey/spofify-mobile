@@ -54,6 +54,15 @@ class VersionTest(unittest.TestCase):
                     else:
                         release.gate_history(auth, public, trial)
 
+    def test_unreserved_historical_release_does_not_reserve_a_version_code(self):
+        tag = "ci-broker-b6eb54f"
+        auth = Mock()
+        public = Mock()
+        current = {"tag_name": tag, "draft": False, "prerelease": False, "assets": []}
+        auth.all.side_effect = [[{"name": tag}], [current]]
+        public.request.return_value = current
+        release.gate_history(auth, public, 1)
+
     def test_malformed_reserved_tag_does_not_get_bypassed(self):
         auth = Mock()
         public = Mock()
@@ -71,14 +80,14 @@ class VersionTest(unittest.TestCase):
 
 
 class ApkMetadataTest(unittest.TestCase):
-    def test_rejects_embedded_private_vcs_information(self):
+    def test_rejects_embedded_vcs_information(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / release.ASSET
             with zipfile.ZipFile(path, "w") as apk:
                 apk.writestr("AndroidManifest.xml", b"fixture")
             release.require_no_vcs_metadata(path)
             with zipfile.ZipFile(path, "a") as apk:
-                apk.writestr("META-INF/version-control-info.textproto", b"private-source-sha")
+                apk.writestr("META-INF/version-control-info.textproto", b"source-sha")
             with self.assertRaisesRegex(release.InvalidRelease, "VCS metadata"):
                 release.require_no_vcs_metadata(path)
 
@@ -95,7 +104,7 @@ class TransportTest(unittest.TestCase):
             github.request(f"/releases/1/assets?name={release.ASSET}", method="POST", upload=apk)
             req = github.opener.open.call_args.args[0]
             self.assertEqual(req.full_url,
-                             f"https://uploads.github.com/repos/{release.REPO}/releases/1/assets?name={release.ASSET}")
+                             f"https://uploads.github.com/repos/Baizey/spofify-mobile/releases/1/assets?name={release.ASSET}")
             self.assertEqual(req.get_header("Content-length"), "3")
             self.assertIs(req.data, apk)
             self.assertEqual(req.get_header("Authorization"), "Bearer disposable-token-fixture")
@@ -109,7 +118,7 @@ class TransportTest(unittest.TestCase):
         response.read.return_value = b"{}"
         public.request("/releases/latest")
         req = public.opener.open.call_args.args[0]
-        self.assertEqual(req.full_url, f"https://api.github.com/repos/{release.REPO}/releases/latest")
+        self.assertEqual(req.full_url, "https://api.github.com/repos/Baizey/spofify-mobile/releases/latest")
         self.assertIsNone(req.get_header("Authorization"))
         response.read.assert_called_once_with(128 * 1024 + 1)
         response.read.return_value = b"{}" + b" " * (128 * 1024 - 2)
@@ -208,7 +217,7 @@ class DownloadTest(unittest.TestCase):
 class PublicationFixture:
     code = 21
     tag = "mobile-v21"
-    main = "a" * 40
+    commit = "a" * 40
     release_id = 7
 
     def __init__(self, apk_bytes):
@@ -221,11 +230,12 @@ class PublicationFixture:
         self.tags = [{"name": "mobile-v19"}]
         self.history = [{"tag_name": "mobile-v20", "id": 4, "draft": False, "prerelease": False}]
         self.created = self.uploaded = self.patched = False
-        self.change_main = self.race = self.hide_latest = self.bad_tag_target = False
+        self.tagged = self.tag_exists = self.bad_created_ref = False
+        self.race = self.hide_latest = self.bad_tag_target = False
         self.apk_digest = hashlib.sha256(apk_bytes).hexdigest()
         self.expected_asset = {
             "name": release.ASSET, "state": "uploaded", "size": len(apk_bytes),
-            "browser_download_url": f"https://github.com/{release.REPO}/releases/download/{self.tag}/{release.ASSET}",
+            "browser_download_url": f"https://github.com/Baizey/spofify-mobile/releases/download/{self.tag}/{release.ASSET}",
             "digest": "sha256:" + self.apk_digest,
         }
         self.draft_asset = copy.deepcopy(self.expected_asset)
@@ -237,7 +247,7 @@ class PublicationFixture:
         assets = [asset] if self.uploaded else []
         if self.extra_asset and self.uploaded:
             assets += [asset]
-        return {"id": self.release_id, "tag_name": self.tag, "target_commitish": self.main, "draft": draft,
+        return {"id": self.release_id, "tag_name": self.tag, "target_commitish": self.commit, "draft": draft,
                 "prerelease": False, "assets": assets}
 
     def auth_list(self, path):
@@ -250,19 +260,17 @@ class PublicationFixture:
     def public_request(self, path, *, missing=False):
         if path == "":
             return self.repo
-        if path == "/git/ref/heads/main":
-            sha = "b" * 40 if self.created and self.change_main else self.main
-            return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": sha}}
         if path == "/releases/latest":
             return self.record(draft=False) if self.patched and not self.hide_latest else self.history[0]
         if path == f"/git/ref/tags/{self.tag}":
-            sha = "c" * 40 if self.bad_tag_target else self.main
+            assert self.tagged
+            sha = "c" * 40 if self.bad_tag_target else self.commit
             return {"ref": f"refs/tags/{self.tag}", "object": {"type": "commit", "sha": sha}}
         raise AssertionError(f"Unexpected public request: {path}")
 
     def auth_request(self, path, *, method="GET", payload=None, upload=None):
         if method == "POST" and path == "/releases":
-            assert payload == {"tag_name": self.tag, "name": self.tag, "target_commitish": self.main, "body": "",
+            assert payload == {"tag_name": self.tag, "name": self.tag, "target_commitish": self.commit, "body": "",
                                "draft": True, "prerelease": False, "generate_release_notes": False,
                                "make_latest": "false"}, payload
             self.created = True
@@ -272,9 +280,17 @@ class PublicationFixture:
             assert hashlib.sha256(upload.read()).hexdigest() == self.apk_digest
             self.uploaded = True
             return self.draft_asset
+        if method == "POST" and path == "/git/refs":
+            assert self.uploaded and not self.tagged
+            ref = f"refs/tags/{self.tag}"
+            assert payload == {"ref": ref, "sha": self.commit}, payload
+            if self.tag_exists:
+                raise release.InvalidRelease("Reference already exists")
+            self.tagged = True
+            return {"ref": ref, "object": {"type": "commit", "sha": "d" * 40 if self.bad_created_ref else self.commit}}
         if path == f"/releases/{self.release_id}":
             if method == "PATCH":
-                assert self.uploaded
+                assert self.tagged
                 assert payload == {"draft": False, "prerelease": False, "make_latest": "true"}, payload
                 self.patched = True
             return self.record(draft=not self.patched)
@@ -298,7 +314,7 @@ class PublicationTest(unittest.TestCase):
                                                "sha256:" + self.fixture.apk_digest))
 
     def publish(self):
-        release.publish(self.fixture.auth, self.fixture.public, self.apk, self.fixture.code)
+        release.publish(self.fixture.auth, self.fixture.public, self.apk, self.fixture.code, self.fixture.commit)
 
     def rejected(self, reason, *, draft_created, patched=False):
         with self.assertRaisesRegex(release.InvalidRelease, reason):
@@ -309,9 +325,15 @@ class PublicationTest(unittest.TestCase):
 
     def test_verified_stable_release(self):
         self.publish()
+        self.assertTrue(self.fixture.tagged)
         self.assertTrue(self.fixture.patched)
         self.download.assert_called_once()
         self.assertIn("Verified public latest: mobile-v21", self.output.getvalue())
+
+    def test_branch_name_is_not_a_packaged_commit(self):
+        self.fixture.commit = "main"
+        self.rejected("exact packaged commit SHA", draft_created=False)
+        self.fixture.auth.request.assert_not_called()
 
     def test_private_repository_rejected_before_mutation(self):
         self.fixture.repo["private"] = True
@@ -324,6 +346,7 @@ class PublicationTest(unittest.TestCase):
     def test_absent_draft_digest_never_publishes(self):
         self.fixture.draft_asset.pop("digest")
         self.rejected("did not supply the APK digest", draft_created=True)
+        self.assertFalse(self.fixture.tagged)
         self.download.assert_not_called()
 
     def test_wrong_draft_digest_never_publishes(self):
@@ -342,9 +365,13 @@ class PublicationTest(unittest.TestCase):
         self.fixture.race = True
         self.rejected("max 99", draft_created=True)
 
-    def test_public_main_move_is_rejected_before_patch(self):
-        self.fixture.change_main = True
-        self.rejected("Public main changed", draft_created=True)
+    def test_tag_created_concurrently_is_not_reused(self):
+        self.fixture.tag_exists = True
+        self.rejected("Reference already exists", draft_created=True)
+
+    def test_wrong_created_ref_is_not_promoted(self):
+        self.fixture.bad_created_ref = True
+        self.rejected("Release tag does not match", draft_created=True)
 
     def test_stale_public_latest_is_not_reported_as_success(self):
         self.fixture.hide_latest = True

@@ -87,8 +87,10 @@ toolchain installation is provided by this repository.
 Debug keeps application ID `dev.spofify.mobile` and the normal Android debug
 signer. Release uses `dev.spofify.mobile.release` and a dedicated signer; the
 variants have separate app data, without a migration. Local Gradle release APKs
-are unsigned. See [Mobile release operations](docs/mobile-release.md) for the
-protected workflow, signing bootstrap and release checks. Do not uninstall,
+are unsigned. Official signed APKs and in-app updates use the public
+[GitHub Releases for Baizey/spofify-mobile](https://github.com/Baizey/spofify-mobile/releases).
+See [Mobile release operations](docs/mobile-release.md) for the manual `main`
+workflow, signing bootstrap and release checks. Do not uninstall,
 clear data or replace keys to work around a signature mismatch.
 
 ## Contracts

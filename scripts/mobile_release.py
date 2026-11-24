@@ -21,7 +21,7 @@ import urllib.request
 import zipfile
 
 
-REPO = "Baizey/spofify-mobile-releases"
+REPO = "Baizey/spofify-mobile"
 API = f"https://api.github.com/repos/{REPO}"
 UPLOADS = f"https://uploads.github.com/repos/{REPO}"
 ASSET = "spofify-mobile-release.apk"
@@ -35,7 +35,7 @@ ASSET_TIMEOUT = 120
 CERT_FILE = Path(__file__).with_name("mobile-release-cert.sha256")
 WAITS = (0, 2, 4, 8, 16, 30)
 SIGN_SECRETS = ("MOBILE_KEYSTORE_B64", "MOBILE_KEYSTORE_PASSWORD", "MOBILE_KEY_ALIAS", "MOBILE_KEY_PASSWORD")
-TOKEN_ENV = "MOBILE_DISTRIBUTION_TOKEN"
+TOKEN_ENV = "GH_TOKEN"
 
 
 class InvalidRelease(Exception):
@@ -245,11 +245,10 @@ class GitHub:
         raise InvalidRelease("GitHub API pagination limit reached; cannot verify complete history.")
 
 
-def public_main(public):
+def require_public_repo(public):
     repo = public.request("")
     need(repo.get("full_name") == REPO and repo.get("private") is False and repo.get("visibility") == "public",
-         f"Expected anonymous access to the public {REPO} distribution repository.")
-    return git_commit(public.request("/git/ref/heads/main"), "refs/heads/main")
+         f"Expected anonymous access to the public {REPO} repository.")
 
 
 def git_commit(ref, name):
@@ -364,7 +363,8 @@ def require_shape(release, identifier, tag, size, digest, *, draft, pending_dige
     return True
 
 
-def publish(auth, public, apk, code):
+def publish(auth, public, apk, code, commit):
+    need(re.fullmatch(r"[0-9a-f]{40}", commit), "Expected the exact packaged commit SHA.")
     tag = f"mobile-v{code}"
     need(apk.name == ASSET, f"Expected the signed APK to be named {ASSET}.")
     size = apk.stat().st_size
@@ -372,7 +372,7 @@ def publish(auth, public, apk, code):
     with apk.open("rb") as stream:
         digest = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
 
-    commit = public_main(public)
+    require_public_repo(public)
     gate_history(auth, public, code)
     draft = auth.request("/releases", method="POST", payload={
         "tag_name": tag, "name": tag, "target_commitish": commit, "body": "", "draft": True,
@@ -380,26 +380,28 @@ def publish(auth, public, apk, code):
     })
     identifier = release_id(draft)
     path = f"/releases/{identifier}"
-    # GitHub creates the tag for a previously untagged draft when it is published, not at draft creation.
     need(draft.get("tag_name") == tag and draft.get("target_commitish") == commit
          and draft.get("draft") is True and draft.get("prerelease") is False and draft.get("assets") == [],
-         "GitHub did not reserve the expected empty draft targeting public main.")
+         "GitHub did not reserve the expected empty draft targeting the packaged commit.")
     with apk.open("rb") as stream:
         auth.request(f"{path}/assets?name={ASSET}", method="POST", upload=stream)
     for delay in WAITS:
         time.sleep(delay)
         draft = auth.request(path)
-        need(draft.get("target_commitish") == commit, "Draft no longer targets the verified public main commit.")
+        need(draft.get("target_commitish") == commit, "Draft no longer targets the packaged commit.")
         if require_shape(draft, identifier, tag, size, digest, draft=True, pending_digest=True):
             break
     else:
         raise InvalidRelease("GitHub did not supply the APK digest before timeout; release remains a draft.")
 
     gate_history(auth, public, code, own_draft=identifier)
-    need(public_main(public) == commit, "Public main changed during publication; release remains a draft.")
     draft = auth.request(path)
-    need(draft.get("target_commitish") == commit, "Draft no longer targets the verified public main commit.")
+    need(draft.get("target_commitish") == commit, "Draft no longer targets the packaged commit.")
     require_shape(draft, identifier, tag, size, digest, draft=True)
+    # Create-only, as on Desktop. Never reuse an existing tag, even if it has the same SHA.
+    ref = f"refs/tags/{tag}"
+    created = auth.request("/git/refs", method="POST", payload={"ref": ref, "sha": commit})
+    need(git_commit(created, ref) == commit, "Release tag does not match the packaged commit.")
     try:
         auth.request(path, method="PATCH", payload={"draft": False, "prerelease": False, "make_latest": "true"})
         last_error = None
@@ -408,9 +410,8 @@ def publish(auth, public, apk, code):
             try:
                 latest = public.request("/releases/latest")
                 require_shape(latest, identifier, tag, size, digest, draft=False)
-                ref = f"refs/tags/{tag}"
                 need(git_commit(public.request(f"/git/ref/tags/{tag}"), ref) == commit,
-                     "Published tag does not point to the verified public main commit.")
+                     "Published tag does not point to the packaged commit.")
                 verify_public_download(tag, size, digest)
                 print(f"Verified public latest: {tag}, {ASSET}, {size} bytes, {digest}")
                 return
@@ -424,7 +425,6 @@ def publish(auth, public, apk, code):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("preflight", help="Check the distribution repo and main anonymously, without writes")
     debug = sub.add_parser("verify-debug")
     debug.add_argument("apk", type=Path)
     for command in ("validate-inputs", "stage-unsigned", "sign", "verify-apk", "publish"):
@@ -440,11 +440,11 @@ def main():
             options.add_argument("apk", type=Path)
         if command == "sign":
             options.add_argument("--unsigned", type=Path, required=True)
+        if command == "publish":
+            options.add_argument("--commit", required=True, help="Exact source commit packaged by the workflow")
     args = parser.parse_args()
     try:
-        if args.command == "preflight":
-            public_main(GitHub())
-        elif args.command == "verify-debug":
+        if args.command == "verify-debug":
             require_apk(args.apk, "dev.spofify.mobile", 1, "0.1.0", debug=True)
             tool("apksigner", "verify", args.apk)
         else:
@@ -453,9 +453,9 @@ def main():
                 stage_unsigned(args.directory, args.apk, code, name)
             elif args.command == "publish":
                 token = os.environ.get(TOKEN_ENV)
-                need(token, "Missing distribution token.")
+                need(token, "Missing GitHub Actions token (GH_TOKEN).")
                 verify_apk(args.apk, code, name, signing_anchor(CERT_FILE))
-                publish(GitHub(token), GitHub(), args.apk, code)
+                publish(GitHub(token), GitHub(), args.apk, code, args.commit)
             else:
                 expected = signing_anchor(args.cert_file)
                 if args.command == "sign":
