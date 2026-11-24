@@ -128,6 +128,13 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
 
     fun foreground() { current?.foreground() }
 
+    /** Installation can stop this process. Protect local output and in-flight starts, not remote playback. */
+    internal fun blocksAppUpdate(): Boolean {
+        val player = current ?: return false
+        return attachment?.let { it.session === player.mediaSession && it.admission != null } == true ||
+            player.view?.let { it.localOutput && it.wantsPause } == true || player.hasPendingNativePlayback()
+    }
+
     internal fun retainServiceAfterTaskRemoval(): Boolean {
         val p = current ?: return false
         val view = p.view ?: return false

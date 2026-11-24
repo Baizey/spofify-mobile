@@ -54,6 +54,7 @@ internal fun MusicRoot(
     identity: AccountIdentity,
     sessions: SessionRepository,
     playbackOwner: PlaybackOwner,
+    updates: @Composable () -> Unit,
     account: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
@@ -73,6 +74,7 @@ internal fun MusicRoot(
     val currentController = rememberUpdatedState(target)
     val navigation = rememberNavController()
     val currentAccount = rememberUpdatedState(account)
+    val currentUpdates = rememberUpdatedState(updates)
     var tab by rememberSaveable { mutableStateOf(MusicTab.HISTORY) }
     var focusIntent by rememberSaveable { mutableIntStateOf(0) }
     val currentFocusIntent = rememberUpdatedState(focusIntent)
@@ -161,7 +163,8 @@ internal fun MusicRoot(
                     modeSetting = { ManualModeSetting(identity, sessions, playbackOwner) },
                     onCache = { navigation.navigate("music-cache") }, onAccount = { navigation.navigate("account") },
                     onCredits = { navigation.navigate("credits") },
-                    playbackSetting = { CrossfadeSetting(currentPlayer.value) })
+                    playbackSetting = { CrossfadeSetting(currentPlayer.value) },
+                    updates = { currentUpdates.value() })
             }
             composable("music-cache") { dev.spofify.mobile.feature.settings.MusicCacheScreen(currentPlayer.value.cache) }
             composable("credits") { CreditsScreen { navigation.navigate("font-license") } }

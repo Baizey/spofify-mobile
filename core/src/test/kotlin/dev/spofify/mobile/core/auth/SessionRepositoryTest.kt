@@ -93,10 +93,58 @@ class SessionRepositoryTest {
         override fun read(): Boolean { if (unreadable) throw IOException(); return offline }
         override fun write(enabled: Boolean) { if (unwritable) throw IOException(); offline = enabled }
     }
-    private fun TestScope.repository(sessions: Sessions, logins: Logins, vararg api: Api, policy: Policy? = null): SessionRepository {
+    private fun TestScope.repository(
+        sessions: Sessions, logins: Logins, vararg api: Api, policy: Policy? = null,
+        installationNetworkAllowed: (Boolean) -> Unit = {},
+    ): SessionRepository {
         val queue = ArrayDeque(api.toList())
         return SessionRepository(sessions, logins, AuthApiFactory { queue.removeFirst() },
-            this, StandardTestDispatcher(testScheduler), policy)
+            this, StandardTestDispatcher(testScheduler), policy, installationNetworkAllowed)
+    }
+
+    @Test fun installationNetworkFencesEverySwitchBeforeThePlaybackHandoff() = runTest {
+        val policy = Policy()
+        val modes = mutableListOf<Pair<Boolean, Boolean>>()
+        val repo = repository(Sessions(stored()), Logins(), Api(), Api(), policy = policy,
+            installationNetworkAllowed = { allowed -> modes += allowed to policy.offline })
+        repo.start()
+        assertTrue(modes.isEmpty())
+        advanceUntilIdle()
+        assertEquals(listOf(true to false), modes)
+
+        val entering = launch(start = CoroutineStart.UNDISPATCHED) {
+            repo.setManualOffline(true) {
+                assertTrue(policy.offline)
+                assertFalse(repo.manualOffline.value)
+                assertEquals(listOf(true to false, false to false), modes)
+            }
+        }
+        // The test IO dispatcher has not run the store write yet, but no updater work may enter.
+        assertFalse(policy.offline)
+        assertEquals(listOf(true to false, false to false), modes)
+        entering.join()
+        repo.setManualOffline(false)
+        assertEquals(listOf(true to false, false to false, true to false), modes)
+    }
+
+    @Test fun installationNetworkStartsClosedAndDoesNotUseTheDefaultOnColdReadFailure() = runTest {
+        val modes = mutableListOf<Boolean>()
+        val policy = Policy().apply { unreadable = true }
+        val repo = repository(Sessions(null), Logins(), policy = policy, installationNetworkAllowed = modes::add)
+        repo.start(); advanceUntilIdle()
+        assertFalse(repo.offlinePolicyLoaded.value)
+        assertTrue(modes.isEmpty())
+    }
+
+    @Test fun installationNetworkRemainsFencedIfTheOfflineWriteFails() = runTest {
+        val modes = mutableListOf<Boolean>()
+        val policy = Policy()
+        val repo = repository(Sessions(null), Logins(), policy = policy, installationNetworkAllowed = modes::add)
+        repo.start(); advanceUntilIdle()
+        policy.unwritable = true
+        assertTrue(runCatching { repo.setManualOffline(true) }.exceptionOrNull() is IOException)
+        assertFalse(repo.manualOffline.value)
+        assertEquals(listOf(true, false), modes)
     }
 
     private fun transientUnavailable() = AuthFailure(AuthFailure.Kind.UNAVAILABLE, transient = true)

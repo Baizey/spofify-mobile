@@ -41,7 +41,8 @@ class MainActivity : ComponentActivity() {
         setContent {
             SpofifyTheme {
                 val model: AuthViewModel = viewModel(factory = AuthViewModel.Factory(repository))
-                AuthRoot(model, repository, app.playback)
+                AuthRoot(model, repository, app.playback,
+                    updates = { app.updates.SettingsRow(this@MainActivity, app.playback::blocksAppUpdate) })
             }
         }
     }
@@ -51,10 +52,13 @@ class MainActivity : ComponentActivity() {
         val app = application as SpofifyApplication
         app.sessions.setAppForeground(true)
         app.playback.foreground()
+        app.updates.setForeground(true)
     }
 
     override fun onStop() {
-        (application as SpofifyApplication).sessions.setAppForeground(false)
+        val app = application as SpofifyApplication
+        app.updates.setForeground(false)
+        app.sessions.setAppForeground(false)
         super.onStop()
     }
 }
@@ -64,6 +68,7 @@ private fun AuthRoot(
     model: AuthViewModel,
     sessions: SessionRepository,
     playback: PlaybackOwner,
+    updates: @Composable () -> Unit,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val inputNotice by model.inputNotice.collectAsStateWithLifecycle()
@@ -90,7 +95,7 @@ private fun AuthRoot(
                 is AuthState.Authenticated -> {
                     pages.SaveableStateProvider(requireNotNull(pageKey)) {
                         var credits by rememberSaveable { mutableStateOf(false) }
-                        MusicRoot(current.identity, sessions, playback) {
+                        MusicRoot(current.identity, sessions, playback, updates = updates) {
                             AccountScreen(current, model::signOut) { credits = true }
                         }
                         if (credits) FontCredits { credits = false }
