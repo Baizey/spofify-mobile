@@ -44,6 +44,56 @@ class OfflinePlaylistRepositoryTest {
     private suspend fun OfflinePlaylistRepository.save(id: String = "p") = refresh(id, 3) { true }
     private fun blobCount(dir: File) = dir.listFiles()!!.count { it.extension == "blob" }
 
+    @Test fun replacementSyncFailureKeepsOldHoldsUntilSameProcessOrReopenRecovers() = runBlocking {
+        for (reopenFirst in listOf(false, true)) {
+            val dir = root.newFolder()
+            var failNextSync = false
+            var insideFence = false
+            var failures = 0
+            val store = MusicBlobStore(dir, { Long.MAX_VALUE }, java.nio.file.Files::deleteIfExists) { path ->
+                assertFalse("Directory sync must not hold the session fence", insideFence)
+                if (failNextSync) {
+                    failNextSync = false
+                    failures++
+                    throw IOException("Injected post-rename directory sync failure")
+                }
+                syncPlaylistDirectory(path)
+            }
+            val previous = playlist("p", 1, "old")
+            val replacement = playlist("p", 2, "new")
+            var manifest = previous
+            val repository = repo(store, manifest = { manifest })
+            repository.save()
+            manifest = replacement
+            val failure = runCatching {
+                repository.refresh("p", 3, commit = { rename ->
+                    insideFence = true
+                    try { rename(); failNextSync = true; true } finally { insideFence = false }
+                }) { true }
+            }.exceptionOrNull()
+            assertTrue(failure is IOException)
+            assertEquals(1, failures)
+            assertEquals(setOf(key("old")), store.songs.value.filter { it.offline }.map { it.key }.toSet())
+            assertTrue(store.hasOfflineReference(key("old")))
+            assertFalse(store.hasOfflineReference(key("new")))
+            assertNull(store.pin(key("new"), downloadOnly = true) { true })
+            assertEquals(2, blobCount(dir))
+            if (!reopenFirst) {
+                assertEquals(replacement, repository.select("p"))
+                assertEquals(setOf(key("new")), store.songs.value.filter { it.offline }.map { it.key }.toSet())
+                assertFalse(store.hasOfflineReference(key("old")))
+                assertEquals(1, blobCount(dir))
+            }
+            val reopened = MusicBlobStore(dir)
+            assertEquals(listOf(replacement), repo(reopened).complete())
+            assertEquals(setOf(key("new")), reopened.songs.value.filter { it.offline }.map { it.key }.toSet())
+            assertEquals(1, blobCount(dir))
+            reopened.pin(key("new"), downloadOnly = true) { true }!!.use { pin ->
+                pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
+            }
+        }
+    }
+
     @Test fun deltaKeepsEveryOccurrenceAndMetadataWhileSharingAutoPlaylistsAndPins() = runBlocking {
         val store = MusicBlobStore(root.root)
         var p = playlist("p", 1, "b", "a", "b")

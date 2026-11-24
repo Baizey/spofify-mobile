@@ -116,7 +116,11 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         scope.launch {
             try {
                 val store = storage.initialized.await() ?: error("Download storage unavailable")
-                withContext(Dispatchers.IO) { if (sessions.isCurrent(identity)) store.removeDownload(SongKey(owner, id), cache.options.value.cap) }
+                withContext(Dispatchers.IO) {
+                    store.removeDownload(SongKey(owner, id), cache.options.value.cap) { replace ->
+                        sessions.commitLocalIfCurrent(identity, replace)
+                    }
+                }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { if (sessions.isCurrent(identity)) failure() }
         }

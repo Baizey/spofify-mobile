@@ -6,6 +6,7 @@ import dev.spofify.mobile.core.offline.OfflineManifest
 import dev.spofify.mobile.core.offline.OfflineMediaDescriptor
 import dev.spofify.mobile.core.offline.PlaylistFiles
 import dev.spofify.mobile.core.offline.trackKeys
+import dev.spofify.mobile.core.offline.syncPlaylistDirectory
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -58,7 +59,9 @@ data class MusicStorageUsage(
  * Only .playlist files publish playlist membership; download holds never authorize playback.
  */
 class MusicBlobStore internal constructor(private val dir: File, private val freeBytes: () -> Long,
-    private val unlink: (Path) -> Boolean) {
+    private val unlink: (Path) -> Boolean, syncDirectory: (File) -> Unit) {
+    internal constructor(dir: File, freeBytes: () -> Long, unlink: (Path) -> Boolean) :
+        this(dir, freeBytes, unlink, ::syncPlaylistDirectory)
     constructor(dir: File, freeBytes: () -> Long = { dir.usableSpace }) : this(dir, freeBytes, Files::deleteIfExists)
 
     @Serializable
@@ -77,7 +80,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     // Two disjoint downloads can make progress without opening a stream per wanted playlist.
     private val playlistAttempts = Semaphore(2)
     private val diskWrites = ReentrantLock()
-    private val playlists = PlaylistFiles(dir)
+    private val playlists = PlaylistFiles(dir, syncDirectory)
     private class Ticket(val auto: Boolean) {
         @Volatile var cleared = false
         val finished = CompletableDeferred<Unit>()
@@ -344,9 +347,26 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         }
     }
 
-    internal fun complete(owner: MusicOwner) = lock.withLock { playlists.complete(owner) }
+    internal fun complete(owner: MusicOwner) = lock.withLock {
+        recoverPendingPlaylist()
+        playlists.complete(owner)
+    }
     internal fun select(owner: MusicOwner, id: String) = lock.withLock {
+        recoverPendingPlaylist()
         playlists.select(owner, id)?.takeIf { entries.keys.containsAll(trackKeys(owner, it)) }
+    }
+
+    private fun recoverPendingPlaylist() {
+        try { publishDurablePlaylist() } catch (_: IOException) { /* Serve the last durable view. */ }
+    }
+
+    private fun publishDurablePlaylist(cap: Int? = null) {
+        val change = playlists.publishDurable() ?: return
+        refresh()
+        reclaim(change.superseded)
+        if (cap != null) try { trim(change.owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
+        try { clearDraft(change.owner, change.id, emptySet(), {}) } catch (_: IOException) { /* Already durable. */ }
+        refresh()
     }
 
     private fun reclaim(keys: Set<SongKey>) {
@@ -361,6 +381,8 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     internal fun resumePlaylist(owner: MusicOwner, id: String, keys: Set<SongKey>,
         trace: OfflineAttemptTrace? = null, checkCurrent: () -> Unit): Set<SongKey> = lock.withLock {
         trace?.step(RESUME_SCAN)
+        checkCurrent()
+        publishDurablePlaylist() // Do not remove drafts held by an unsynced manifest.
         checkCurrent()
         clearDraft(owner, id, keys, checkCurrent)
         keys.filterTo(hashSetOf()) { key ->
@@ -393,23 +415,23 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int,
         trace: OfflineAttemptTrace? = null, commit: (() -> Unit) -> Boolean) = lock.withLock {
         trace?.step(COMMIT_INDEX)
+        publishDurablePlaylist(cap)
         val keys = trackKeys(owner, manifest)
         val id = manifest.collection.reference.id
         check(keys.all { key -> entries.getValue(key).let { e ->
             (id in e.row.drafts || playlists.contains(owner, id, key)) && canOpen(e)
         } })
         trace?.step(COMMIT_DISK_WAIT)
-        val old = diskWrites.withLock {
+        diskWrites.withLock {
             trace?.step(COMMIT_WRITE)
-            playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, commit, ::refresh)
+            playlists.rename(owner, manifest, keys, freeBytes() - RESERVE, commit)
         }
         trace?.step(COMMIT_CLEANUP)
-        afterCommit(owner, cap, old)
-        // Keep the hold until the complete manifest rename is durable. A failed cleanup
-        // is harmless; the tracks are already published and cleanup can run on retry.
-        try { clearDraft(owner, id, emptySet(), {}) } catch (_: IOException) { }
+        publishDurablePlaylist(cap)
     }
     internal fun remove(owner: MusicOwner, id: String, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
+        checkCurrent()
+        publishDurablePlaylist()
         checkCurrent()
         val old = playlists.remove(owner, id)
         if (old != null) {
@@ -431,7 +453,21 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         consume: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
         fillShared(key, title, cap, emptyList(), null, commit, current, prepare, null, consume)
 
-    fun removeDownload(key: SongKey, cap: Int) = offlineReference(key, DIRECT_DOWNLOAD, false, cap)
+    fun removeDownload(key: SongKey, cap: Int, commit: (() -> Unit) -> Boolean): Boolean = lock.withLock {
+        require(cap in CacheOptions.caps)
+        val entry = entries[key] ?: return@withLock false
+        if (DIRECT_DOWNLOAD !in entry.row.refs) return@withLock false
+        // Stage the rewrite before checking the exact incarnation. Only its final replace is fenced.
+        if (!save(entry, entry.row.copy(refs = entry.row.refs - DIRECT_DOWNLOAD), commit, playlists::markDirectoryDirty))
+            return@withLock false
+        try {
+            // Never reclaim the blob while the durable metadata may still name its direct hold.
+            playlists.beforeReclaim()
+            releaseUnused(entry)
+            trim(key.owner, cap, emptyList())
+            true
+        } finally { refresh() }
+    }
 
     internal suspend fun stage(playlistId: String, key: SongKey, title: String, cap: Int, current: () -> Boolean,
         prepare: suspend () -> OfflineMediaDescriptor, trace: OfflineAttemptTrace? = null,

@@ -164,6 +164,40 @@ class AccountPersonalSourceTest {
         }
     }
 
+    @Test fun retiredRemovalCannotDeleteSuccessorDownloadForTheSameAccount() = runTest {
+        val fixture = Fixture(this, temporary.root, stale = false)
+        val retired = requireNotNull(fixture.sessions.onlineGrant.value).identity
+        val key = SongKey(MusicOwner(origin.value, retired.accountId), "track")
+        val dir = temporary.newFolder()
+        val store = MusicBlobStore(dir, freeBytes = { Long.MAX_VALUE })
+        val admitted = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val removal = async {
+            assertTrue(fixture.sessions.isCurrent(retired))
+            admitted.complete(Unit)
+            release.await()
+            store.removeDownload(key, 3) { replace -> fixture.sessions.commitLocalIfCurrent(retired, replace) }
+        }
+        admitted.await()
+        fixture.sessions.signOut()
+        fixture.sessions.signIn(origin.value, retired.username, "fixture")
+        runCurrent()
+        val successor = requireNotNull(fixture.sessions.onlineGrant.value)
+        assertEquals(retired.accountId, successor.identity.accountId)
+        assertNotEquals(retired.incarnation, successor.identity.incarnation)
+        store.download(key, "Successor's song", 3, { true }, { descriptor(key.id) },
+            commit = { fixture.sessions.publishIfCurrent(successor, it) }) { _, consume -> consume(bytes.inputStream()) }
+        release.complete(Unit)
+        assertFalse(removal.await())
+        assertTrue(store.songs.value.single().direct)
+        val reopened = MusicBlobStore(dir)
+        reopened.pin(key, downloadOnly = true) { true }!!.use { pin ->
+            pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }
+        }
+        assertTrue(reopened.removeDownload(key, 3) { replace -> fixture.sessions.commitLocalIfCurrent(successor.identity, replace) })
+        assertNull(MusicBlobStore(dir).pin(key, downloadOnly = true) { true })
+    }
+
     private val bytes = byteArrayOf(1, 2, 3)
     private fun descriptor(id: String): OfflineMediaDescriptor {
         val sha = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
