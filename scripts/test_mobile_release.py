@@ -40,10 +40,10 @@ def mobile_release(code, name, *, draft=False, prerelease=False):
 
 class PlanTest(unittest.TestCase):
     def history(self, tags=(), releases=(), latest=None):
-        auth, public = Mock(), Mock()
+        auth = Mock()
         auth.all.side_effect = {"/tags": [{"name": tag} for tag in tags], "/releases": releases}.__getitem__
-        public.request.return_value = latest
-        return auth, public
+        auth.request.return_value = latest
+        return (auth,)
 
     def test_first_release_and_ignored_broker(self):
         broker = {"tag_name": "ci-broker-b6eb54f", "draft": False, "prerelease": False, "assets": []}
@@ -79,11 +79,11 @@ class PlanTest(unittest.TestCase):
         with self.assertRaisesRegex(release.InvalidRelease, "Missing release status"):
             release.resolve_versions(*self.history(releases=[invalid]), "patch")
 
-    def test_fails_closed_if_public_latest_disagrees(self):
+    def test_fails_closed_if_latest_disagrees(self):
         record = mobile_release(4, "Spofify Mobile 1.2.3")
         for history in (self.history(latest=record),
                         self.history(releases=[dict(record, name="Spofify Mobile 1.2.4")], latest=record)):
-            with self.assertRaisesRegex(release.InvalidRelease, "Anonymous latest disagrees"):
+            with self.assertRaisesRegex(release.InvalidRelease, "Latest release disagrees"):
                 release.resolve_versions(*history, "patch")
 
     def test_version_limits(self):
@@ -101,16 +101,16 @@ class PlanTest(unittest.TestCase):
         release.check_plan(*self.history(), "patch", 1, "0.0.1")
 
     def test_resolution_uses_tags_and_releases_beyond_first_page(self):
-        github, public = release.GitHub(), Mock()
+        github = release.GitHub("fixture-token")
         github.request = Mock(side_effect=[
             ([{"name": "unrelated"}] * 100, True), ([{"name": "mobile-v101"}], False),
             ([{"tag_name": "unrelated"}] * 100, True), ([mobile_release(7, "Spofify Mobile 1.10.0")], False),
+            None,
         ])
-        public.request.return_value = None
-        self.assertEqual(release.resolve_versions(github, public, "patch"), (102, "1.10.1"))
+        self.assertEqual(release.resolve_versions(github, "patch"), (102, "1.10.1"))
         self.assertEqual([c.args[0] for c in github.request.call_args_list], [
             "/tags?per_page=100&page=1", "/tags?per_page=100&page=2",
-            "/releases?per_page=100&page=1", "/releases?per_page=100&page=2",
+            "/releases?per_page=100&page=1", "/releases?per_page=100&page=2", "/releases/latest",
         ])
 
 
@@ -158,25 +158,25 @@ class TransportTest(unittest.TestCase):
             self.assertEqual(req.get_header("Authorization"), "Bearer disposable-token-fixture")
         self.assertIsNone(release.NoRedirect().redirect_request(None, None, 302, None, {}, "https://example.invalid"))
 
-    def test_latest_check_is_anonymous(self):
-        public = release.GitHub()
-        public.opener = MagicMock()
-        response = public.opener.open.return_value.__enter__.return_value
+    def test_latest_check_uses_token_and_validates_framing(self):
+        github = release.GitHub("fixture-token")
+        github.opener = MagicMock()
+        response = github.opener.open.return_value.__enter__.return_value
         response.status, response.headers = 200, {}
         response.read.return_value = b"{}"
-        public.request("/releases/latest")
-        req = public.opener.open.call_args.args[0]
+        github.request("/releases/latest")
+        req = github.opener.open.call_args.args[0]
         self.assertEqual(req.full_url, "https://api.github.com/repos/Baizey/spofify-mobile/releases/latest")
-        self.assertIsNone(req.get_header("Authorization"))
+        self.assertEqual(req.get_header("Authorization"), "Bearer fixture-token")
         response.read.assert_called_once_with(128 * 1024 + 1)
         response.read.return_value = b"{}" + b" " * (128 * 1024 - 2)
-        self.assertEqual(public.request("/releases/latest"), {})
+        self.assertEqual(github.request("/releases/latest"), {})
         response.read.return_value += b" "
         with self.assertRaisesRegex(release.InvalidRelease, "exceeded size limit"):
-            public.request("/releases/latest")
+            github.request("/releases/latest")
         response.read.return_value = b'{"tag_name":"mobile-v1","\\u0074ag_name":"mobile-v2"}'
         with self.assertRaisesRegex(release.InvalidRelease, "Duplicate JSON key"):
-            public.request("/releases/latest")
+            github.request("/releases/latest")
 
 
 class DownloadTest(unittest.TestCase):
@@ -271,9 +271,7 @@ class PublicationFixture:
     release_id = 7
 
     def __init__(self, apk_bytes):
-        self.public = Mock()
         self.auth = Mock()
-        self.public.request.side_effect = self.public_request
         self.auth.request.side_effect = self.auth_request
         self.auth.all.side_effect = self.auth_list
         self.repo = {"full_name": release.REPO, "private": False, "visibility": "public"}
@@ -314,20 +312,11 @@ class PublicationFixture:
                 [mobile_release(22, "Spofify Mobile 0.2.0")] if self.promotion_race and self.patched else [])
         raise AssertionError(f"Unexpected list: {path}")
 
-    def public_request(self, path, *, missing=False):
-        if path == "":
-            return self.repo
-        if path == "/releases/latest":
-            return self.record(draft=False) if self.patched and not self.hide_latest else self.history[0]
-        if path == f"/git/ref/tags/{self.tag}":
-            assert self.tagged
-            sha = "c" * 40 if self.bad_tag_target else self.commit
-            return {"ref": f"refs/tags/{self.tag}", "object": {"type": "commit", "sha": sha}}
-        raise AssertionError(f"Unexpected public request: {path}")
-
     def auth_request(self, path, *, method="GET", payload=None, upload=None, missing=False):
-        if method == "GET" and path in ("", "/releases/latest"):
-            return self.public_request(path, missing=missing)
+        if method == "GET" and path == "":
+            return self.repo
+        if method == "GET" and path == "/releases/latest":
+            return self.record(draft=False) if self.patched and not self.hide_latest else self.history[0]
         if method == "POST" and path == "/releases":
             assert payload == {"tag_name": self.tag, "name": self.title, "target_commitish": self.commit, "body": "",
                                "draft": True, "prerelease": False, "generate_release_notes": False,
@@ -349,7 +338,8 @@ class PublicationFixture:
             return {"ref": ref, "object": {"type": "commit", "sha": "d" * 40 if self.bad_created_ref else self.commit}}
         if path == f"/git/ref/tags/{self.tag}":
             assert self.tagged
-            return {"ref": f"refs/tags/{self.tag}", "object": {"type": "commit", "sha": self.commit}}
+            sha = "c" * 40 if self.patched and self.bad_tag_target else self.commit
+            return {"ref": f"refs/tags/{self.tag}", "object": {"type": "commit", "sha": sha}}
         if path == f"/releases/{self.release_id}":
             if method == "PATCH":
                 assert self.tagged
@@ -379,7 +369,7 @@ class PublicationTest(unittest.TestCase):
                                                "sha256:" + self.fixture.apk_digest))
 
     def publish(self):
-        release.publish(self.fixture.auth, self.fixture.public, self.apk, "patch",
+        release.publish(self.fixture.auth, self.apk, "patch",
                         self.fixture.code, self.fixture.name, self.fixture.commit)
 
     def rejected(self, reason, *, draft_created, patched=False):
@@ -387,7 +377,7 @@ class PublicationTest(unittest.TestCase):
             self.publish()
         self.assertEqual(self.fixture.created, draft_created)
         self.assertEqual(self.fixture.patched, patched)
-        self.assertNotIn("Verified public latest", self.output.getvalue())
+        self.assertNotIn("Verified latest release and public APK", self.output.getvalue())
 
     def test_verified_stable_release(self):
         self.publish()
@@ -395,7 +385,18 @@ class PublicationTest(unittest.TestCase):
         self.assertTrue(self.fixture.patched)
         self.verify_apk.assert_called_once_with(self.apk, self.fixture.code, self.fixture.name, self.anchor)
         self.download.assert_called_once()
-        self.assertIn("Verified public latest: mobile-v21", self.output.getvalue())
+        self.assertIn("Verified latest release and public APK: mobile-v21", self.output.getvalue())
+
+    def test_publish_cli_uses_one_authenticated_client_for_all_api_checks(self):
+        token = "fixture-token"
+        argv = ["mobile_release.py", "publish", "--bump", "patch",
+                "--version-code", str(self.fixture.code), "--version-name", self.fixture.name,
+                "--commit", self.fixture.commit, str(self.apk)]
+        with patch.dict(release.os.environ, {release.TOKEN_ENV: token}), patch.object(release.sys, "argv", argv), \
+             patch.object(release, "GitHub", return_value=self.fixture.auth) as api:
+            release.main()
+        api.assert_called_once_with(token)
+        self.download.assert_called_once()
 
     def test_branch_name_is_not_a_packaged_commit(self):
         self.fixture.commit = "main"

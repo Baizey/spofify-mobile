@@ -201,7 +201,7 @@ def require_full_response(response):
 
 def unique_json_object(values):
     mapping = dict(values)
-    need(len(mapping) == len(values), "Duplicate JSON key in public latest response.")
+    need(len(mapping) == len(values), "Duplicate JSON key in latest release response.")
     return mapping
 
 
@@ -285,7 +285,7 @@ def stable_release_version(release, code):
         raise InvalidRelease(f"Stable mobile-v{code} must have the exact title '{TITLE_PREFIX}X.Y.Z': {exc}") from exc
 
 
-def release_history(auth, public, *, own_draft=None, own_tag=None):
+def release_history(auth, *, own_draft=None, own_tag=None):
     highest = 0
     for tag in auth.all("/tags"):
         name = tag.get("name")
@@ -312,20 +312,20 @@ def release_history(auth, public, *, own_draft=None, own_tag=None):
             stable.add((release_id(release), code, stable_release_version(release, code)))
     need(own_draft is None or found_own_draft, "The reserved draft is missing from authenticated history.")
 
-    # Anonymous latest is an independent consistency check, not a substitute for the full history.
-    latest = public.request("/releases/latest", missing=True)
+    # Latest is a consistency check, not a substitute for the full history.
+    latest = auth.request("/releases/latest", missing=True)
     if latest is not None:
         code = tag_code(latest.get("tag_name"))
         if code is not None:
             need(latest.get("draft") is False and latest.get("prerelease") is False
                  and (release_id(latest), code, stable_release_version(latest, code)) in stable,
-                 "Anonymous latest disagrees with authenticated Mobile release history.")
+                 "Latest release disagrees with authenticated Mobile release history.")
     return highest, stable
 
 
-def resolve_versions(auth, public, bump, *, own_draft=None, own_tag=None):
+def resolve_versions(auth, bump, *, own_draft=None, own_tag=None):
     need(bump in BUMPS, "Choose major, minor, or patch.")
-    highest, stable = release_history(auth, public, own_draft=own_draft, own_tag=own_tag)
+    highest, stable = release_history(auth, own_draft=own_draft, own_tag=own_tag)
     need(highest < MAX_CODE, f"No Android version codes remain above {highest}.")
     previous = max((version for _, _, version in stable), default=(0, 0, 0))
     i = BUMPS.index(bump)
@@ -334,7 +334,7 @@ def resolve_versions(auth, public, bump, *, own_draft=None, own_tag=None):
     return highest + 1, ".".join(map(str, bumped))
 
 
-def check_plan(auth, public, bump, code, name, *, draft_id=None, commit=None):
+def check_plan(auth, bump, code, name, *, draft_id=None, commit=None):
     title = TITLE_PREFIX + name
     own_draft = None if draft_id is None else (draft_id, code, title)
     own_tag = None
@@ -344,7 +344,7 @@ def check_plan(auth, public, bump, code, name, *, draft_id=None, commit=None):
         ref = f"refs/tags/{own_tag}"
         need(git_commit(auth.request(f"/git/ref/tags/{own_tag}"), ref) == commit,
              "Reserved tag no longer points to the packaged commit.")
-    planned_code, planned_name = resolve_versions(auth, public, bump, own_draft=own_draft, own_tag=own_tag)
+    planned_code, planned_name = resolve_versions(auth, bump, own_draft=own_draft, own_tag=own_tag)
     need((code, name) == (planned_code, planned_name),
          f"Packaged version ({code}, {name}) no longer matches the {bump} plan ({planned_code}, {planned_name}).")
 
@@ -437,7 +437,7 @@ def require_shape(release, identifier, tag, title, size, digest, *, draft, pendi
     return True
 
 
-def publish(auth, public, apk, bump, code, name, commit):
+def publish(auth, apk, bump, code, name, commit):
     need(re.fullmatch(r"[0-9a-f]{40}", commit), "Expected the exact packaged commit SHA.")
     tag = f"mobile-v{code}"
     title = TITLE_PREFIX + name
@@ -449,7 +449,7 @@ def publish(auth, public, apk, bump, code, name, commit):
         digest = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
 
     require_public_repo(auth)
-    check_plan(auth, auth, bump, code, name)
+    check_plan(auth, bump, code, name)
     draft = auth.request("/releases", method="POST", payload={
         "tag_name": tag, "name": title, "target_commitish": commit, "body": "", "draft": True,
         "prerelease": False, "generate_release_notes": False, "make_latest": "false",
@@ -470,12 +470,12 @@ def publish(auth, public, apk, bump, code, name, commit):
     else:
         raise InvalidRelease("GitHub did not supply the APK digest before timeout; release remains a draft.")
 
-    check_plan(auth, auth, bump, code, name, draft_id=identifier)
+    check_plan(auth, bump, code, name, draft_id=identifier)
     # Create-only, as on Desktop. Never reuse an existing tag, even if it has the same SHA.
     ref = f"refs/tags/{tag}"
     created = auth.request("/git/refs", method="POST", payload={"ref": ref, "sha": commit})
     need(git_commit(created, ref) == commit, "Release tag does not match the packaged commit.")
-    check_plan(auth, auth, bump, code, name, draft_id=identifier, commit=commit)
+    check_plan(auth, bump, code, name, draft_id=identifier, commit=commit)
     draft = auth.request(path)
     need(draft.get("target_commitish") == commit, "Draft no longer targets the packaged commit.")
     require_shape(draft, identifier, tag, title, size, digest, draft=True)
@@ -485,21 +485,21 @@ def publish(auth, public, apk, bump, code, name, commit):
         for delay in WAITS:
             time.sleep(delay)
             try:
-                latest = public.request("/releases/latest")
+                latest = auth.request("/releases/latest")
                 require_shape(latest, identifier, tag, title, size, digest, draft=False)
-                need(git_commit(public.request(f"/git/ref/tags/{tag}"), ref) == commit,
+                need(git_commit(auth.request(f"/git/ref/tags/{tag}"), ref) == commit,
                      "Published tag does not point to the packaged commit.")
-                _, stable = release_history(auth, public)
+                _, stable = release_history(auth)
                 current = (identifier, code, stable_version(name))
                 need(current in stable and all(record == current or (record[1] < code and record[2] < current[2])
                                                for record in stable),
                      "Published release is not ahead of all other stable Mobile releases; inspect for a race.")
                 verify_public_download(tag, size, digest)
-                print(f"Verified public latest: {tag}, {ASSET}, {size} bytes, {digest}")
+                print(f"Verified latest release and public APK: {tag}, {ASSET}, {size} bytes, {digest}")
                 return
             except InvalidRelease as exc:
                 last_error = exc
-        raise InvalidRelease(f"Anonymous latest verification did not complete: {last_error}")
+        raise InvalidRelease(f"Final release verification did not complete: {last_error}")
     except InvalidRelease as exc:
         raise InvalidRelease(f"Release may already be public; inspect {tag} before taking action. {exc}") from exc
 
@@ -535,20 +535,20 @@ def main():
         elif args.command in ("resolve", "check-plan", "publish"):
             token = os.environ.get(TOKEN_ENV)
             need(token, "Missing GitHub Actions token (GH_TOKEN).")
-            auth, public = GitHub(token), GitHub()
+            auth = GitHub(token)
             if args.command == "resolve":
                 signing_anchor(CERT_FILE)
                 require_public_repo(auth)
-                code, name = resolve_versions(auth, auth, args.bump)
+                code, name = resolve_versions(auth, args.bump)
                 print(f"version_code={code}\nversion_name={name}")
             else:
                 code, name = version_code(args.version_code), args.version_name
                 stable_version(name)
                 if args.command == "check-plan":
                     require_public_repo(auth)
-                    check_plan(auth, auth, args.bump, code, name)
+                    check_plan(auth, args.bump, code, name)
                 else:
-                    publish(auth, public, args.apk, args.bump, code, name, args.commit)
+                    publish(auth, args.apk, args.bump, code, name, args.commit)
         else:
             code, name = version_code(args.version_code), version_name(args.version_name)
             if args.command == "stage-unsigned":
