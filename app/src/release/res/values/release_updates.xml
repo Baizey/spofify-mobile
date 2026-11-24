@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="release_app_name">Spofify Release</string>
+    <string name="app_updates">App updates</string>
+    <string name="updates_paused">Updates paused</string>
+    <string name="updates_checking">Checking for updates…</string>
+    <string name="updates_downloading">Downloading update…</string>
+    <string name="updates_current">Up to date</string>
+    <string name="updates_unavailable">Updates unavailable</string>
+    <string name="updates_install">Install update</string>
+    <string name="updates_preparing">Preparing installer…</string>
+    <string name="updates_pause_playback">Pause playback to install</string>
+    <string name="updates_installer_unavailable">Couldn’t open Android installer</string>
+</resources>

@@ -27,6 +27,7 @@ internal fun SettingsScreen(
     onAccount: () -> Unit,
     onCredits: () -> Unit,
     playbackSetting: @Composable () -> Unit = {},
+    updates: @Composable () -> Unit = {},
 ) {
     SettingsPage("Settings") {
         SettingsGroup("Account")
@@ -37,6 +38,7 @@ internal fun SettingsScreen(
         modeSetting()
         SettingsLink("Music storage", musicStorageSummary(cache?.usage?.collectAsStateWithLifecycle()?.value), onCache)
         SettingsGroup("About")
+        updates()
         SettingsLink("Credits", null, onCredits)
     }
 }
