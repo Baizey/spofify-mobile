@@ -52,6 +52,9 @@ class SessionRepository(
     private val scope: CoroutineScope,
     private val io: CoroutineDispatcher = Dispatchers.IO,
     private val manualOfflineStore: ManualOfflineStore? = null,
+    // Synchronous, non-blocking and non-throwing fence for installation-wide work
+    // that uses no account authority. The consumer must start closed.
+    private val onInstallationNetworkAllowed: (Boolean) -> Unit = {},
 ) {
     private val lock = Any()
     private val mutableState = MutableStateFlow<AuthState>(AuthState.Starting)
@@ -288,6 +291,7 @@ class SessionRepository(
                 }
                 synchronized(lock) {
                     mutableOffline.value = offline
+                    onInstallationNetworkAllowed(!offline)
                     mutablePolicyLoaded.value = true
                     if (generation == token) operationLocked { restoreStored(token) } else null
                 }?.start()
@@ -358,6 +362,10 @@ class SessionRepository(
             // Accept fallback only while the failing socket batch still owns the current grant.
             if (required != null && synchronized(lock) { mutableGrant.value !== required }) return@withContext false
             val store = checkNotNull(manualOfflineStore) { "No durable manual mode store" }
+            // Fence before the durable write, not after asynchronous StateFlow delivery
+            // or after the existing playback socket's cooperative handoff. If the write
+            // throws, durability is uncertain: keep installation-wide work fenced.
+            if (enabled) onInstallationNetworkAllowed(false)
             store.write(enabled)
             if (required != null) {
                 // The preference write may have been blocked while sign-out or validation
@@ -369,6 +377,7 @@ class SessionRepository(
                     // modeChanges is still held: restore the unchanged policy before any
                     // newer explicit mode command can write to the store.
                     store.write(!enabled)
+                    onInstallationNetworkAllowed(enabled)
                     return@withContext false
                 }
                 completeModeSwitch(transition)
@@ -381,7 +390,9 @@ class SessionRepository(
             try {
                 if (enabled && owner != null) withTimeoutOrNull(1_000) { beforeDisconnect(owner) }
             } finally {
-                completeModeSwitch(synchronized(lock) { switchModeLocked(enabled) })
+                val transition = synchronized(lock) { switchModeLocked(enabled) }
+                if (!enabled) onInstallationNetworkAllowed(true)
+                completeModeSwitch(transition)
             }
             true
         }
