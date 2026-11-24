@@ -56,7 +56,9 @@ internal class OriginMediaTransport(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 connection.attach(webSocket)
                 val firstFrame = pendingHello.getAndSet(null)
-                if (firstFrame == null || !continuation.isActive || !authority.isCurrent) {
+                // OkHttp validates the upgrade but does not reject unsolicited subprotocols (RFC 6455 §4.1).
+                if (firstFrame == null || !continuation.isActive || !authority.isCurrent ||
+                    response.header("Sec-WebSocket-Protocol") != null) {
                     connection.close()
                     if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
                     return

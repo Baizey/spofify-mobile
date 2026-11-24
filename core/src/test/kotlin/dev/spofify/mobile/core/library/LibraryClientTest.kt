@@ -443,6 +443,19 @@ class LibraryClientTest {
         assertTrue(sessions.isCurrent(identity))
     } }
 
+    @Test fun socketRejectsUnsolicitedSubprotocolBeforeSendingHello() = runBlocking { fixture { server, sessions, identity ->
+        server.enqueue(json("""{"ticket":"fixture"}"""))
+        val hello = CompletableDeferred<String>()
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+            override fun onMessage(socket: okhttp3.WebSocket, text: String) { hello.complete(text) }
+        }).setHeader("Sec-WebSocket-Protocol", "unsolicited"))
+        val failure = runCatching { withTimeout(3000) { sessions.playbackTransport(identity).connect("phone", "device") } }
+            .exceptionOrNull()
+        assertTrue(failure.toString(), failure is AuthFailure)
+        assertNull(withTimeoutOrNull(100) { hello.await() })
+        assertTrue(sessions.isCurrent(identity))
+    } }
+
     @Test fun invalidDeviceNamesDoNotRequestAdmission() = runBlocking { fixture { server, sessions, identity ->
         val transport = sessions.playbackTransport(identity)
         for (name in listOf("", "  ", "a".repeat(65), "😀".repeat(65), "Phone\n", "\uD83D", "\uDE00")) {
