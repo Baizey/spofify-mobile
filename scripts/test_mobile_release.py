@@ -117,6 +117,9 @@ class TransportTest(unittest.TestCase):
         response.read.return_value += b" "
         with self.assertRaisesRegex(release.InvalidRelease, "exceeded size limit"):
             public.request("/releases/latest")
+        response.read.return_value = b'{"tag_name":"mobile-v1","\\u0074ag_name":"mobile-v2"}'
+        with self.assertRaisesRegex(release.InvalidRelease, "Duplicate JSON key"):
+            public.request("/releases/latest")
 
 
 class DownloadTest(unittest.TestCase):
@@ -152,6 +155,7 @@ class DownloadTest(unittest.TestCase):
             self.assertEqual(req.get_method(), "GET")
             self.assertIsNone(req.get_header("Authorization"))
             self.assertIsNone(req.get_header("Cookie"))
+            self.assertEqual(req.get_header("Accept"), "application/octet-stream")
 
     def test_rejects_unapproved_and_ambiguous_redirect_origins(self):
         for target in ("http://release-assets.githubusercontent.com/asset",
@@ -171,6 +175,21 @@ class DownloadTest(unittest.TestCase):
         with self.assertRaisesRegex(release.InvalidRelease, "exceeded redirect limit"):
             self.verify()
         self.assertEqual(self.opener.open.call_count, 4)
+        self.opener.open.side_effect = [self.redirect(self.cdn + "x" * 8192)]
+        with self.assertRaisesRegex(release.InvalidRelease, "Unsafe APK download redirect"):
+            self.verify()
+
+    def test_rejects_partial_and_ambiguous_body_headers(self):
+        for pairs in ((('Content-Range', 'bytes 0-17/18'),),
+                      (('Content-Encoding', 'identity'), ('Content-Encoding', 'identity')),
+                      (('Content-Length', '18'), ('Content-Length', '18'))):
+            response = self.response()
+            response.headers = Message()
+            for name, value in pairs:
+                response.headers[name] = value
+            self.opener.open.return_value = response
+            with self.assertRaises(release.InvalidRelease):
+                self.verify()
 
     def test_rejects_length_hash_and_encoding_mismatch(self):
         for data, headers, message in (

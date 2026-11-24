@@ -170,10 +170,34 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def header_values(headers, name):
+    if hasattr(headers, "get_all"):
+        return headers.get_all(name, [])
+    value = headers.get(name)
+    return [] if value is None else [value]
+
+
+def require_full_response(response):
+    encoding = header_values(response.headers, "Content-Encoding")
+    need(response.status == 200 and (not encoding or len(encoding) == 1 and encoding[0].lower() == "identity")
+         and not header_values(response.headers, "Content-Range"), "Unexpected HTTP status, range or encoding for full body.")
+    lengths = header_values(response.headers, "Content-Length")
+    if not lengths:
+        return None
+    need(len(lengths) == 1 and re.fullmatch(r"[0-9]{1,19}", lengths[0]), "Invalid HTTP Content-Length.")
+    return int(lengths[0])
+
+
+def unique_json_object(values):
+    mapping = dict(values)
+    need(len(mapping) == len(values), "Duplicate JSON key in public latest response.")
+    return mapping
+
+
 class GitHub:
     def __init__(self, token=None):
         self.token = token
-        self.opener = urllib.request.build_opener(NoRedirect())
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def request(self, path, *, method="GET", payload=None, upload=None, missing=False):
         headers = {"Accept": "application/vnd.github+json", "Accept-Encoding": "identity",
@@ -192,19 +216,22 @@ class GitHub:
                             "Content-Length": str(os.fstat(upload.fileno()).st_size)})
         request = urllib.request.Request(origin + path, data=data, headers=headers, method=method)
         try:
-            with self.opener.open(request, timeout=60) as response:
-                if path == "/releases/latest":
-                    need(response.status == 200 and response.headers.get("Content-Encoding", "identity").lower() == "identity",
-                         "Unexpected response status or encoding from public latest.")
-                limit = MAX_LATEST_BYTES if path == "/releases/latest" else 16 * 1024 * 1024
+            latest = path == "/releases/latest"
+            with self.opener.open(request, timeout=10 if latest else 60) as response:
+                limit = MAX_LATEST_BYTES if latest else 16 * 1024 * 1024
+                length = require_full_response(response) if latest else None
+                need(length is None or length <= limit, "GitHub API response exceeded size limit.")
                 body = response.read(limit + 1)
                 need(len(body) <= limit, "GitHub API response exceeded size limit.")
+                need(length is None or len(body) == length, "Invalid GitHub API response length.")
+                if latest:
+                    return json.loads(body.decode("utf-8"), object_pairs_hook=unique_json_object)
                 return json.loads(body)
         except urllib.error.HTTPError as exc:
             if missing and exc.code == 404:
                 return None
             raise InvalidRelease(f"GitHub API {method} {path} failed (HTTP {exc.code}).") from exc
-        except (OSError, ValueError, http.client.HTTPException) as exc:
+        except (OSError, ValueError, RecursionError, http.client.HTTPException) as exc:
             raise InvalidRelease(f"GitHub API {method} {path} did not return readable JSON.") from exc
 
     def all(self, path):
@@ -255,7 +282,8 @@ def browser_url(tag):
 
 
 def approved_asset_redirect(location):
-    need(location and not re.search(r"[\x00-\x20\x7f\\#]", location), "Unsafe APK download redirect.")
+    need(location and len(location) <= 8192 and not re.search(r"[^\x21-\x7e]|[\\#]", location),
+         "Unsafe APK download redirect.")
     parsed = urllib.parse.urlsplit(location)
     need(parsed.scheme == "https" and parsed.netloc == ASSET_CDN and parsed.path.startswith("/"),
          "APK download redirected outside the approved GitHub CDN.")
@@ -270,18 +298,18 @@ def verify_public_download(tag, size, digest):
     deadline = time.monotonic() + ASSET_TIMEOUT
     for hop in range(ASSET_MAX_REDIRECTS + 1):
         need(time.monotonic() < deadline, "Public APK download exceeded time limit.")
-        request = urllib.request.Request(url, headers={"Accept-Encoding": "identity", "User-Agent": "spofify-mobile-release"})
+        request = urllib.request.Request(url, headers={"Accept-Encoding": "identity", "Accept": "application/octet-stream",
+                                                       "User-Agent": "Spofify-Mobile-Updater"})
         try:
-            with opener.open(request, timeout=30) as response:
-                need(response.status == 200 and response.headers.get("Content-Encoding", "identity").lower() == "identity",
-                     "Unexpected public APK response status or encoding.")
-                length = response.headers.get("Content-Length")
-                need(length is None or length.strip() == str(size), "Public APK Content-Length does not match signed APK.")
+            with opener.open(request, timeout=min(10, max(0.1, deadline - time.monotonic()))) as response:
+                length = require_full_response(response)
+                need(length is None or length == size, "Public APK Content-Length does not match signed APK.")
                 downloaded = 0
                 actual = hashlib.sha256()
                 while True:
                     need(time.monotonic() < deadline, "Public APK download exceeded time limit.")
                     chunk = response.read1(min(64 * 1024, size - downloaded + 1))
+                    need(time.monotonic() < deadline, "Public APK download exceeded time limit.")
                     if not chunk:
                         break
                     downloaded += len(chunk)
