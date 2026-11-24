@@ -690,6 +690,23 @@ class AccountChannelTest {
         assertTrue(f.audio.starts.isEmpty())
     }
 
+    @Test fun snapshotWithLegacyCursorCannotEstablishPlaybackBinding() = runTest {
+        val f = Fixture(this)
+        f.connect()
+        val legacyCursor = fields("key" to 1L, "chain" to "old", "visit" to 1L, "run" to 1L,
+            "elapsed" to 0.0, "desired" to true, "playing" to true)
+        val player = JsonObject(encode(AccountState(rows, first, "off", false)).jsonObject + ("cursor" to legacyCursor))
+        f.socket.frame("type" to "snapshot", "sessionId" to "room", "connectionId" to "socket-1", "revision" to 1L,
+            "owner" to encode(AccountOwner(1, "self")), "devices" to encode(emptyList<AccountDevice>()),
+            "player" to player, "serverTimeMs" to WALL)
+        runCurrent()
+        assertFalse(f.socket.isOpen)
+        assertEquals(0L, f.view.established)
+        assertEquals(PlaybackConnectionState.DISCONNECTED, f.view.connection)
+        assertTrue(f.socket.sent.isEmpty())
+        assertTrue(f.audio.starts.isEmpty())
+    }
+
     @Test fun socketAndFirstSnapshotShareOneAttemptDeadline() = runTest {
         val f = Fixture(this)
         f.upgradeDelay = 7_500

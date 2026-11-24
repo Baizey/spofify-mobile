@@ -41,8 +41,7 @@ internal class OriginMediaTransport(
         cookie: String, hello: String, authority: FeatureAuthority, onHeaders: (Int, String?) -> Unit,
     ): PlaybackConnection {
         require(hello.utf8Size() <= SessionSocket.MAX_HELLO_BYTES)
-        val request = request(listOf("api", "me", "player", "socket"), cookie)
-            .header("Sec-WebSocket-Protocol", PROTOCOL).build()
+        val request = request(listOf("api", "me", "player", "socket"), cookie).build()
         return upgrade(request, hello, authority, onHeaders)
     }
 
@@ -57,8 +56,7 @@ internal class OriginMediaTransport(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 connection.attach(webSocket)
                 val firstFrame = pendingHello.getAndSet(null)
-                if (firstFrame == null || !continuation.isActive || !authority.isCurrent ||
-                    response.headers.values("Sec-WebSocket-Protocol") != listOf(PROTOCOL)) {
+                if (firstFrame == null || !continuation.isActive || !authority.isCurrent) {
                     connection.close()
                     if (continuation.isActive) continuation.resumeWithException(AuthFailure(AuthFailure.Kind.UNAVAILABLE))
                     return
@@ -211,7 +209,6 @@ internal class OriginMediaTransport(
     }
 
     private companion object {
-        const val PROTOCOL = "spofify.account-state.v3"
         val SHA = Regex("[0-9a-f]{64}")
         val EVIDENCE_HEADERS = listOf("Content-Range", "Content-Length", "Content-Type", "Content-Encoding", "ETag", "Last-Modified")
         val STRONG_ETAG = Regex("\"[!#-~\\x80-\\xff]*\"")

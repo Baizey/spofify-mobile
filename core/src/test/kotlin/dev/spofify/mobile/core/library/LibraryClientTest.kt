@@ -354,15 +354,18 @@ class LibraryClientTest {
         assertEquals(2, server.requestCount)
     } }
 
-    @Test fun playbackAdmissionKeepsTicketOutOfUrlAndUsesExactSubprotocol() = runBlocking { fixture { server, sessions, identity ->
+    @Test fun playbackAdmissionKeepsTicketOutOfUrlAndUpgradesWithoutSubprotocol() = runBlocking { fixture { server, sessions, identity ->
         val hello = CompletableDeferred<String>()
+        val snapshot = """{"type":"snapshot","sessionId":"room","connectionId":"socket-1","revision":0,
+            "owner":{"generation":0},"player":{"queue":[],"cursor":{"key":0,"positionMs":0,"desiredPlaying":false},
+            "repeat":"off","shuffle":false},"devices":[],"serverTimeMs":1700000000000}"""
         server.enqueue(json("""{"ticket":"one-use-fixture-ticket"}"""))
         server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
             override fun onMessage(socket: okhttp3.WebSocket, text: String) {
                 hello.complete(text)
-                socket.send("""{"type":"snapshot"}""")
+                socket.send(snapshot)
             }
-        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v3"))
+        }))
         val deviceName = "😀".repeat(64)
         val connection = sessions.playbackTransport(identity).connect(deviceName, "fixture-device")
         try {
@@ -373,7 +376,7 @@ class LibraryClientTest {
             assertEquals(deviceName, (frame.getValue("name") as kotlinx.serialization.json.JsonPrimitive).content)
             assertEquals("one-use-fixture-ticket", (frame.getValue("ticket") as kotlinx.serialization.json.JsonPrimitive).content)
             assertEquals("true", (frame.getValue("canPlay") as kotlinx.serialization.json.JsonPrimitive).content)
-            assertEquals("""{"type":"snapshot"}""", withTimeout(3000) { connection.messages.first() })
+            assertEquals(snapshot, withTimeout(3000) { connection.messages.first() })
             val admission = server.takeRequest(2, TimeUnit.SECONDS)!!
             assertEquals("POST", admission.method)
             assertEquals("/api/me/player/connect", admission.path)
@@ -382,8 +385,10 @@ class LibraryClientTest {
             val upgrade = server.takeRequest(2, TimeUnit.SECONDS)!!
             assertEquals("/api/me/player/socket", upgrade.path)
             assertNull(upgrade.requestUrl!!.query)
-            assertEquals("spofify.account-state.v3", upgrade.getHeader("Sec-WebSocket-Protocol"))
+            assertNull(upgrade.getHeader("Sec-WebSocket-Protocol"))
+            assertEquals("13", upgrade.getHeader("Sec-WebSocket-Version"))
             assertEquals(identity.origin, upgrade.getHeader("Origin"))
+            assertEquals("spofify_session=fixture-token", upgrade.getHeader("Cookie"))
             assertFalse(upgrade.path!!.contains("fixture-ticket"))
         } finally { connection.close() }
     } }
@@ -396,7 +401,7 @@ class LibraryClientTest {
             override fun onMessage(socket: okhttp3.WebSocket, text: String) {
                 hello.complete(kotlinx.serialization.json.Json.parseToJsonElement(text) as JsonObject)
             }
-        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v3"))
+        }))
         val player = buildJsonObject {
             put("repeat", "one"); put("shuffle", false)
             putJsonObject("cursor") {
@@ -428,15 +433,13 @@ class LibraryClientTest {
         }
     } }
 
-    @Test fun socketRejectsLegacySubprotocolBeforeSendingHello() = runBlocking { fixture { server, sessions, identity ->
+    @Test fun socketRejectsInvalidWebSocketAccept() = runBlocking { fixture { server, sessions, identity ->
         server.enqueue(json("""{"ticket":"fixture"}"""))
-        val hello = CompletableDeferred<String>()
-        server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
-            override fun onMessage(socket: okhttp3.WebSocket, text: String) { hello.complete(text) }
-        }).setHeader("Sec-WebSocket-Protocol", "spofify.account-state.v1"))
-        assertTrue(runCatching { sessions.playbackTransport(identity).connect("phone", "device") }
-            .exceptionOrNull() is AuthFailure)
-        assertNull(withTimeoutOrNull(100) { hello.await() })
+        server.enqueue(MockResponse().setResponseCode(101).setHeader("Connection", "Upgrade")
+            .setHeader("Upgrade", "websocket").setHeader("Sec-WebSocket-Accept", "invalid"))
+        val failure = runCatching { withTimeout(3000) { sessions.playbackTransport(identity).connect("phone", "device") } }
+            .exceptionOrNull()
+        assertTrue(failure.toString(), failure is AuthFailure)
         assertTrue(sessions.isCurrent(identity))
     } }
 
