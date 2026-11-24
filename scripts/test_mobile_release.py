@@ -1,5 +1,6 @@
 import contextlib
 import copy
+from email.message import Message
 import hashlib
 import io
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import MagicMock, Mock, patch
+from urllib.error import HTTPError
 
 import mobile_release as release
 
@@ -88,11 +90,86 @@ class TransportTest(unittest.TestCase):
     def test_latest_check_is_anonymous(self):
         public = release.GitHub()
         public.opener = MagicMock()
-        public.opener.open.return_value.__enter__.return_value.read.return_value = b"{}"
+        response = public.opener.open.return_value.__enter__.return_value
+        response.status, response.headers = 200, {}
+        response.read.return_value = b"{}"
         public.request("/releases/latest")
         req = public.opener.open.call_args.args[0]
         self.assertEqual(req.full_url, f"https://api.github.com/repos/{release.REPO}/releases/latest")
         self.assertIsNone(req.get_header("Authorization"))
+        response.read.assert_called_once_with(128 * 1024 + 1)
+        response.read.return_value = b"{}" + b" " * (128 * 1024 - 2)
+        self.assertEqual(public.request("/releases/latest"), {})
+        response.read.return_value += b" "
+        with self.assertRaisesRegex(release.InvalidRelease, "exceeded size limit"):
+            public.request("/releases/latest")
+
+
+class DownloadTest(unittest.TestCase):
+    tag = "mobile-v21"
+    apk = b"synthetic APK bytes"
+    cdn = "https://release-assets.githubusercontent.com/fixture?id=21"
+    digest = "sha256:" + hashlib.sha256(apk).hexdigest()
+
+    def setUp(self):
+        self.opener = Mock()
+        self.enterContext(patch.object(release.urllib.request, "build_opener", return_value=self.opener))
+
+    def verify(self):
+        release.verify_public_download(self.tag, len(self.apk), self.digest)
+
+    def redirect(self, target, url=None):
+        headers = Message()
+        headers["Location"] = target
+        return HTTPError(url or release.browser_url(self.tag), 302, "Found", headers, io.BytesIO())
+
+    def response(self, data=None, **headers):
+        response = io.BytesIO(self.apk if data is None else data)
+        response.status = 200
+        response.headers = {key.replace("_", "-"): value for key, value in headers.items()}
+        return response
+
+    def test_download_starts_from_canonical_url_and_follows_only_approved_cdn_anonymously(self):
+        self.opener.open.side_effect = [self.redirect(self.cdn), self.response(Content_Length=str(len(self.apk)))]
+        self.verify()
+        requests = [call.args[0] for call in self.opener.open.call_args_list]
+        self.assertEqual([req.full_url for req in requests], [release.browser_url(self.tag), self.cdn])
+        for req in requests:
+            self.assertEqual(req.get_method(), "GET")
+            self.assertIsNone(req.get_header("Authorization"))
+            self.assertIsNone(req.get_header("Cookie"))
+
+    def test_rejects_unapproved_and_ambiguous_redirect_origins(self):
+        for target in ("http://release-assets.githubusercontent.com/asset",
+                       "https://release-assets.githubusercontent.com.evil.invalid/asset",
+                       "https://example.invalid@release-assets.githubusercontent.com/asset",
+                       "https://release-assets.githubusercontent.com:444/asset", "//release-assets.githubusercontent.com/asset",
+                       "https://github.com/other", "/asset"):
+            with self.subTest(target=target):
+                self.opener.open.reset_mock()
+                self.opener.open.side_effect = [self.redirect(target)]
+                with self.assertRaisesRegex(release.InvalidRelease, "approved GitHub CDN"):
+                    self.verify()
+                self.assertEqual(self.opener.open.call_count, 1)
+
+    def test_redirect_chain_is_bounded(self):
+        self.opener.open.side_effect = [self.redirect(self.cdn) for _ in range(4)]
+        with self.assertRaisesRegex(release.InvalidRelease, "exceeded redirect limit"):
+            self.verify()
+        self.assertEqual(self.opener.open.call_count, 4)
+
+    def test_rejects_length_hash_and_encoding_mismatch(self):
+        for data, headers, message in (
+            (self.apk, {"Content_Length": "999"}, "Content-Length"),
+            (self.apk, {"Content_Encoding": "gzip"}, "encoding"),
+            (self.apk + b"X", {}, "exceeds the signed APK size"),
+            (self.apk[:-1], {}, "size does not match"),
+            (b"\x00" * len(self.apk), {}, "SHA-256 does not match"),
+        ):
+            with self.subTest(message=message):
+                self.opener.open.return_value = self.response(data, **headers)
+                with self.assertRaisesRegex(release.InvalidRelease, message):
+                    self.verify()
 
 
 class PublicationFixture:
@@ -179,6 +256,13 @@ class PublicationTest(unittest.TestCase):
         self.fixture = PublicationFixture(self.apk.read_bytes())
         self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.enterContext(patch.object(release, "WAITS", (0, 0)))
+        self.download = self.enterContext(patch.object(release, "verify_public_download"))
+        self.download.side_effect = self.verify_download_after_promotion
+
+    def verify_download_after_promotion(self, tag, size, digest):
+        self.assertTrue(self.fixture.patched)
+        self.assertEqual((tag, size, digest), (self.fixture.tag, self.apk.stat().st_size,
+                                               "sha256:" + self.fixture.apk_digest))
 
     def publish(self):
         release.publish(self.fixture.auth, self.fixture.public, self.apk, self.fixture.code)
@@ -193,6 +277,7 @@ class PublicationTest(unittest.TestCase):
     def test_verified_stable_release(self):
         self.publish()
         self.assertTrue(self.fixture.patched)
+        self.download.assert_called_once()
         self.assertIn("Verified public latest: mobile-v21", self.output.getvalue())
 
     def test_private_repository_rejected_before_mutation(self):
@@ -206,6 +291,7 @@ class PublicationTest(unittest.TestCase):
     def test_absent_draft_digest_never_publishes(self):
         self.fixture.draft_asset.pop("digest")
         self.rejected("did not supply the APK digest", draft_created=True)
+        self.download.assert_not_called()
 
     def test_wrong_draft_digest_never_publishes(self):
         self.fixture.draft_asset["digest"] = "sha256:" + "0" * 64
@@ -238,6 +324,10 @@ class PublicationTest(unittest.TestCase):
     def test_wrong_public_download_url_is_not_reported_as_success(self):
         self.fixture.expected_asset["browser_download_url"] = "https://example.invalid/wrong.apk"
         self.rejected("Unexpected public APK download URL", draft_created=True, patched=True)
+
+    def test_failed_anonymous_download_is_not_reported_as_success(self):
+        self.download.side_effect = release.InvalidRelease("asset smoke failed")
+        self.rejected("asset smoke failed", draft_created=True, patched=True)
 
     def test_wrong_public_tag_commit_is_not_reported_as_success(self):
         self.fixture.bad_tag_target = True

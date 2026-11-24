@@ -18,7 +18,11 @@ make_fixture() {
 }
 
 release=(python3 scripts/mobile_release.py)
-args=(--version-code 12345 --version-name 0.0.0-ci)
+case $# in
+  0) args=(--version-code 12345 --version-name 0.0.0-ci) ;;
+  2) args=(--version-code "$1" --version-name "$2") ;;
+  *) echo "Usage: $0 [version-code version-name]" >&2; exit 2 ;;
+esac
 "${release[@]}" verify-debug app/build/outputs/apk/debug/app-debug.apk
 "${release[@]}" stage-unsigned "${args[@]}" app/build/outputs/apk/release "$work/unsigned.apk"
 make_fixture first
@@ -35,7 +39,9 @@ if "${release[@]}" verify-apk "${args[@]}" --cert-file "$work/second.sha256" "$w
   exit 1
 fi
 grep -F 'APK signer does not match the public certificate anchor.' "$work/wrong-signer.log"
-if "${release[@]}" verify-apk --version-code 12346 --version-name 0.0.0-ci --cert-file "$work/first.sha256" \
+wrong_code=1
+if [[ ${args[1]} == 1 ]]; then wrong_code=2; fi
+if "${release[@]}" verify-apk --version-code "$wrong_code" --version-name "${args[3]}" --cert-file "$work/first.sha256" \
     "$work/spofify-mobile-release.apk" > "$work/wrong-version.log" 2>&1; then
   echo 'Unexpectedly accepted an APK with the wrong version code.' >&2
   exit 1

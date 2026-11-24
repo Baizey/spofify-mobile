@@ -5,6 +5,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -25,6 +27,10 @@ ASSET = "spofify-mobile-release.apk"
 RELEASE_ID = "dev.spofify.mobile.release"
 MAX_CODE = 2_100_000_000
 MAX_BYTES = 150 * 1024 * 1024
+MAX_LATEST_BYTES = 128 * 1024
+ASSET_CDN = "release-assets.githubusercontent.com"
+ASSET_MAX_REDIRECTS = 3
+ASSET_TIMEOUT = 120
 CERT_FILE = Path(__file__).with_name("mobile-release-cert.sha256")
 WAITS = (0, 2, 4, 8, 16, 30)
 SIGN_SECRETS = ("MOBILE_KEYSTORE_B64", "MOBILE_KEYSTORE_PASSWORD", "MOBILE_KEY_ALIAS", "MOBILE_KEY_PASSWORD")
@@ -158,8 +164,8 @@ class GitHub:
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def request(self, path, *, method="GET", payload=None, upload=None, missing=False):
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": "spofify-mobile-release",
-                   "X-GitHub-Api-Version": "2022-11-28"}
+        headers = {"Accept": "application/vnd.github+json", "Accept-Encoding": "identity",
+                   "User-Agent": "spofify-mobile-release", "X-GitHub-Api-Version": "2022-11-28"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         data = None
@@ -175,7 +181,10 @@ class GitHub:
         request = urllib.request.Request(origin + path, data=data, headers=headers, method=method)
         try:
             with self.opener.open(request, timeout=60) as response:
-                limit = 16 * 1024 * 1024
+                if path == "/releases/latest":
+                    need(response.status == 200 and response.headers.get("Content-Encoding", "identity").lower() == "identity",
+                         "Unexpected response status or encoding from public latest.")
+                limit = MAX_LATEST_BYTES if path == "/releases/latest" else 16 * 1024 * 1024
                 body = response.read(limit + 1)
                 need(len(body) <= limit, "GitHub API response exceeded size limit.")
                 return json.loads(body)
@@ -183,7 +192,7 @@ class GitHub:
             if missing and exc.code == 404:
                 return None
             raise InvalidRelease(f"GitHub API {method} {path} failed (HTTP {exc.code}).") from exc
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             raise InvalidRelease(f"GitHub API {method} {path} did not return readable JSON.") from exc
 
     def all(self, path):
@@ -229,6 +238,61 @@ def gate_history(auth, public, code, *, own_draft=None):
     need(code > highest, f"Version code {code} must exceed all existing mobile release/tag codes (max {highest}).")
 
 
+def browser_url(tag):
+    return f"https://github.com/{REPO}/releases/download/{tag}/{ASSET}"
+
+
+def approved_asset_redirect(location):
+    need(location and not re.search(r"[\x00-\x20\x7f\\#]", location), "Unsafe APK download redirect.")
+    parsed = urllib.parse.urlsplit(location)
+    need(parsed.scheme == "https" and parsed.netloc == ASSET_CDN and parsed.path.startswith("/"),
+         "APK download redirected outside the approved GitHub CDN.")
+    return location
+
+
+def verify_public_download(tag, size, digest):
+    """Fetch the same canonical APK bytes as the updater; never use API auth or redirects implicitly."""
+    need(tag_code(tag) is not None and 0 < size <= MAX_BYTES, "Invalid public APK tag or size.")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    url = browser_url(tag)
+    deadline = time.monotonic() + ASSET_TIMEOUT
+    for hop in range(ASSET_MAX_REDIRECTS + 1):
+        need(time.monotonic() < deadline, "Public APK download exceeded time limit.")
+        request = urllib.request.Request(url, headers={"Accept-Encoding": "identity", "User-Agent": "spofify-mobile-release"})
+        try:
+            with opener.open(request, timeout=30) as response:
+                need(response.status == 200 and response.headers.get("Content-Encoding", "identity").lower() == "identity",
+                     "Unexpected public APK response status or encoding.")
+                length = response.headers.get("Content-Length")
+                need(length is None or length.strip() == str(size), "Public APK Content-Length does not match signed APK.")
+                downloaded = 0
+                actual = hashlib.sha256()
+                while True:
+                    need(time.monotonic() < deadline, "Public APK download exceeded time limit.")
+                    chunk = response.read1(min(64 * 1024, size - downloaded + 1))
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    need(downloaded <= size, "Public APK exceeds the signed APK size.")
+                    actual.update(chunk)
+                need(downloaded == size, "Public APK size does not match signed APK.")
+                need("sha256:" + actual.hexdigest() == digest, "Public APK SHA-256 does not match signed APK.")
+                return
+        except urllib.error.HTTPError as exc:
+            with exc:
+                if exc.code not in (301, 302, 303, 307, 308):
+                    raise InvalidRelease(f"Anonymous APK download failed (HTTP {exc.code}).") from exc
+                need(hop < ASSET_MAX_REDIRECTS, "Public APK exceeded redirect limit.")
+                urls = exc.headers.get_all("Location", [])
+                need(len(urls) == 1, "Missing or ambiguous APK download redirect.")
+                try:
+                    url = approved_asset_redirect(urls[0])
+                except ValueError as invalid:
+                    raise InvalidRelease("Invalid APK download redirect.") from invalid
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise InvalidRelease("Anonymous APK download did not return readable bytes.") from exc
+
+
 def release_id(release):
     identifier = release.get("id")
     need(type(identifier) is int and identifier > 0, "GitHub did not return a valid release ID.")
@@ -245,12 +309,11 @@ def require_shape(release, identifier, tag, size, digest, *, draft, pending_dige
         return False
     need(len(assets) == 1 and isinstance(assets[0], dict), "Release must have exactly one asset.")
     asset = assets[0]
-    url = f"https://github.com/{REPO}/releases/download/{tag}/{ASSET}"
     need(asset.get("name") == ASSET and asset.get("state") == "uploaded",
          "Unexpected release asset name or upload state.")
     # Drafts may use GitHub's temporary "untagged-..." download URL; only the public URL is a contract.
     if not draft:
-        need(asset.get("browser_download_url") == url, "Unexpected public APK download URL.")
+        need(asset.get("browser_download_url") == browser_url(tag), "Unexpected public APK download URL.")
     need(type(asset.get("size")) is int and 0 < asset["size"] <= MAX_BYTES and asset["size"] == size,
          "GitHub asset size does not match the signed APK (or is over 150 MiB).")
     value = asset.get("digest")
@@ -308,6 +371,7 @@ def publish(auth, public, apk, code):
                 ref = f"refs/tags/{tag}"
                 need(git_commit(public.request(f"/git/ref/tags/{tag}"), ref) == commit,
                      "Published tag does not point to the verified public main commit.")
+                verify_public_download(tag, size, digest)
                 print(f"Verified public latest: {tag}, {ASSET}, {size} bytes, {digest}")
                 return
             except InvalidRelease as exc:

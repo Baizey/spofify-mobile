@@ -22,7 +22,7 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'Baizey/spofify-mobile' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    if: github.repository == 'Baizey/spofify-mobile' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.run_attempt == '1'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -30,18 +30,25 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Validate explicit version and public certificate anchor
         run: python3 scripts/mobile_release.py validate-inputs --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
+      # Bootstrap JVM for SDK tools/wrapper; Gradle provisions JetBrains Runtime 25 via Foojay.
       - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.7.1
         with:
           distribution: temurin
           java-version: '25'
       - name: Install Android SDK packages
         run: sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0'
-      - name: Build the universal unsigned release APK
+      - name: Gate the exact dispatch revision and prepare the unsigned APK
+        env:
+          ANDROID_USER_HOME: ${{ runner.temp }}/mobile-disposable-android-home
         run: |
-          ./gradlew --no-daemon "-PmobileReleaseVersionCode=$VERSION_CODE" "-PmobileReleaseVersionName=$VERSION_NAME" :app:assembleRelease
+          python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
+          ./gradlew --no-daemon "-PmobileReleaseVersionCode=$VERSION_CODE" "-PmobileReleaseVersionName=$VERSION_NAME" \
+            :core:test :app:testDebugUnitTest :app:testReleaseUnitTest :app:assembleDebug :app:assembleRelease
+          bash scripts/test-mobile-signing.sh "$VERSION_CODE" "$VERSION_NAME"
           python3 scripts/mobile_release.py stage-unsigned --version-code "$VERSION_CODE" --version-name "$VERSION_NAME" \
             app/build/outputs/apk/release "$RUNNER_TEMP/mobile-unsigned.apk"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -52,6 +59,7 @@ jobs:
           retention-days: 1
 
   sign:
+    if: github.run_attempt == '1'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -61,6 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -85,6 +94,7 @@ jobs:
           retention-days: 1
 
   publish:
+    if: github.run_attempt == '1'
     needs: sign
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -94,6 +104,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -112,7 +123,7 @@ jobs:
           owner: Baizey
           repositories: spofify-mobile-releases
           permission-contents: write
-      - name: Gate version, publish, and verify public latest
+      - name: Gate version, publish, and smoke-test the anonymous channel
         env:
           MOBILE_DISTRIBUTION_TOKEN: ${{ steps.distribution-token.outputs.token }}
         run: |
