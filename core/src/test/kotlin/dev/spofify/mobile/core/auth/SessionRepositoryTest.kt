@@ -351,61 +351,28 @@ class SessionRepositoryTest {
         val retired = requireNotNull(repo.onlineGrant.value)
         repo.refresh(); advanceUntilIdle()
         val current = requireNotNull(repo.onlineGrant.value)
-        assertFalse(repo.fallbackToManualOffline(retired)); assertFalse(policy.offline)
-        assertTrue(repo.fallbackToManualOffline(current)); assertTrue(policy.offline)
-        assertEquals(OnlineValidation.IDLE, repo.onlineValidation.value)
-        assertNull(repo.onlineGrant.value); assertTrue(repo.isCurrent(id))
-        assertFalse(repo.fallbackToManualOffline(current))
+        assertNotSame(retired, current)
+        assertFalse(policy.offline)
+        repo.recoverUnavailable()
+        assertSame(current, repo.onlineGrant.value)
+        assertTrue(repo.isCurrent(id))
         assertEquals(0, third.logoutCalls)
     }
 
-    @Test fun staleFallbackAfterBlockedPolicyWriteDoesNotRetireSuccessor() = runBlocking {
-        val policyWriteStarted = CompletableDeferred<Unit>()
-        val releasePolicyWrite = CountDownLatch(1)
-        val policy = object : ManualOfflineStore {
-            val stored = AtomicBoolean(false)
-            override fun read() = stored.get()
-            override fun write(enabled: Boolean) {
-                if (enabled) {
-                    policyWriteStarted.complete(Unit)
-                    check(releasePolicyWrite.await(5, TimeUnit.SECONDS)) { "Blocked write was not released" }
-                }
-                stored.set(enabled)
-            }
-        }
-        val first = Api()
-        val successor = Api().apply {
-            loginReply = AuthReply(summary("successor"), cookie(), "rolling-v1")
-            sessionReply = AuthReply(summary("successor"), null, null)
-        }
-        val logout = Api()
-        val logoutCreated = CompletableDeferred<Unit>()
-        val clients = ConcurrentLinkedQueue(listOf(first, logout, successor))
-        val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val repo = SessionRepository(Sessions(stored()), Logins(), AuthApiFactory {
-            clients.remove().also { if (it === logout) logoutCreated.complete(Unit) }
-        }, owner, manualOfflineStore = policy)
-        try {
-            withTimeout(5_000) {
-                repo.start()
-                val firstGrant = repo.onlineGrant.first { it != null }!!
-                val staleFallback = owner.async { repo.fallbackToManualOffline(firstGrant) }
-                policyWriteStarted.await()
-                repo.signOut()
-                logoutCreated.await()
-                repo.signIn(origin.value, "successor", "fixture-password")
-                val next = repo.onlineGrant.first { it?.identity?.accountId == "successor" }!!
-                releasePolicyWrite.countDown()
-                assertFalse(staleFallback.await())
-                assertSame(next, repo.onlineGrant.value)
-                assertTrue(repo.isCurrent(next.identity))
-                assertFalse(repo.manualOffline.value)
-                assertFalse(policy.stored.get())
-            }
-        } finally {
-            releasePolicyWrite.countDown()
-            owner.coroutineContext.job.cancelAndJoin()
-        }
+    @Test fun transientStartupExhaustionKeepsPolicyAndCanRecoverAutomatically() = runTest {
+        val policy = Policy()
+        val unreachable = Api().apply { sessionError = AuthFailure(AuthFailure.Kind.UNAVAILABLE, transient = true) }
+        val reachable = Api()
+        val repo = repository(Sessions(stored()), Logins(), unreachable, reachable, policy = policy)
+        repo.start(); advanceUntilIdle()
+        val id = (repo.state.value as AuthState.Authenticated).identity
+        assertEquals(4, unreachable.sessionCalls)
+        assertFalse(policy.offline)
+        assertNull(repo.onlineGrant.value)
+        repo.recoverUnavailable(); advanceUntilIdle()
+        assertEquals(id, repo.onlineGrant.value?.identity)
+        assertFalse(policy.offline)
+        assertEquals(1, reachable.sessionCalls)
     }
 
     @Test fun structurallyInvalidStoredCookieCannotGrantLocalOrNetworkAuthority() = runTest {

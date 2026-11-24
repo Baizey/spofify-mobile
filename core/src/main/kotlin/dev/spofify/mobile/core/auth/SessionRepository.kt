@@ -77,6 +77,7 @@ class SessionRepository(
     private var appBackgrounded = false
     private var foregroundEpoch = 0L
     private var validationRetry: Job? = null
+    private var recoverable = false
     private var persistenceTail: Job? = null
     private var sessionSaveFailed = false
     private var profileSaveFailed = false
@@ -337,15 +338,12 @@ class SessionRepository(
      * use an existing socket only; it must check actual playback ownership itself.
      */
     suspend fun setManualOffline(enabled: Boolean, beforeDisconnect: suspend (AccountIdentity) -> Unit = {}) {
-        changeManualMode(enabled, null, beforeDisconnect)
+        changeManualMode(enabled, beforeDisconnect)
     }
 
-    /** Call outside grant-owned work after exhausting the current socket handshake batch. */
-    suspend fun fallbackToManualOffline(grant: OnlineGrant): Boolean = changeManualMode(true, grant) {}
-
     private suspend fun changeManualMode(
-        enabled: Boolean, required: OnlineGrant?, beforeDisconnect: suspend (AccountIdentity) -> Unit,
-    ): Boolean = modeChanges.withLock {
+        enabled: Boolean, beforeDisconnect: suspend (AccountIdentity) -> Unit,
+    ): Unit = modeChanges.withLock {
         val alreadySet = synchronized(lock) {
             check(mutablePolicyLoaded.value) { "Session policy not loaded" }
             mutableOffline.value == enabled
@@ -356,33 +354,14 @@ class SessionRepository(
                 if (bootstrapAllowed && mutableGrant.value == null && mutableValidation.value != OnlineValidation.VALIDATING)
                     validateLocalLocked() else null
             }?.start()
-            return@withLock required == null
+            return@withLock
         }
         val store = checkNotNull(manualOfflineStore) { "No durable manual mode store" }
-        // Fence explicit commands at serialized transition admission, before dispatching
-        // the durable write or waiting for playback handoff. A failed write leaves the
-        // installation-wide gate closed because durability could not be established.
-        if (enabled && required == null) onInstallationNetworkAllowed(false)
+        if (enabled) onInstallationNetworkAllowed(false)
         withContext(io + NonCancellable) {
-            // Accept fallback only while the failing socket batch still owns the current grant.
-            if (required != null && synchronized(lock) { mutableGrant.value !== required }) return@withContext false
-            if (enabled && required != null) onInstallationNetworkAllowed(false)
-            store.write(enabled)
-            if (required != null) {
-                // The preference write may have been blocked while sign-out or validation
-                // installed a successor. Commit the in-memory transition only if still current.
-                val transition = synchronized(lock) {
-                    if (mutableGrant.value === required) switchModeLocked(enabled) else null
-                }
-                if (transition == null) {
-                    // modeChanges is still held: restore the unchanged policy before any
-                    // newer explicit mode command can write to the store.
-                    store.write(!enabled)
-                    onInstallationNetworkAllowed(enabled)
-                    return@withContext false
-                }
-                completeModeSwitch(transition)
-                return@withContext true
+            try { store.write(enabled) } catch (failure: Exception) {
+                if (enabled) onInstallationNetworkAllowed(true)
+                throw failure
             }
             val owner = synchronized(lock) {
                 handingOff = true
@@ -395,7 +374,6 @@ class SessionRepository(
                 if (!enabled) onInstallationNetworkAllowed(true)
                 completeModeSwitch(transition)
             }
-            true
         }
     }
 
@@ -494,7 +472,16 @@ class SessionRepository(
         }
     }
 
-    /** Main-safe foreground revalidation of a live grant; never restarts a terminal validation. */
+    /** App-owned recovery timer or connectivity hint, never a screen-triggered retry. */
+    fun recoverUnavailable() {
+        val job = synchronized(lock) {
+            if (!bootstrapAllowed || appBackgrounded || !recoverable || mutableValidation.value != OnlineValidation.UNAVAILABLE) return
+            validateLocalLocked()
+        }
+        job?.start()
+    }
+
+    /** Main-safe foreground revalidation of a live grant. */
     fun refresh() {
         val job = synchronized(lock) {
             if (!bootstrapAllowed || mutableGrant.value == null) return
@@ -583,6 +570,7 @@ class SessionRepository(
                     api?.cancel()
                     api = null
                     mutableState.value = AuthState.Authenticated(requireNotNull(identity), AuthNotice.CONNECTION_FAILED)
+                    recoverable = error is AuthFailure && error.canRetryValidation()
                     mutableValidation.value = OnlineValidation.UNAVAILABLE
                     null
                 }
@@ -693,6 +681,7 @@ class SessionRepository(
         generation++
         mutableGrant.value = null
         mutableValidation.value = OnlineValidation.IDLE
+        recoverable = false
         operation?.cancel()
         featureJobs.toList().forEach { it.cancel() }
         api?.cancel()

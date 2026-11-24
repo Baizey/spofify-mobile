@@ -24,8 +24,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
     private val sessions: SessionRepository, parentScope: CoroutineScope, storage: MusicStorage,
     requestPlaybackStart: suspend () -> Boolean, canContinuePlayback: () -> Boolean,
     private val acceptsNotificationControl: (MediaSession, Intent) -> Boolean,
-    private val reconcile: () -> Unit, private val detachService: () -> Unit,
-    private val onExhausted: suspend (OnlineGrant, stillCurrent: () -> Boolean) -> Unit) {
+    private val reconcile: () -> Unit, private val detachService: () -> Unit) {
     val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]))
     val cache = AutomaticMusicCache(app, sessions, identity, storage, scope)
     val music = AccountMusic(app, identity, sessions, storage, cache, scope)
@@ -137,7 +136,6 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
                         Log.w("SpofifyPlayer", "Playback connection attempts exhausted: phase=${diagnostic.phase.name} " +
                             "status=${diagnostic.failure?.name ?: "NOT_ESTABLISHED"}")
                     }
-                    onExhausted(owner, stillCurrent)
                 })
                 .also { it.start(explicit) }
         }

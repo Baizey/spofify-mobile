@@ -9,9 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
-/** Four serial admission + first-snapshot attempts at startup or after an established loss.
- * The Core job bounds each handshake. The app does not delay, replay commands, or negotiate.
- */
+/** One account-owned loop: bounded handshake bursts, then spaced recovery probes. */
 internal class PlaybackReconnect(
     private val scope: CoroutineScope,
     private val views: StateFlow<PlaybackView>,
@@ -55,8 +53,14 @@ internal class PlaybackReconnect(
                 }
                 if (++failures == 4) {
                     onExhausted { current() && !views.value.superseded }
-                    return@launch
                 }
+                kotlinx.coroutines.delay(when (failures) {
+                    1 -> 1_000L
+                    2 -> 2_000L
+                    3 -> 4_000L
+                    else -> 30_000L
+                })
+                failures = failures.coerceAtMost(4)
             }
         }
     }

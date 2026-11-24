@@ -69,6 +69,14 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         if (started) return
         started = true
         scope.launch {
+            sessions.onlineValidation.collectLatest { validation ->
+                if (validation == OnlineValidation.UNAVAILABLE) while (isActive) {
+                    delay(30_000)
+                    sessions.recoverUnavailable()
+                }
+            }
+        }
+        scope.launch {
             sessions.state.collect { auth ->
                 val identity = (auth as? AuthState.Authenticated)?.identity
                 if (mutable.value?.identity == identity) return@collect
@@ -83,8 +91,7 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
                         requestPlaybackStart = { admitPlaybackStart(identity) },
                         canContinuePlayback = { canContinuePlayback(identity) }, acceptsNotificationControl = ::acceptsNotificationControl,
                         reconcile = { current?.let(::reconcileServiceFor) },
-                        detachService = { current?.let(::stopServiceFor) },
-                        onExhausted = ::persistFallback)
+                        detachService = { current?.let(::stopServiceFor) })
                     mutable.value = player
                     player.start()
                 }
@@ -102,17 +109,6 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         }
     }
 
-    private suspend fun persistFallback(grant: OnlineGrant, stillCurrent: () -> Boolean) {
-        modeChanges.withLock {
-            val player = current?.takeIf { it.identity == grant.identity && stillCurrent() } ?: return
-            try {
-                withContext(NonCancellable) {
-                    if (sessions.fallbackToManualOffline(grant) && current === player) player.applyMode(manual = true)
-                }
-            } catch (_: Exception) { Log.w("SpofifyPlayer", "Could not persist offline playback mode") }
-        }
-    }
-
     private suspend fun setMode(player: NativePlayer, enabled: Boolean) {
         // Failure leaves the previous durable policy intact. A committed change must publish
         // even if the screen's caller went away while persistence was running.
@@ -126,7 +122,7 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         }
     }
 
-    fun foreground() { current?.foreground() }
+    fun foreground() { sessions.recoverUnavailable(); current?.foreground() }
 
     /** Installation can stop this process. Protect local output and in-flight starts, not remote playback. */
     internal fun blocksAppUpdate(): Boolean {
