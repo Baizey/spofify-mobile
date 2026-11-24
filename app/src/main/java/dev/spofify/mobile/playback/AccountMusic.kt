@@ -84,7 +84,14 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
                     withContext(Dispatchers.IO) {
                         val job = coroutineContext.job
                         store.download(SongKey(owner, track.id), track.name, cache.options.value.cap,
-                            { job.isActive && sessions.onlineGrant.value === grant }, { api.prepareMedia(track.id) }) { media, consume ->
+                            { job.isActive && sessions.onlineGrant.value === grant }, { api.prepareMedia(track.id) },
+                            commit = { publish ->
+                                var committed = false
+                                sessions.publishIfCurrent(grant) {
+                                    if (job.isActive) { publish(); committed = true }
+                                }
+                                committed
+                            }) { media, consume ->
                             sessions.versionedAudio(identity, media).use { consume(it.input) }
                         }
                     }
@@ -93,6 +100,12 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { if (sessions.isCurrent(identity)) failure() }
             finally { trackDownloads.update { it - track.id } }
+        }
+    }
+
+    fun verifyDownloads() {
+        scope.launch(Dispatchers.IO) {
+            storage.initialized.await()?.verifyDownloads(owner) { sessions.isCurrent(identity) }
         }
     }
 

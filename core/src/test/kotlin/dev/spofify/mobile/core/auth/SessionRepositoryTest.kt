@@ -136,7 +136,7 @@ class SessionRepositoryTest {
         assertTrue(modes.isEmpty())
     }
 
-    @Test fun installationNetworkRemainsFencedIfTheOfflineWriteFails() = runTest {
+    @Test fun failedOfflineWriteRestoresInstallationNetworkEligibility() = runTest {
         val modes = mutableListOf<Boolean>()
         val policy = Policy()
         val repo = repository(Sessions(null), Logins(), policy = policy, installationNetworkAllowed = modes::add)
@@ -144,7 +144,63 @@ class SessionRepositoryTest {
         policy.unwritable = true
         assertTrue(runCatching { repo.setManualOffline(true) }.exceptionOrNull() is IOException)
         assertFalse(repo.manualOffline.value)
-        assertEquals(listOf(true, false), modes)
+        assertEquals(listOf(true, false, true), modes)
+    }
+
+    @Test fun manualAdmissionFencesNewAndInFlightWorkBeforeBlockedPreferenceWrite() = runBlocking {
+        val storeEntered = CompletableDeferred<Unit>()
+        val releaseStore = CountDownLatch(1)
+        val workerEntered = CompletableDeferred<Unit>()
+        val releaseWorker = CompletableDeferred<Unit>()
+        val attemptedPublication = CompletableDeferred<Boolean>()
+        val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val api = Api()
+        val repo = SessionRepository(Sessions(stored()), Logins(), AuthApiFactory { api }, owner,
+            manualOfflineStore = object : ManualOfflineStore {
+                override fun read() = false
+                override fun write(enabled: Boolean) {
+                    storeEntered.complete(Unit)
+                    check(releaseStore.await(5, TimeUnit.SECONDS))
+                    throw IOException("Denied")
+                }
+            })
+        try {
+            withTimeout(5_000) {
+                repo.start()
+                val grant = requireNotNull(repo.onlineGrant.first { it != null })
+                val old = owner.launch {
+                    repo.withOnlineGrant(grant) {
+                        withContext(NonCancellable) {
+                            workerEntered.complete(Unit)
+                            releaseWorker.await()
+                            attemptedPublication.complete(repo.publishIfCurrent(grant) { fail("Late result published") })
+                        }
+                    }
+                }
+                workerEntered.await()
+                val entering = owner.async { runCatching { repo.setManualOffline(true) } }
+                storeEntered.await()
+                assertNull(repo.onlineGrant.value)
+                assertFalse(repo.manualOffline.value)
+                repo.refresh()
+                assertEquals(1, api.sessionCalls)
+                val blocked = runCatching { repo.withOnlineGrant(grant) { fail("New work admitted"); Unit } }
+                assertTrue(blocked.exceptionOrNull() is CancellationException)
+                releaseWorker.complete(Unit)
+                assertFalse(attemptedPublication.await())
+                old.join()
+                releaseStore.countDown()
+                assertTrue(entering.await().exceptionOrNull() is IOException)
+                val restored = requireNotNull(repo.onlineGrant.value)
+                assertNotSame(grant, restored)
+                assertEquals(grant.identity, restored.identity)
+                assertTrue(repo.withOnlineGrant(restored) { true })
+            }
+        } finally {
+            releaseStore.countDown()
+            releaseWorker.complete(Unit)
+            owner.coroutineContext.job.cancelAndJoin()
+        }
     }
 
     private fun transientUnavailable() = AuthFailure(AuthFailure.Kind.UNAVAILABLE, transient = true)

@@ -582,13 +582,28 @@ class AccountChannelTest {
         assertEquals(2L, f.view.current?.key)
     }
 
-    @Test fun offlineSelectionDoesNotBecomeAnOnlineClaim() = runTest {
+    @Test fun transportAndPersonalRecoverDuringRepeatingLocalPlaybackWithoutClaimOrReplacement() = runTest {
         val f = Fixture(this, shareDetachedPlayback = false)
         assertTrue(f.channel.playTrack(PlaybackTrackReference(rows.first().id)))
+        assertTrue(f.channel.setRepeat("one"))
         runCurrent()
+        val installed = f.audio.starts.single()
+        val pauses = f.audio.pauses
         f.connect()
         assertNull(f.claims.last())
         assertNull(f.reattach.last())
+        f.snapshot(owner = "other", cursor = first.copy(key = rows[1].key))
+        assertEquals(PlaybackConnectionState.READY, f.view.connection)
+        assertFalse(f.view.offline)
+        assertTrue(f.view.isolatedOutput)
+        assertTrue(f.view.isPlaying)
+        assertEquals(rows.first().id, f.view.current?.id)
+        assertEquals(listOf(installed), f.audio.starts)
+        assertEquals(pauses, f.audio.pauses)
+        assertEquals("one", f.view.snapshot?.state?.repeat)
+        assertTrue(f.channel.sendPersonal(fields("type" to "renamePlaylist", "playlistId" to "p", "name" to "Updated")))
+        assertTrue(f.socket.sent.any { it.kind == "personal" })
+        assertTrue(f.socket.commands().isEmpty())
     }
 
     @Test fun claimRepairAfterNextEchoDoesNotReloadNativeSuccessorAlreadyStartedByEof() = runTest {

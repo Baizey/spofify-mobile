@@ -187,12 +187,16 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     private fun offline(row: Row) = row.refs.isNotEmpty() || row.key in playlists.required
     fun hasOfflineReference(key: SongKey) = lock.withLock { entries[key]?.row?.let(::offline) == true }
     private fun meta(file: File) = File(dir, file.nameWithoutExtension + ".meta")
-    private fun save(entry: Entry, row: Row) {
+    private fun save(entry: Entry, row: Row, commit: ((() -> Unit) -> Boolean)? = null, durable: () -> Unit = {}): Boolean {
         val tmp = File.createTempFile("ref", ".tmp", dir)
         try {
             tmp.outputStream().use { it.write(Json.encodeToString(row).toByteArray()); it.fd.sync() }
-            Files.move(tmp.toPath(), meta(entry.file).toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
-            entry.row = row
+            val replace = {
+                Files.move(tmp.toPath(), meta(entry.file).toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+                entry.row = row
+                durable()
+            }
+            return commit?.invoke(replace) ?: run { replace(); true }
         } finally { tmp.delete() }
     }
     private fun unused(entry: Entry) = entry.readers == 0 && !entry.row.auto && !offline(entry.row) && entry.row.drafts.isEmpty()
@@ -229,7 +233,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             if (!canOpen(entry)) { invalidate(entry); return null }
             touch(entry)
             entry.readers++
-            return PinnedSong(entry.file, entry.row.size, current) {
+            return PinnedSong(entry.file, entry.row.size, current, downloaded = offline(entry.row)) {
                 lock.withLock {
                     entry.readers--
                     if (!entry.row.auto && !offline(entry.row)) {
@@ -246,10 +250,17 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         entry.file.isFile && entry.file.inputStream().use { it.channel.size() == entry.row.size }
     }.getOrDefault(false)
 
-    private fun invalidate(entry: Entry) {
+    private fun invalidate(entry: Entry, publish: Boolean = true) {
         entries.remove(entry.row.key, entry)
         staleMetadata[meta(entry.file).toPath()] = entry.row.key
-        refresh()
+        if (publish) refresh()
+    }
+
+    fun verifyDownloads(owner: MusicOwner, current: () -> Boolean) = lock.withLock {
+        if (!current()) return@withLock
+        val invalid = entries.values.filter { it.row.key.owner == owner && offline(it.row) && !canOpen(it) }
+        invalid.forEach { invalidate(it, publish = false) }
+        if (invalid.isNotEmpty()) refresh()
     }
 
     fun clearAuto(owner: MusicOwner, id: String? = null) = lock.withLock {
@@ -405,23 +416,26 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     /** Network and digest never hold the index lock. The ticket also fences clear during descriptor lookup. */
     suspend fun fill(key: SongKey, title: String, cap: Int, priority: List<String>, current: () -> Boolean,
         prepare: suspend () -> OfflineMediaDescriptor, download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
-        fillShared(key, title, cap, priority, null, false, current, prepare, null, download)
+        fillShared(key, title, cap, priority, null, null, current, prepare, null, download)
 
     suspend fun download(key: SongKey, title: String, cap: Int, current: () -> Boolean,
-        prepare: suspend () -> OfflineMediaDescriptor, consume: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
-        fillShared(key, title, cap, emptyList(), null, true, current, prepare, null, consume)
+        prepare: suspend () -> OfflineMediaDescriptor,
+        commit: (() -> Unit) -> Boolean,
+        consume: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
+        fillShared(key, title, cap, emptyList(), null, commit, current, prepare, null, consume)
 
     fun removeDownload(key: SongKey, cap: Int) = offlineReference(key, DIRECT_DOWNLOAD, false, cap)
 
     internal suspend fun stage(playlistId: String, key: SongKey, title: String, cap: Int, current: () -> Boolean,
         prepare: suspend () -> OfflineMediaDescriptor, trace: OfflineAttemptTrace? = null,
         download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
-        fillShared(key, title, cap, emptyList(), playlistId, false, current, prepare, trace, download)
+        fillShared(key, title, cap, emptyList(), playlistId, null, current, prepare, trace, download)
 
-    private suspend fun fillShared(key: SongKey, title: String, cap: Int, priority: List<String>, playlistId: String?, direct: Boolean,
+    private suspend fun fillShared(key: SongKey, title: String, cap: Int, priority: List<String>, playlistId: String?, commitDownload: ((() -> Unit) -> Boolean)?,
         current: () -> Boolean, prepare: suspend () -> OfflineMediaDescriptor, trace: OfflineAttemptTrace?,
         download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) {
         require(cap in CacheOptions.caps)
+        val direct = commitDownload != null
         val auto = playlistId == null && !direct
         val ticket = Ticket(auto)
         fun live() = (!auto || !ticket.cleared) && current()
@@ -441,10 +455,14 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                                 save(it, before.copy(drafts = before.drafts + playlistId))
                                 try { playlists.syncDirectory() } finally { publishStage(it, before) }
                             }
-                        } else if (direct) {
-                            save(it, it.row.copy(refs = it.row.refs + DIRECT_DOWNLOAD))
-                            playlists.syncDirectory()
-                            refresh()
+                        } else if (commitDownload != null) {
+                            val previous = it.row
+                            if (DIRECT_DOWNLOAD !in previous.refs) {
+                                save(it, previous.copy(refs = previous.refs + DIRECT_DOWNLOAD), commitDownload) {
+                                    playlists.syncDirectory()
+                                    refresh()
+                                }
+                            }
                         } else if (!it.row.auto) retainAuto(it, cap, priority)
                         return
                     }
@@ -523,6 +541,16 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 val entry = Entry(File(dir, "${UUID.randomUUID()}.blob"), row, 0)
                 Files.move(tmp.toPath(), entry.file.toPath(), ATOMIC_MOVE)
                 try {
+                    if (commitDownload != null) {
+                        if (!canOpen(entry)) throw IOException("Verified audio cannot be opened")
+                        if (!save(entry, row, commitDownload) {
+                                playlists.syncDirectory()
+                                entries[key] = entry
+                                touch(entry)
+                                refresh()
+                            }) Files.deleteIfExists(entry.file.toPath())
+                        return
+                    }
                     save(entry, row)
                     if (!auto) playlists.syncDirectory()
                 } catch (e: Exception) {
@@ -536,7 +564,6 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 }
                 touch(entry); entries[key] = entry
                 if (auto) try { trim(key.owner, cap, priority) } finally { refresh() }
-                else if (direct) refresh()
                 else publishStage(entry)
             }
         } finally {

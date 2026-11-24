@@ -56,7 +56,8 @@ class MusicBlobStoreTest {
 
     @Test fun explicitDownloadSurvivesReopenAndEvictionButMissingFileRevokesIt() = runBlocking {
         val store = MusicBlobStore(root.root)
-        suspend fun download(data: ByteArray) = store.download(key, "Song", 3, { true }, { descriptor(key.id) }) { _, read ->
+        suspend fun download(data: ByteArray) = store.download(key, "Song", 3, { true }, { descriptor(key.id) },
+            commit = { publish -> publish(); true }) { _, read ->
             read(data.inputStream())
         }
         assertTrue(runCatching { download(bytes.copyOf(2)) }.isFailure)
@@ -72,6 +73,33 @@ class MusicBlobStoreTest {
         assertNull(reopened.pin(key, downloadOnly = true) { true })
         assertTrue(reopened.songs.value.isEmpty())
         assertTrue(MusicBlobStore(root.root).songs.value.isEmpty())
+    }
+
+    @Test fun existingAutoCannotBecomeDownloadedWhenGrantRetiresWhileCommitIsHeld() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        store.put()
+        val reachedCommit = CompletableDeferred<Unit>()
+        val releaseCommit = java.util.concurrent.CountDownLatch(1)
+        val live = java.util.concurrent.atomic.AtomicBoolean(true)
+        try {
+            withTimeout(5_000) {
+                val promotion = launch(Dispatchers.IO) {
+                    store.download(key, "Song", 3, live::get, { error("Must reuse verified bytes") }, commit = { publish ->
+                        reachedCommit.complete(Unit)
+                        check(releaseCommit.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                        if (live.get()) { publish(); true } else false
+                    }) { _, _ -> error("Must not transfer bytes") }
+                }
+                reachedCommit.await()
+                live.set(false)
+                releaseCommit.countDown()
+                promotion.join()
+            }
+        } finally { releaseCommit.countDown() }
+        assertFalse(store.songs.value.single().offline)
+        val reopened = MusicBlobStore(root.root)
+        assertTrue(reopened.songs.value.single().auto)
+        assertNull(reopened.pin(key, downloadOnly = true) { true })
     }
 
     @Test fun recoveryDiscardsOrphanStagingAndSameLengthCorruption() = runBlocking {

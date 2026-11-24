@@ -13,6 +13,7 @@ internal fun playbackNotice(view: PlaybackView): String? = when {
 
 internal fun playbackFailureNotice(error: String?): String? = when (error) {
     "blocked" -> "Audio output unavailable"
+    "connection" -> "Paused: connection lost"
     "media", "unavailable" -> "Audio unavailable"
     else -> null
 }

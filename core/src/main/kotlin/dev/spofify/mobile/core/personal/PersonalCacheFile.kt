@@ -3,7 +3,10 @@ package dev.spofify.mobile.core.personal
 import dev.spofify.mobile.core.auth.AccountIdentity
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.channels.FileChannel
 import java.nio.file.Files
+import java.nio.file.StandardOpenOption.READ
+import java.time.Instant
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.security.MessageDigest
@@ -19,7 +22,9 @@ class PersonalCacheFile(root: File, identity: AccountIdentity) {
 
     fun read(): PersonalCacheSnapshot = runCatching {
         require(file.length() in 1L..MAX_BYTES.toLong())
-        Json.decodeFromString<PersonalCacheSnapshot>(file.readText())
+        Json.decodeFromString<PersonalCacheSnapshot>(file.readText()).also { data ->
+            (data.recent + data.localPlays).forEach { Instant.parse(it.playedAt) }
+        }
     }.getOrDefault(PersonalCacheSnapshot())
 
     fun write(snapshot: PersonalCacheSnapshot, commit: (() -> Unit) -> Unit = { it() }) {
@@ -29,7 +34,12 @@ class PersonalCacheFile(root: File, identity: AccountIdentity) {
         val temporary = Files.createTempFile(directory.toPath(), ".personal-", ".tmp")
         try {
             FileOutputStream(temporary.toFile()).use { it.write(bytes); it.fd.sync() }
-            commit { Files.move(temporary, file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING) }
+            var published = false
+            commit {
+                Files.move(temporary, file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+                published = true
+            }
+            if (published) FileChannel.open(directory.toPath(), READ).use { it.force(true) }
         } finally {
             Files.deleteIfExists(temporary)
         }

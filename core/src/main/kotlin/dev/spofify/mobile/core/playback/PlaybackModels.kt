@@ -132,6 +132,8 @@ data class PlaybackView(
     /** Increases on each completed handshake, even if READY and loss coalesce for observers. */
     val established: Long = 0,
     val transferPending: Boolean = false,
+    /** An existing on-device visit remains private after transport recovery. */
+    val isolatedOutput: Boolean = false,
 ) {
     val current: PlaybackTrack? get() = snapshot?.state?.current
     val queue: List<PlaybackTrack> get() = snapshot?.state?.queue.orEmpty()

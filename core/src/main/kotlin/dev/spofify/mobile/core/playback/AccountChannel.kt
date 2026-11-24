@@ -28,6 +28,7 @@ class AccountChannel(
     private var manual = false
     private var superseded = false
     private var online = false
+    private var retainedLocal = false
     @Volatile private var localAuthority = true
     private var deviceId = ""
     private var connectionId = ""
@@ -77,14 +78,14 @@ class AccountChannel(
     private val history = PlaybackHistory(clock, recordPlay)
     private fun sampleHistory(facts: AudioFacts) {
         val q = engine.state.value
-        history.sample(q.current, q.occurrence?.eventId, sessionId.takeIf { isOwner() }, facts, !online)
+        history.sample(q.current, q.occurrence?.eventId, sessionId.takeIf { isOwner() }, facts, !online || retainedLocal)
     }
     private val engine = LocalPlaybackController(audio, object : LocalPlaybackLibrary by library {
         override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) =
-            if (online) isAuthorized() else library.hasAudio(track, isAuthorized)
+            if (online && !retainedLocal) isAuthorized() else library.hasAudio(track, isAuthorized)
     }, scope, { localAuthority && current() }, onNaturalEnd = ::ended, onObserved = ::observed,
         onFailure = ::failed, outputVersion = { owner.generation })
-    private val nativeView = scope.launch { engine.state.collect { if (!online) publish() } }
+    private val nativeView = scope.launch { engine.state.collect { if (!online || retainedLocal) publish() } }
     private val ticker = scope.launch {
         while (isActive) {
             delay(250)
@@ -118,7 +119,7 @@ class AccountChannel(
     }
     fun sendPersonal(command: JsonObject) = online && send(fields("type" to "personal", "command" to command))
     fun matchesLocalAudio(binding: AudioBinding): Boolean = localAuthority && engine.operationIsCurrent(binding)
-    private fun isOwner() = online && owner.deviceId == deviceId
+    private fun isOwner() = online && !retainedLocal && owner.deviceId == deviceId
     private fun localQueue(): AccountState = AccountState.from(engine.state.value)
     private fun projected() = projection.project(confirmed, pending.values)
     private fun displayBasis(): AccountState = if (isOwner() && nativeAhead() && confirmed.queue.any { it.key == nativeCursor.key })
@@ -128,7 +129,7 @@ class AccountChannel(
         val v = view.value
         val q: PlaybackQueueState
         var fact: AccountObservation? = null
-        if (!online && !superseded) {
+        if (!online && !superseded || retainedLocal) {
             q = engine.state.value
         } else {
             // Do not roll an owner UI back to the outgoing row while EOF is in flight.
@@ -150,14 +151,14 @@ class AccountChannel(
         }
         val outputVersion = owner.generation
         val p = PlaybackStatus(outputVersion, revision, sequence, q.occurrence?.eventId.orEmpty(),
-            if (online || superseded) fact != null else q.current != null, q.elapsed, q.duration,
+            if (!retainedLocal && (online || superseded)) fact != null else q.current != null, q.elapsed, q.duration,
             q.isPlaying, q.isBuffering, q.isLoading, q.error)
         val snap = PlaybackSnapshot(sessionId, revision, outputVersion, q, p,
             if (online) devices.map { PlaybackDevice(it.deviceId, it.name, true, it.canPlay) } else emptyList(),
             if (online) owner.deviceId.orEmpty() else "", if (isOwner()) connectionId else "", null, 0)
         val next = PlaybackView(connection, sessionId, connectionId, deviceId, snap, p, error,
             localAuthority, !online && !superseded, superseded, established,
-            transferPending = online && pending.values.any { it.command.action.kind == "select" })
+            transferPending = online && pending.values.any { it.command.action.kind == "select" }, isolatedOutput = retainedLocal)
         if (next != v) view.value = next
     }
 
@@ -257,7 +258,7 @@ class AccountChannel(
     }
 
     private fun detach(replaced: Boolean) {
-        val fallback = if (!replaced && online && !isOwner()) {
+        val fallback = if (!replaced && !retainedLocal && online && !isOwner()) {
             // One queue per account: a controller keeps the latest confirmed shared
             // traversal, never its old isolated queue or an optimistic prediction.
             val measured = actual?.takeIf { it.matches(confirmed.cursor) }
@@ -267,13 +268,14 @@ class AccountChannel(
         if (isOwner() && !replaced && !nativeAhead()) detached = Detached(sessionId, owner.generation, revision, confirmed.cursor.occurrence)
         // Do not smuggle an unconfirmed/rejected online transition back as detached progress.
         if (replaced || nativeAhead()) detached = null
-        if (replaced || online && !isOwner()) {
+        if (replaced || !retainedLocal && online && !isOwner()) {
             localAuthority = false
             engine.resetOutput()
             nativeCursor = AccountCursor.Empty
             nativeFact = null
         }
         online = false
+        retainedLocal = false
         superseded = replaced
         localAuthority = !replaced
         advances.clear()
@@ -313,6 +315,8 @@ class AccountChannel(
             nextRevision == revision && next.cursor == old.cursor
         claimRepairFollowsCommit = false
         val local = localQueue()
+        if (!previouslyOnline && !shareDetachedPlayback && localAuthority &&
+            (local.cursor.desiredPlaying || engine.state.value.error == "connection")) retainedLocal = true
         // The matching snapshot, not the hello alone, proves what was accepted. An operation
         // started after hello (e.g. an isolated seek) isn't covered by that acknowledgement.
         val acceptedClaim = nextOwner.deviceId == deviceId && !previouslyOnline && localAtHello?.state?.cursor == next.cursor
@@ -364,6 +368,12 @@ class AccountChannel(
         advances.addAll(buffered)
         transportCommit = null
         claimReconciliation = null
+        if (retainedLocal) {
+            // The socket is recovered (including personal updates) but this local visit
+            // remains private. Do not replace its queue or report progress to the room.
+            publish()
+            return
+        }
         val own = isOwner()
         if (!own) {
             localAuthority = false
@@ -673,7 +683,7 @@ class AccountChannel(
     private fun ended(q: PlaybackQueueState, f: AudioFacts) {
         if (!localAuthority) return
         sampleHistory(f)
-        if (!online) {
+        if (!online || retainedLocal) {
             ++localAction
             engine.advanceAvailable(q)
             publish()
@@ -754,7 +764,7 @@ class AccountChannel(
 
     private fun issue(action: JsonObject, offline: () -> Boolean = { false }): Boolean {
         if (!current() || superseded || connection == PlaybackConnectionState.CLOSED || !addressableAccountChoice(action)) return false
-        if (!online) {
+        if (!online || retainedLocal && action.kind !in setOf("play", "select")) {
             val before = localQueue().cursor
             val applied = offline()
             if (applied && localQueue().cursor != before) ++localAction
@@ -773,6 +783,13 @@ class AccountChannel(
             AccountBasis(sessionId, owner.generation, revision, c.occurrence, c.key.takeIf { it != 0L }, successor), action)
         val frame = JsonObject(playbackJson.encodeToJsonElement(cmd).jsonObject + fields("type" to "command"))
         if (!send(frame)) return false
+        if (retainedLocal) {
+            retainedLocal = false
+            engine.resetOutput()
+            localAuthority = isOwner()
+            nativeCursor = confirmed.cursor
+            nativeRevision = revision
+        }
         pending[cmd.id] = projection.prepare(cmd, projected())
         timeouts[cmd.id] = clock.monotonicMs() + SETTLEMENT_MS
         error = null

@@ -25,11 +25,15 @@ class OnlineMusicRangesTest {
     private val key = SongKey(MusicOwner("https://music.example", "account"), "track")
     private val bytes = byteArrayOf(1, 2, 3, 4)
 
-    private suspend fun saveForOffline(store: MusicBlobStore) {
+    private suspend fun saveAuto(store: MusicBlobStore) {
         val sha = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         store.fill(key, "Song", 3, listOf(key.id), { true }, {
             OfflineMediaDescriptor(key.id, "sha256:$sha", sha, bytes.size.toLong(), "mp3", "audio/mpeg", "unused")
         }) { _, consume -> consume(bytes.inputStream()) }
+    }
+
+    private suspend fun saveForOffline(store: MusicBlobStore) {
+        saveAuto(store)
         assertTrue(store.offlineReference(key, "playlist", retain = true, cap = 3))
         store.clearAuto(key.owner)
         assertTrue(store.hasOfflineReference(key))
@@ -59,6 +63,36 @@ class OnlineMusicRangesTest {
                 assertThrows(IOException::class.java) { stream.input.read() }
             }
             assertThrows(IOException::class.java) { ranges.openLocal(source, 0) }
+        }
+    }
+
+    @Test fun isolationFencesNewAndExistingAutoBytesButNotVerifiedDownloadBytes() = runTest {
+        val store = MusicBlobStore(root.root)
+        saveAuto(store)
+        val grant = AtomicBoolean(true)
+        fun ranges() = OnlineMusicRanges(CompletableDeferred(store), MusicSourceChoice({ store.pin(key) { true } })) { true }
+        val auto = AudioSourceOwner("auto", key.id)
+        ranges().use { ranges ->
+            requireNotNull(ranges.openLocal(auto, 0, grant::get)).use { stream ->
+                assertEquals(1, stream.input.read())
+                assertFalse(auto.verifiedDownload)
+                grant.set(false)
+                assertThrows(IOException::class.java) { stream.input.read() }
+                grant.set(true)
+                auto.stopNetwork(drain = true) // The current audio may drain, but no more disk bytes.
+                assertThrows(IOException::class.java) { stream.input.read() }
+                assertThrows(IOException::class.java) { ranges.openLocal(auto, 1, grant::get) }
+            }
+        }
+        assertTrue(store.offlineReference(key, "playlist", retain = true, cap = 3))
+        val saved = AudioSourceOwner("saved", key.id)
+        ranges().use { ranges ->
+            requireNotNull(ranges.openLocal(saved, 0, grant::get)).use { stream ->
+                grant.set(false)
+                saved.stopNetwork(drain = true)
+                assertTrue(saved.verifiedDownload)
+                assertArrayEquals(bytes, stream.input.readBytes())
+            }
         }
     }
 
@@ -99,7 +133,9 @@ class OnlineMusicRangesTest {
             assertTrue(moved.renameTo(blob))
             assertNull(ranges.openLocal(source, 2)) // Same extractor: keep its first representation.
         }
-        ranges().use { next ->
+        ranges().use { next -> assertNull(next.openLocal(source, 2)) }
+        val reopened = MusicBlobStore(root.root)
+        OnlineMusicRanges(CompletableDeferred(reopened), MusicSourceChoice({ reopened.pin(key) { true } })) { true }.use { next ->
             requireNotNull(next.openLocal(source, 2)).use { assertEquals(3, it.input.read()) }
         }
     }

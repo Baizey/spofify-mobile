@@ -71,7 +71,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
     fun start() {
         if (mutable.value != null || retired || !scope.isActive || !sessions.isCurrent(identity)) return
         val current = { !retired && scope.isActive && sessions.isCurrent(identity) }
-        val port = audio.port({ sessions.manualOffline.value || view?.offline != false }, current)
+        val port = audio.port({ sessions.manualOffline.value || view?.let { it.offline || it.isolatedOutput } != false }, current)
         val transport = sessions.playbackTransport(identity)
         val boundTransport = PlaybackTransport { name, device, local, reattachBasis ->
             val grant = reconnectGrant ?: throw CancellationException("No playback admission grant")
@@ -114,7 +114,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         scope.launch {
             controller.state.collect { state ->
                 music.observePlayback(state)
-                audio.recheckSourceMode(isolated = state.offline || sessions.manualOffline.value || sessions.onlineGrant.value == null)
+                audio.recheckSourceMode(isolated = state.offline || state.isolatedOutput || sessions.manualOffline.value || sessions.onlineGrant.value == null)
                 reconcile()
             }
         }
@@ -159,7 +159,11 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         audio.player === player && target.value === selected && mediaSession?.controllerForCurrentRequest != null
     }
 
-    fun foreground() { music.personal.checkFreshness(); maintenance?.refreshNow() }
+    fun foreground() {
+        music.verifyDownloads()
+        music.personal.checkFreshness()
+        maintenance?.refreshNow()
+    }
 
     private fun systemPause() {
         if (view?.localOutput == true) target.value?.pause()

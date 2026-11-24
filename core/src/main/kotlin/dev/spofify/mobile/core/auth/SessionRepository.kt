@@ -362,15 +362,47 @@ class SessionRepository(
             return@withLock
         }
         val store = checkNotNull(manualOfflineStore) { "No durable manual mode store" }
-        if (enabled) onInstallationNetworkAllowed(false)
+        // Admission closes both gates before queuing the potentially blocked preference write.
+        val entry = if (enabled) synchronized(lock) {
+            onInstallationNetworkAllowed(false)
+            handingOff = true
+            val grant = mutableGrant.value
+            val validating = mutableValidation.value == OnlineValidation.VALIDATING
+            mutableGrant.value = null
+            val token = ++generation
+            (authJobs.toList() + featureJobs.toList()).forEach { it.cancel() }
+            api?.cancel()
+            ModeEntry(token, grant?.identity, validating, api as? FeatureTransport)
+        } else null
         withContext(io + NonCancellable) {
-            store.write(enabled)
-            val owner = synchronized(lock) {
-                handingOff = true
-                mutableGrant.value?.identity
+            try {
+                entry?.transport?.closeRetiredStreams()
+                store.write(enabled)
+            } catch (failure: Exception) {
+                if (entry != null) {
+                    val next = synchronized(lock) {
+                        handingOff = false
+                        onInstallationNetworkAllowed(true)
+                        if (generation != entry.generation) null else when (val current = state.value) {
+                            is AuthState.Authenticated -> when {
+                                current.identity == entry.owner && api != null -> {
+                                    mutableGrant.value = OnlineGrant(current.identity, generation)
+                                    null
+                                }
+                                entry.validating -> validationLocked(generation, requireNotNull(saved))
+                                else -> null
+                            }
+                            AuthState.Starting, AuthState.Validating -> operationLocked { restoreStored(entry.generation) }
+                            AuthState.SigningIn -> { mutableState.value = signedOutState(null); null }
+                            else -> null
+                        }
+                    }
+                    next?.start()
+                }
+                throw failure
             }
             try {
-                if (enabled && owner != null) withTimeoutOrNull(1_000) { beforeDisconnect(owner) }
+                entry?.owner?.takeIf(::isCurrent)?.let { owner -> withTimeoutOrNull(1_000) { beforeDisconnect(owner) } }
             } finally {
                 val transition = synchronized(lock) { switchModeLocked(enabled) }
                 if (!enabled) onInstallationNetworkAllowed(true)
@@ -378,6 +410,9 @@ class SessionRepository(
             }
         }
     }
+
+    private class ModeEntry(val generation: Long, val owner: AccountIdentity?, val validating: Boolean,
+        val transport: FeatureTransport?)
 
     private suspend fun completeModeSwitch(transition: Transition) {
         try { transition.transport?.closeRetiredStreams() } finally {

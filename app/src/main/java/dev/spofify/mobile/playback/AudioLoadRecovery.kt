@@ -48,7 +48,7 @@ internal const val AUDIO_PREPARATION_TIMEOUT_MS = 20_000L
  * once an interruption belongs to a binding, never hand its period/task to another binding. */
 internal class AudioSourceOwner(val key: String, val trackId: String) {
     val job = SupervisorJob()
-    @Volatile var usingNetwork = false
+    @Volatile var verifiedDownload = false
     @Volatile var drainOnLoss = false
     val networkJob = SupervisorJob(job)
     val networkStopped get() = !networkJob.isActive
@@ -63,6 +63,7 @@ internal class AudioSourceOwner(val key: String, val trackId: String) {
     }
 
     @Synchronized fun unbind() { binding = null }
+    @Synchronized fun isPlaying(): Boolean = binding?.let { it.playing && it.isCurrent() } == true
 
     @Synchronized fun interrupted(retry: AudioLoadRetry): AudioLoadScope? {
         interruptions.add(retry)

@@ -213,10 +213,10 @@ internal class Media3AudioExecutor(
             val position = playbackPositionMs(elapsed)
             val wait = NativePreparation(token, next, track.id, position, playRequested)
             preparation = wait
-            val replaceNetwork = source?.usingNetwork == true &&
+            val replaceTemporary = source?.verifiedDownload == false &&
                 (cache.hasStoredAudio(track.id) || primary.sourceGrant !== sessions.onlineGrant.value)
             // Local ranges also capture the previous operation's storage pin authority.
-            if (localOnly || primary.localSource || replaceNetwork || player.currentMediaItem?.mediaId != track.id ||
+            if (localOnly || primary.localSource || replaceTemporary || player.currentMediaItem?.mediaId != track.id ||
                 player.playbackState in setOf(Player.STATE_IDLE, Player.STATE_ENDED) ||
                 player.playerError != null || source?.bind(owner) != true) {
                 retireSource()
@@ -309,7 +309,7 @@ internal class Media3AudioExecutor(
             attempted = null
         }
         val installed = source ?: return
-        if (!isolated || primary.localSource || !installed.usingNetwork || installed.networkStopped) return
+        if (!isolated || primary.localSource || installed.verifiedDownload || installed.networkStopped) return
         val continuing = preparation == null && player.playWhenReady && hasPlaybackAuthority()
         installed.stopNetwork(drain = continuing)
         if (!continuing) return

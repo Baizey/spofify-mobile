@@ -29,7 +29,7 @@ internal class OnlineMusicRanges(
     private val choice: MusicSourceChoice,
     private val current: () -> Boolean,
 ) : Closeable {
-    fun openLocal(source: AudioSourceOwner, position: Long): AudioStream? {
+    fun openLocal(source: AudioSourceOwner, position: Long, networkAllowed: () -> Boolean = { true }): AudioStream? {
         fun retired() = !source.job.isActive || !current()
         if (retired()) throw InterruptedIOException("Online audio source retired")
         if (!initialized.isCompleted) try {
@@ -40,7 +40,9 @@ internal class OnlineMusicRanges(
             throw InterruptedIOException("Audio storage wait interrupted")
         }
         if (retired()) throw InterruptedIOException("Online audio source retired")
-        val local = choice.openLocal(source.trackId, position)
+        val local = choice.openLocal(source.trackId, position,
+            allowTemporary = { !source.networkStopped && networkAllowed() },
+            onChoice = { source.verifiedDownload = it })
         if (retired()) {
             local?.close()
             throw InterruptedIOException("Online audio source retired")
@@ -60,6 +62,8 @@ internal class SessionAudioDataSource(
     private val currentSource: () -> AudioSourceOwner?,
 ) : DataSource {
     private var local: AudioStream? = null
+    private var installed: AudioSourceOwner? = null
+    private fun networkAllowed() = !sessions.manualOffline.value && grant != null && sessions.onlineGrant.value === grant
     private val disk = RangeSource(false) { requireNotNull(local).also { local = null } }
     private val network = RangeSource(true, ::openNetwork)
     private var active: RangeSource? = null
@@ -73,17 +77,20 @@ internal class SessionAudioDataSource(
         require(uri.scheme == "spofify" && uri.authority == "audio" && uri.pathSegments.size == 1 && uri.query == null && uri.fragment == null)
         val id = requireNotNull(uri.lastPathSegment)
         val installed = currentSource().forRange(id, dataSpec.key)
-        local = ranges.openLocal(installed, dataSpec.position)
-        val source = if (local != null) disk else network
-        active = source
+        this.installed = installed
         return try {
+            local = ranges.openLocal(installed, dataSpec.position, ::networkAllowed)
+            val source = if (local != null) disk else network
+            active = source
             if (source === network) {
-                installed.usingNetwork = true
                 if (!::retry.isInitialized) retry = AudioLoadRetry(installed)
                 if (retry.source !== installed) throw InterruptedIOException("Audio period replaced")
             }
             source.open(dataSpec)
-        } catch (e: Exception) { close(); throw e }
+        } catch (e: Exception) {
+            try { drainBufferedAudio() } finally { close() }
+            throw e
+        }
     }
 
     private fun openNetwork(dataSpec: DataSpec): AudioStream {
@@ -117,7 +124,6 @@ internal class SessionAudioDataSource(
             return opened
         } catch (failure: Exception) {
             acquired?.close()
-            drainBufferedAudio()
             throw when (failure) {
                 is TransientAudioLoadFailure -> failure.forLoader()
                 is CancellationException, is InterruptedException -> InterruptedIOException("Audio load cancelled")
@@ -128,8 +134,9 @@ internal class SessionAudioDataSource(
 
     /** Keep the progressive loader alive without I/O while its existing samples drain. */
     private fun drainBufferedAudio() {
-        val owner = retry.source
-        if (!owner.drainOnLoss || !owner.networkStopped) return
+        val owner = installed ?: return
+        if (owner.verifiedDownload || !(owner.networkStopped || !networkAllowed()) ||
+            !(owner.drainOnLoss || owner.isPlaying())) return
         try { runBlocking(owner.job) { awaitCancellation() } }
         catch (_: CancellationException) { throw InterruptedIOException("Buffered playback retired") }
         catch (_: InterruptedException) { throw InterruptedIOException("Buffered playback interrupted") }
@@ -145,15 +152,14 @@ internal class SessionAudioDataSource(
     override fun addTransferListener(listener: TransferListener) { disk.addTransferListener(listener); network.addTransferListener(listener) }
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         val source = requireNotNull(active)
-        if (source === network && (retry.source.networkStopped || sessions.manualOffline.value || sessions.onlineGrant.value !== grant)) {
+        val owner = requireNotNull(installed)
+        if (!owner.verifiedDownload && (owner.networkStopped || !networkAllowed())) {
             drainBufferedAudio()
             throw InterruptedIOException("Audio network retired")
         }
         return try { source.read(buffer, offset, length) } catch (failure: IOException) {
-            if (source === network) {
-                drainBufferedAudio()
-                if (failure is TransientAudioLoadFailure) throw failure.forLoader()
-            }
+            drainBufferedAudio()
+            if (source === network && failure is TransientAudioLoadFailure) throw failure.forLoader()
             throw failure
         }
     }
@@ -161,7 +167,7 @@ internal class SessionAudioDataSource(
     override fun close() {
         cancellation?.dispose()
         cancellation = null
-        try { active?.close() } finally { active = null; local?.close(); local = null }
+        try { active?.close() } finally { active = null; local?.close(); local = null; installed = null }
     }
 }
 

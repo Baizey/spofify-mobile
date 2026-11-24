@@ -155,6 +155,7 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
     fun receive(update: PersonalUpdate): Resource.Detail? {
         require((update.snapshot == null) != (update.change == null))
         update.snapshot?.let { snap ->
+            require(validRecent(snap.recent))
             connected = true
             socketRecent = snap.recent
             changed(Resource.History)
@@ -169,10 +170,17 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
         delta.recent?.let { edit ->
             val removed = edit.removed.toHashSet()
             val items = socketRecent.filterNot { key(it) in removed }.toMutableList()
-            for ((index, item) in edit.inserted) items.add(index, item)
+            for ((index, item) in edit.inserted) {
+                require(index in 0..items.size)
+                items.add(index, item)
+            }
+            require(validRecent(items))
+            val before = socketRecent.mapTo(hashSetOf(), ::key)
+            val additional = next.recent.filterNot { key(it) in before }
             socketRecent = items
             changed(Resource.History)
-            next = mergeServerHistory(next, items)
+            next = mergeServerHistory(next, (items + additional).distinctBy(::key)
+                .sortedByDescending { Instant.parse(it.playedAt) }.take(RECENT_LIMIT))
         }
         delta.deleted?.let { id ->
             changed(Resource.Lists); changed(Resource.Detail(id))
@@ -232,6 +240,8 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
 
     private fun replace(rows: List<PersonalPlaylistSummary>, p: PersonalPlaylistSummary) = rows.filterNot { it.id == p.id } + p
     private fun key(entry: PersonalHistoryEntry) = RecentKey(entry.id, entry.origin.orEmpty())
+    private fun validRecent(rows: List<PersonalHistoryEntry>) = rows.size <= RECENT_LIMIT &&
+        rows.distinctBy(::key).size == rows.size && rows.all { runCatching { Instant.parse(it.playedAt) }.isSuccess }
     private fun mergeServerHistory(data: PersonalCacheSnapshot, rows: List<PersonalHistoryEntry>): PersonalCacheSnapshot {
         val keys = rows.mapTo(hashSetOf(), ::key)
         return data.copy(recent = rows, localPlays = data.localPlays.filterNot { key(it) in keys })

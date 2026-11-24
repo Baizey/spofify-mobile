@@ -57,14 +57,16 @@ class ManualOfflineBoundaryTest {
                     fun path() = server.takeRequest(2, TimeUnit.SECONDS)!!.path
                     assertEquals("/api/auth/session", path())
                     server.enqueue(json("""{"ticket":"fixture"}"""))
-                    val handoffFrame = CompletableDeferred<Unit>()
+                    val frames = java.util.concurrent.LinkedBlockingQueue<String>()
                     server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
                         override fun onMessage(webSocket: WebSocket, text: String) {
-                            if (text == "handoff") handoffFrame.complete(Unit) else webSocket.send("queued-event")
+                            frames.add(text)
+                            webSocket.send("queued-event")
                         }
                     }))
                     val socket = repo.playbackTransport(id).connect("phone", "device")
                     assertEquals("/api/me/player/connect", path()); assertEquals("/api/me/player/socket", path())
+                    assertNotNull(frames.poll(2, TimeUnit.SECONDS)) // Initial hello only.
                     server.enqueue(MockResponse().setResponseCode(206).setHeader("Content-Range", "bytes 2-4/6").setBody("234"))
                     repo.audio(id, "track", 2, 3).use { stream ->
                         assertEquals("bytes=2-4", server.takeRequest(2, TimeUnit.SECONDS)!!.getHeader("Range"))
@@ -78,13 +80,14 @@ class ManualOfflineBoundaryTest {
                         } }
                         entered.await()
                         repo.setManualOffline(true) { active ->
-                            assertEquals(id, active); assertTrue(socket.send("handoff")); handoffFrame.await()
+                            assertEquals(id, active); assertFalse(socket.send("handoff"))
                             rejected { repo.audio(id, "new", 0, null) }
                         }
                         assertTrue(cleaned.isCompleted); worker.join(); rejected { pending.await() }
                         assertTrue(repo.isCurrent(id)); assertTrue(policy.enabled); assertNull(repo.onlineGrant.value)
                         assertFalse(repo.publishIfCurrent(first) { fail("queued publication") })
                         assertFalse(socket.send("retired")); rejected { socket.messages.first() }
+                        assertNull(frames.poll(100, TimeUnit.MILLISECONDS))
                         assertTrue(runCatching { stream.input.read() }.exceptionOrNull() is IOException)
                         probe(repo, id)
                         // Recreate from the exact session + policy just committed. Not even a

@@ -51,7 +51,7 @@ internal fun PlaybackView.readyForMusicCache(facts: AudioFacts, authorized: Bool
 }
 
 private fun PlaybackView.onlineLocalOutput() =
-    localOutput && !offline && !superseded && connection == PlaybackConnectionState.READY
+    localOutput && !offline && !isolatedOutput && !superseded && connection == PlaybackConnectionState.READY
 
 internal fun network(app: Application) = callbackFlow {
     val cm = app.getSystemService(ConnectivityManager::class.java)

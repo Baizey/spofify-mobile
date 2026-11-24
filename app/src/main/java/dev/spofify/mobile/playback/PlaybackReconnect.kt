@@ -36,11 +36,6 @@ internal class PlaybackReconnect(
                     views.first { it.connection != PlaybackConnectionState.READY || it.superseded }
                     continue
                 }
-                if (state.localOutput && state.offline && state.isolatedPlaying()) {
-                    // Rebinding to a separate shared queue must not replace active local output.
-                    views.first { !it.isolatedPlaying() || it.superseded }
-                    continue
-                }
                 try {
                     val attempt = connectFresh()
                     try { attempt.join() } catch (cancelled: CancellationException) {
@@ -69,8 +64,6 @@ internal class PlaybackReconnect(
             }
         }
     }
-
-    private fun PlaybackView.isolatedPlaying() = offline && localOutput && desiredPlaying
 
     fun stop() {
         epoch++

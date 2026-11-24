@@ -9,17 +9,18 @@ private class MusicPositionOutOfBounds : IOException("Music range position out o
 
 /** The store hold lasts through source release AND the final outstanding range close. */
 class PinnedSong internal constructor(private val file: File, private val size: Long,
-    private val current: () -> Boolean, private val release: () -> Unit) : Closeable {
+    private val current: () -> Boolean, val downloaded: Boolean = false, private val release: () -> Unit) : Closeable {
     private var retired = false
     private var ranges = 0
 
-    @Synchronized fun open(position: Long): AudioStream {
-        if (retired || !current()) throw IOException("Music range unavailable")
+    @Synchronized fun open(position: Long, readingAllowed: () -> Boolean = { true }): AudioStream {
+        fun allowed() = current() && readingAllowed()
+        if (retired || !allowed()) throw IOException("Music range unavailable")
         if (position !in 0..size) throw MusicPositionOutOfBounds()
         val input = file.inputStream()
         try { input.channel.position(position) } catch (e: Exception) { input.close(); throw e }
         ranges++
-        return AudioStream(input, size - position, permitted = current) {
+        return AudioStream(input, size - position, permitted = ::allowed) {
             try { input.close() } finally { synchronized(this) { if (--ranges == 0 && retired) release() } }
         }
     }
@@ -39,14 +40,19 @@ class MusicSourceChoice(private val acquire: (String) -> PinnedSong?, private va
     private var pin: PinnedSong? = null
     private var closed = false
 
-    @Synchronized fun openLocal(track: String, position: Long): AudioStream? {
+    @Synchronized fun openLocal(track: String, position: Long,
+        allowTemporary: () -> Boolean = { true }, onChoice: (downloaded: Boolean) -> Unit = {}): AudioStream? {
         if (closed || id != null && track != id) throw IOException("Music source retired")
-        if (id != null) return pin?.open(position)
+        fun open(held: PinnedSong): AudioStream {
+            onChoice(held.downloaded)
+            return held.open(position) { held.downloaded || allowTemporary() }
+        }
+        if (id != null) return pin?.let(::open)
         // Cancellation while acquiring a pin is not an authoritative miss.
         val held = acquire(track)
         id = track
         if (held == null) return null
-        return try { held.open(position).also { pin = held } }
+        return try { open(held).also { pin = held } }
         catch (e: MusicPositionOutOfBounds) { pin = held; throw e }
         catch (_: IOException) { release(held); null }
         catch (_: SecurityException) { release(held); null }

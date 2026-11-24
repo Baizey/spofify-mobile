@@ -20,6 +20,7 @@ internal fun DownloadsScreen(music: AccountMusic, loader: ImageLoader, playback:
     val ready by music.indexReady.collectAsStateWithLifecycle()
     val direct by music.directDownloads.collectAsStateWithLifecycle()
     var removing by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(music) { music.verifyDownloads() }
     val player = playback?.observe()
     var error by remember { mutableStateOf<String?>(null) }
     Column(Modifier.fillMaxSize()) {

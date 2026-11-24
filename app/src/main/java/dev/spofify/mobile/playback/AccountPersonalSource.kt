@@ -28,6 +28,8 @@ internal class AccountPersonalSource(
     root: File, private val identity: AccountIdentity, private val sessions: SessionRepository,
     private val scope: CoroutineScope, private val client: PersonalLibraryApi = PersonalLibraryClient(sessions, identity),
     override val replica: AccountPersonalReplica = AccountPersonalReplica(),
+    private val io: CoroutineDispatcher = Dispatchers.IO,
+    private val monotonicMs: () -> Long = android.os.SystemClock::elapsedRealtime,
 ) : LivePersonal, PersonalLibraryApi by client {
     private val codec = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val file = PersonalCacheFile(root, identity)
@@ -36,16 +38,18 @@ internal class AccountPersonalSource(
     private val watching = mutableMapOf<String, Int>()
     private val requests = mutableMapOf<Resource, Job>()
     private val missed = mutableSetOf<Resource>()
+    private val pendingRepair = mutableSetOf<Resource.Detail>()
     private val failed = mutableMapOf<Resource, Long>()
     private var grant: OnlineGrant? = null
     private var connectionGrant: OnlineGrant? = null
     private var channel: AccountChannel? = null
     private var subscription: AutoCloseable? = null
+    private var connectionEpoch = 0L
     private val beforeRestore = ArrayDeque<() -> Unit>()
 
     init {
         scope.launch {
-            val saved = withContext(Dispatchers.IO) { file.read() }
+            val saved = withContext(io) { file.read() }
             if (!sessions.isCurrent(identity)) return@launch
             persisted.value = saved
             replica.restore(saved)
@@ -54,7 +58,7 @@ internal class AccountPersonalSource(
             var last = saved
             replica.snapshots.collect { snapshot ->
                 if (snapshot == last) return@collect
-                withContext(Dispatchers.IO) {
+                withContext(io) {
                     try {
                         file.write(snapshot) { commit -> sessions.commitLocalIfCurrent(identity, commit) }
                         last = snapshot
@@ -69,7 +73,7 @@ internal class AccountPersonalSource(
                 val owner = next?.takeIf { it.identity == identity }
                 if (owner === grant) return@collect
                 requests.values.forEach { it.cancel() }
-                requests.clear(); missed.clear(); failed.clear()
+                requests.clear(); missed.clear(); pendingRepair.clear(); failed.clear()
                 grant = owner
                 if (connectionGrant !== owner) replica.disconnected()
                 checkFreshness()
@@ -84,7 +88,7 @@ internal class AccountPersonalSource(
     fun attach(next: AccountChannel?) {
         if (next === channel) return
         subscription?.close()
-        beforeRestore.clear()
+        connectionEpoch++
         replica.disconnected()
         connectionGrant = null
         channel = next
@@ -92,21 +96,32 @@ internal class AccountPersonalSource(
             if (channel !== next || !sessions.isCurrent(identity)) return@onPersonal
             if (wire == null) {
                 connectionGrant = null
-                beforeRestore.clear()
+                connectionEpoch++
                 replica.disconnected()
             } else {
                 val owner = sessions.onlineGrant.value?.takeIf { it.identity == identity } ?: return@onPersonal
-                val update = codec.decodeFromJsonElement(PersonalUpdate.serializer(), wire)
-                afterRestore {
-                    sessions.publishIfCurrent(owner) {
-                        connectionGrant = owner
-                        val repair = replica.receive(update)
-                        if (repair != null && repair.id in watching) refresh(repair)
-                        if (update.change?.playlist != null || update.change?.deleted != null) refresh(Resource.Lists)
-                    }
-                    if (update.snapshot != null) checkFreshness()
-                }
+                val update = runCatching { codec.decodeFromJsonElement(PersonalUpdate.serializer(), wire) }
+                    .getOrNull() ?: return@onPersonal
+                applyConfirmed(owner, update)
             }
+        }
+    }
+
+    internal fun applyConfirmed(owner: OnlineGrant, update: PersonalUpdate) {
+        val epoch = connectionEpoch
+        afterRestore {
+            if (epoch != connectionEpoch) return@afterRestore
+            var repair: Resource.Detail? = null
+            val applied = try {
+                sessions.publishIfCurrent(owner) {
+                    repair = replica.receive(update)
+                    connectionGrant = owner
+                }
+            } catch (_: IllegalArgumentException) { false }
+            if (!applied) return@afterRestore
+            repair?.takeIf { it.id in watching }?.let { request(it, confirmedRepair = true) }
+            if (update.change?.playlist != null || update.change?.deleted != null) refresh(Resource.Lists)
+            if (update.snapshot != null) checkFreshness()
         }
     }
 
@@ -136,19 +151,23 @@ internal class AccountPersonalSource(
         }
     }
 
-    override fun refresh(resource: Resource) {
+    override fun refresh(resource: Resource) = request(resource, confirmedRepair = false)
+
+    private fun request(resource: Resource, confirmedRepair: Boolean) {
         val owner = grant ?: return
         if (!replica.view.value.ready || sessions.onlineGrant.value !== owner || !replica.stale(resource)) return
         val version = replica.version(resource)
         if (requests[resource]?.isActive == true) {
-            missed.add(resource)
+            if (confirmedRepair && resource is Resource.Detail) pendingRepair.add(resource) else missed.add(resource)
             return
         }
-        if (failed[resource]?.let { android.os.SystemClock.elapsedRealtime() < it } == true) return
+        if (!confirmedRepair && failed[resource]?.let { monotonicMs() < it } == true) return
         val task = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 sessions.withOnlineGrant(owner) {
+                    if (confirmedRepair) delay(500)
                     for (attempt in 0..2) {
+                        if (replica.version(resource) != version) break
                         try {
                             val publish: () -> Unit = when (resource) {
                                 Resource.Lists -> reads.lists().let { { replica.replaceLists(version, it) } }
@@ -161,6 +180,7 @@ internal class AccountPersonalSource(
                             sessions.publishIfCurrent(owner, publish)
                             break
                         } catch (failure: PersonalLibraryException) {
+                            if (replica.version(resource) != version) break
                             if (attempt == 2 || failure.code != PersonalLibraryErrorCode.CONNECTION_FAILED &&
                                 failure.status !in setOf(408, 429, 502, 503, 504)) throw failure
                             delay(500L shl attempt)
@@ -168,11 +188,16 @@ internal class AccountPersonalSource(
                     }
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { failed[resource] = android.os.SystemClock.elapsedRealtime() + 30_000 }
+            catch (_: Exception) {
+                if (replica.version(resource) == version) failed[resource] = monotonicMs() + 30_000
+            }
             finally {
                 if (requests[resource] === coroutineContext.job) {
                     requests.remove(resource)
-                    if (missed.remove(resource) && replica.version(resource) != version) refresh(resource)
+                    val repair = resource is Resource.Detail && pendingRepair.remove(resource)
+                    val repeat = missed.remove(resource)
+                    if (repair) request(resource, confirmedRepair = true)
+                    else if (repeat && replica.version(resource) != version) refresh(resource)
                 }
             }
         }
