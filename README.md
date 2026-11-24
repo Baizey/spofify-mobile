@@ -1,107 +1,80 @@
 # Spofify for Android
 
-Native Kotlin / Jetpack Compose client. The Android-free `:core` owns validated
-HTTP/session contracts and server-authoritative playback; `:app` owns platform
-storage, native audio, lifecycle and presentation.
+Spofify is an Android client for a running, self-hosted
+[Spofify Server](https://github.com/Baizey/spofify-server). Listen to your own
+music library or one shared with you through a listener account. The app runs
+on **Android 8.0 (API 26) or newer**.
 
-Implemented surfaces include authentication, server-ranked Search, artist/album details,
-playlists, Recently played, mini/full player, queue/output controls, waveform/lyrics,
-and Settings. Full History insights and artist rankings remain deferred.
-Settings → Offline mode switches the existing app to this account’s local music. It requires an explicit switch; network outages do not transfer playback ownership.
-Keep 3 / 10 / 100 / 1000 distinct songs to look ahead 1 / 3 / 6 / 12 songs respectively.
-Prefetch defaults to unmetered connections; requested streams are unrestricted. Settings →
-Music storage separates offline playlist audio (including pending saves) from automatic
-cache, and counts shared audio once. Clear automatic cache preserves playlist downloads;
-bytes held by current playback may remain until that source closes. Save a fully playable
-playlist from its More menu. Only a verified complete save appears in offline Playlists.
-Online playback also prefers verified on-device audio for the selected track. Offline
-History reads a previously observed online snapshot; device playback never records or
-uploads history. Display lyrics are not saved. Going online retires local output and its
-queue before validating the session and waiting for a fresh server snapshot.
-
-Settings → Crossfade is off by default and applies to playback on this phone, including
-manual offline mode. It overlaps natural transitions by up to five seconds. Short tracks
-use less overlap, and a missing, unconfirmed, or late successor plays with the usual
-transition. Skips, seeks, pauses, and changes to the upcoming track cancel the overlap.
-Online crossfade can start loading the next track before the current one ends; it does not
-change which device owns playback or which queue entry is reported before natural EOF.
-
-## UI specification
-
-The agreed, iterated visual and interaction specification is
-[the interactive wireframe](docs/reference/index.html). Open it directly in a browser;
-it is self-contained and works offline. Its final rendered screens and touch behavior
-are the specification, not suggestions. The file contains cumulative renderer overrides,
-so earlier function definitions alone do not describe the final UI. Its synthetic music,
-accounts and playback are fixtures, not production API contracts.
-
-The subsequently approved player changes are recorded in
-[player layout](docs/player-layout.md): album navigation above artwork, fixed-height
-scrollable lyrics at the 13.2sp album/artist scale with tap-to-open text and no
-menu, lyric icon or scroll hint, compact
-identity/seek spacing, and time labels aligned with Shuffle and Repeat.
-[Settings appearance](docs/settings-appearance.md) describes Android’s fixed dark theme.
-[Unified search](docs/search.md) records the subsequent search migration: the
-server now owns matching and cross-kind ranking, rather than the reference fixture’s
-local ranking heuristic. Search layout and bottom-oriented
-results remain unchanged. [Artist discography](docs/artist-discography.md) records
-the subsequent native grouping refinement: separate own Albums and Singles, with
-Appears on collapsed at the bottom using backend release relationships.
-
-The reference remains self-contained. Its rendered behavior check uses Node.js 24
-and an already provisioned Playwright module plus matching Chromium headless shell:
+## Build and install from source
 
 ```sh
-node docs/reference/check.cjs "$PLAYWRIGHT_MODULE" "$CHROMIUM_HEADLESS_SHELL" "$PRIVATE_ARTIFACT_DIR"
+git clone https://github.com/Baizey/spofify-mobile.git
+cd spofify-mobile
 ```
 
-Supply a private output directory for the browser profile, temporary state and
-screenshots. The check does not download browsers, start a server or contact a
-backend. It covers player geometry, lyrics, navigation, and row action alignment;
-it is not a native Android or cross-browser acceptance test.
+1. In Android Studio's SDK Manager, install **Android SDK Platform 37.0**,
+   **Build-Tools 36.0.0**, and **Platform-Tools**. Set `sdk.dir` in
+   `local.properties` to your SDK path. Set `JAVA_HOME` to your **JetBrains
+   Runtime (JBR) 25** installation directory; the Gradle daemon is pinned to it.
+2. Enable USB debugging, connect your device, and approve the debugging prompt.
+   Build and install the debug app:
+
+   ```sh
+   ./gradlew :app:installDebug
+   ```
+
+   You can also select JBR 25 as the **Gradle JDK** in Android Studio and run
+   the `app` configuration on your device.
+
+   To build without installing, run `./gradlew :app:assembleDebug`. The APK is
+   `app/build/outputs/apk/debug/app-debug.apk`; install it with `adb install`
+   followed by that path. Updating an existing install requires the same signing
+   key; use `adb install -r` for a manual update.
+3. Open **spofify** and sign in with your server username and password. In
+   **Server URL**, enter the server's [configured LAN or HTTPS address](https://github.com/Baizey/spofify-server#remote-and-local-network-access),
+   such as `https://music.example.com`, not a loopback address or a dashboard
+   path. Include the scheme and any non-default port. Prefer HTTPS.
+
+Online playback requires [playback sync v3](https://github.com/Baizey/spofify-server/blob/main/docs/playback-sync-v3.md).
+If you use a reverse proxy, it must preserve the configured Host and pass
+WebSocket upgrades.
+
+## Listening
+
+- Search for songs, albums and artists, and browse album and artist pages.
+- Create and edit manual playlists and see recently played tracks in **History**.
+- Stream music, manage the queue, and switch playback to another connected
+  Spofify device on the same account. The player shows waveforms and lyrics
+  when available. **Settings → Crossfade** enables crossfade on this device.
+
+### Offline listening
+
+While online, open the **⋯** menu on a playlist with audio available for every
+track and turn on **Save for offline**. Wait for its **Saved for offline**
+indicator. Turn on **Settings → Offline mode** to search and play music on this
+device. The app can also switch automatically after repeated failures to connect
+for playback. Turn **Offline mode** off to reconnect.
+
+Offline mode plays only saved or cached audio. Only fully downloaded playlists
+appear in offline **Playlists**. Lyrics aren't saved. **History** shows a cached
+snapshot; offline plays aren't recorded or synced. **Settings → Music storage**
+lets you clear the automatic cache without removing saved playlists.
 
 ## Development
 
-Open this directory in Android Studio. Use JDK 25, Android platform 37.0 and
-build-tools 36.0.0. The version catalog pins AGP 9.5.2, Kotlin / Compose compiler
-2.4.21. The wrapper pins Gradle 9.9.1. AGP built-in Kotlin consumes
-the newer KGP loaded by the root JVM plugin; no second Android Kotlin plugin is
-applied. Sources target Java 17; runtime minimum is Android 8 (API 26), target API 36.
-
-The earlier 9.9.0 wrapper was used for unit tests, lint, APK assembly and
-emulator checks during native integration. Those checks do not establish every
-upstream toolchain combination, deployment readiness or complete feature acceptance.
-Keep toolchain upgrades separate from feature changes.
-
-On an environment with these dependencies legitimately provisioned:
+`:app` contains the Android UI and audio playback; `:core` contains the
+Android-free server and playback contracts. The code targets Java 17 bytecode.
+Run unit tests and lint from the repository root:
 
 ```sh
-./gradlew :core:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon
+./gradlew :core:test :app:testDebugUnitTest :app:lintDebug
 ```
 
-Use `--offline` only when dependencies and the wrapper distribution are already
-provisioned; it does not prevent wrapper bootstrap. Independent builds need separate
-writable Gradle homes and temporary state. No cache repair, download workaround or
-toolchain installation is provided by this repository.
+`./gradlew :app:assembleRelease` produces
+`app/build/outputs/apk/release/app-release-unsigned.apk` for the separate release
+app. For signing and publishing to GitHub Releases, see [Mobile releases](docs/mobile-release.md).
 
-Debug keeps application ID `dev.spofify.mobile` and the normal Android debug
-signer. Release uses `dev.spofify.mobile.release` and a dedicated signer; the
-variants have separate app data, without a migration. Local Gradle release APKs
-are unsigned. Official signed APKs and in-app updates use the public
-[GitHub Releases for Baizey/spofify-mobile](https://github.com/Baizey/spofify-mobile/releases).
-See [Mobile release operations](docs/mobile-release.md) for the manual `main`
-workflow, signing bootstrap and release checks. Do not uninstall,
-clear data or replace keys to work around a signature mismatch.
-
-## Contracts
-
-See [authentication](docs/authentication.md) for transport, state ownership and
-installed storage compatibility, and [unified search](docs/search.md) for ranked
-snapshots, cursor continuation and typed search failures. JetBrains Mono is bundled from the previously
-approved public [JetBrains Mono 2.304](https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304) source; its complete OFL is in
-`app/src/main/assets/licenses/JetBrainsMono-OFL.txt` and locally accessible from
-Settings → Credits → Font license, as well as Account.
-Fonts retain the approved existing regular/medium/semibold/bold bytes.
-
-Unit/contract checks do not establish rendered UI, Keystore behavior on a device,
-installation compatibility or real-server operation.
+- **Client behavior:** [Authentication](docs/authentication.md),
+  [search](docs/search.md), and [offline mode and reconnection](docs/manual-network-boundary.md).
+- **UI design:** [Player layout](docs/player-layout.md) and the [interactive
+  design prototype](docs/reference/index.html), which doesn't track every native change.
