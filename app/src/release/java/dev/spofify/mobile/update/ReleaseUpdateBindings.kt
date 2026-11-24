@@ -25,11 +25,14 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.spofify.mobile.R
 import dev.spofify.mobile.feature.settings.SettingsLink
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -76,7 +79,14 @@ internal class AppUpdates(app: Application, scope: CoroutineScope) {
             }
             notice = null
             opening = true
-            scope.launch {
+            scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                // Register on this tap, before any suspension. A pause permanently retires
+                // the gesture even if the same Activity resumes before preparation returns.
+                val gestureScope = this
+                val cancelOnPause = LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_PAUSE) gestureScope.cancel()
+                }
+                activity.lifecycle.addObserver(cancelOnPause)
                 try {
                     val verified = owner.revalidate(apk) ?: return@launch
                     val intent = withContext(Dispatchers.IO) { installer.prepare(verified.file) }
@@ -93,6 +103,7 @@ internal class AppUpdates(app: Application, scope: CoroutineScope) {
                         }
                     }
                 } finally {
+                    activity.lifecycle.removeObserver(cancelOnPause)
                     opening = false
                 }
             }

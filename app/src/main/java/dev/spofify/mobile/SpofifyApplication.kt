@@ -4,6 +4,7 @@ import android.app.Application
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.http.OkHttpAuthApiFactory
 import dev.spofify.mobile.storage.EncryptedAuthStores
+import dev.spofify.mobile.storage.installationOfflineStore
 import dev.spofify.mobile.playback.PlaybackOwner
 import dev.spofify.mobile.update.AppUpdates
 import kotlinx.coroutines.CoroutineScope
@@ -27,7 +28,7 @@ class SpofifyApplication : Application() {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         updates = AppUpdates(this, scope)
         sessions = SessionRepository(stores.sessions, stores.logins, OkHttpAuthApiFactory(), scope,
-            manualOfflineStore = dev.spofify.mobile.storage.PreferenceManualOfflineStore(this),
+            manualOfflineStore = installationOfflineStore(this),
             onInstallationNetworkAllowed = updates::setOnline)
         val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         playback = PlaybackOwner(this, sessions, mainScope)

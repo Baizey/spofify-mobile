@@ -358,14 +358,15 @@ class SessionRepository(
             }?.start()
             return@withLock required == null
         }
+        val store = checkNotNull(manualOfflineStore) { "No durable manual mode store" }
+        // Fence explicit commands at serialized transition admission, before dispatching
+        // the durable write or waiting for playback handoff. A failed write leaves the
+        // installation-wide gate closed because durability could not be established.
+        if (enabled && required == null) onInstallationNetworkAllowed(false)
         withContext(io + NonCancellable) {
             // Accept fallback only while the failing socket batch still owns the current grant.
             if (required != null && synchronized(lock) { mutableGrant.value !== required }) return@withContext false
-            val store = checkNotNull(manualOfflineStore) { "No durable manual mode store" }
-            // Fence before the durable write, not after asynchronous StateFlow delivery
-            // or after the existing playback socket's cooperative handoff. If the write
-            // throws, durability is uncertain: keep installation-wide work fenced.
-            if (enabled) onInstallationNetworkAllowed(false)
+            if (enabled && required != null) onInstallationNetworkAllowed(false)
             store.write(enabled)
             if (required != null) {
                 // The preference write may have been blocked while sign-out or validation
