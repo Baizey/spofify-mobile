@@ -13,7 +13,7 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackLifetimeTest {
-    @Test fun fourFailedHandshakesFallbackOnceAndExplicitGoOnlineGetsFreshBatch() = runTest {
+    @Test fun fourFailedHandshakesBackOffThenProbeWithoutRestartingOnObserverStart() = runTest {
         val views = MutableStateFlow(PlaybackView(localOutput = true, offline = true))
         val attempts = mutableListOf<Long>()
         var fallback = 0
@@ -26,16 +26,18 @@ class PlaybackLifetimeTest {
             }
         }, onExhausted = { current -> if (current()) fallback++ })
         loop.start()
-        advanceTimeBy(400); runCurrent()
-        assertEquals(listOf(0L, 100L, 200L, 300L), attempts)
+        advanceTimeBy(7_400); runCurrent()
+        assertEquals(listOf(0L, 1_100L, 3_200L, 7_300L), attempts)
         assertEquals(1, fallback)
-        loop.start() // not an explicit request; a foreground/observer callback cannot reset the budget.
-        advanceTimeBy(10_000); runCurrent()
+        loop.start() // A foreground/observer callback cannot reset the budget.
+        advanceTimeBy(29_999); runCurrent()
         assertEquals(4, attempts.size)
+        advanceTimeBy(1); runCurrent()
+        assertEquals(37_400L, attempts.last())
+        assertEquals(1, fallback)
         loop.start(explicit = true)
-        advanceTimeBy(400); runCurrent()
-        assertEquals(listOf(10_400L, 10_500L, 10_600L, 10_700L), attempts.drop(4))
-        assertEquals(2, fallback)
+        runCurrent()
+        assertEquals(listOf(37_400L, 37_400L), attempts.takeLast(2))
         loop.close()
     }
 
@@ -52,7 +54,7 @@ class PlaybackLifetimeTest {
             }
         }, onExhausted = { if (it()) fallback++ })
         loop.start()
-        runCurrent()
+        advanceTimeBy(10_000); runCurrent()
         assertEquals(7, attempts)
         assertEquals(1, fallback)
         loop.close()
@@ -71,10 +73,11 @@ class PlaybackLifetimeTest {
             runCurrent()
             assertEquals(PlaybackConnectionState.CONNECTING, h.controller.state.value.connection)
             assertTrue(h.controller.state.value.offline)
-            repeat(4) {
+            repeat(4) { index ->
                 assertTrue(h.transport.sockets.last().commands().isEmpty())
                 h.transport.sockets.last().finish()
                 runCurrent()
+                if (index < 3) { advanceTimeBy(1_000L shl index); runCurrent() }
             }
             assertEquals(5, h.transport.sockets.size)
             assertEquals(1, h.fallback)
@@ -133,8 +136,10 @@ class PlaybackLifetimeTest {
             assertEquals(12.0, h.audio.actual.elapsed, 0.0)
             assertTrue(h.transport.sockets.single().commands().isEmpty())
             h.snapshot(local = false)
-            assertFalse(h.audio.actual.isPlaying)
-            assertTrue(h.controller.state.value.isPlaying) // The new observation belongs to the other owner.
+            assertTrue(h.controller.state.value.isolatedOutput)
+            assertTrue(h.audio.actual.isPlaying)
+            assertEquals(12.0, h.audio.actual.elapsed, 0.0)
+            assertTrue(h.controller.state.value.isPlaying)
         }
     }
 
@@ -154,7 +159,7 @@ class PlaybackLifetimeTest {
         }
     }
 
-    @Test fun isolatedSoundStopsOnFirstConflictingSnapshotAndOnSupersession() = runTest {
+    @Test fun isolatedSoundSurvivesConflictingSnapshotButStopsOnSupersession() = runTest {
         for (superseded in listOf(false, true)) Harness(this).use { h ->
             h.start()
             h.snapshot(local = true)
@@ -171,11 +176,12 @@ class PlaybackLifetimeTest {
                 runCurrent()
                 assertTrue(h.audio.actual.isPlaying)
                 h.snapshot(local = false, generation = 2)
+                assertTrue(h.controller.state.value.isolatedOutput)
             }
-            assertFalse(h.controller.state.value.localOutput)
-            assertFalse(h.audio.actual.isPlaying)
-            assertFalse(h.audio.hasAuthority)
-            assertTrue(shouldStopPlaybackService(h.controller.state.value, h.audio.facts()))
+            assertEquals(!superseded, h.controller.state.value.localOutput)
+            assertEquals(!superseded, h.audio.actual.isPlaying)
+            assertEquals(!superseded, h.audio.hasAuthority)
+            assertEquals(superseded, shouldStopPlaybackService(h.controller.state.value, h.audio.facts()))
             assertEquals(0, h.fallback)
         }
     }

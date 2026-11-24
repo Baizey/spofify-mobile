@@ -337,10 +337,9 @@ class SessionRepository(
     }
 
     /**
-     * Invoke from the mode controller, outside session-owned network work. Persist first:
-     * a failed write does not advertise a successful switch. Once committed, caller
-     * cancellation cannot strand half a transition. The optional cooperative handoff may
-     * use an existing socket only; it must check actual playback ownership itself.
+     * Invoke from the mode controller, outside session-owned network work. Entry fences
+     * authority before persistence; only a successful write changes the preference. The
+     * optional callback coordinates local output only, after the network gate is closed.
      */
     suspend fun setManualOffline(enabled: Boolean, beforeDisconnect: suspend (AccountIdentity) -> Unit = {}) {
         changeManualMode(enabled, beforeDisconnect)
