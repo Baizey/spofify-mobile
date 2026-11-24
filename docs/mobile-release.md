@@ -1,6 +1,6 @@
 # Mobile release operations
 
-`Baizey/spofify-mobile` stays **private**. Official APKs go only to the separately provisioned public `Baizey/spofify-mobile-releases`. The release workflow builds an unsigned APK on private `main`, signs it in a protected job, and publishes it from a separate protected job. CI does not publish and requires no secrets. Debug remains `dev.spofify.mobile` with its existing Android debug signing and data. Release is `dev.spofify.mobile.release` with its own signer and data. Nothing migrates or copies between the two apps.
+`Baizey/spofify-mobile` stays **private**. Official APKs go only to the separately provisioned public `Baizey/spofify-mobile-releases`. The release workflow builds an unsigned APK on private `main`, signs it in a protected job, and publishes it from a separate protected job. CI does not publish and requires no secrets. Debug remains `dev.spofify.mobile` with its existing Android debug signing and data. Release is `dev.spofify.mobile.release` with its own signer and data. Nothing migrates or copies between the two apps. The public APK does not include the Android Gradle Plugin's Git revision stamp; staging, signing and publication reject an APK containing it.
 
 ## One-time bootstrap (operator only)
 
@@ -17,6 +17,12 @@
 
 5. In `mobile-release-signing` only, provision secrets `MOBILE_KEYSTORE_B64` (single-line base64 of the PKCS#12 file), `MOBILE_KEYSTORE_PASSWORD`, `MOBILE_KEY_ALIAS` and `MOBILE_KEY_PASSWORD`. Do not print or commit base64, keystore, passwords or App private keys. Transfer them through the operator's approved secret-management channel.
 6. Create a dedicated GitHub App with repository **Contents: read and write** (and GitHub's mandatory Metadata read), no other permissions or subscriptions, and install it **only** on `Baizey/spofify-mobile-releases`. In `mobile-release-deploy` only, provision variable `MOBILE_DISTRIBUTION_APP_ID` and secret `MOBILE_DISTRIBUTION_APP_PRIVATE_KEY`. The pinned action requests a short-lived installation token restricted to the distribution repo and Contents write, and revokes it at job end. The source workflow's `GITHUB_TOKEN` is read-only for checkout and is not used for distribution. If organizational policy precludes a GitHub App, a separately reviewed workflow change may use an expiring fine-grained token scoped only to distribution Contents write; never use a classic PAT or a token with access to private source.
+
+## How in-app updating works
+
+The release app checks the anonymous channel on foreground entry or return from Work offline, not on a background timer. Completed checks are normally held for 30 minutes. A verified update stays ready without polling across foreground returns until the process restarts, Work offline fences it, or it fails revalidation. Installation requires a new explicit tap from Settings while the app is resumed and not playing locally, then Android's own confirmation. Debug has no update surface or installer permission.
+
+Release records Work offline in its own versioned private policy file; it does not load or migrate the debug preference. Malformed or interrupted state starts offline, preserving local access; an explicit return online rewrites the policy. An unreadable policy fails closed. Test failure and recovery with synthetic app data only.
 
 ## Publish a stable release
 

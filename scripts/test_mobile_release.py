@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError
+import zipfile
 
 import mobile_release as release
 
@@ -67,6 +68,19 @@ class VersionTest(unittest.TestCase):
         self.assertIn({"name": "mobile-v101"}, list(github.all("/tags")))
         self.assertEqual([c.args[0] for c in github.request.call_args_list],
                          ["/tags?per_page=100&page=1", "/tags?per_page=100&page=2"])
+
+
+class ApkMetadataTest(unittest.TestCase):
+    def test_rejects_embedded_private_vcs_information(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / release.ASSET
+            with zipfile.ZipFile(path, "w") as apk:
+                apk.writestr("AndroidManifest.xml", b"fixture")
+            release.require_no_vcs_metadata(path)
+            with zipfile.ZipFile(path, "a") as apk:
+                apk.writestr("META-INF/version-control-info.textproto", b"private-source-sha")
+            with self.assertRaisesRegex(release.InvalidRelease, "VCS metadata"):
+                release.require_no_vcs_metadata(path)
 
 
 class TransportTest(unittest.TestCase):

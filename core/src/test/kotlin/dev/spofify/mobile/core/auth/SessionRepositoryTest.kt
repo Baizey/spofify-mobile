@@ -112,12 +112,17 @@ class SessionRepositoryTest {
         advanceUntilIdle()
         assertEquals(listOf(true to false), modes)
 
-        repo.setManualOffline(true) {
-            assertTrue(policy.offline)
-            assertFalse(repo.manualOffline.value)
-            // The installation fence has already run, before the durable write.
-            assertEquals(listOf(true to false, false to false), modes)
+        val entering = launch(start = CoroutineStart.UNDISPATCHED) {
+            repo.setManualOffline(true) {
+                assertTrue(policy.offline)
+                assertFalse(repo.manualOffline.value)
+                assertEquals(listOf(true to false, false to false), modes)
+            }
         }
+        // The test IO dispatcher has not run the store write yet, but no updater work may enter.
+        assertFalse(policy.offline)
+        assertEquals(listOf(true to false, false to false), modes)
+        entering.join()
         repo.setManualOffline(false)
         assertEquals(listOf(true to false, false to false, true to false), modes)
     }

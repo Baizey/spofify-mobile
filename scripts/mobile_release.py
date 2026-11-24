@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 
 REPO = "Baizey/spofify-mobile-releases"
@@ -95,8 +96,19 @@ def tool(name, *args, sensitive=False):
     return result.stdout
 
 
+def require_no_vcs_metadata(apk):
+    try:
+        with zipfile.ZipFile(apk) as package:
+            need("META-INF/version-control-info.textproto" not in package.namelist(),
+                 "APK contains build VCS metadata; do not publish it.")
+    except zipfile.BadZipFile as exc:
+        raise InvalidRelease("APK is not a readable ZIP package.") from exc
+
+
 def require_apk(apk, app_id, code, name, *, debug=False):
     need(apk.is_file() and 0 < apk.stat().st_size <= MAX_BYTES, "APK missing, empty or over 150 MiB.")
+    if not debug:
+        require_no_vcs_metadata(apk)
     output = tool("aapt", "dump", "badging", apk)
     packages = [line for line in output.splitlines() if line.startswith("package:")]
     need(len(packages) == 1, "APK tool did not report exactly one package.")

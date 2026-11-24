@@ -11,6 +11,7 @@ import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.CREATE
+import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
 import java.nio.file.StandardOpenOption.WRITE
 
@@ -23,9 +24,10 @@ internal class ReleaseOfflineStore(directory: File) : ManualOfflineStore {
     private val pending = root.resolve("network-policy-v1.pending")
 
     override fun read(): Boolean {
-        if (!Files.isDirectory(root, NOFOLLOW_LINKS) || !Files.notExists(pending, NOFOLLOW_LINKS)) {
-            throw IOException("Cannot read completed network policy")
-        }
+        if (!Files.isDirectory(root, NOFOLLOW_LINKS)) throw IOException("Unreadable network policy directory")
+        // Interrupted or malformed state is conservatively offline. Local sessions still
+        // load, and an explicit mode change can rewrite a normal policy without clearing data.
+        if (!Files.notExists(pending, NOFOLLOW_LINKS)) return true
         if (Files.notExists(policy, NOFOLLOW_LINKS)) return false
         if (!Files.isRegularFile(policy, NOFOLLOW_LINKS)) throw IOException("Unreadable network policy")
         val bytes = Files.newInputStream(policy, NOFOLLOW_LINKS).use { input ->
@@ -39,23 +41,23 @@ internal class ReleaseOfflineStore(directory: File) : ManualOfflineStore {
             }
             bounded.copyOf(count)
         }
-        return when {
-            bytes.contentEquals(ONLINE) -> false
-            bytes.contentEquals(OFFLINE) -> true
-            else -> throw IOException("Invalid network policy")
-        }
+        return !bytes.contentEquals(ONLINE)
     }
 
     override fun write(enabled: Boolean) {
         // SessionRepository serializes reads/writes. Preserve the pending marker on failure so
         // the next process cannot mistake an interrupted offline write for first launch/online.
         FileChannel.open(pending, CREATE, TRUNCATE_EXISTING, WRITE, NOFOLLOW_LINKS).use { output ->
+            syncDirectory() // Make the fail-closed marker durable before writing the new record.
             val bytes = ByteBuffer.wrap(if (enabled) OFFLINE else ONLINE)
             while (bytes.hasRemaining()) output.write(bytes)
             output.force(true)
         }
         Files.move(pending, policy, ATOMIC_MOVE, REPLACE_EXISTING)
+        syncDirectory() // Do not report a successful switch until the rename is durable.
     }
+
+    private fun syncDirectory() = FileChannel.open(root, READ).use { it.force(true) }
 
     private companion object {
         val OFFLINE = "spofify-offline-v1\n".encodeToByteArray()
