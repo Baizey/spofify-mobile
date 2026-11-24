@@ -24,9 +24,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
-      - name: Install Android SDK packages and configure the runner
+      - name: Provision Android SDK
+        run: bash scripts/setup-ci-android-sdk.sh 'platforms;android-37.0' 'build-tools;36.0.0'
+      - name: Configure the runner checkout
         run: |
-          sdkmanager --install 'platforms;android-37.0' 'build-tools;36.0.0'
           # Replace workstation-only settings in this runner checkout.
           printf 'sdk.dir=%s\n' "${ANDROID_HOME:?Android SDK path is missing}" > local.properties
           rm -f .gradle/config.properties
