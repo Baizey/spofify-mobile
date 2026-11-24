@@ -262,10 +262,10 @@ class GitHub:
         raise InvalidRelease("GitHub API pagination limit reached; cannot verify complete history.")
 
 
-def require_public_repo(public):
-    repo = public.request("")
+def require_public_repo(github):
+    repo = github.request("")
     need(repo.get("full_name") == REPO and repo.get("private") is False and repo.get("visibility") == "public",
-         f"Expected anonymous access to the public {REPO} repository.")
+         f"Expected the canonical {REPO} repository to be public.")
 
 
 def git_commit(ref, name):
@@ -448,8 +448,8 @@ def publish(auth, public, apk, bump, code, name, commit):
     with apk.open("rb") as stream:
         digest = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
 
-    require_public_repo(public)
-    check_plan(auth, public, bump, code, name)
+    require_public_repo(auth)
+    check_plan(auth, auth, bump, code, name)
     draft = auth.request("/releases", method="POST", payload={
         "tag_name": tag, "name": title, "target_commitish": commit, "body": "", "draft": True,
         "prerelease": False, "generate_release_notes": False, "make_latest": "false",
@@ -470,12 +470,12 @@ def publish(auth, public, apk, bump, code, name, commit):
     else:
         raise InvalidRelease("GitHub did not supply the APK digest before timeout; release remains a draft.")
 
-    check_plan(auth, public, bump, code, name, draft_id=identifier)
+    check_plan(auth, auth, bump, code, name, draft_id=identifier)
     # Create-only, as on Desktop. Never reuse an existing tag, even if it has the same SHA.
     ref = f"refs/tags/{tag}"
     created = auth.request("/git/refs", method="POST", payload={"ref": ref, "sha": commit})
     need(git_commit(created, ref) == commit, "Release tag does not match the packaged commit.")
-    check_plan(auth, public, bump, code, name, draft_id=identifier, commit=commit)
+    check_plan(auth, auth, bump, code, name, draft_id=identifier, commit=commit)
     draft = auth.request(path)
     need(draft.get("target_commitish") == commit, "Draft no longer targets the packaged commit.")
     require_shape(draft, identifier, tag, title, size, digest, draft=True)
@@ -538,15 +538,15 @@ def main():
             auth, public = GitHub(token), GitHub()
             if args.command == "resolve":
                 signing_anchor(CERT_FILE)
-                require_public_repo(public)
-                code, name = resolve_versions(auth, public, args.bump)
+                require_public_repo(auth)
+                code, name = resolve_versions(auth, auth, args.bump)
                 print(f"version_code={code}\nversion_name={name}")
             else:
                 code, name = version_code(args.version_code), args.version_name
                 stable_version(name)
                 if args.command == "check-plan":
-                    require_public_repo(public)
-                    check_plan(auth, public, args.bump, code, name)
+                    require_public_repo(auth)
+                    check_plan(auth, auth, args.bump, code, name)
                 else:
                     publish(auth, public, args.apk, args.bump, code, name, args.commit)
         else:

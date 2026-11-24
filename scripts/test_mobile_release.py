@@ -325,7 +325,9 @@ class PublicationFixture:
             return {"ref": f"refs/tags/{self.tag}", "object": {"type": "commit", "sha": sha}}
         raise AssertionError(f"Unexpected public request: {path}")
 
-    def auth_request(self, path, *, method="GET", payload=None, upload=None):
+    def auth_request(self, path, *, method="GET", payload=None, upload=None, missing=False):
+        if method == "GET" and path in ("", "/releases/latest"):
+            return self.public_request(path, missing=missing)
         if method == "POST" and path == "/releases":
             assert payload == {"tag_name": self.tag, "name": self.title, "target_commitish": self.commit, "body": "",
                                "draft": True, "prerelease": False, "generate_release_notes": False,
@@ -402,7 +404,7 @@ class PublicationTest(unittest.TestCase):
 
     def test_private_repository_rejected_before_mutation(self):
         self.fixture.repo["private"] = True
-        self.rejected("Expected anonymous access", draft_created=False)
+        self.rejected("repository to be public", draft_created=False)
 
     def test_existing_tag_rejected_before_mutation(self):
         self.fixture.tags = [{"name": self.fixture.tag}]
