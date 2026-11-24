@@ -94,6 +94,59 @@ class OfflinePlaylistRepositoryTest {
         }
     }
 
+    @Test fun recoveringReplacementDoesNotPublishMissingOrCorruptAudio() = runBlocking {
+        for (deleteReplacement in listOf(true, false)) {
+            val dir = root.newFolder()
+            var failNextSync = false
+            val store = MusicBlobStore(dir, { Long.MAX_VALUE }, java.nio.file.Files::deleteIfExists) { path ->
+                if (failNextSync) {
+                    failNextSync = false
+                    throw IOException("Injected post-rename directory sync failure")
+                }
+                syncPlaylistDirectory(path)
+            }
+            val previous = playlist("p", 1, "old")
+            val replacement = playlist("p", 2, "new")
+            var manifest = previous
+            val repository = repo(store, manifest = { manifest })
+            repository.save()
+            val oldFile = dir.listFiles()!!.single { it.extension == "blob" }
+            store.pin(key("old")) { true }!!.use { oldPin ->
+                oldPin.open(0).use { oldRange ->
+                    assertEquals(bytes.first().toInt(), oldRange.input.read())
+                    manifest = replacement
+                    val result = runCatching {
+                        repository.refresh("p", 3, commit = { rename -> rename(); failNextSync = true; true }) { true }
+                    }
+                    assertTrue(result.exceptionOrNull() is IOException)
+                    val newFile = dir.listFiles()!!.single { it.extension == "blob" && it != oldFile }
+                    if (deleteReplacement) assertTrue(newFile.delete())
+                    else newFile.writeBytes(bytes.reversedArray())
+                    assertEquals(setOf("p"), repository.completeIds().first())
+                    assertTrue(store.hasOfflineReference(key("old")))
+                    assertTrue(oldPin.isDownloaded())
+
+                    assertNull(repository.select("p")) // Retry fsync; the manifest is durable, but its audio is not available.
+                    assertEquals(listOf(replacement), repository.complete()) // Keep valid metadata, as on reopen.
+                    assertTrue(repository.completeIds().first().isEmpty())
+                    assertFalse(store.songs.value.any { it.offline || it.key == key("new") })
+                    assertFalse(store.hasOfflineReference(key("new")))
+                    assertNull(store.pin(key("new"), downloadOnly = true) { true })
+                    assertFalse(oldPin.isDownloaded())
+                    assertTrue(oldFile.exists())
+                    assertArrayEquals(bytes.copyOfRange(1, bytes.size), oldRange.input.readBytes())
+                }
+            }
+            assertFalse(oldFile.exists())
+            val reopened = MusicBlobStore(dir)
+            val recovered = repo(reopened)
+            assertEquals(listOf(replacement), recovered.complete())
+            assertNull(recovered.select("p"))
+            assertTrue(recovered.completeIds().first().isEmpty())
+            assertTrue(reopened.songs.value.isEmpty())
+        }
+    }
+
     @Test fun deltaKeepsEveryOccurrenceAndMetadataWhileSharingAutoPlaylistsAndPins() = runBlocking {
         val store = MusicBlobStore(root.root)
         var p = playlist("p", 1, "b", "a", "b")

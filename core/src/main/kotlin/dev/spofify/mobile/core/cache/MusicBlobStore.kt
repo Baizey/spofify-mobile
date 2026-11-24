@@ -113,8 +113,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 staleMetadata[meta.toPath()] = row.key
                 return@forEach
             }
-            val valid = runCatching { file.isFile && file.length() == row.size && file.inputStream().use { digest(it) == row.sha } }
-                .getOrDefault(false)
+            val valid = canOpen(file, row, verifyDigest = true)
             if (valid && (row.auto || offline(row) || row.drafts.isNotEmpty())) {
                 check(row.key !in entries)
                 entries[row.key] = Entry(file, row, file.lastModified())
@@ -252,8 +251,10 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         finally { lock.unlock() }
     }
 
-    private fun canOpen(entry: Entry): Boolean = runCatching {
-        entry.file.isFile && entry.file.inputStream().use { it.channel.size() == entry.row.size }
+    private fun canOpen(entry: Entry, verifyDigest: Boolean = false): Boolean = canOpen(entry.file, entry.row, verifyDigest)
+
+    private fun canOpen(file: File, row: Row, verifyDigest: Boolean): Boolean = runCatching {
+        file.isFile && file.inputStream().use { it.channel.size() == row.size && (!verifyDigest || digest(it) == row.sha) }
     }.getOrDefault(false)
 
     private fun invalidate(entry: Entry, publish: Boolean = true) {
@@ -360,13 +361,21 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         try { publishDurablePlaylist() } catch (_: IOException) { /* Serve the last durable view. */ }
     }
 
-    private fun publishDurablePlaylist(cap: Int? = null) {
-        val change = playlists.publishDurable() ?: return
+    private fun publishDurablePlaylist(cap: Int? = null, recovering: Boolean = true): Boolean? {
+        val change = playlists.publishDurable() ?: return null
+        // A failed sync allows arbitrary time before a retry. Recheck those bytes just as
+        // on reopen. Even a new commit needs to prove its verified bytes still open after sync.
+        for (key in change.required) {
+            val entry = entries[key] ?: continue
+            if (!canOpen(entry, verifyDigest = recovering)) invalidate(entry, publish = false)
+        }
+        val playable = entries.keys.containsAll(change.required)
         refresh()
         reclaim(change.superseded)
         if (cap != null) try { trim(change.owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
         try { clearDraft(change.owner, change.id, emptySet(), {}) } catch (_: IOException) { /* Already durable. */ }
         refresh()
+        return playable
     }
 
     private fun reclaim(keys: Set<SongKey>) {
@@ -427,7 +436,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             playlists.rename(owner, manifest, keys, freeBytes() - RESERVE, commit)
         }
         trace?.step(COMMIT_CLEANUP)
-        publishDurablePlaylist(cap)
+        if (publishDurablePlaylist(cap, recovering = false) != true) throw IOException("Playlist audio is unavailable")
     }
     internal fun remove(owner: MusicOwner, id: String, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
         checkCurrent()

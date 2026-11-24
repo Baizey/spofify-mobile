@@ -33,7 +33,7 @@ internal class PlaylistFiles(private val dir: File, private val forceDirectory: 
     }
     private data class Saved(val file: File, val tracks: Set<SongKey>)
     private data class Pending(val key: Pair<MusicOwner, String>, val next: Saved, val previous: OfflineManifest?)
-    data class Publication(val owner: MusicOwner, val id: String, val superseded: Set<SongKey>)
+    data class Publication(val owner: MusicOwner, val id: String, val superseded: Set<SongKey>, val required: Set<SongKey>)
     private var pending: Pending? = null
     private val saved = mutableMapOf<Pair<MusicOwner, String>, Saved>()
     private val counts = mutableMapOf<SongKey, Int>()
@@ -118,7 +118,7 @@ internal class PlaylistFiles(private val dir: File, private val forceDirectory: 
         beforeReclaim()
         val superseded = replace(next.key, next.next)
         pending = null
-        return Publication(next.key.first, next.key.second, superseded)
+        return Publication(next.key.first, next.key.second, superseded, next.next.tracks)
     }
 
     fun remove(owner: MusicOwner, id: String): Set<SongKey>? {
