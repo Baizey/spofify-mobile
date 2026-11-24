@@ -39,7 +39,10 @@ class ReleaseUpdateEngineTest {
     @get:Rule val temp = TemporaryFolder()
 
     @Test fun onlyExplicitOnlineForegroundChecksAndNeverDownloadsAnInstalledOrOlderRelease() = runTest {
-        val wire = FakeWire().apply { enqueue(release(tag = "mobile-v3")); enqueue(release(tag = "mobile-v2")) }
+        val wire = FakeWire().apply {
+            enqueue(release(tag = "mobile-v3"))
+            repeat(2) { enqueue(release(tag = "mobile-v2")) }
+        }
         val engine = engine(wire, installed = 3) { _, _ -> error("archive should not be inspected") }
         engine.setForeground(true)
         engine.setOnline(false)
@@ -50,14 +53,27 @@ class ReleaseUpdateEngineTest {
         assertSame(UpdateStatus.Checking, engine.status.value)
         runCurrent()
         assertSame(UpdateStatus.UpToDate, engine.status.value)
+        engine.setForeground(false)
+        engine.setForeground(true)
+        runCurrent()
+        assertEquals(1, wire.requests.size)
+        advanceTimeBy(30 * 60 * 1000L)
+        engine.setForeground(true)
+        runCurrent()
+        assertEquals(1, wire.requests.size)
+        engine.setForeground(false)
+        engine.setForeground(true)
+        runCurrent()
+        assertSame(UpdateStatus.UpToDate, engine.status.value)
+        assertEquals(2, wire.requests.size)
         engine.setOnline(null)
         engine.setOnline(true)
         runCurrent()
         assertSame(UpdateStatus.UpToDate, engine.status.value)
-        assertEquals(listOf(UpdateResource.METADATA, UpdateResource.METADATA), wire.requests.map { it.resource })
+        assertEquals(List(3) { UpdateResource.METADATA }, wire.requests.map { it.resource })
     }
 
-    @Test fun readyIsVerifiedAndSurvivesBackgroundButNotAnEligibleRefresh() = runTest {
+    @Test fun verifiedReadySurvivesForegroundReturnsWithoutPollingUntilOffline() = runTest {
         val cache = temp.newFolder()
         val partial = File(cache, "spofify-update-abandoned.part.apk").apply { writeText("partial") }
         val old = File(cache, "spofify-update-abandoned.apk").apply { writeText("old") }
@@ -97,17 +113,24 @@ class ReleaseUpdateEngineTest {
         runCurrent()
         assertEquals(3, wire.requests.size)
         engine.setForeground(false)
-        assertTrue(ready.file.exists())
         engine.setForeground(true)
+        runCurrent()
+        assertEquals(3, wire.requests.size)
+        assertSame(ready, (engine.status.value as UpdateStatus.Ready).apk)
+        assertSame(ready, engine.revalidate(ready))
+        engine.setOnline(null)
         assertFalse(engine.isCurrent(ready))
         runCurrent()
-        assertSame(UpdateStatus.UpToDate, engine.status.value)
         assertFalse(ready.file.exists())
+        engine.setOnline(true)
+        runCurrent()
+        assertSame(UpdateStatus.UpToDate, engine.status.value)
+        assertEquals(4, wire.requests.size)
         assertNull(engine.withCurrentApk(ready) { error("previous handle was admitted") })
     }
 
     @Test fun mutatedReadyFileCannotBeRevalidatedEvenAtTheSameSize() = runTest {
-        val wire = FakeWire().apply { enqueue(release()); enqueue(apk()) }
+        val wire = FakeWire().apply { enqueue(release()); enqueue(apk()); enqueue(release(tag = "mobile-v1")) }
         var archiveChecks = 0
         val engine = engine(wire) { _, _ -> archiveChecks++; true }
         engine.start()
@@ -120,6 +143,12 @@ class ReleaseUpdateEngineTest {
         assertSame(UpdateStatus.Failure, engine.status.value)
         assertFalse(ready.file.exists())
         assertFalse(engine.isCurrent(ready))
+        advanceTimeBy(30 * 60 * 1000L)
+        engine.setForeground(false)
+        engine.setForeground(true)
+        runCurrent()
+        assertSame(UpdateStatus.UpToDate, engine.status.value)
+        assertEquals(3, wire.requests.size)
     }
 
     @Test fun rejectsBadArchiveAndCleansUpStagingFileWithoutRetry() = runTest {

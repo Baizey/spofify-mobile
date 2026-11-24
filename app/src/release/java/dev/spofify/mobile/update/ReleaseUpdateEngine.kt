@@ -198,8 +198,10 @@ class ReleaseUpdateEngine internal constructor(
 
     private fun maybeStartLocked() {
         if (!foreground || online != true || flight != null || !scope.isActive) return
+        // Keep a verified APK for the user's explicit install, including while the installer is
+        // opening. No further polling until process restart, offline/unknown, or failed revalidation.
+        if (ready != null) return
         if (lastFinished?.let { nowMillis() - it < REFRESH_INTERVAL_MS } == true) return
-        discardReadyLocked()
         val next = Flight()
         next.job = scope.launch(io, start = CoroutineStart.LAZY) { runFlight(next) }
         flight = next
