@@ -11,6 +11,7 @@ import java.nio.file.StandardOpenOption.READ
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -35,6 +36,8 @@ internal class PlaylistFiles(private val dir: File) {
     private val counts = mutableMapOf<SongKey, Int>()
     val required: Set<SongKey> get() = counts.keys
     fun committedIds(): Set<Pair<MusicOwner, String>> = saved.keys.toSet()
+    fun readyIds(available: Set<SongKey>): Set<Pair<MusicOwner, String>> =
+        saved.entries.mapNotNullTo(hashSetOf()) { (id, playlist) -> id.takeIf { available.containsAll(playlist.tracks) } }
 
     // A rename/unlink linearizes the operation. Don't delete any superseded bytes before the
     // directory entry is durable (including reopen after process death before this barrier).
@@ -73,7 +76,7 @@ internal class PlaylistFiles(private val dir: File) {
     }
 
     fun commit(owner: MusicOwner, manifest: OfflineManifest, keys: Set<SongKey>, available: Long,
-        checkCurrent: () -> Unit): Set<SongKey> {
+        commit: ((() -> Unit) -> Boolean), publish: () -> Unit): Set<SongKey> {
         val c = manifest.collection
         val key = owner to c.reference.id
         val doc = Document(1, owner, c.reference.id, requireNotNull(c.playlistKind), c.name,
@@ -86,11 +89,16 @@ internal class PlaylistFiles(private val dir: File) {
             if (bytes.size > available) throw IOException("Insufficient manifest space")
             tmp.outputStream().use { it.write(bytes); it.fd.sync() }
             syncDirectory() // Make the verified .blob and synced .meta names durable first.
-            checkCurrent()
-            Files.move(tmp.toPath(), file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
-            flushNeeded = true
+            var previous = emptySet<SongKey>()
+            if (!commit {
+                    Files.move(tmp.toPath(), file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+                    flushNeeded = true
+                    beforeReclaim()
+                    previous = replace(key, Saved(file, keys))
+                    publish()
+                }) throw CancellationException("Playlist commit retired")
+            return previous
         } finally { tmp.delete() }
-        return replace(key, Saved(file, keys))
     }
 
     fun remove(owner: MusicOwner, id: String): Set<SongKey>? {

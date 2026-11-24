@@ -11,10 +11,11 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 
 /** All callers are serialized by the catalog owner. No file here can stand in for an audio blob. */
-internal class LocalCatalogStorage(root: File, identity: AccountIdentity) {
+internal class LocalCatalogStorage(root: File, identity: AccountIdentity, private val commit: (() -> Unit) -> Boolean) {
     private val directory = File(root, "catalog-v1-${key(identity.origin, identity.accountId)}")
     private val artwork = File(directory, "artwork")
     private val tracksFile = File(directory, "tracks.json")
@@ -45,7 +46,9 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity) {
         for (file in entries.filterNot { it == target }.sortedWith(compareBy(File::lastModified, File::getName))) {
             if (size <= MAX_ARTWORK_TOTAL_BYTES && count <= MAX_ARTWORK_ENTRIES) break
             val length = file.length()
-            if (Files.deleteIfExists(file.toPath())) { size -= length; count-- }
+            var deleted = false
+            if (!commit { deleted = Files.deleteIfExists(file.toPath()) }) break
+            if (deleted) { size -= length; count-- }
         }
     }
 
@@ -92,7 +95,8 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity) {
                 stream.write(bytes)
                 stream.fd.sync()
             }
-            Files.move(temporary, file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+            if (!commit { Files.move(temporary, file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING) })
+                throw CancellationException("Catalog owner retired")
         } finally {
             Files.deleteIfExists(temporary)
         }

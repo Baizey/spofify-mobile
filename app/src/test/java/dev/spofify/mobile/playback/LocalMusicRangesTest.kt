@@ -22,6 +22,7 @@ class LocalMusicRangesTest {
         store.fill(key, "track", 3, listOf(key.id), { true }, {
             OfflineMediaDescriptor(key.id, "sha256:$sha", sha, 4, "mp3", "audio/mpeg", "unused")
         }) { _, consume -> consume(bytes.inputStream()) }
+        assertTrue(store.offlineReference(key, "saved", true, 3))
         var allowed = true
         val ranges = LocalMusicRanges(installed, { allowed }) { current -> MusicSourceChoice({ store.pin(key, current) }) }
         ranges.open(installed.key, 0).use { first ->
@@ -29,6 +30,9 @@ class LocalMusicRangesTest {
             store.clearAuto(key.owner)
             ranges.open(installed.key, 2).use { seek ->
                 assertEquals(3, seek.input.read())
+                assertTrue(store.offlineReference(key, "saved", false, 3))
+                assertFalse(installed.verifiedDownload)
+                assertThrows(IOException::class.java) { first.input.read() }
                 allowed = false
                 assertThrows(IOException::class.java) { seek.input.read() }
                 assertThrows(IOException::class.java) { ranges.open(installed.key, 0) }

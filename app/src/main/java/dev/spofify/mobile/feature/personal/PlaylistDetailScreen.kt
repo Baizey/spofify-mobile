@@ -144,7 +144,7 @@ internal fun PlaylistDetailScreen(
         val downloadAction: Pair<String, () -> Unit>? = when {
             music == null -> null
             row.track.id in direct -> "Remove download" to { music.removeDownload(row.track.id) { actionError = "Couldn’t remove download." } }
-            canDownload && row.track.hasAudio && row.track.id !in downloaded -> "Download" to { music.download(row.track, id) { actionError = "Couldn’t download this song." } }
+            canDownload && row.track.hasAudio && row.track.id !in downloaded -> "Download" to { music.download(row.track, id, row.identity) { actionError = "Couldn’t download this song." } }
             else -> null
         }
         PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null,

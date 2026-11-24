@@ -5,11 +5,15 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.LoadErrorInfo
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.util.concurrent.atomic.AtomicReference
 import dev.spofify.mobile.core.playback.AudioResult
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -48,7 +52,8 @@ internal const val AUDIO_PREPARATION_TIMEOUT_MS = 20_000L
  * once an interruption belongs to a binding, never hand its period/task to another binding. */
 internal class AudioSourceOwner(val key: String, val trackId: String) {
     val job = SupervisorJob()
-    @Volatile var verifiedDownload = false
+    @Volatile var downloadRetention: (() -> Boolean)? = null
+    val verifiedDownload get() = downloadRetention?.invoke() == true
     @Volatile var drainOnLoss = false
     val networkJob = SupervisorJob(job)
     val networkStopped get() = !networkJob.isActive
@@ -64,6 +69,14 @@ internal class AudioSourceOwner(val key: String, val trackId: String) {
 
     @Synchronized fun unbind() { binding = null }
     @Synchronized fun isPlaying(): Boolean = binding?.let { it.playing && it.isCurrent() } == true
+
+    /** Park the extractor without reading further bytes while existing samples drain. */
+    fun drainBufferedAudioIf(retired: Boolean) {
+        if (!retired || verifiedDownload || !(drainOnLoss || isPlaying())) return
+        try { runBlocking(job) { awaitCancellation() } }
+        catch (_: CancellationException) { throw InterruptedIOException("Buffered playback retired") }
+        catch (_: InterruptedException) { throw InterruptedIOException("Buffered playback interrupted") }
+    }
 
     @Synchronized fun interrupted(retry: AudioLoadRetry): AudioLoadScope? {
         interruptions.add(retry)

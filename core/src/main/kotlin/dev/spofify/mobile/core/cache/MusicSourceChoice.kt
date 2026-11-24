@@ -9,12 +9,15 @@ private class MusicPositionOutOfBounds : IOException("Music range position out o
 
 /** The store hold lasts through source release AND the final outstanding range close. */
 class PinnedSong internal constructor(private val file: File, private val size: Long,
-    private val current: () -> Boolean, val downloaded: Boolean = false, private val release: () -> Unit) : Closeable {
+    private val current: () -> Boolean, private val downloadRetained: () -> Boolean = { false },
+    private val downloadOnly: Boolean = false, private val release: () -> Unit) : Closeable {
     private var retired = false
     private var ranges = 0
 
+    fun isDownloaded(): Boolean = downloadRetained()
+
     @Synchronized fun open(position: Long, readingAllowed: () -> Boolean = { true }): AudioStream {
-        fun allowed() = current() && readingAllowed()
+        fun allowed() = current() && (!downloadOnly || isDownloaded()) && readingAllowed()
         if (retired || !allowed()) throw IOException("Music range unavailable")
         if (position !in 0..size) throw MusicPositionOutOfBounds()
         val input = file.inputStream()
@@ -41,11 +44,11 @@ class MusicSourceChoice(private val acquire: (String) -> PinnedSong?, private va
     private var closed = false
 
     @Synchronized fun openLocal(track: String, position: Long,
-        allowTemporary: () -> Boolean = { true }, onChoice: (downloaded: Boolean) -> Unit = {}): AudioStream? {
+        allowTemporary: () -> Boolean = { true }, onChoice: (isDownloaded: () -> Boolean) -> Unit = {}): AudioStream? {
         if (closed || id != null && track != id) throw IOException("Music source retired")
         fun open(held: PinnedSong): AudioStream {
-            onChoice(held.downloaded)
-            return held.open(position) { held.downloaded || allowTemporary() }
+            onChoice(held::isDownloaded)
+            return held.open(position) { held.isDownloaded() || allowTemporary() }
         }
         if (id != null) return pin?.let(::open)
         // Cancellation while acquiring a pin is not an authoritative miss.

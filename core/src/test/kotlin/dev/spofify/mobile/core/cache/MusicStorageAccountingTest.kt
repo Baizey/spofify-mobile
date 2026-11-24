@@ -60,7 +60,7 @@ class MusicStorageAccountingTest {
         store.stage("saved", auto, auto.id, 10, { true }, { descriptor(auto.id) }) { _, consume ->
             consume(bytes.inputStream())
         }
-        store.commit(owner, manifest, 10) {}
+        store.commit(owner, manifest, 10) { publish -> publish(); true }
         assertTrue(autoMeta.exists())
         val reopened = openStore()
         assertEquals(manifest, reopened.select(owner, "saved"))

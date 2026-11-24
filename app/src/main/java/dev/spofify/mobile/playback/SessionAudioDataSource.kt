@@ -18,7 +18,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.withTimeout
 
 /** Resolve storage recovery before choosing the representation, off the player looper. A real
@@ -42,7 +41,7 @@ internal class OnlineMusicRanges(
         if (retired()) throw InterruptedIOException("Online audio source retired")
         val local = choice.openLocal(source.trackId, position,
             allowTemporary = { !source.networkStopped && networkAllowed() },
-            onChoice = { source.verifiedDownload = it })
+            onChoice = { source.downloadRetention = it })
         if (retired()) {
             local?.close()
             throw InterruptedIOException("Online audio source retired")
@@ -65,7 +64,7 @@ internal class SessionAudioDataSource(
     private var installed: AudioSourceOwner? = null
     private fun networkAllowed() = !sessions.manualOffline.value && grant != null && sessions.onlineGrant.value === grant
     private val disk = RangeSource(false) { requireNotNull(local).also { local = null } }
-    private val network = RangeSource(true, ::openNetwork)
+    private val network = RangeSource(true, acquire = ::openNetwork)
     private var active: RangeSource? = null
     private var cancellation: DisposableHandle? = null
     private var representation: AudioRepresentation? = null
@@ -134,12 +133,7 @@ internal class SessionAudioDataSource(
 
     /** Keep the progressive loader alive without I/O while its existing samples drain. */
     private fun drainBufferedAudio() {
-        val owner = installed ?: return
-        if (owner.verifiedDownload || !(owner.networkStopped || !networkAllowed()) ||
-            !(owner.drainOnLoss || owner.isPlaying())) return
-        try { runBlocking(owner.job) { awaitCancellation() } }
-        catch (_: CancellationException) { throw InterruptedIOException("Buffered playback retired") }
-        catch (_: InterruptedException) { throw InterruptedIOException("Buffered playback interrupted") }
+        installed?.let { it.drainBufferedAudioIf(it.networkStopped || !networkAllowed()) }
     }
 
     private fun TransientAudioLoadFailure.forLoader(): IOException {
@@ -172,7 +166,8 @@ internal class SessionAudioDataSource(
 }
 
 @UnstableApi
-internal class RangeSource(network: Boolean, private val acquire: (DataSpec) -> AudioStream) : BaseDataSource(network) {
+internal class RangeSource(network: Boolean, private val onReadFailure: (IOException) -> Unit = {},
+    private val acquire: (DataSpec) -> AudioStream) : BaseDataSource(network) {
     private var stream: AudioStream? = null
     private var uri: Uri? = null
     private var remaining = C.LENGTH_UNSET.toLong()
@@ -193,7 +188,8 @@ internal class RangeSource(network: Boolean, private val acquire: (DataSpec) -> 
         if (length == 0) return 0
         if (remaining == 0L) return C.RESULT_END_OF_INPUT
         val count = if (remaining < 0) length else minOf(length.toLong(), remaining).toInt()
-        val read = requireNotNull(stream).input.read(buffer, offset, count)
+        val read = try { requireNotNull(stream).input.read(buffer, offset, count) }
+        catch (failure: IOException) { onReadFailure(failure); throw failure }
         if (read < 0) {
             if (remaining > 0) throw EOFException("Audio range ended early")
             return C.RESULT_END_OF_INPUT

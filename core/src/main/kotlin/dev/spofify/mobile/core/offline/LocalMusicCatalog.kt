@@ -38,8 +38,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Account/origin scoped, exclusively local read APIs. Keep one live owner per account + directory;
- * retire its readers/writers before swapping owners. [availableTrackIds] is a stable snapshot from
+ * Account/origin scoped, exclusively local read APIs. The commit gate serializes final
+ * replacements with authenticated-incarnation retirement. [availableTrackIds] is a stable snapshot from
  * the shared local audio inventory (manual downloads and/or auto-cache), not a network lookup.
  * Metadata does not authorize playback. Offline callers use only the read methods; remember methods
  * consume successful online observations, never local plays or receipts.
@@ -49,11 +49,15 @@ class LocalMusicCatalog internal constructor(
     identity: AccountIdentity,
     private val availableTrackIds: suspend () -> Set<String>,
     private val clock: Clock,
+    commit: (() -> Unit) -> Boolean = { it(); true },
 ) : LibraryApi, SearchApi {
     constructor(root: File, identity: AccountIdentity, availableTrackIds: suspend () -> Set<String>) :
         this(root, identity, availableTrackIds, Clock.systemUTC())
 
-    private val storage = LocalCatalogStorage(root, identity)
+    constructor(root: File, identity: AccountIdentity, commit: (() -> Unit) -> Boolean,
+        availableTrackIds: suspend () -> Set<String>) : this(root, identity, availableTrackIds, Clock.systemUTC(), commit)
+
+    private val storage = LocalCatalogStorage(root, identity, commit)
     private val mutex = Mutex()
     private var tracks: CatalogTrackData? = null
     private var retainedHistory: CatalogHistory? = null

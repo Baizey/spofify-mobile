@@ -55,8 +55,16 @@ class OfflinePlaylistRepositoryTest {
         saved.save(); saved.save("q")
         store.clearAuto(owner); store.limit(owner, 3, emptyList())
         val pin = store.pin(key("b")) { true }!!
-        p = playlist("p", 2, "c", "a", "c")
-        saved.save()
+        store.pin(key("b"), downloadOnly = true) { true }!!.use { offlinePin ->
+            offlinePin.open(0).use { stream ->
+                assertEquals(bytes.first().toInt(), stream.input.read())
+                p = playlist("p", 2, "c", "a", "c")
+                saved.save()
+                assertFalse(offlinePin.isDownloaded())
+                assertThrows(IOException::class.java) { stream.input.read() }
+                assertThrows(IOException::class.java) { offlinePin.open(0) }
+            }
+        }
         assertEquals(listOf("b", "c"), prepared); assertEquals(prepared, opened)
         assertEquals(p, saved.select("p")); assertNull(store.pin(key("b")) { true })
         assertEquals(3, blobCount(root.root)); pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) }; pin.close()

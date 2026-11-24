@@ -309,7 +309,10 @@ internal class Media3AudioExecutor(
             attempted = null
         }
         val installed = source ?: return
-        if (!isolated || primary.localSource || installed.verifiedDownload || installed.networkStopped) return
+        if (installed.networkStopped || installed.verifiedDownload) return
+        if (primary.localSource) {
+            if (installed.downloadRetention == null) return // Initial local preparation has not selected a pin.
+        } else if (!isolated) return
         val continuing = preparation == null && player.playWhenReady && hasPlaybackAuthority()
         installed.stopNetwork(drain = continuing)
         if (!continuing) return

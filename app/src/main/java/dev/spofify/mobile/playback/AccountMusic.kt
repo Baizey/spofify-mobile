@@ -22,7 +22,10 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         .mapTo(hashSetOf()) { it.key.id }
     private val ids = MutableStateFlow<Set<String>>(emptySet())
     val downloadedIds = ids.asStateFlow()
-    val catalog = LocalMusicCatalog(java.io.File(app.noBackupFilesDir, "offline-v2"), identity) { storage.initialized.await()?.songs?.value?.let(::storedIds).orEmpty() }
+    val catalog = LocalMusicCatalog(java.io.File(app.noBackupFilesDir, "offline-v2"), identity,
+        commit = { replace -> sessions.commitLocalIfCurrent(identity, replace) }) {
+        storage.initialized.await()?.songs?.value?.let(::storedIds).orEmpty()
+    }
     private val api = OfflineClient(sessions, identity)
     private val repository = scope.async {
         storage.initialized.await()?.let { OfflinePlaylistRepository(it, owner, api::manifest, api::prepareMedia) { media ->
@@ -71,7 +74,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
     }.stateIn(scope, SharingStarted.Eagerly, emptySet())
     val trackDownloads = MutableStateFlow<Set<String>>(emptySet())
 
-    fun download(track: PersonalTrack, playlistId: String?, failure: () -> Unit) {
+    fun download(track: PersonalTrack, playlistId: String, occurrenceId: String, failure: () -> Unit) {
         val grant = sessions.onlineGrant.value?.takeIf { it.identity == identity && onlinePlayback.value } ?: return
         if (track.id in trackDownloads.value) return
         trackDownloads.update { it + track.id }
@@ -79,7 +82,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
             try {
                 val store = storage.initialized.await() ?: error("Download storage unavailable")
                 sessions.withOnlineGrant(grant) {
-                    if (playlistId != null) personal.persistPlaylistForDownload(playlistId, grant)
+                    personal.persistPlaylistForDownload(playlistId, occurrenceId, track.id, grant)
                     catalog.rememberTracks(listOf(LocalTrackMetadata.Personal(track)))
                     withContext(Dispatchers.IO) {
                         val job = coroutineContext.job
@@ -220,7 +223,9 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
                             val manifest = try {
                                 repo.refresh(id, cache.options.value.cap, onProgress = { progress ->
                                     playlistProgress.update { it + (id to progress) }
-                                }, trace = trace) { wanted() && sessions.onlineGrant.value === grant && cache.link.value == link }
+                                }, trace = trace, commit = { publish -> sessions.publishIfCurrent(grant, publish) }) {
+                                    wanted() && sessions.onlineGrant.value === grant && cache.link.value == link
+                                }
                             } finally {
                                 playlistProgress.update { it - id }
                             }

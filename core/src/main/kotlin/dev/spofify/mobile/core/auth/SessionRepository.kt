@@ -272,8 +272,8 @@ class SessionRepository(
     }
 
     /** Serialize a final local-cache commit with session retirement. Prepare bytes before calling. */
-    fun commitLocalIfCurrent(expected: AccountIdentity, commit: () -> Unit) = synchronized(lock) {
-        if (isCurrent(expected)) commit()
+    fun commitLocalIfCurrent(expected: AccountIdentity, commit: () -> Unit): Boolean = synchronized(lock) {
+        if (!isCurrent(expected)) false else { commit(); true }
     }
 
     fun isCurrent(expected: AccountIdentity): Boolean = synchronized(lock) {

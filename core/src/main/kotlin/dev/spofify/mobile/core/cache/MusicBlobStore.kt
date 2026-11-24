@@ -64,7 +64,10 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     @Serializable
     private data class Row(val key: SongKey, val title: String, val size: Long, val sha: String,
         val auto: Boolean = true, val refs: Set<String> = emptySet(), val drafts: Set<String> = emptySet())
-    private class Entry(val file: File, var row: Row, var last: Long, var readers: Int = 0)
+    private class Entry(val file: File, var row: Row, var last: Long, var readers: Int = 0) {
+        // Pins preserve bytes, not download authority. Loader threads recheck this on each read.
+        @Volatile var downloaded = false
+    }
     private val lock = ReentrantLock()
     private val entries = mutableMapOf<SongKey, Entry>()
     // A metadata-only remnant never occupies a track's live entry.
@@ -154,9 +157,8 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     }
 
     private fun refresh() {
-        val complete = playlists.committedIds().filterTo(hashSetOf()) { (owner, id) ->
-            playlists.select(owner, id)?.let { entries.keys.containsAll(trackKeys(owner, it)) } == true
-        }
+        entries.values.forEach { it.downloaded = offline(it.row) }
+        val complete = playlists.readyIds(entries.keys)
         usageByOwner.clear()
         for ((owner, _) in complete) usageByOwner.getOrPut(owner, ::Usage).playlists++
         mutable.value = entries.values.mapNotNull { entry ->
@@ -194,6 +196,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             val replace = {
                 Files.move(tmp.toPath(), meta(entry.file).toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
                 entry.row = row
+                entry.downloaded = offline(row)
                 durable()
             }
             return commit?.invoke(replace) ?: run { replace(); true }
@@ -204,7 +207,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         if (!unused(entry)) return
         playlists.beforeReclaim()
         unlink(entry.file.toPath())
-        entries.remove(entry.row.key)
+        entries.remove(entry.row.key, entry)
         val path = meta(entry.file).toPath()
         staleMetadata[path] = entry.row.key
         unlinkStaleMetadata(path)
@@ -233,7 +236,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             if (!canOpen(entry)) { invalidate(entry); return null }
             touch(entry)
             entry.readers++
-            return PinnedSong(entry.file, entry.row.size, current, downloaded = offline(entry.row)) {
+            return PinnedSong(entry.file, entry.row.size, current, downloadRetained = { entry.downloaded }, downloadOnly = downloadOnly) {
                 lock.withLock {
                     entry.readers--
                     if (!entry.row.auto && !offline(entry.row)) {
@@ -251,6 +254,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     }.getOrDefault(false)
 
     private fun invalidate(entry: Entry, publish: Boolean = true) {
+        entry.downloaded = false
         entries.remove(entry.row.key, entry)
         staleMetadata[meta(entry.file).toPath()] = entry.row.key
         if (publish) refresh()
@@ -387,7 +391,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         finally { refresh() }
     }
     internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int,
-        trace: OfflineAttemptTrace? = null, checkCurrent: () -> Unit) = lock.withLock {
+        trace: OfflineAttemptTrace? = null, commit: (() -> Unit) -> Boolean) = lock.withLock {
         trace?.step(COMMIT_INDEX)
         val keys = trackKeys(owner, manifest)
         val id = manifest.collection.reference.id
@@ -397,7 +401,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         trace?.step(COMMIT_DISK_WAIT)
         val old = diskWrites.withLock {
             trace?.step(COMMIT_WRITE)
-            playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, checkCurrent)
+            playlists.commit(owner, manifest, keys, freeBytes() - RESERVE, commit, ::refresh)
         }
         trace?.step(COMMIT_CLEANUP)
         afterCommit(owner, cap, old)
@@ -408,7 +412,10 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     internal fun remove(owner: MusicOwner, id: String, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
         checkCurrent()
         val old = playlists.remove(owner, id)
-        if (old != null) afterCommit(owner, cap, old)
+        if (old != null) {
+            old.forEach { key -> entries[key]?.let { it.downloaded = offline(it.row) } }
+            afterCommit(owner, cap, old)
+        }
         val removedDraft = clearDraft(owner, id, emptySet(), checkCurrent)
         old != null || removedDraft
     }

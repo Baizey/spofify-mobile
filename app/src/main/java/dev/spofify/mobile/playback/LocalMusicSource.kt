@@ -22,8 +22,13 @@ internal class LocalMusicRanges(
 
     fun open(key: String?, position: Long): AudioStream {
         if (key != installed.key || !active()) throw InterruptedIOException("Local audio source retired")
-        return choice.openLocal(installed.trackId, position) ?: throw IOException("Song unavailable locally")
+        return try {
+            choice.openLocal(installed.trackId, position, allowTemporary = { false },
+                onChoice = { installed.downloadRetention = it }) ?: throw IOException("Song unavailable locally")
+        } catch (e: IOException) { onReadFailure(); throw e }
     }
+
+    fun onReadFailure() = installed.drainBufferedAudioIf(retired = !installed.verifiedDownload)
 
     override fun close() = choice.close()
 }
@@ -31,7 +36,7 @@ internal class LocalMusicRanges(
 @UnstableApi
 internal fun localMusicSource(item: MediaItem, ranges: LocalMusicRanges): WrappingMediaSource {
     val factory = ProgressiveMediaSource.Factory(DataSource.Factory {
-        RangeSource(false) { spec -> ranges.open(spec.key, spec.position) }
+        RangeSource(false, onReadFailure = { ranges.onReadFailure() }) { spec -> ranges.open(spec.key, spec.position) }
     }).setLoadErrorHandlingPolicy(AudioLoadRecovery()) // Plain disk errors never request a retry.
     return object : WrappingMediaSource(factory.createMediaSource(item)) {
         override fun releaseSourceInternal() {

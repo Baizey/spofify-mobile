@@ -96,6 +96,28 @@ class OnlineMusicRangesTest {
         }
     }
 
+    @Test fun removingFinalDownloadReferenceRevokesNewReadsOnOldPinInManualMode() = runTest {
+        val fixture = MusicBlobStore(root.root)
+        saveAuto(fixture)
+        assertTrue(fixture.offlineReference(key, "download", true, 3))
+        val allowed = AtomicBoolean(true)
+        val source = AudioSourceOwner("leaving-online", key.id)
+        val ranges = OnlineMusicRanges(CompletableDeferred(fixture), MusicSourceChoice({ fixture.pin(key) { true } })) { true }
+        ranges.use {
+            requireNotNull(ranges.openLocal(source, 0, allowed::get)).use { stream ->
+                assertEquals(1, stream.input.read())
+                assertTrue(source.verifiedDownload)
+                assertTrue(fixture.offlineReference(key, "download", false, 3))
+                assertFalse(source.verifiedDownload)
+                assertEquals(2, stream.input.read()) // AUTO data is still permitted online.
+                allowed.set(false)
+                source.stopNetwork(drain = true)
+                assertThrows(IOException::class.java) { stream.input.read() }
+                assertThrows(IOException::class.java) { ranges.openLocal(source, 1, allowed::get) }
+            }
+        }
+    }
+
     @Test fun firstRangeAtExactEofIsLocalAndPastEofCannotFallBackToHttp() = runTest {
         val store = MusicBlobStore(root.root)
         saveForOffline(store)

@@ -30,6 +30,7 @@ internal class AccountPersonalSource(
     override val replica: AccountPersonalReplica = AccountPersonalReplica(),
     private val io: CoroutineDispatcher = Dispatchers.IO,
     private val monotonicMs: () -> Long = android.os.SystemClock::elapsedRealtime,
+    private val beforePersist: suspend (PersonalCacheSnapshot) -> Unit = {},
 ) : LivePersonal, PersonalLibraryApi by client {
     private val codec = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val file = PersonalCacheFile(root, identity)
@@ -60,6 +61,7 @@ internal class AccountPersonalSource(
                 if (snapshot == last) return@collect
                 withContext(io) {
                     try {
+                        beforePersist(snapshot)
                         file.write(snapshot) { commit -> sessions.commitLocalIfCurrent(identity, commit) }
                         last = snapshot
                         if (sessions.isCurrent(identity)) persisted.value = snapshot
@@ -205,10 +207,19 @@ internal class AccountPersonalSource(
         task.start()
     }
 
-    suspend fun persistPlaylistForDownload(id: String, owner: OnlineGrant) {
+    suspend fun persistPlaylistForDownload(id: String, occurrenceId: String, trackId: String, owner: OnlineGrant) {
+        fun ReplicaPlaylist.containsOccurrence() = rows.any { it.id == occurrenceId && it.track.id == trackId }
         check(sessions.onlineGrant.value === owner)
-        check(id in replica.snapshots.value.details)
-        check(withTimeoutOrNull(5_000) { persisted.first { id in it.details }; true } == true)
+        val current = replica.snapshots.value
+        val selected = checkNotNull(current.details[id])
+        check(selected.containsOccurrence())
+        val revision = maxOf(selected.revision, current.playlists.firstOrNull { it.id == id }?.revision ?: 0)
+        check(withTimeoutOrNull(5_000) {
+            persisted.first { snapshot ->
+                snapshot.details[id]?.let { it.revision >= revision && it.containsOccurrence() } == true
+            }
+        } != null)
+        if (sessions.onlineGrant.value !== owner) throw CancellationException("Download grant retired")
     }
 
     fun retainDownload(summary: PersonalPlaylistSummary, rows: List<PersonalManualEntry>, owner: OnlineGrant?) = afterRestore {

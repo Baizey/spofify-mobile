@@ -29,7 +29,8 @@ class OfflinePlaylistRepository(
     suspend fun retainedIds(): Set<String> = withContext(Dispatchers.IO) { store.retainedPlaylistIds(owner) }
 
     suspend fun refresh(id: String, cap: Int, onProgress: (OfflinePlaylistProgress) -> Unit = {},
-        trace: OfflineAttemptTrace? = null, current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
+        trace: OfflineAttemptTrace? = null, commit: (() -> Unit) -> Boolean = { it(); true },
+        current: () -> Boolean): OfflineManifest = withContext(Dispatchers.IO) {
         val ref = OfflineCollectionRef(OfflineCollectionKind.PLAYLIST, id)
         require(cap in CacheOptions.caps && OfflineParser.validReference(ref))
         val job = currentCoroutineContext().job
@@ -79,7 +80,14 @@ class OfflinePlaylistRepository(
                 }
                 checkCurrent()
                 trace?.step(COMMIT)
-                store.commit(owner, result, cap, trace, ::checkCurrent)
+                store.commit(owner, result, cap, trace) { publish ->
+                    var committed = false
+                    commit {
+                        checkCurrent()
+                        publish()
+                        committed = true
+                    } && committed
+                }
                 trace?.step(COMMITTED)
                 checkCurrent()
                 result
