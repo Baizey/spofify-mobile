@@ -46,6 +46,12 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         private set
     private var reconnect: PlaybackReconnect? = null
     private var reconnectGrant: OnlineGrant? = null
+    private enum class ReconnectPhase { ADMISSION_OR_UPGRADE, FIRST_SNAPSHOT }
+    private class ReconnectDiagnostic {
+        var phase = ReconnectPhase.ADMISSION_OR_UPGRADE
+        var failure: AuthFailure.Kind? = null
+    }
+    private var reconnectDiagnostic = ReconnectDiagnostic()
     @Volatile private var retired = false
     private var manual = sessions.manualOffline.value
     private var maintenance: PlaybackSessionMaintenance? = null
@@ -70,7 +76,14 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         val transport = sessions.playbackTransport(identity)
         val boundTransport = PlaybackTransport { name, device, local, reattachBasis ->
             val grant = reconnectGrant ?: throw CancellationException("No playback admission grant")
-            sessions.withOnlineGrant(grant) { transport.connect(name, device, local, reattachBasis) }
+            val diagnostic = reconnectDiagnostic
+            try {
+                sessions.withOnlineGrant(grant) { transport.connect(name, device, local, reattachBasis) }
+                    .also { diagnostic.phase = ReconnectPhase.FIRST_SNAPSHOT }
+            } catch (failure: AuthFailure) {
+                diagnostic.failure = failure.kind
+                throw failure
+            }
         }
         val controller = AccountChannel(boundTransport, port, scope, object : PlaybackClock {
             override fun monotonicMs() = SystemClock.elapsedRealtime()
@@ -118,7 +131,14 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         reconnect = exact?.let { owner ->
             PlaybackReconnect(scope, controller.state,
                 { !retired && sessions.isCurrent(identity) && !sessions.manualOffline.value && sessions.onlineGrant.value === owner },
-                { controller.connect("Phone", deviceId) }, { stillCurrent -> onExhausted(owner, stillCurrent) })
+                { reconnectDiagnostic = ReconnectDiagnostic(); controller.connect("Phone", deviceId) }, { stillCurrent ->
+                    if (stillCurrent()) {
+                        val diagnostic = reconnectDiagnostic
+                        Log.w("SpofifyPlayer", "Playback connection attempts exhausted: phase=${diagnostic.phase.name} " +
+                            "status=${diagnostic.failure?.name ?: "NOT_ESTABLISHED"}")
+                    }
+                    onExhausted(owner, stillCurrent)
+                })
                 .also { it.start(explicit) }
         }
     }
