@@ -12,6 +12,7 @@ import kotlinx.coroutines.launch
 internal data class PlaylistsState(
     val items: List<PersonalPlaylistSummary> = emptyList(),
     val loaded: Boolean = false,
+    val canCreate: Boolean = true,
     val loading: Boolean = false,
     val error: String? = null,
     val writing: Boolean = false,
@@ -32,15 +33,20 @@ internal class PlaylistsViewModel(private val api: PersonalLibraryApi, private v
     private val live = api as? dev.spofify.mobile.playback.LivePersonal
     init {
         if (live == null) refresh() else viewModelScope.launch {
+            refresh()
             live.replica.view.collect { snapshot ->
                 val rows = snapshot.playlists.filter { !manualOnly || it.kind == PersonalPlaylistKind.MANUAL }
-                mutable.value = mutable.value.copy(items = naturalPlaylistOrder(rows), loaded = true)
+                mutable.value = mutable.value.copy(items = naturalPlaylistOrder(rows), loaded = snapshot.ready,
+                    canCreate = snapshot.connected, message = if (snapshot.ready && !snapshot.listsKnown) "Playlists not saved on this device." else null)
             }
         }
     }
 
     fun refresh() {
-        if (live != null) return
+        if (live != null) {
+            live.refresh(AccountPersonalReplica.Resource.Lists)
+            return
+        }
         reading?.cancel()
         val token = ++generation
         mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null)

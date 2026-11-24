@@ -45,14 +45,14 @@ internal class PlaylistDetailViewModel(
     private var reading: Job? = null
 
     private val live = api as? dev.spofify.mobile.playback.LivePersonal
-    private val watch = live?.watch(id)
     private var seen = false
     init {
         if (live == null) refresh() else viewModelScope.launch {
             live.replica.view.collect { snapshot ->
                 val summary = snapshot.playlists.firstOrNull { it.id == id }
                 if (summary == null) {
-                    if (seen && snapshot.connected) mutable.value = mutable.value.copy(deleted = true)
+                    if (seen && snapshot.listsKnown) mutable.value = mutable.value.copy(deleted = true)
+                    else if (snapshot.ready) mutable.value = mutable.value.copy(message = "Not saved on this device.")
                     return@collect
                 }
                 seen = true
@@ -65,17 +65,22 @@ internal class PlaylistDetailViewModel(
                 }
                 mutable.value = mutable.value.copy(summary = summary, rows = rows,
                     loaded = detail != null, completeCollection = detail != null,
+                    message = if (snapshot.ready && detail == null) "Not saved on this device." else null,
                     context = if (detail == null) null else PlaybackContext(if (derived) "derived" else "playlist", id, summary.name))
             }
         }
     }
 
-    override fun onCleared() { watch?.close() }
+    fun watch(): AutoCloseable? = live?.watch(id)
 
     fun filter(value: String) { mutable.value = mutable.value.copy(filter = value) }
 
     fun refresh() {
-        if (live != null || mutable.value.deleted) return
+        if (live != null) {
+            if (!mutable.value.deleted) live.refresh(AccountPersonalReplica.Resource.Detail(id))
+            return
+        }
+        if (mutable.value.deleted) return
         reading?.cancel()
         val token = ++generation
         mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null, context = null)

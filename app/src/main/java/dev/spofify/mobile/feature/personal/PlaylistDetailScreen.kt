@@ -47,8 +47,12 @@ internal fun PlaylistDetailScreen(
     val context = state.context
     val summary = state.summary
     val playable = ready && context != null && !state.loading && !state.writing && !state.needsRefresh &&
-        summary?.capabilities?.play == true && state.rows.isNotEmpty()
+        summary?.capabilities?.play == true && state.rows.any { it.track.hasAudio }
     val offlineStatus = music?.offlinePlaylistStatuses?.collectAsStateWithLifecycle()?.value?.get(id)
+    val downloaded = music?.downloadedIds?.collectAsStateWithLifecycle()?.value.orEmpty()
+    val direct = music?.directDownloads?.collectAsStateWithLifecycle()?.value.orEmpty()
+    val downloading = music?.trackDownloads?.collectAsStateWithLifecycle()?.value.orEmpty()
+    val canDownload = music?.canManageDownloads?.collectAsStateWithLifecycle()?.value == true
     var menu by remember(model) { mutableStateOf(false) }
     var songMenu by remember(model) { mutableStateOf<PlaylistSong?>(null) }
     var renaming by remember(model) { mutableStateOf<PersonalPlaylistSummary?>(null) }
@@ -59,13 +63,16 @@ internal fun PlaylistDetailScreen(
     val playRow: (PlaylistSong) -> Unit = { row ->
         val reference = row.takeIf { it in state.rows }?.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)
         if (playable && reference != null) send { playback?.playTrack(reference, context) }
-        else if (!ready && row in state.rows) onNavigate(MusicKind.TRACK, row.track.id)
-        else actionError = "This song isn't available to play."
+        else if (row.track.hasAudio && !ready && row in state.rows) onNavigate(MusicKind.TRACK, row.track.id)
+        else actionError = if (player?.view?.offline == true) "This song isn’t downloaded." else "Audio unavailable"
     }
     val queueRow: (PlaylistSong) -> Unit = { row ->
         if (playable && row in state.rows) row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)?.let { reference -> send { playback?.queueTrack(reference, context) } }
     }
-    LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
+    DisposableEffect(model) {
+        val watch = model.watch()
+        onDispose { watch?.close() }
+    }
     LaunchedEffect(state.context, state.rows) { songMenu = null }
     LaunchedEffect(state.deleted) { if (state.deleted) onBack() }
     BackHandler(onBack = onBack)
@@ -107,7 +114,8 @@ internal fun PlaylistDetailScreen(
                 items(visibleRows.asReversed(), key = { it.identity }) { row ->
                     PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
                         onQueue = if (playable && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null) ({ queueRow(row) }) else null,
-                        gestureBinding = playback to personalGestureBinding(row, context, player?.view))
+                        gestureBinding = playback to personalGestureBinding(row, context, player?.view),
+                        downloaded = row.track.id in downloaded, downloading = row.track.id in downloading)
                 }
             }
         }
@@ -133,11 +141,17 @@ internal fun PlaylistDetailScreen(
         onDismiss = { menu = false },
         onOfflineRemoved = if (api is dev.spofify.mobile.playback.DevicePersonalLibrary) ({ menu = false; onBack() }) else null)
     songMenu?.let { row ->
+        val downloadAction: Pair<String, () -> Unit>? = when {
+            music == null -> null
+            row.track.id in direct -> "Remove download" to { music.removeDownload(row.track.id) { actionError = "Couldn’t remove download." } }
+            canDownload && row.track.hasAudio && row.track.id !in downloaded -> "Download" to { music.download(row.track, id) { actionError = "Couldn’t download this song." } }
+            else -> null
+        }
         PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null,
             onPlay = { playRow(row) }, onQueue = { queueRow(row) }, onNavigate = onNavigate,
             onRemove = if (state.canEdit && summary?.capabilities?.editEntries == true && row.entryId != null) ({
                 removing = row to requireNotNull(summary).revision
-            }) else null, onDismiss = { songMenu = null })
+            }) else null, onDismiss = { songMenu = null }, downloadAction = downloadAction, downloading = row.track.id in downloading)
     }
     renaming?.let { original ->
         PlaylistNameSheet("Edit details", original.name, original.description, onDismiss = { renaming = null }) { name, description ->

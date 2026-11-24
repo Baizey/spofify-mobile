@@ -22,8 +22,8 @@ class ReleaseOfflineStoreTest {
 
     @Test fun existingInvalidStateNeverFallsBackToFirstLaunch() {
         val root = temp.newFolder()
-        val state = root.resolve("network-policy-v1")
-        for (content in listOf("", "spofify-offline-v", "spofify-online-v1\n0", "x".repeat(8192))) {
+        val state = root.resolve("network-policy-v2")
+        for (content in listOf("", "spofify-offline-v", "spofify-online-v2\n0", "x".repeat(8192))) {
             state.writeText(content)
             assertTrue(ReleaseOfflineStore(root).read())
         }
@@ -34,12 +34,12 @@ class ReleaseOfflineStoreTest {
 
     @Test fun anInterruptedWriteFencesColdLaunchEvenWithAnOnlineRecord() {
         val root = temp.newFolder()
-        val interrupted = root.resolve("network-policy-v1.pending")
+        val interrupted = root.resolve("network-policy-v2.pending")
         interrupted.writeText("")
         assertTrue(ReleaseOfflineStore(root).read())
         ReleaseOfflineStore(root).write(false)
         assertFalse(ReleaseOfflineStore(root).read())
-        interrupted.writeText("spofify-offline-v1\n")
+        interrupted.writeText("spofify-offline-v2\n")
         assertTrue(ReleaseOfflineStore(root).read())
         ReleaseOfflineStore(root).write(false)
         assertFalse(ReleaseOfflineStore(root).read())

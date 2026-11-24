@@ -42,6 +42,7 @@ internal fun PlaylistCollectionSheet(
     val wanted = offline?.wanted?.collectAsStateWithLifecycle()?.value
     val pending = offline?.pending?.collectAsStateWithLifecycle()?.value.orEmpty()
     val checked = summary?.id in wanted.orEmpty()
+    val connected = music?.canManageDownloads?.collectAsStateWithLifecycle()?.value == true
     val removed by rememberUpdatedState(onOfflineRemoved)
     LaunchedEffect(summary?.id, checked) {
         // Offline screens show complete downloads only; after removing one, leave/refresh it.
@@ -60,7 +61,7 @@ internal fun PlaylistCollectionSheet(
             if (summary != null) {
                 item("library") { SheetGroup("Library") }
                 if (offline != null) item("save-offline") {
-                    val enabled = wanted != null && summary.id !in pending
+                    val enabled = wanted != null && summary.id !in pending && (checked || connected)
                     Row(Modifier.fillMaxWidth().heightIn(min = 54.dp)
                         .toggleable(checked, enabled = enabled, role = Role.Switch) { offline.set(summary.id, it) }
                         .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
@@ -103,7 +104,10 @@ internal fun PlaylistSummaryActions(
         !state.loading && !state.writing && !state.needsRefresh && state.rows.isNotEmpty() && state.summary?.capabilities?.play == true
     var editing by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var deleting by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
-    LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
+    DisposableEffect(model) {
+        val watch = model.watch()
+        onDispose { watch?.close() }
+    }
     LaunchedEffect(state.deleted) { if (state.deleted) onDismiss() }
     when {
         editing != null -> {

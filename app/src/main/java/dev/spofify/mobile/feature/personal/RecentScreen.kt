@@ -40,7 +40,11 @@ internal fun RecentScreen(
     var menu by remember(model) { mutableStateOf<PersonalHistoryEntry?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
     val send: (() -> Boolean?) -> Unit = { action -> action(); actionError = null }
-    val play: (PersonalHistoryEntry) -> Unit = { entry ->
+    val play: (PersonalHistoryEntry) -> Unit = play@{ entry ->
+        if (!entry.track.hasAudio && player?.view?.offline == true) {
+            actionError = "This song isn’t downloaded."
+            return@play
+        }
         activateTrackRow(entry.track.id, entry.track.hasAudio && playback?.presentation?.canLoadTrack == true,
             play = { playback?.playTrack(it) },
             openDetails = if (entry.metadataMissing || api is dev.spofify.mobile.playback.DevicePersonalLibrary && !entry.track.hasAudio) null else ({ onNavigate(MusicKind.TRACK, entry.track.id) }),
@@ -53,7 +57,7 @@ internal fun RecentScreen(
     LaunchedEffect(state.items) { menu = null }
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp)) {
-            PageTitle("History")
+            PageTitle("Recently Played")
             val error = state.error ?: actionError ?: player?.error
             if (error != null) PersonalStatus(false, error)
         }

@@ -18,6 +18,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.withTimeout
 
 /** Resolve storage recovery before choosing the representation, off the player looper. A real
@@ -88,10 +89,10 @@ internal class SessionAudioDataSource(
     private fun openNetwork(dataSpec: DataSpec): AudioStream {
         val grant = grant ?: throw InterruptedIOException("No online audio grant")
         val pending = retry.pending.get()
-        val job = pending?.job ?: retry.source.job
+        val job = retry.source.networkJob
         val length = dataSpec.length.takeIf { it != C.LENGTH_UNSET.toLong() }
         fun checkOwner() {
-            if (sessions.manualOffline.value || !retry.source.job.isActive || sessions.onlineGrant.value !== grant || pending != null && !pending.isCurrent()) {
+            if (sessions.manualOffline.value || retry.source.networkStopped || sessions.onlineGrant.value !== grant || pending != null && !pending.isCurrent()) {
                 throw InterruptedIOException("Audio load retired")
             }
         }
@@ -103,8 +104,11 @@ internal class SessionAudioDataSource(
                 suspend fun acquire() = sessions.withOnlineGrant(grant) {
                     sessions.audio(grant.identity, retry.source.trackId, dataSpec.position, length)
                 }.also { acquired = it }
-                val budget = pending?.remainingPrepareRetryMs()
-                if (budget == null) acquire() else withTimeout(budget) { acquire() }
+                val cancelRetry = pending?.job?.invokeOnCompletion { coroutineContext[kotlinx.coroutines.Job]?.cancel() }
+                try {
+                    val budget = pending?.remainingPrepareRetryMs()
+                    if (budget == null) acquire() else withTimeout(budget) { acquire() }
+                } finally { cancelRetry?.dispose() }
             }
             if (pending != null) opened.checkContinuation(representation, dataSpec.position, length)
             cancellation = job.invokeOnCompletion { opened.cancel() }
@@ -113,12 +117,22 @@ internal class SessionAudioDataSource(
             return opened
         } catch (failure: Exception) {
             acquired?.close()
+            drainBufferedAudio()
             throw when (failure) {
                 is TransientAudioLoadFailure -> failure.forLoader()
                 is CancellationException, is InterruptedException -> InterruptedIOException("Audio load cancelled")
                 else -> failure
             }
         }
+    }
+
+    /** Keep the progressive loader alive without I/O while its existing samples drain. */
+    private fun drainBufferedAudio() {
+        val owner = retry.source
+        if (!owner.drainOnLoss || !owner.networkStopped) return
+        try { runBlocking(owner.job) { awaitCancellation() } }
+        catch (_: CancellationException) { throw InterruptedIOException("Buffered playback retired") }
+        catch (_: InterruptedException) { throw InterruptedIOException("Buffered playback interrupted") }
     }
 
     private fun TransientAudioLoadFailure.forLoader(): IOException {
@@ -131,9 +145,16 @@ internal class SessionAudioDataSource(
     override fun addTransferListener(listener: TransferListener) { disk.addTransferListener(listener); network.addTransferListener(listener) }
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         val source = requireNotNull(active)
-        if (source === network && sessions.manualOffline.value) throw InterruptedIOException("Manual offline")
-        return try { source.read(buffer, offset, length) } catch (failure: TransientAudioLoadFailure) {
-            throw if (source === network) failure.forLoader() else failure
+        if (source === network && (retry.source.networkStopped || sessions.manualOffline.value || sessions.onlineGrant.value !== grant)) {
+            drainBufferedAudio()
+            throw InterruptedIOException("Audio network retired")
+        }
+        return try { source.read(buffer, offset, length) } catch (failure: IOException) {
+            if (source === network) {
+                drainBufferedAudio()
+                if (failure is TransientAudioLoadFailure) throw failure.forLoader()
+            }
+            throw failure
         }
     }
     override fun getUri() = active?.uri

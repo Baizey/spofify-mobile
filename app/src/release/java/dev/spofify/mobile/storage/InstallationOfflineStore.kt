@@ -20,8 +20,8 @@ internal fun installationOfflineStore(context: Context) = ReleaseOfflineStore(co
 /** A new release-only store: absent on first launch, never treats corrupt state as a default. */
 internal class ReleaseOfflineStore(directory: File) : ManualOfflineStore {
     private val root = directory.toPath()
-    private val policy = root.resolve("network-policy-v1")
-    private val pending = root.resolve("network-policy-v1.pending")
+    private val policy = root.resolve("network-policy-v2")
+    private val pending = root.resolve("network-policy-v2.pending")
 
     override fun read(): Boolean {
         if (!Files.isDirectory(root, NOFOLLOW_LINKS)) throw IOException("Unreadable network policy directory")
@@ -60,7 +60,7 @@ internal class ReleaseOfflineStore(directory: File) : ManualOfflineStore {
     private fun syncDirectory() = FileChannel.open(root, READ).use { it.force(true) }
 
     private companion object {
-        val OFFLINE = "spofify-offline-v1\n".encodeToByteArray()
-        val ONLINE = "spofify-online-v1\n".encodeToByteArray()
+        val OFFLINE = "spofify-offline-v2\n".encodeToByteArray()
+        val ONLINE = "spofify-online-v2\n".encodeToByteArray()
     }
 }

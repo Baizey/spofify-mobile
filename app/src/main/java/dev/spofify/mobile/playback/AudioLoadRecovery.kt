@@ -49,6 +49,10 @@ internal const val AUDIO_PREPARATION_TIMEOUT_MS = 20_000L
 internal class AudioSourceOwner(val key: String, val trackId: String) {
     val job = SupervisorJob()
     @Volatile var usingNetwork = false
+    @Volatile var drainOnLoss = false
+    val networkJob = SupervisorJob(job)
+    val networkStopped get() = !networkJob.isActive
+    fun stopNetwork(drain: Boolean) { drainOnLoss = drain; networkJob.cancel() }
     private var binding: AudioLoadScope? = null
     private val interruptions = mutableSetOf<AudioLoadRetry>()
 

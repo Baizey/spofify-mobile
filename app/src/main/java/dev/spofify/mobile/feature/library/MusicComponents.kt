@@ -90,6 +90,7 @@ internal fun MusicRow(
     onMore: (() -> Unit)? = null,
     gestureBinding: Any = item.key,
     containerColor: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.background,
+    availability: String? = null,
     onOpen: () -> Unit,
 ) {
     var menu by remember(item.key) { mutableStateOf(false) }
@@ -124,6 +125,10 @@ internal fun MusicRow(
                         }
                         Text(subtitle, Modifier.padding(top = 3.dp), style = MaterialTheme.typography.bodySmall.copy(lineHeight = 16.8.sp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    availability?.let {
+                        Text(it, Modifier.padding(start = 8.dp), style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (reservePopularity) Spacer(Modifier.width(MusicRowGeometry.POPULARITY_SLOT.dp)
                         .height(MusicRowGeometry.ACTION_SLOT.dp))

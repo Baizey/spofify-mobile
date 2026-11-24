@@ -69,6 +69,11 @@ class PlaybackOwner(private val app: Application, private val sessions: SessionR
         if (started) return
         started = true
         scope.launch {
+            network(app).distinctUntilChanged().collect { hint ->
+                if (hint != null) sessions.recoverUnavailable()
+            }
+        }
+        scope.launch {
             sessions.onlineValidation.collectLatest { validation ->
                 if (validation == OnlineValidation.UNAVAILABLE) while (isActive) {
                     delay(30_000)

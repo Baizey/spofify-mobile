@@ -8,19 +8,21 @@ import dev.spofify.mobile.core.library.LibraryClient
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.offline.*
 import dev.spofify.mobile.core.playback.*
+import dev.spofify.mobile.core.personal.*
 import java.io.IOException
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 /** One local account and the existing verified blob inventory. Network jobs capture the exact
- * grant; only a committed manifest contributes membership. No history writes from playback. */
+ * grant; only verified downloads authorize isolated playback. */
 internal class AccountMusic(app: Application, private val identity: AccountIdentity, private val sessions: SessionRepository,
     private val storage: MusicStorage, private val cache: AutomaticMusicCache, private val scope: CoroutineScope) {
     private val owner = MusicOwner(identity.origin, identity.accountId)
-    private fun storedIds(songs: List<StoredSong>) = songs.filter { it.key.owner == owner && (it.auto || it.offline) }
+    private fun storedIds(songs: List<StoredSong>) = songs.filter { it.key.owner == owner && it.offline }
         .mapTo(hashSetOf()) { it.key.id }
     private val ids = MutableStateFlow<Set<String>>(emptySet())
-    val catalog = LocalMusicCatalog(app.noBackupFilesDir, identity) { storage.initialized.await()?.songs?.value?.let(::storedIds).orEmpty() }
+    val downloadedIds = ids.asStateFlow()
+    val catalog = LocalMusicCatalog(java.io.File(app.noBackupFilesDir, "offline-v2"), identity) { storage.initialized.await()?.songs?.value?.let(::storedIds).orEmpty() }
     private val api = OfflineClient(sessions, identity)
     private val repository = scope.async {
         storage.initialized.await()?.let { OfflinePlaylistRepository(it, owner, api::manifest, api::prepareMedia) { media ->
@@ -29,7 +31,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
     }
     private val ownerActive = sessions.state.map { (it as? AuthState.Authenticated)?.identity == identity }
         .stateIn(scope, SharingStarted.Eagerly, sessions.isCurrent(identity))
-    private val preferences = app.getSharedPreferences("offline-playlists", 0)
+    private val preferences = app.getSharedPreferences("offline-v2-playlists", 0)
     private val preferenceKey = "${identity.origin.length}:${identity.origin}:${identity.accountId}"
     val offlinePlaylists = PlaylistOfflinePreference(scope,
         read = { withContext(Dispatchers.IO) { preferences.getStringSet(preferenceKey, null)?.toSet() } },
@@ -52,19 +54,72 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         if (!preferences.edit().putStringSet(preferenceKey, ids).commit()) throw IOException("Offline preference unavailable")
     }
 
-    private val localSources = MusicSources(catalog, catalog,
-        DevicePersonalLibrary(catalog, offlinePlaylists::complete), catalog.trackContent(ownerActive), true)
-    val personal = AccountPersonalSource()
+    val personal = AccountPersonalSource(app.noBackupFilesDir, identity, sessions, scope)
+    private val localSources = MusicSources(catalog, catalog, personal, catalog.trackContent(ownerActive), true)
     private val onlinePlayback = MutableStateFlow(false)
     private val mutableSources = MutableStateFlow(localSources)
     val sources = mutableSources.asStateFlow()
     private val metadataVersion = MutableStateFlow(0L)
+    val downloads = combine(ids, metadataVersion) { _, _ -> Unit }.mapLatest {
+        catalog.availableTracks().filter { it.id in ids.value }.sortedBy { it.name.lowercase() }
+    }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val canManageDownloads = onlinePlayback.asStateFlow()
+    val directDownloads: StateFlow<Set<String>> = flow {
+        storage.initialized.await()?.let { store -> emitAll(store.songs.map { songs ->
+            songs.filter { it.key.owner == owner && it.direct }.mapTo(hashSetOf()) { it.key.id }
+        }) }
+    }.stateIn(scope, SharingStarted.Eagerly, emptySet())
+    val trackDownloads = MutableStateFlow<Set<String>>(emptySet())
+
+    fun download(track: PersonalTrack, playlistId: String?, failure: () -> Unit) {
+        val grant = sessions.onlineGrant.value?.takeIf { it.identity == identity && onlinePlayback.value } ?: return
+        if (track.id in trackDownloads.value) return
+        trackDownloads.update { it + track.id }
+        scope.launch {
+            try {
+                val store = storage.initialized.await() ?: error("Download storage unavailable")
+                sessions.withOnlineGrant(grant) {
+                    if (playlistId != null) personal.persistPlaylistForDownload(playlistId, grant)
+                    catalog.rememberTracks(listOf(LocalTrackMetadata.Personal(track)))
+                    withContext(Dispatchers.IO) {
+                        val job = coroutineContext.job
+                        store.download(SongKey(owner, track.id), track.name, cache.options.value.cap,
+                            { job.isActive && sessions.onlineGrant.value === grant }, { api.prepareMedia(track.id) }) { media, consume ->
+                            sessions.versionedAudio(identity, media).use { consume(it.input) }
+                        }
+                    }
+                }
+                metadataVersion.value++
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { if (sessions.isCurrent(identity)) failure() }
+            finally { trackDownloads.update { it - track.id } }
+        }
+    }
+
+    fun removeDownload(id: String, failure: () -> Unit) {
+        scope.launch {
+            try {
+                val store = storage.initialized.await() ?: error("Download storage unavailable")
+                withContext(Dispatchers.IO) { if (sessions.isCurrent(identity)) store.removeDownload(SongKey(owner, id), cache.options.value.cap) }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { if (sessions.isCurrent(identity)) failure() }
+        }
+    }
     private var deviceIndex: DeviceMusicLibrary? = null
     private val mutableIndexReady = MutableStateFlow(false)
     val indexReady = mutableIndexReady.asStateFlow()
     val library = object : LocalPlaybackLibrary {
-        override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = deviceIndex?.resolve(track, context)
-        override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized() && track.id in ids.value
+        override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?): LocalPlaybackRows? {
+            if (!sessions.isCurrent(identity)) return null
+            if (context?.kind !in setOf("playlist", "derived")) return deviceIndex?.resolve(track, context)
+            val collection = context ?: return null
+            val rows = personal.replica.snapshots.value.details[collection.id]?.rows ?: return null
+            return cachedPlaylistRows(rows, collection, track, ids.value)
+        }
+        override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean): Boolean {
+            if (track.id !in ids.value || !isAuthorized()) return false
+            return withContext(Dispatchers.IO) { cache.hasPlayableDownload(track.id, isAuthorized) }
+        }
     }
 
     private val queue = MutableStateFlow<List<PlaybackTrack>>(emptyList())
@@ -75,14 +130,12 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
 
     init {
         scope.launch {
-            personal.replica.view.filter { it.connected }.map { it.recent }.distinctUntilChanged().collectLatest { rows ->
-                try { catalog.rememberHistory(rows) }
-                catch (cancelled: CancellationException) { throw cancelled }
-                catch (_: Exception) { /* Keep the previous complete on-device snapshot. */ }
-            }
+            combine(sessions.onlineGrant, onlinePlayback, ids) { grant, online, downloads ->
+                (grant?.identity == identity && online) to downloads
+            }.distinctUntilChanged().collect { (online, downloads) -> personal.availability(online, downloads) }
         }
         scope.launch {
-            combine(sessions.onlineGrant, onlinePlayback) { grant, online -> grant?.takeIf { online && it.identity == identity } }
+            sessions.onlineGrant.map { grant -> grant?.takeIf { it.identity == identity } }
                 .distinctUntilChanged().collect { grant ->
                     mutableSources.value = if (grant == null) localSources else onlineMusicSources(sessions, grant, catalog, personal)
                 }
@@ -106,7 +159,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
             storage.initialized.await()?.songs?.map(::storedIds)?.distinctUntilChanged()?.collect { ids.value = it }
         }
         scope.launch {
-            for (manifest in offlinePlaylists.complete()) remember(manifest)
+            for (manifest in offlinePlaylists.complete()) remember(manifest, null)
             metadataVersion.value++
         }
         scope.launch {
@@ -159,7 +212,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
                                 playlistProgress.update { it - id }
                             }
                             trace?.step(OfflineDiagnosticStage.CATALOG)
-                            remember(manifest)
+                            remember(manifest, grant)
                             metadataVersion.value++
                         } else {
                             trace?.step(OfflineDiagnosticStage.METERED_SKIP)
@@ -188,7 +241,14 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         }
     }
 
-    private suspend fun remember(manifest: OfflineManifest) {
+    private suspend fun remember(manifest: OfflineManifest, grant: OnlineGrant?) {
+        val collection = manifest.collection
+        val kind = if (collection.playlistKind == OfflinePlaylistKind.MANUAL) PersonalPlaylistKind.MANUAL else PersonalPlaylistKind.DERIVED
+        val summary = PersonalPlaylistSummary(collection.reference.id, collection.name, collection.description.orEmpty(), kind,
+            PersonalCountState.EXACT, manifest.total, manifest.recordedAudioTotal,
+            PersonalPlaylistCapabilities(false, false, false, true, false, false, false),
+            requireNotNull(collection.revision), "", "")
+        personal.retainDownload(summary, manifest.items.map { PersonalManualEntry(it.occurrenceId, it.position, it.track) }, grant)
         manifest.items.distinctBy { it.track.id }.chunked(500).forEach { chunk ->
             try { catalog.rememberTracks(chunk.map { LocalTrackMetadata.Personal(it.track) }) }
             catch (e: CancellationException) { throw e } catch (_: Exception) { /* Manifest retains its own verified metadata. */ }

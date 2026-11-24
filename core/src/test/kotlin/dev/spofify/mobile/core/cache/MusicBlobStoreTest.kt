@@ -54,6 +54,26 @@ class MusicBlobStoreTest {
         }
     }
 
+    @Test fun explicitDownloadSurvivesReopenAndEvictionButMissingFileRevokesIt() = runBlocking {
+        val store = MusicBlobStore(root.root)
+        suspend fun download(data: ByteArray) = store.download(key, "Song", 3, { true }, { descriptor(key.id) }) { _, read ->
+            read(data.inputStream())
+        }
+        assertTrue(runCatching { download(bytes.copyOf(2)) }.isFailure)
+        assertNull(store.pin(key, downloadOnly = true) { true })
+        store.put()
+        assertNull(store.pin(key, downloadOnly = true) { true })
+        download(bytes)
+        store.clearAuto(owner)
+        assertTrue(store.songs.value.single().direct)
+        val reopened = MusicBlobStore(root.root)
+        reopened.pin(key, downloadOnly = true) { true }!!.use { assertNotNull(it.open(0)?.also { stream -> stream.close() }) }
+        assertTrue(root.root.listFiles()!!.single { it.extension == "blob" }.delete())
+        assertNull(reopened.pin(key, downloadOnly = true) { true })
+        assertTrue(reopened.songs.value.isEmpty())
+        assertTrue(MusicBlobStore(root.root).songs.value.isEmpty())
+    }
+
     @Test fun recoveryDiscardsOrphanStagingAndSameLengthCorruption() = runBlocking {
         MusicBlobStore(root.root).put()
         root.root.listFiles()!!.single { it.extension == "blob" }.writeBytes(bytes.reversedArray())

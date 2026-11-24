@@ -7,7 +7,7 @@ import java.io.IOException
 
 /** Non-secret installation policy. Inject at composition time, separately from auth records. */
 class PreferenceManualOfflineStore(context: Context) : ManualOfflineStore {
-    private val prefs = context.getSharedPreferences("network_policy", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("network_policy_v2", Context.MODE_PRIVATE)
     override fun read(): Boolean = prefs.getBoolean("manual_offline", false)
 
     @SuppressLint("UseKtx")

@@ -161,13 +161,12 @@ class LocalPlaybackControllerTest {
         assertEquals(0, h.state.position)
     }
 
-    @Test fun missingSuccessorStaysSelectedUntilExplicitAdvance() = runTest {
+    @Test fun explicitlySelectedMissingOccurrenceDoesNotSubstituteAnotherSong() = runTest {
         val h = Harness(this)
         h.controller.playCollection(playlist)
         runCurrent()
-        val old = h.audio.attempts.single().binding
         h.library.missing += "b"
-        h.audio.end(old)
+        h.controller.jump(h.state.queue.first { it.id == "b" }.key)
         runCurrent()
         assertEquals(listOf("a", "b"), h.library.probes)
         assertEquals("b", h.state.current?.id)
@@ -175,14 +174,6 @@ class LocalPlaybackControllerTest {
         assertFalse(h.state.isPlaying)
         assertFalse(h.state.desiredPlaying)
         assertEquals(1, h.audio.attempts.size)
-        h.audio.end(old)
-        runCurrent()
-        assertEquals("b", h.state.current?.id)
-        h.controller.next()
-        runCurrent()
-        assertEquals("c", h.state.current?.id)
-        assertTrue(h.state.isPlaying)
-        assertEquals(listOf("a", "b", "c"), h.library.probes)
     }
 
     @Test fun unavailableRowsCannotEnterNewQueue() = runTest {
@@ -370,6 +361,20 @@ class LocalPlaybackControllerTest {
         h.controller.playCollection(playlist); runCurrent()
         h.controller.setRepeat("all")
         assertNull(requireNotNull(h.audio.successor).invoke())
+    }
+
+    @Test fun naturalAdvanceSkipsMissingInOrderAndRepeatStopsAfterOneTraversal() = runTest {
+        val h = Harness(this)
+        h.controller.playCollection(playlist); runCurrent()
+        h.library.missing += "b"
+        h.audio.end(h.audio.starts.last()); runCurrent()
+        assertEquals(listOf("a", "b", "c"), h.library.probes)
+        assertEquals("c", h.state.current?.id)
+        h.library.missing += listOf("a", "c")
+        h.controller.setRepeat("all")
+        h.audio.end(h.audio.starts.last()); runCurrent()
+        assertEquals(listOf("a", "b", "c", "a", "b", "c"), h.library.probes)
+        assertFalse(h.state.desiredPlaying)
     }
 
     private class Harness(scope: TestScope) {

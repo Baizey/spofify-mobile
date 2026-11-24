@@ -28,7 +28,7 @@ internal class MusicStorage(app: Application, private val scope: CoroutineScope)
         val diagnostics = playlistDownloadDiagnostics
         val start = diagnostics?.let { SystemClock.elapsedRealtime() }
         diagnostics?.event(OfflineDiagnosticEvent.CACHE_RECOVERY_START)
-        ready.value = try { MusicBlobStore(File(app.noBackupFilesDir, "music-blobs")) }
+        ready.value = try { MusicBlobStore(File(app.noBackupFilesDir, "music-blobs-v2")) }
         catch (e: Exception) {
             diagnostics?.event(OfflineDiagnosticEvent.CACHE_RECOVERY_UNAVAILABLE,
                 elapsedMs = start?.let { SystemClock.elapsedRealtime() - it }, error = e)
@@ -53,7 +53,7 @@ internal fun PlaybackView.readyForMusicCache(facts: AudioFacts, authorized: Bool
 private fun PlaybackView.onlineLocalOutput() =
     localOutput && !offline && !superseded && connection == PlaybackConnectionState.READY
 
-private fun network(app: Application) = callbackFlow {
+internal fun network(app: Application) = callbackFlow {
     val cm = app.getSystemService(ConnectivityManager::class.java)
     val callback = object : ConnectivityManager.NetworkCallback() {
         // API 26+ supplies the initial capabilities after onAvailable. Never reuse the old
@@ -162,7 +162,12 @@ internal class AutomaticMusicCache(app: Application, private val sessions: Sessi
         it.key.owner == owner && it.key.id == trackId && (it.offline || it.auto)
     } == true
 
-    fun sourceChoice(allowed: () -> Boolean = { true }) = MusicSourceChoice({ id ->
-        storage.ready.value?.pin(SongKey(owner, id)) { allowed() && sessions.isCurrent(identity) }
+    fun hasPlayableDownload(trackId: String, allowed: () -> Boolean): Boolean =
+        storage.ready.value?.pin(SongKey(owner, trackId), downloadOnly = true) {
+            allowed() && sessions.isCurrent(identity)
+        }?.use { true } == true
+
+    fun sourceChoice(allowed: () -> Boolean = { true }, downloadOnly: Boolean = false) = MusicSourceChoice({ id ->
+        storage.ready.value?.pin(SongKey(owner, id), downloadOnly) { allowed() && sessions.isCurrent(identity) }
     }, storage::release)
 }

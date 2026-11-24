@@ -37,7 +37,7 @@ data class MusicOwner(val origin: String, val accountId: String)
 @Serializable
 data class SongKey(val owner: MusicOwner, val id: String)
 
-data class StoredSong(val key: SongKey, val title: String, val bytes: Long, val auto: Boolean, val offline: Boolean)
+data class StoredSong(val key: SongKey, val title: String, val bytes: Long, val auto: Boolean, val offline: Boolean, val direct: Boolean = false)
 
 /** Verified audio bytes (not manifests, metadata, or incomplete transfers). Shared blobs belong
  * to offline storage first; cache bytes also include audio still in use or awaiting a retry to unlink.
@@ -107,7 +107,8 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 staleMetadata[meta.toPath()] = row.key
                 return@forEach
             }
-            val valid = file.isFile && file.length() == row.size && file.inputStream().use { digest(it) == row.sha }
+            val valid = runCatching { file.isFile && file.length() == row.size && file.inputStream().use { digest(it) == row.sha } }
+                .getOrDefault(false)
             if (valid && (row.auto || offline(row) || row.drafts.isNotEmpty())) {
                 check(row.key !in entries)
                 entries[row.key] = Entry(file, row, file.lastModified())
@@ -115,15 +116,17 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             } else if (!offline(row)) {
                 playlists.beforeReclaim()
                 Files.deleteIfExists(meta.toPath()); Files.deleteIfExists(file.toPath())
-            } else throw IOException("Referenced media unavailable")
+            } else {
+                // Keep the saved collection metadata, but do not grant this blob's playback.
+                staleMetadata[meta.toPath()] = row.key
+            }
         }
-        if (!entries.keys.containsAll(playlists.required)) throw IOException("Incomplete saved playlist")
         for (path in staleMetadata.keys.toList()) {
             try { unlinkStaleMetadata(path) } catch (_: IOException) { /* Clear can retry. */ }
         }
         val live = entries.values.mapTo(hashSetOf()) { it.file }
         files.filter { it.extension == "tmp" || it.extension == "blob" && it !in live }.forEach { Files.deleteIfExists(it.toPath()) }
-        refresh(playlists.committedIds())
+        refresh()
     }
 
     private class Usage {
@@ -150,7 +153,10 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         fun snapshot() = MusicStorageUsage(playlists, offlineBytes, pendingBytes, cachedSongs, cacheBytes, inUseBytes)
     }
 
-    private fun refresh(complete: Set<Pair<MusicOwner, String>> = committedPlaylists.value) {
+    private fun refresh() {
+        val complete = playlists.committedIds().filterTo(hashSetOf()) { (owner, id) ->
+            playlists.select(owner, id)?.let { entries.keys.containsAll(trackKeys(owner, it)) } == true
+        }
         usageByOwner.clear()
         for ((owner, _) in complete) usageByOwner.getOrPut(owner, ::Usage).playlists++
         mutable.value = entries.values.mapNotNull { entry ->
@@ -159,7 +165,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             val reading = entry.readers > 0
             usageByOwner.getOrPut(row.key.owner, ::Usage).change(row, offline, reading)
             if (!row.auto && !offline && !reading) null
-            else StoredSong(row.key, row.title, row.size, row.auto, offline)
+            else StoredSong(row.key, row.title, row.size, row.auto, offline, DIRECT_DOWNLOAD in row.refs)
         }
         mutableUsage.value = usageByOwner.mapValues { it.value.snapshot() }
         committedPlaylists.value = complete
@@ -212,13 +218,15 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     /** Serialize with retention transactions so contention cannot become an HTTP source decision.
      * Transfer and verification run outside this lock. Call on a loader/IO thread.
      */
-    fun pin(key: SongKey, current: () -> Boolean): PinnedSong? {
+    fun pin(key: SongKey, current: () -> Boolean): PinnedSong? = pin(key, false, current)
+
+    fun pin(key: SongKey, downloadOnly: Boolean, current: () -> Boolean): PinnedSong? {
         try { lock.lockInterruptibly() }
         catch (_: InterruptedException) { throw InterruptedIOException("Music pin interrupted") }
         try {
             val entry = entries[key] ?: return null
-            if (!current() || (!entry.row.auto && !offline(entry.row)) ||
-                entry.file.length() != entry.row.size) return null
+            if (!current() || ((downloadOnly || !entry.row.auto) && !offline(entry.row))) return null
+            if (!canOpen(entry)) { invalidate(entry); return null }
             touch(entry)
             entry.readers++
             return PinnedSong(entry.file, entry.row.size, current) {
@@ -232,6 +240,16 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
             }
         } catch (_: IOException) { return null } catch (_: SecurityException) { return null }
         finally { lock.unlock() }
+    }
+
+    private fun canOpen(entry: Entry): Boolean = runCatching {
+        entry.file.isFile && entry.file.inputStream().use { it.channel.size() == entry.row.size }
+    }.getOrDefault(false)
+
+    private fun invalidate(entry: Entry) {
+        entries.remove(entry.row.key, entry)
+        staleMetadata[meta(entry.file).toPath()] = entry.row.key
+        refresh()
     }
 
     fun clearAuto(owner: MusicOwner, id: String? = null) = lock.withLock {
@@ -312,7 +330,9 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     }
 
     internal fun complete(owner: MusicOwner) = lock.withLock { playlists.complete(owner) }
-    internal fun select(owner: MusicOwner, id: String) = lock.withLock { playlists.select(owner, id) }
+    internal fun select(owner: MusicOwner, id: String) = lock.withLock {
+        playlists.select(owner, id)?.takeIf { entries.keys.containsAll(trackKeys(owner, it)) }
+    }
 
     private fun reclaim(keys: Set<SongKey>) {
         for (key in keys) try { entries[key]?.let(::releaseUnused) }
@@ -330,7 +350,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         clearDraft(owner, id, keys, checkCurrent)
         keys.filterTo(hashSetOf()) { key ->
             entries[key]?.let { entry ->
-                (id in entry.row.drafts || playlists.contains(owner, id, key)) && entry.file.length() == entry.row.size
+                (id in entry.row.drafts || playlists.contains(owner, id, key)) && canOpen(entry)
             } == true
         }
     }
@@ -353,7 +373,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         reclaim(old)
         // Commit has succeeded. A failure trimming AUTO is not a failed playlist replacement.
         try { trim(owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
-        finally { refresh(playlists.committedIds()) }
+        finally { refresh() }
     }
     internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int,
         trace: OfflineAttemptTrace? = null, checkCurrent: () -> Unit) = lock.withLock {
@@ -361,7 +381,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         val keys = trackKeys(owner, manifest)
         val id = manifest.collection.reference.id
         check(keys.all { key -> entries.getValue(key).let { e ->
-            (id in e.row.drafts || playlists.contains(owner, id, key)) && e.file.length() == e.row.size
+            (id in e.row.drafts || playlists.contains(owner, id, key)) && canOpen(e)
         } })
         trace?.step(COMMIT_DISK_WAIT)
         val old = diskWrites.withLock {
@@ -385,18 +405,24 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     /** Network and digest never hold the index lock. The ticket also fences clear during descriptor lookup. */
     suspend fun fill(key: SongKey, title: String, cap: Int, priority: List<String>, current: () -> Boolean,
         prepare: suspend () -> OfflineMediaDescriptor, download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
-        fillShared(key, title, cap, priority, null, current, prepare, null, download)
+        fillShared(key, title, cap, priority, null, false, current, prepare, null, download)
+
+    suspend fun download(key: SongKey, title: String, cap: Int, current: () -> Boolean,
+        prepare: suspend () -> OfflineMediaDescriptor, consume: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
+        fillShared(key, title, cap, emptyList(), null, true, current, prepare, null, consume)
+
+    fun removeDownload(key: SongKey, cap: Int) = offlineReference(key, DIRECT_DOWNLOAD, false, cap)
 
     internal suspend fun stage(playlistId: String, key: SongKey, title: String, cap: Int, current: () -> Boolean,
         prepare: suspend () -> OfflineMediaDescriptor, trace: OfflineAttemptTrace? = null,
         download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) =
-        fillShared(key, title, cap, emptyList(), playlistId, current, prepare, trace, download)
+        fillShared(key, title, cap, emptyList(), playlistId, false, current, prepare, trace, download)
 
-    private suspend fun fillShared(key: SongKey, title: String, cap: Int, priority: List<String>, playlistId: String?,
+    private suspend fun fillShared(key: SongKey, title: String, cap: Int, priority: List<String>, playlistId: String?, direct: Boolean,
         current: () -> Boolean, prepare: suspend () -> OfflineMediaDescriptor, trace: OfflineAttemptTrace?,
         download: suspend (OfflineMediaDescriptor, (InputStream) -> Unit) -> Unit) {
         require(cap in CacheOptions.caps)
-        val auto = playlistId == null
+        val auto = playlistId == null && !direct
         val ticket = Ticket(auto)
         fun live() = (!auto || !ticket.cleared) && current()
         var joined = false
@@ -406,15 +432,22 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 if (!current()) return
                 entries[key]?.let {
                     trace?.step(MEDIA_REUSE)
-                    if (it.file.length() != it.row.size) throw IOException("Verified media unavailable")
-                    if (playlistId != null) {
-                        if (playlistId !in it.row.drafts && !playlists.contains(key.owner, playlistId, key)) {
-                            val before = it.row
-                            save(it, before.copy(drafts = before.drafts + playlistId))
-                            try { playlists.syncDirectory() } finally { publishStage(it, before) }
-                        }
-                    } else if (!it.row.auto) retainAuto(it, cap, priority)
-                    return
+                    if (!canOpen(it)) {
+                        invalidate(it)
+                    } else {
+                        if (playlistId != null) {
+                            if (playlistId !in it.row.drafts && !playlists.contains(key.owner, playlistId, key)) {
+                                val before = it.row
+                                save(it, before.copy(drafts = before.drafts + playlistId))
+                                try { playlists.syncDirectory() } finally { publishStage(it, before) }
+                            }
+                        } else if (direct) {
+                            save(it, it.row.copy(refs = it.row.refs + DIRECT_DOWNLOAD))
+                            playlists.syncDirectory()
+                            refresh()
+                        } else if (!it.row.auto) retainAuto(it, cap, priority)
+                        return
+                    }
                 }
                 pending[key].also {
                     if (it == null) pending[key] = ticket
@@ -485,7 +518,8 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 // Linearization point: session/window cancellation before admission cannot publish;
                 // clears after admission serialize here and release AUTO before returning.
                 if (!live()) return
-                val row = Row(key, title, media.byteLength, media.sha256, auto = auto, drafts = setOfNotNull(playlistId))
+                val row = Row(key, title, media.byteLength, media.sha256, auto = auto,
+                    refs = if (direct) setOf(DIRECT_DOWNLOAD) else emptySet(), drafts = setOfNotNull(playlistId))
                 val entry = Entry(File(dir, "${UUID.randomUUID()}.blob"), row, 0)
                 Files.move(tmp.toPath(), entry.file.toPath(), ATOMIC_MOVE)
                 try {
@@ -494,12 +528,15 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 } catch (e: Exception) {
                     meta(entry.file).delete(); entry.file.delete(); throw e
                 }
-                if (!live()) {
+                val opened = canOpen(entry)
+                if (!live() || !opened) {
                     Files.deleteIfExists(meta(entry.file).toPath()); Files.deleteIfExists(entry.file.toPath())
+                    if (!opened) throw IOException("Verified audio cannot be opened")
                     return
                 }
                 touch(entry); entries[key] = entry
                 if (auto) try { trim(key.owner, cap, priority) } finally { refresh() }
+                else if (direct) refresh()
                 else publishStage(entry)
             }
         } finally {
@@ -510,6 +547,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     }
 
     private companion object {
+        const val DIRECT_DOWNLOAD = "offline-v2-direct"
         const val MAX_BLOB = 512L * 1024 * 1024
         const val RESERVE = 64L * 1024 * 1024
         fun ByteArray.hex() = joinToString("") { "%02x".format(it) }

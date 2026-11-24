@@ -30,7 +30,7 @@ import androidx.compose.ui.unit.sp
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.PersonalLibraryApi
-import dev.spofify.mobile.playback.DevicePersonalLibrary
+import dev.spofify.mobile.playback.personalEditsAvailable
 import dev.spofify.mobile.core.personal.PersonalTrack
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
@@ -44,8 +44,16 @@ internal fun PersonalSongRow(
     onMore: () -> Unit,
     onQueue: (() -> Unit)? = null,
     gestureBinding: Any = track,
+    downloaded: Boolean = false,
+    downloading: Boolean = false,
 ) {
-    MusicRow(track.musicItem(), loader, onQueue = onQueue, onMore = onMore, gestureBinding = gestureBinding, onOpen = onPlay)
+    MusicRow(track.musicItem(), loader, onQueue = onQueue, onMore = onMore, gestureBinding = gestureBinding,
+        availability = when {
+            downloading -> "Downloading"
+            downloaded -> "Downloaded"
+            !track.hasAudio -> "Unavailable"
+            else -> null
+        }, onOpen = onPlay)
 }
 
 /** No permanent refresh control or healthy-state helper prose. */
@@ -151,6 +159,8 @@ internal fun PersonalSongActions(
     onNavigate: (MusicKind, String) -> Unit,
     onRemove: (() -> Unit)? = null,
     onDismiss: () -> Unit,
+    downloadAction: Pair<String, () -> Unit>? = null,
+    downloading: Boolean = false,
 ) {
     var adding by remember(track.id) { mutableStateOf(false) }
     if (adding) {
@@ -183,7 +193,11 @@ internal fun PersonalSongActions(
                 onQueue()
             } }
             item("library") { SheetGroup("Library") }
-            item("add") { SheetAction("Add to playlist", SpofifyGlyph.Plus, api !is DevicePersonalLibrary && track.hasAudio) { adding = true } }
+            if (downloading) item("downloading") { PersonalStatus(true, "Downloading…") }
+            downloadAction?.let { (label, action) -> item("download") {
+                SheetAction(label, SpofifyGlyph.Down, !downloading) { action() }
+            } }
+            item("add") { SheetAction("Add to playlist", SpofifyGlyph.Plus, api.personalEditsAvailable() && track.hasAudio) { adding = true } }
             onRemove?.let { remove -> item("remove") { SheetAction("Remove this entry", SpofifyGlyph.Trash) {
                 onDismiss()
                 remove()

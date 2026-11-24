@@ -44,6 +44,7 @@ internal fun PlaylistsScreen(
     music: dev.spofify.mobile.playback.AccountMusic?,
     onOpenPlaylist: (String) -> Unit,
     onNavigate: (MusicKind, String) -> Unit,
+    onDownloads: () -> Unit,
 ) {
     val owner = requireNotNull(LocalViewModelStoreOwner.current)
     val model: PlaylistsViewModel = viewModel(owner, key = "playlists-${System.identityHashCode(api)}",
@@ -76,6 +77,7 @@ internal fun PlaylistsScreen(
     }
     LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
     LaunchedEffect(state.created) {
+        model.refresh()
         state.created?.let {
             model.consumeCreated()
             onOpenPlaylist(it.id)
@@ -85,17 +87,18 @@ internal fun PlaylistsScreen(
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically) {
             Text("Playlists", Modifier.weight(1f).semantics { heading() }, style = MaterialTheme.typography.headlineMedium)
-            IconButton({ creating = true }, enabled = api !is DevicePersonalLibrary && !state.writing && !state.needsReview, modifier = Modifier.size(48.dp)) {
+            IconButton({ creating = true }, enabled = state.canCreate && !state.writing && !state.needsReview, modifier = Modifier.size(48.dp)) {
                 SpofifyIcon(SpofifyGlyph.Plus, "Create playlist", Modifier.size(24.dp))
             }
         }
+        TextButton(onDownloads, Modifier.padding(start = 12.dp)) { Text("Downloads") }
         if (state.writing) LinearProgressIndicator(Modifier.fillMaxWidth().height(3.dp))
         val failure = state.error ?: state.message ?: queueError
         if (failure != null) Box(Modifier.padding(horizontal = 20.dp)) {
             PersonalStatus(false, failure)
         }
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            if (state.loaded && state.items.isEmpty()) {
+            if (state.loaded && state.items.isEmpty() && state.message == null) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("No playlists", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -115,8 +118,10 @@ internal fun PlaylistsScreen(
         creating = false
         model.create(name, description)
     }
-    more?.let { summary ->
-        PlaylistSummaryActions(api, summary, playback, music, onMutationAcknowledged = model::refresh, onDismiss = { more = null })
+    more?.let { selection ->
+        state.items.firstOrNull { it.id == selection.id }?.let { summary ->
+            PlaylistSummaryActions(api, summary, playback, music, onMutationAcknowledged = model::refresh, onDismiss = { more = null })
+        }
     }
 }
 

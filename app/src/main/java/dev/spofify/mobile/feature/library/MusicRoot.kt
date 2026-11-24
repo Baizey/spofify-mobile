@@ -38,6 +38,7 @@ import dev.spofify.mobile.designsystem.SpofifyIcon
 import dev.spofify.mobile.feature.personal.PlaylistsScreen
 import dev.spofify.mobile.feature.personal.PlaylistDetailScreen
 import dev.spofify.mobile.feature.personal.RecentScreen
+import dev.spofify.mobile.feature.personal.DownloadsScreen
 import dev.spofify.mobile.feature.settings.*
 import dev.spofify.mobile.core.search.SearchClient
 import dev.spofify.mobile.playback.*
@@ -121,9 +122,9 @@ internal fun MusicRoot(
     val currentOpen by rememberUpdatedState(open)
     val graph: NavGraphBuilder.() -> Unit = remember(navigation, navigate, openActions) {
         {
-            composable("history") { currentStores.Content {
+            composable("history") {
                 RecentScreen(currentSource.personal, currentLoader, currentController.value, navigate)
-            } }
+            }
             composable("search") { owner ->
                 val api = currentSource.search
                 val model: SearchViewModel = viewModel(owner, factory = viewModelFactory { initializer { SearchViewModel(api) } })
@@ -131,15 +132,16 @@ internal fun MusicRoot(
                 SearchScreen(model, currentLoader, currentFocusIntent.value, currentOpen, currentController.value,
                     onMore = { openActions(it, null) })
             }
-            composable("playlists") { currentStores.Content {
+            composable("playlists") {
                 PlaylistsScreen(currentSource.personal, currentLoader, currentController.value, currentPlayer.value.music,
-                    { id -> navigation.navigate("playlist/${Uri.encode(id)}") }, navigate)
-            } }
+                    { id -> navigation.navigate("playlist/${Uri.encode(id)}") }, navigate, { navigation.navigate("downloads") })
+            }
+            composable("downloads") {
+                DownloadsScreen(currentPlayer.value.music, currentLoader, currentController.value) { navigation.popBackStack() }
+            }
             composable("playlist/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { owner ->
-                currentStores.Content {
-                    PlaylistDetailScreen(currentSource.personal, requireNotNull(owner.arguments?.getString("id")), currentLoader,
-                        currentController.value, currentPlayer.value.music, { navigation.popBackStack() }, navigate)
-                }
+                PlaylistDetailScreen(currentSource.personal, requireNotNull(owner.arguments?.getString("id")), currentLoader,
+                    currentController.value, currentPlayer.value.music, { navigation.popBackStack() }, navigate)
             }
             composable("music/{kind}/{id}", arguments = listOf(
                 navArgument("kind") { type = NavType.StringType }, navArgument("id") { type = NavType.StringType },

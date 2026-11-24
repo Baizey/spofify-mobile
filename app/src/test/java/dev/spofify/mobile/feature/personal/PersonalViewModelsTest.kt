@@ -449,21 +449,21 @@ class PersonalViewModelsTest {
         val api = object : PersonalLibraryApi by Api(), LivePersonal {
             override val replica = replica
             override fun command(intent: PersonalIntent) = true
-            override fun watch(id: String): AutoCloseable {
-                replica.watch(id)
-                return AutoCloseable { replica.unwatch(id) }
-            }
+            override fun watch(id: String) = AutoCloseable {}
         }
         val summary = summary(count = 3, kind = PersonalPlaylistKind.DERIVED)
         val model = keep(PlaylistDetailViewModel(api, summary.id))
+        replica.restore(PersonalCacheSnapshot())
+        replica.availability(true, emptySet())
+        replica.replaceLists(0, listOf(summary))
         replica.receive(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
         runCurrent()
         assertNull(model.state.value.context)
         val song = track()
-        replica.receive(PersonalUpdate(part = PersonalPart(summary, "v1", 0, listOf(
+        replica.replaceDetail(0, summary, listOf(
             PersonalManualEntry("first", 0, song), PersonalManualEntry("second", 1, song),
             PersonalManualEntry("unavailable", 2, track(audio = false)),
-        ), false)))
+        ))
         runCurrent()
         val state = model.state.value
         val context = state.context

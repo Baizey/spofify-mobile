@@ -15,7 +15,7 @@ import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.PersonalLibraryApi
-import dev.spofify.mobile.playback.DevicePersonalLibrary
+import dev.spofify.mobile.playback.personalEditsAvailable
 import dev.spofify.mobile.core.playback.*
 import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.designsystem.*
@@ -71,7 +71,7 @@ internal fun MusicActionsSheet(
             }
             if (item.kind == MusicKind.TRACK) {
                 SheetGroup("Library")
-                SheetAction("Add to playlist", SpofifyGlyph.Plus, personal !is DevicePersonalLibrary && item.hasAudio) { adding = true }
+                SheetAction("Add to playlist", SpofifyGlyph.Plus, personal.personalEditsAvailable() && item.hasAudio) { adding = true }
                 val navigableArtists = item.artists.filter { it.id.isNotBlank() }
                 if (navigableArtists.isNotEmpty() || item.albumId.isNotBlank()) SheetGroup("Go to")
                 navigableArtists.forEach { artist ->

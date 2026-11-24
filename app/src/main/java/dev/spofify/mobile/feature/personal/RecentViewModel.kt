@@ -2,6 +2,7 @@ package dev.spofify.mobile.feature.personal
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dev.spofify.mobile.core.personal.AccountPersonalReplica
 import dev.spofify.mobile.core.personal.PersonalHistoryEntry
 import dev.spofify.mobile.core.personal.PersonalLibraryApi
 import kotlinx.coroutines.CancellationException
@@ -23,12 +24,16 @@ internal class RecentViewModel(private val api: PersonalLibraryApi) : ViewModel(
     private val live = api as? dev.spofify.mobile.playback.LivePersonal
     init {
         live?.let { source -> viewModelScope.launch {
-            source.replica.view.collect { mutable.value = RecentState(items = it.recent) }
+            source.replica.view.collect {
+                mutable.value = RecentState(items = it.recent.takeIf { _ -> it.historyKnown },
+                    error = if (it.ready && !it.historyKnown) "Recently Played not saved on this device." else null)
+            }
         } }
     }
 
     fun refresh() {
-        if (live != null || mutable.value.loading) return
+        if (live != null) { live.refresh(AccountPersonalReplica.Resource.History); return }
+        if (mutable.value.loading) return
         mutable.value = mutable.value.copy(loading = api !is dev.spofify.mobile.playback.DevicePersonalLibrary, error = null)
         viewModelScope.launch {
             try {

@@ -38,7 +38,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         fade.value = enabled
         audio.setCrossfadeEnabled(enabled)
     }
-    val audio: Media3AudioExecutor = Media3AudioExecutor(app, sessions, identity, cache, ::systemPause, requestPlaybackStart, canContinuePlayback) { player ->
+    val audio: Media3AudioExecutor = Media3AudioExecutor(app, sessions, identity, cache, ::systemPause, requestPlaybackStart, canContinuePlayback, scope) { player ->
         mutable.value?.let { selected -> mediaSession?.setPlayer(routed(player, selected)) }
     }.apply { setCrossfadeEnabled(fade.value) }
     var mediaSession: MediaSession? = null
@@ -87,7 +87,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         val controller = AccountChannel(boundTransport, port, scope, object : PlaybackClock {
             override fun monotonicMs() = SystemClock.elapsedRealtime()
             override fun wallTimeMs() = System.currentTimeMillis()
-        }, current, library = music.library)
+        }, current, library = music.library, recordPlay = music.personal::recordLocal)
         val selected = AppPlayback(controller, music.indexReady) { current() && mutable.value?.controller === controller }
         controller.setOffline(manual)
         music.personal.attach(controller)
@@ -103,7 +103,10 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         mutable.value = selected
         scope.launch {
             combine(sessions.onlineGrant, sessions.manualOffline) { grant, manual -> grant?.takeIf { !manual } }
-                .distinctUntilChanged().collect { synchronizeReconnect() }
+                .distinctUntilChanged().collect {
+                    synchronizeReconnect()
+                    if (it?.identity != identity) audio.recheckSourceMode(isolated = true)
+                }
         }
         maintenance = PlaybackSessionMaintenance(scope, current,
             { PlayerPresentation(controller.state.value).onlineReady && sessions.onlineGrant.value?.identity == identity },
@@ -111,7 +114,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         scope.launch {
             controller.state.collect { state ->
                 music.observePlayback(state)
-                audio.recheckSourceMode()
+                audio.recheckSourceMode(isolated = state.offline || sessions.manualOffline.value || sessions.onlineGrant.value == null)
                 reconcile()
             }
         }
@@ -135,6 +138,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
                         val diagnostic = reconnectDiagnostic
                         Log.w("SpofifyPlayer", "Playback connection attempts exhausted: phase=${diagnostic.phase.name} " +
                             "status=${diagnostic.failure?.name ?: "NOT_ESTABLISHED"}")
+                        sessions.confirmServiceAfterSocketFailures(owner)
                     }
                 })
                 .also { it.start(explicit) }
@@ -146,6 +150,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         val controller = target.value?.controller ?: return
         if (manual && this.manual) return
         this.manual = manual
+        if (manual) audio.recheckSourceMode(isolated = true)
         controller.setOffline(manual)
         synchronizeReconnect(explicit = !manual)
     }
@@ -154,7 +159,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         audio.player === player && target.value === selected && mediaSession?.controllerForCurrentRequest != null
     }
 
-    fun foreground() { maintenance?.refreshNow() }
+    fun foreground() { music.personal.checkFreshness(); maintenance?.refreshNow() }
 
     private fun systemPause() {
         if (view?.localOutput == true) target.value?.pause()

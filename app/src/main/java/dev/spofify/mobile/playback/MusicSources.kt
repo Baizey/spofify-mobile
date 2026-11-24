@@ -14,11 +14,10 @@ import kotlinx.coroutines.flow.*
 internal class MusicSources(val library: LibraryApi, val search: SearchApi, val personal: PersonalLibraryApi,
     val content: TrackContentApi, val local: Boolean, val readOwner: LibraryReadOwner? = null)
 
-internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant, catalog: LocalMusicCatalog, account: LivePersonal): MusicSources {
+internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant, catalog: LocalMusicCatalog, account: PersonalLibraryApi): MusicSources {
     val id = grant.identity
     val library = LibraryClient(sessions, id)
     val search = SearchClient(sessions, id)
-    val personal = PersonalLibraryClient(sessions, id)
     val content = TrackContentClient(sessions, id)
     suspend fun <T : Any> read(block: suspend () -> T) = sessions.withOnlineGrant(grant) { block() }
     suspend fun retain(block: suspend () -> Unit) {
@@ -41,32 +40,13 @@ internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant,
         override suspend fun search(query: String, kind: MusicKind?, limit: Int) = read { search.search(query, kind, limit).also { remember(it.items) } }
         override suspend fun next(cursor: String) = read { search.next(cursor).also { remember(it.items) } }
     }
-    val user = object : PersonalLibraryApi, LivePersonal by account {
-        private fun useReplica(): Nothing = error("Use the live personal replica for shared state")
-        override suspend fun playlists(limit: Int, offset: Int, kind: PersonalPlaylistKind?) = useReplica()
-        override suspend fun playlist(id: String) = useReplica()
-        override suspend fun manualEntries(id: String, limit: Int, offset: Int) = useReplica()
-        override suspend fun derivedEntries(id: String, limit: Int, cursor: String?) = useReplica()
-        override suspend fun likes(limit: Int, offset: Int) = read { personal.likes(limit, offset) }
-        override suspend fun likeStatus(trackIds: List<String>) = read { personal.likeStatus(trackIds) }
-        override suspend fun setLike(trackId: String, liked: Boolean) = read { personal.setLike(trackId, liked) }
-        override suspend fun toggleLike(trackId: String, currentlyLiked: Boolean) = read { personal.toggleLike(trackId, currentlyLiked) }
-        override suspend fun createManualPlaylist(name: String, description: String) = useReplica()
-        override suspend fun renamePlaylist(id: String, name: String, description: String, expectedRevision: Long) = useReplica()
-        override suspend fun deletePlaylist(id: String, expectedRevision: Long) = useReplica()
-        override suspend fun addTrack(id: String, trackId: String, expectedRevision: Long) = useReplica()
-        override suspend fun removeEntry(id: String, entryId: String, expectedRevision: Long) = useReplica()
-        override suspend fun reorderEntries(id: String, entryIds: List<String>, expectedRevision: Long) = useReplica()
-        override suspend fun recent(limit: Int) = useReplica()
-        override suspend fun history(limit: Int, offset: Int) = useReplica()
-    }
     val track = object : TrackContentApi {
         override val active = sessions.onlineGrant.map { it === grant }
         override val isCurrent get() = sessions.onlineGrant.value === grant
         override suspend fun waveform(trackId: String) = read { content.waveform(trackId) }
         override suspend fun lyrics(trackId: String) = read { content.lyrics(trackId) } // Display rights only, never persist text.
     }
-    return MusicSources(browse, ranked, user, track, false, LibraryReadOwner(sessions, grant))
+    return MusicSources(browse, ranked, account, track, false, LibraryReadOwner(sessions, grant))
 }
 
 /** Read-only projection of complete saved memberships, not server mutation or derived-selection authority. */

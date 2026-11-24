@@ -271,6 +271,11 @@ class SessionRepository(
         }
     }
 
+    /** Serialize a final local-cache commit with session retirement. Prepare bytes before calling. */
+    fun commitLocalIfCurrent(expected: AccountIdentity, commit: () -> Unit) = synchronized(lock) {
+        if (isCurrent(expected)) commit()
+    }
+
     fun isCurrent(expected: AccountIdentity): Boolean = synchronized(lock) {
         (state.value as? AuthState.Authenticated)?.identity == expected
     }
@@ -359,10 +364,7 @@ class SessionRepository(
         val store = checkNotNull(manualOfflineStore) { "No durable manual mode store" }
         if (enabled) onInstallationNetworkAllowed(false)
         withContext(io + NonCancellable) {
-            try { store.write(enabled) } catch (failure: Exception) {
-                if (enabled) onInstallationNetworkAllowed(true)
-                throw failure
-            }
+            store.write(enabled)
             val owner = synchronized(lock) {
                 handingOff = true
                 mutableGrant.value?.identity
@@ -469,6 +471,22 @@ class SessionRepository(
         if (!foreground) {
             foregroundEpoch++
             validationRetry?.cancel(ValidationBackgrounded())
+        }
+    }
+
+    /** Independent reachability probe after repeated player handshake failures. Only a
+     * transient session transport failure retires the grant; a broken endpoint cannot. */
+    suspend fun confirmServiceAfterSocketFailures(grant: OnlineGrant) {
+        try { withOnlineGrant(grant) { renew(grant.identity) } }
+        catch (failure: AuthFailure) {
+            if (!failure.canRetryValidation()) return
+            synchronized(lock) {
+                val current = state.value as? AuthState.Authenticated ?: return
+                if (mutableGrant.value !== grant || !bootstrapAllowed) return
+                advance(current.copy(notice = AuthNotice.CONNECTION_FAILED))
+                recoverable = true
+                mutableValidation.value = OnlineValidation.UNAVAILABLE
+            }
         }
     }
 

@@ -12,7 +12,7 @@ import dev.spofify.mobile.core.auth.OnlineGrant
 import dev.spofify.mobile.core.auth.SessionRepository
 import dev.spofify.mobile.core.playback.*
 import java.io.Closeable
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -27,6 +27,7 @@ internal class Media3AudioExecutor(
     private val onSystemPause: () -> Unit,
     private val requestPlaybackStart: suspend () -> Boolean,
     private val canContinuePlayback: () -> Boolean,
+    private val scope: CoroutineScope,
     private val onPlayerChanged: (ExoPlayer) -> Unit = {},
 ) : AudioExecutor, Closeable {
     private var audioLoadScope: AudioLoadScope? = null
@@ -35,6 +36,7 @@ internal class Media3AudioExecutor(
         @Volatile var source: AudioSourceOwner? = null
         var sourceGrant: OnlineGrant? = null
         var localSource = false
+        var track: PlaybackTrack? = null
         val player = ExoPlayer.Builder(context)
             .setMediaSourceFactory(SessionMusicSourceFactory(sessions, identity, cache) { source }
                 .setLoadErrorHandlingPolicy(AudioLoadRecovery()))
@@ -248,10 +250,11 @@ internal class Media3AudioExecutor(
         val uri = Uri.Builder().scheme("spofify").authority("audio").appendPath(track.id).build()
         val item = MediaItem.Builder().setMediaId(track.id).setUri(uri).setCustomCacheKey(installed.key)
             .setMimeType("application/octet-stream").setMediaMetadata(metadata).build()
+        deck.track = track
         deck.sourceGrant = if (localOnly) null else sessions.onlineGrant.value
         deck.localSource = localOnly
         if (localOnly) deck.player.setMediaSource(localMusicSource(item,
-            LocalMusicRanges(installed, owner::isCurrent, cache::sourceChoice)), position)
+            LocalMusicRanges(installed, owner::isCurrent) { current -> cache.sourceChoice(current, downloadOnly = true) }), position)
         else deck.player.setMediaItem(item, position)
         deck.player.prepare()
     }
@@ -296,12 +299,44 @@ internal class Media3AudioExecutor(
         discardPreview()
     }
 
-    fun recheckSourceMode() {
-        if (preview?.let { !it.local && localPreview() } == true) {
+    private var draining: Job? = null
+
+    fun recheckSourceMode(isolated: Boolean = localPreview()) {
+        if (preview?.let { !it.local && isolated } == true) {
             // An isolated advance must use verified storage, even if a network-backed deck
             // was being prepared before the socket fell. Never disturb the primary period.
             discardPreview()
             attempted = null
+        }
+        val installed = source ?: return
+        if (!isolated || primary.localSource || !installed.usingNetwork || installed.networkStopped) return
+        val continuing = preparation == null && player.playWhenReady && hasPlaybackAuthority()
+        installed.stopNetwork(drain = continuing)
+        if (!continuing) return
+        val track = primary.track ?: return
+        val currentBinding = binding ?: return
+        val owner = audioLoadScope ?: return
+        val permit = playbackAuthority ?: return
+        draining?.cancel()
+        draining = scope.launch {
+            fun current() = source === installed && binding == currentBinding && permit() && player.playWhenReady
+            val hasDownload = withContext(Dispatchers.IO) { cache.hasPlayableDownload(track.id, owner::isCurrent) }
+            if (!current()) return@launch
+            if (hasDownload && player.playbackState != Player.STATE_ENDED) {
+                val position = player.currentPosition.coerceAtLeast(0)
+                retireSource()
+                val local = AudioSourceOwner("offline-${installed.key}", track.id)
+                check(local.bind(owner))
+                source = local
+                install(primary, track, local, owner, localOnly = true, position = position)
+                return@launch
+            }
+            while (current() && player.playerError == null && player.playbackState == Player.STATE_READY) delay(100)
+            if (current() && player.playbackState != Player.STATE_ENDED) {
+                pause(retireMedia = true)
+                terminalError = "connection"
+                mutableObservations.tryEmit(AudioObservation(currentBinding, facts()))
+            }
         }
     }
 
@@ -427,6 +462,8 @@ internal class Media3AudioExecutor(
 
     private fun pause(retireMedia: Boolean) {
         checkThread()
+        draining?.cancel()
+        draining = null
         val pending = preparation
         val starting = pending != null || admittingStart != null || confirmingStart != null
         // Revoke callbacks before any synchronous Player listener can sample the old start.

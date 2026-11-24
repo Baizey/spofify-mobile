@@ -1,5 +1,7 @@
 package dev.spofify.mobile.core.personal
 
+import java.time.Clock
+import java.time.Instant
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.Serializable
@@ -13,21 +15,13 @@ data class PersonalIntent(
     val after: String? = null,
     val name: String? = null,
     val description: String? = null,
-    val known: String? = null,
-    val offset: Int = 0,
 )
 
 @Serializable
-data class PersonalUpdate(val snapshot: PersonalSnapshot? = null, val part: PersonalPart? = null, val change: PersonalChange? = null)
+data class PersonalUpdate(val snapshot: PersonalSnapshot? = null, val change: PersonalChange? = null)
 
 @Serializable
 data class PersonalSnapshot(val playlists: List<PersonalPlaylistSummary>, val recent: List<PersonalHistoryEntry>)
-
-@Serializable
-data class PersonalPart(
-    val summary: PersonalPlaylistSummary, val token: String, val offset: Int,
-    val rows: List<PersonalManualEntry>, val more: Boolean,
-)
 
 @Serializable
 data class PersonalChange(
@@ -48,102 +42,175 @@ data class RecentKey(val id: String, val origin: String = "")
 @Serializable
 data class RecentInsertion(val index: Int, val item: PersonalHistoryEntry)
 
-data class ReplicaPlaylist(val token: String, val rows: List<PersonalManualEntry>)
+@Serializable
+data class ReplicaPlaylist(val revision: Long, val rows: List<PersonalManualEntry>, val refreshedAt: Long? = null)
+
+@Serializable
+data class PersonalCacheSnapshot(
+    val playlists: List<PersonalPlaylistSummary> = emptyList(),
+    val recent: List<PersonalHistoryEntry> = emptyList(),
+    val localPlays: List<PersonalHistoryEntry> = emptyList(),
+    val details: Map<String, ReplicaPlaylist> = emptyMap(),
+    val listsAt: Long? = null,
+    val recentAt: Long? = null,
+)
+
 data class PersonalReplicaView(
     val connected: Boolean = false,
     val playlists: List<PersonalPlaylistSummary> = emptyList(),
     val recent: List<PersonalHistoryEntry> = emptyList(),
     val details: Map<String, ReplicaPlaylist> = emptyMap(),
+    val ready: Boolean = false,
+    val historyKnown: Boolean = false,
+    val listsKnown: Boolean = false,
 )
 
-/** State belongs to the account, not to the socket lifetime. No transport call, waiting for an
- * acknowledgment, or deferred command queue. The socket generation owns dispatch of returned sync intents. */
-class AccountPersonalReplica {
-    private val lock = Any()
+/** Player-looper reducer. A server delta is already committed. Its resource version
+ * invalidates reads started before the delta; only complete reads may replace snapshots. */
+class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), private val freshnessMs: Long = 300_000) {
     private val mutable = MutableStateFlow(PersonalReplicaView())
     val view = mutable.asStateFlow()
-    private val watches = mutableMapOf<String, Int>()
-    private val building = mutableMapOf<String, ReplicaPlaylist>()
-    private val confirmed = mutableSetOf<String>()
+    private val durable = MutableStateFlow(PersonalCacheSnapshot())
+    val snapshots = durable.asStateFlow()
+    private var connected = false
+    private var online = false
+    private var ready = false
+    private var available = emptySet<String>()
+    // WS recent deltas are relative to the initial socket window, not to an HTTP refresh or local event.
+    private var socketRecent = emptyList<PersonalHistoryEntry>()
+    private val versions = mutableMapOf<Resource, Long>()
 
-    fun watch(id: String): PersonalIntent? = synchronized(lock) {
-        val count = watches.getOrDefault(id, 0)
-        watches[id] = count + 1
-        val v = mutable.value
-        if (count == 0 && v.connected && v.playlists.any { it.id == id } && id !in confirmed) {
-            sync(id, v.details[id]?.token)
-        } else null
+    sealed interface Resource {
+        data object Lists : Resource
+        data object History : Resource
+        data class Detail(val id: String) : Resource
+    }
+    fun version(resource: Resource) = versions[resource] ?: 0L
+    private fun changed(resource: Resource) { versions[resource] = version(resource) + 1 }
+
+    fun restore(data: PersonalCacheSnapshot) { check(!ready); ready = true; publish(data) }
+
+    fun availability(online: Boolean, ids: Set<String>) {
+        this.online = online
+        available = ids
+        publish(durable.value)
     }
 
-    fun unwatch(id: String) = synchronized(lock) {
-        val count = watches[id] ?: return@synchronized
-        if (count == 1) { watches.remove(id); building.remove(id) } else watches[id] = count - 1
+    fun disconnected() { connected = false; socketRecent = emptyList(); publish(durable.value) }
+
+    fun stale(resource: Resource): Boolean {
+        val data = durable.value
+        val at = when (resource) {
+            Resource.Lists -> data.listsAt
+            Resource.History -> data.recentAt
+            is Resource.Detail -> data.details[resource.id]?.refreshedAt
+        }
+        return at == null || clock.millis() - at !in 0 until freshnessMs
     }
 
-    fun disconnected() = synchronized(lock) {
-        building.clear(); confirmed.clear()
-        mutable.value = mutable.value.copy(connected = false)
+    fun replaceLists(version: Long, lists: List<PersonalPlaylistSummary>) {
+        if (version != version(Resource.Lists)) return
+        val data = durable.value
+        val ids = lists.associateBy { it.id }
+        check(ids.size == lists.size)
+        // Keep old complete details while a changed revision refreshes, but make them stale.
+        data.playlists.filterNot { it.id in ids }.forEach { changed(Resource.Detail(it.id)) }
+        val details = data.details.filterKeys(ids::containsKey).mapValues { (id, detail) ->
+            if (detail.revision == ids.getValue(id).revision) detail else detail.copy(refreshedAt = null)
+        }
+        publish(data.copy(playlists = lists, listsAt = clock.millis(), details = details))
     }
 
-    fun clear() = synchronized(lock) {
-        watches.clear(); building.clear(); confirmed.clear()
-        mutable.value = PersonalReplicaView()
+    fun replaceDetail(version: Long, summary: PersonalPlaylistSummary, rows: List<PersonalManualEntry>) {
+        val resource = Resource.Detail(summary.id)
+        if (version != version(resource)) return
+        val data = durable.value
+        if (data.playlists.any { it.id == summary.id && it.revision > summary.revision }) return
+        val detail = ReplicaPlaylist(summary.revision, rows, clock.millis())
+        if (data.playlists.firstOrNull { it.id == summary.id } != summary) changed(Resource.Lists)
+        publish(data.copy(playlists = replace(data.playlists, summary), details = data.details + (summary.id to detail)))
     }
 
-    fun receive(update: PersonalUpdate): List<PersonalIntent> = synchronized(lock) {
-        require(listOf(update.snapshot, update.part, update.change).count { it != null } == 1)
-        val v = mutable.value
+    /** Download manifests supply a complete ordered collection; never replace a network snapshot. */
+    fun retainDownload(summary: PersonalPlaylistSummary, rows: List<PersonalManualEntry>) {
+        val data = durable.value
+        if (summary.id in data.details) return
+        val known = data.playlists.any { it.id == summary.id }
+        publish(data.copy(playlists = if (known) data.playlists else replace(data.playlists, summary),
+            details = data.details + (summary.id to ReplicaPlaylist(summary.revision, rows))))
+    }
+
+    fun replaceHistory(version: Long, rows: List<PersonalHistoryEntry>) {
+        if (version != version(Resource.History)) return
+        publish(mergeServerHistory(durable.value, rows).copy(recentAt = clock.millis()))
+    }
+
+    fun recordLocal(entry: PersonalHistoryEntry) {
+        val data = durable.value
+        if (data.recent.any { key(it) == key(entry) }) return
+        publish(data.copy(localPlays = (listOf(entry) + data.localPlays).distinctBy(::key).take(LOCAL_HISTORY_LIMIT)))
+    }
+
+    /** Returns the resource to refresh when a confirmed edit cannot update its rows exactly. */
+    fun receive(update: PersonalUpdate): Resource.Detail? {
+        require((update.snapshot == null) != (update.change == null))
         update.snapshot?.let { snap ->
-            val ids = snap.playlists.mapTo(HashSet()) { it.id }
-            require(ids.size == snap.playlists.size)
-            building.clear(); confirmed.clear()
-            mutable.value = PersonalReplicaView(true, sorted(snap.playlists), snap.recent, v.details.filterKeys { it in ids })
-            return@synchronized watches.keys.filter { it in ids }.map { sync(it, v.details[it]?.token) }
+            connected = true
+            socketRecent = snap.recent
+            changed(Resource.History)
+            replaceHistory(version(Resource.History), socketRecent)
+            // The socket playlist list is a bounded prefix. Never install it as the complete list.
+            return null
         }
-        if (!v.connected) return@synchronized emptyList()
-        update.part?.let { part ->
-            val id = part.summary.id
-            if (id !in watches || v.playlists.none { it.id == id }) return@synchronized emptyList()
-            require(part.token.isNotEmpty() && part.offset >= 0 && (!part.more || part.rows.isNotEmpty()))
-            val old = building[id]
-            if (part.offset > 0 && (old?.token != part.token || old.rows.size != part.offset)) {
-                building.remove(id)
-                return@synchronized listOf(sync(id))
-            }
-            val rows = (if (part.offset == 0) emptyList() else requireNotNull(old).rows) + part.rows
-            if (part.more) {
-                building[id] = ReplicaPlaylist(part.token, rows)
-                return@synchronized listOf(sync(id, part.token, rows.size))
-            }
-            require(rows.mapTo(HashSet()) { it.id }.size == rows.size)
-            building.remove(id); confirmed.add(id)
-            mutable.value = v.copy(playlists = replace(v.playlists, part.summary), details = v.details + (id to ReplicaPlaylist(part.token, rows)))
-            return@synchronized emptyList()
-        }
+        if (!connected) return null
         val delta = requireNotNull(update.change)
-        var next = v
-        val jobs = mutableListOf<PersonalIntent>()
+        var next = durable.value
+        var repair: Resource.Detail? = null
         delta.recent?.let { edit ->
             val removed = edit.removed.toHashSet()
-            val items = next.recent.filterNot { RecentKey(it.id, it.origin.orEmpty()) in removed }.toMutableList()
+            val items = socketRecent.filterNot { key(it) in removed }.toMutableList()
             for ((index, item) in edit.inserted) items.add(index, item)
-            next = next.copy(recent = items)
+            socketRecent = items
+            changed(Resource.History)
+            next = mergeServerHistory(next, items)
         }
         delta.deleted?.let { id ->
-            confirmed.remove(id); building.remove(id)
+            changed(Resource.Lists); changed(Resource.Detail(id))
             next = next.copy(playlists = next.playlists.filterNot { it.id == id }, details = next.details - id)
         }
         delta.playlist?.let { summary ->
             val id = summary.id
+            val resource = Resource.Detail(id)
+            if (next.playlists.any { it.id == id && it.revision > summary.revision }) return@let
+            changed(Resource.Lists); changed(resource)
             next = next.copy(playlists = replace(next.playlists, summary))
             val old = next.details[id]
-            val rows = old?.let { applyEntries(it.rows, delta.entries) }
-            val repair = building.remove(id) != null || delta.rowsInvalid || rows == null
-            if (old != null && rows != null) next = next.copy(details = next.details + (id to ReplicaPlaylist("", rows)))
-            if (repair) { confirmed.remove(id); if (id in watches) jobs += sync(id) }
+            val rows = old?.takeIf { !delta.rowsInvalid && it.revision == summary.revision - 1 }
+                ?.let { applyEntries(it.rows, delta.entries) }
+            if (rows != null) {
+                next = next.copy(details = next.details + (id to old.copy(revision = summary.revision, rows = rows)))
+            } else {
+                if (old != null) next = next.copy(details = next.details + (id to old.copy(refreshedAt = null)))
+                repair = resource
+            }
         }
-        mutable.value = next
-        jobs
+        publish(next)
+        return repair
+    }
+
+    private fun publish(data: PersonalCacheSnapshot) {
+        durable.value = data
+        val recent = (data.recent + data.localPlays).distinctBy(::key)
+            .sortedByDescending { Instant.parse(it.playedAt) }.take(RECENT_LIMIT)
+        fun PersonalTrack.visible() = copy(hasAudio = if (online) hasAudio || id in available else id in available)
+        val details = data.details.mapValues { (_, detail) ->
+            detail.copy(rows = detail.rows.map { it.copy(track = it.track.visible()) })
+        }
+        val lists = if (connected) data.playlists else data.playlists.map {
+            it.copy(capabilities = PersonalPlaylistCapabilities(false, false, false, it.capabilities.play, false, false, false))
+        }
+        mutable.value = PersonalReplicaView(connected, lists, recent.map { it.copy(track = it.track.visible()) }, details,
+            ready, data.recentAt != null || data.localPlays.isNotEmpty(), data.listsAt != null || data.playlists.isNotEmpty())
     }
 
     private fun applyEntries(original: List<PersonalManualEntry>, edit: EntryChange?): List<PersonalManualEntry>? {
@@ -163,8 +230,15 @@ class AccountPersonalReplica {
         return rows
     }
 
-    private fun replace(rows: List<PersonalPlaylistSummary>, p: PersonalPlaylistSummary) = sorted(rows.filterNot { it.id == p.id } + p)
-    private fun sorted(rows: List<PersonalPlaylistSummary>) = rows.sortedWith(compareByDescending<PersonalPlaylistSummary> { it.updatedAt }.thenBy { it.id })
-    private fun sync(id: String, known: String? = null, offset: Int = 0) =
-        PersonalIntent("syncPlaylist", playlistId = id, known = known?.takeUnless(String::isEmpty), offset = offset)
+    private fun replace(rows: List<PersonalPlaylistSummary>, p: PersonalPlaylistSummary) = rows.filterNot { it.id == p.id } + p
+    private fun key(entry: PersonalHistoryEntry) = RecentKey(entry.id, entry.origin.orEmpty())
+    private fun mergeServerHistory(data: PersonalCacheSnapshot, rows: List<PersonalHistoryEntry>): PersonalCacheSnapshot {
+        val keys = rows.mapTo(hashSetOf(), ::key)
+        return data.copy(recent = rows, localPlays = data.localPlays.filterNot { key(it) in keys })
+    }
+
+    companion object {
+        const val RECENT_LIMIT = 40
+        private const val LOCAL_HISTORY_LIMIT = 10_000
+    }
 }

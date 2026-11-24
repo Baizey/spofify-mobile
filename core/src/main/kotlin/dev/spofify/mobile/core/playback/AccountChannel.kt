@@ -16,6 +16,8 @@ class AccountChannel(
     private val transport: PlaybackTransport, audio: AudioExecutor, private val scope: CoroutineScope,
     private val clock: PlaybackClock = SystemPlaybackClock, private val current: () -> Boolean = { true },
     library: LocalPlaybackLibrary = EmptyPlaybackLibrary,
+    recordPlay: (dev.spofify.mobile.core.personal.PersonalHistoryEntry) -> Unit = {},
+    private val shareDetachedPlayback: Boolean = false,
 ) : AutoCloseable {
     private val view = MutableStateFlow(PlaybackView(localOutput = true, offline = true))
     val state = view.asStateFlow()
@@ -72,6 +74,11 @@ class AccountChannel(
         }
     }
     private val listeners = mutableSetOf<(JsonObject?) -> Unit>()
+    private val history = PlaybackHistory(clock, recordPlay)
+    private fun sampleHistory(facts: AudioFacts) {
+        val q = engine.state.value
+        history.sample(q.current, q.occurrence?.eventId, sessionId.takeIf { isOwner() }, facts, !online)
+    }
     private val engine = LocalPlaybackController(audio, object : LocalPlaybackLibrary by library {
         override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) =
             if (online) isAuthorized() else library.hasAudio(track, isAuthorized)
@@ -188,9 +195,9 @@ class AccountChannel(
             var handshake: Job? = null
             try {
                 val started = clock.monotonicMs()
-                val localAtHello = localQueue().takeIf { it.queue.isNotEmpty() }?.let { HelloLocal(it, engine.operationBinding(), localAction) }
+                val localAtHello = localQueue().takeIf { shareDetachedPlayback && it.queue.isNotEmpty() }?.let { HelloLocal(it, engine.operationBinding(), localAction) }
                 val claim = localAtHello?.let { playbackJson.encodeToJsonElement(it.state).jsonObject }
-                val live = withTimeout(ATTEMPT_MS) { transport.connect(name, deviceId, claim, detached?.json()) }
+                val live = withTimeout(ATTEMPT_MS) { transport.connect(name, deviceId, claim, detached?.json().takeIf { shareDetachedPlayback }) }
                 conn = live
                 if (attempt != life || !current()) return@launch
                 socket = live
@@ -310,6 +317,8 @@ class AccountChannel(
         // started after hello (e.g. an isolated seek) isn't covered by that acknowledgement.
         val acceptedClaim = nextOwner.deviceId == deviceId && !previouslyOnline && localAtHello?.state?.cursor == next.cursor
         val localFailure = engine.state.value.error
+        val pausedAfterLoss = !shareDetachedPlayback && !previouslyOnline && nextOwner.deviceId == deviceId &&
+            local.cursor.occurrence != null && local.cursor.occurrence == next.cursor.occurrence && !local.cursor.desiredPlaying
         val retainedFailure = acceptedClaim && localFailure.isNotEmpty() && local.cursor.sameVisit(next.cursor) &&
             localAction == localAtHello.action
         val retained = retainedFailure || acceptedClaim && local.cursor.key != 0L && local.cursor.sameVisit(next.cursor) &&
@@ -391,7 +400,8 @@ class AccountChannel(
             publish() // FGS admission must see this device as current before the native start.
             if (execution != operation || !isOwner()) return
             if (buffered.isNotEmpty()) { sendAdvance(); return }
-            engine.adopt(next.presentation().let { if (keep) it.copy(elapsed = local.cursor.positionMs.seconds(),
+            engine.adopt(next.presentation().let { if (pausedAfterLoss) it.copy(desiredPlaying = false,
+                elapsed = local.cursor.positionMs.seconds(), error = localFailure) else if (keep) it.copy(elapsed = local.cursor.positionMs.seconds(),
                 isPlaying = engine.state.value.isPlaying, error = localFailure,
                 desiredPlaying = it.desiredPlaying && localFailure.isEmpty()) else it }, !keep)
             if (keep) syncLocalMeasurements()
@@ -636,6 +646,7 @@ class AccountChannel(
         })
 
     private fun observed(f: AudioFacts) {
+        if (localAuthority && !f.ended) sampleHistory(f)
         if (!isOwner() || !localAuthority || f.ended || !safeSeconds(f.elapsed)) return
         val fact = newObservation(nativeCursor, f)
         nativeFact = fact
@@ -649,6 +660,7 @@ class AccountChannel(
 
     private fun observedEmpty() = observed(AudioFacts())
     private fun failed(error: String, f: AudioFacts?) {
+        history.discontinuity()
         if (!isOwner() || !localAuthority) return
         val fact = newObservation(nativeCursor, AudioFacts(elapsed = f?.elapsed ?: nativeCursor.positionMs.seconds(), error = error), failed = true)
         nativeFact = fact
@@ -660,7 +672,13 @@ class AccountChannel(
 
     private fun ended(q: PlaybackQueueState, f: AudioFacts) {
         if (!localAuthority) return
-        if (!online) ++localAction
+        sampleHistory(f)
+        if (!online) {
+            ++localAction
+            engine.advanceAvailable(q)
+            publish()
+            return
+        }
         val i = LocalPlaybackQueue.successor(q, naturalEnd = true)
         val old = if (online) nativeCursor else localQueue().cursor
         val row = i?.let(q.queue::get)

@@ -61,7 +61,7 @@ class AccountChannelTest {
         }
     }
 
-    private class Fixture(val test: TestScope) {
+    private class Fixture(val test: TestScope, shareDetachedPlayback: Boolean = true) {
         val audio = Audio()
         var socket = Socket()
         val claims = mutableListOf<AccountState?>()
@@ -80,7 +80,7 @@ class AccountChannelTest {
         }, audio, test.backgroundScope, clock, library = object : LocalPlaybackLibrary {
             override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
             override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = LocalPlaybackRows(rows)
-        })
+        }, shareDetachedPlayback = shareDetachedPlayback)
         val view get() = channel.state.value
         fun connect() { channel.connect("Phone", "self"); test.runCurrent() }
         fun snapshot(owner: String? = "self", generation: Long = 1, revision: Long = 1,
@@ -580,6 +580,15 @@ class AccountChannelTest {
         f.snapshot(submitted.copy(cursor = cursor), revision = 2)
         assertEquals(listOf(0.0, 11.0, 0.0), f.audio.seeks)
         assertEquals(2L, f.view.current?.key)
+    }
+
+    @Test fun offlineSelectionDoesNotBecomeAnOnlineClaim() = runTest {
+        val f = Fixture(this, shareDetachedPlayback = false)
+        assertTrue(f.channel.playTrack(PlaybackTrackReference(rows.first().id)))
+        runCurrent()
+        f.connect()
+        assertNull(f.claims.last())
+        assertNull(f.reattach.last())
     }
 
     @Test fun claimRepairAfterNextEchoDoesNotReloadNativeSuccessorAlreadyStartedByEof() = runTest {

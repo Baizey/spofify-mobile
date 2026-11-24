@@ -290,7 +290,26 @@ class LocalPlaybackController(
         }
     }
 
-    private fun start(next: PlaybackQueueState, natural: Boolean = false) {
+    /** Each occurrence is considered at most once, including repeat-one/all. */
+    internal fun advanceAvailable(previous: PlaybackQueueState) {
+        val first = LocalPlaybackQueue.successor(previous, naturalEnd = true)
+        if (first == null) { finishNaturalEnd(previous); return }
+        val remaining = when (previous.repeat) {
+            "one" -> listOf(first)
+            "all" -> (0 until previous.queue.size).map { (first + it) % previous.queue.size }
+            else -> (first..previous.queue.lastIndex).toList()
+        }
+        advanceAvailable(previous, remaining)
+    }
+
+    private fun advanceAvailable(previous: PlaybackQueueState, candidates: List<Int>) {
+        if (candidates.isEmpty()) { finishNaturalEnd(previous); return }
+        start(newVisit(previous, candidates.first()), natural = true, onUnavailable = {
+            advanceAvailable(previous, candidates.subList(1, candidates.size))
+        })
+    }
+
+    private fun start(next: PlaybackQueueState, natural: Boolean = false, onUnavailable: (() -> Unit)? = null) {
         val track = next.current ?: return
         if (!allowed()) return
         val outgoing = active.takeIf { natural }
@@ -322,7 +341,10 @@ class LocalPlaybackController(
                 if (!keep(op)) return@launch
                 val available = library.hasAudio(track, permitted)
                 if (!keep(op)) return@launch
-                if (!available) { fail(op, "unavailable"); return@launch }
+                if (!available) {
+                    if (onUnavailable != null) onUnavailable() else fail(op, "unavailable")
+                    return@launch
+                }
                 // execute also handles a paused seek; prepare() lacks a per-step authorization callback.
                 val result = audio.execute(op.binding, track, next.elapsed, next.desiredPlaying, permitted)
                 if (!keep(op)) return@launch
@@ -334,8 +356,11 @@ class LocalPlaybackController(
                         op.earlyEnd = null
                     }
                     AudioResult.BLOCKED -> fail(op, "blocked")
-                    AudioResult.MEDIA -> fail(op, "media")
-                    AudioResult.REJECTED -> fail(op, "unavailable")
+                    AudioResult.MEDIA -> {
+                        if (onUnavailable != null && !library.hasAudio(track, permitted) && keep(op)) onUnavailable()
+                        else fail(op, "media")
+                    }
+                    AudioResult.REJECTED -> if (onUnavailable != null) onUnavailable() else fail(op, "unavailable")
                 }
             } catch (cancelled: CancellationException) {
                 if (scope.isActive && keep(op)) fail(op, audio.facts().takeIf { it.binding == op.binding }?.error.orEmpty())
@@ -381,8 +406,7 @@ class LocalPlaybackController(
         val previous = state.value
         if (!keep(op) || !previous.desiredPlaying || facts.error.isNotEmpty()) return
         if (onNaturalEnd != null) onNaturalEnd.invoke(previous, facts)
-        else LocalPlaybackQueue.successor(previous, naturalEnd = true)
-            ?.let { start(newVisit(previous, it), natural = true) } ?: finishNaturalEnd(previous)
+        else advanceAvailable(previous)
     }
 
     private fun fail(op: Operation, error: String, native: AudioFacts = audio.facts()) {
@@ -390,7 +414,7 @@ class LocalPlaybackController(
         val observed = native.takeIf { it.binding == op.binding }
         val stoppedByRefusal = observed?.let { error == "blocked" && it.error == "blocked" && it.stoppedByRefusal } == true
         val failure = when (error) {
-            "unavailable", "blocked" -> error
+            "unavailable", "blocked", "connection" -> error
             else -> "media"
         }
         invalidate(pauseNative = !stoppedByRefusal)
