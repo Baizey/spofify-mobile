@@ -1,3 +1,5 @@
+import com.android.build.api.variant.HostTestBuilder
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -20,10 +22,44 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    buildTypes { release { isMinifyEnabled = false } }
+    buildTypes {
+        release {
+            applicationIdSuffix = ".release"
+            isMinifyEnabled = false
+            // Keep Gradle release APKs unsigned. The protected workflow signs the one universal APK.
+        }
+    }
 }
+
+// AGP enables unit tests only for its default test build type; CI also tests release.
+androidComponents.beforeVariants(androidComponents.selector().withBuildType("release")) {
+    it.hostTests.getValue(HostTestBuilder.UNIT_TEST_TYPE).enable = true
+}
+
+val releaseCode = providers.gradleProperty("mobileReleaseVersionCode").orNull
+val releaseName = providers.gradleProperty("mobileReleaseVersionName").orNull
+require((releaseCode == null) == (releaseName == null)) {
+    "Supply both mobileReleaseVersionCode and mobileReleaseVersionName, or neither."
+}
+if (releaseCode != null && releaseName != null) {
+    val code = releaseCode.toIntOrNull()
+    require(releaseCode.matches(Regex("[1-9][0-9]{0,9}")) && code != null && code <= 2_100_000_000) {
+        "mobileReleaseVersionCode must be a positive decimal integer, at most 2100000000."
+    }
+    require(releaseName.matches(Regex("[A-Za-z0-9][A-Za-z0-9.+_-]{0,79}"))) {
+        "mobileReleaseVersionName must be 1–80 ASCII letters/digits or .+_-, starting with a letter or digit."
+    }
+    androidComponents.onVariants(androidComponents.selector().withBuildType("release")) { variant ->
+        variant.outputs.forEach { output ->
+            output.versionCode.set(code)
+            output.versionName.set(releaseName)
+        }
+    }
+}
+
 dependencies {
     implementation(project(":core"))
+    releaseImplementation(libs.okhttp)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.material3)
     implementation(libs.compose.preview)

@@ -63,7 +63,7 @@ it is not a native Android or cross-browser acceptance test.
 ## Development
 
 Open this directory in Android Studio. Use JDK 25, Android platform 37.0 and
-build-tools 36.0.0. The version catalog pins AGP 9.5.1, Kotlin / Compose compiler
+build-tools 36.0.0. The version catalog pins AGP 9.5.2, Kotlin / Compose compiler
 2.4.21. The wrapper pins Gradle 9.9.1. AGP built-in Kotlin consumes
 the newer KGP loaded by the root JVM plugin; no second Android Kotlin plugin is
 applied. Sources target Java 17; runtime minimum is Android 8 (API 26), target API 36.
@@ -84,11 +84,12 @@ provisioned; it does not prevent wrapper bootstrap. Independent builds need sepa
 writable Gradle homes and temporary state. No cache repair, download workaround or
 toolchain installation is provided by this repository.
 
-Debug/release are standard Android Studio build types, both with application ID
-`dev.spofify.mobile`. Release signing is not configured here. Debug signing is the
-normal Android tooling default. This does not establish compatibility with an
-already installed application's signature; do not uninstall, clear data, replace keys
-or change signing material to work around an incompatibility.
+Debug keeps application ID `dev.spofify.mobile` and the normal Android debug
+signer. Release uses `dev.spofify.mobile.release` and a dedicated signer; the
+variants have separate app data, without a migration. Local Gradle release APKs
+are unsigned. See [Mobile release operations](docs/mobile-release.md) for the
+protected workflow, signing bootstrap and release checks. Do not uninstall,
+clear data or replace keys to work around a signature mismatch.
 
 ## Contracts
 
