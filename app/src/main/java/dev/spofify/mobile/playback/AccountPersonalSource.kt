@@ -111,6 +111,7 @@ internal class AccountPersonalSource(
                 if (snapshot != null) {
                     waitingForAccount = false
                     try { replica.receiveSnapshot(snapshot) } catch (_: IllegalArgumentException) { return@publishIfCurrent }
+                    nextAccountReadAt = 0L
                     connectionGrant = owner
                     watching.keys.toList().forEach(::requestDetail)
                 } else if (connectionGrant === owner) {

@@ -45,10 +45,16 @@ class AccountPersonalSourceTest {
         f.clock = Clock.offset(f.clock, java.time.Duration.ofMinutes(5))
         repeat(6) { f.source.checkFreshness() }
         assertEquals(1, f.socket.sent.count { it["type"] == JsonPrimitive("sync") })
+        f.playerSnapshot()
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
+        val acceptedAt = f.clock.millis()
+        f.clock = Clock.offset(f.clock, java.time.Duration.ofMinutes(5))
+        repeat(6) { f.source.checkFreshness() }
+        assertEquals(2, f.socket.sent.count { it["type"] == JsonPrimitive("sync") })
         f.sessions.setManualOffline(true)
         f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary.copy(name = "Late response")), emptyList())))
         assertEquals("Saved name", f.source.replica.view.value.playlists.single().name)
-        assertEquals(at.toEpochMilli(), f.saved.read().listsAt)
+        assertEquals(acceptedAt, f.saved.read().listsAt)
     }
 
     @Test fun socketReconnectKeepsDistinctRecentRowsAndLocalUnmatchedOccurrence() = runTest {
@@ -398,8 +404,12 @@ class AccountPersonalSourceTest {
 
         fun open() {
             channel.connect("Phone", "phone", requireNotNull(sessions.onlineGrant.value))
-            socket.offer("""{"type":"snapshot","sessionId":"room","connectionId":"conn","revision":0,"owner":{"generation":0},"devices":[{"deviceId":"phone","name":"Phone","canPlay":true}],"player":{"queue":[],"cursor":{"key":0,"positionMs":0,"desiredPlaying":false},"repeat":"off","shuffle":false},"serverTimeMs":${at.toEpochMilli()}}""")
+            playerSnapshot()
             test.runCurrent()
+        }
+
+        fun playerSnapshot() {
+            socket.offer("""{"type":"snapshot","sessionId":"room","connectionId":"conn","revision":0,"owner":{"generation":0},"devices":[{"deviceId":"phone","name":"Phone","canPlay":true}],"player":{"queue":[],"cursor":{"key":0,"positionMs":0,"desiredPlaying":false},"repeat":"off","shuffle":false},"serverTimeMs":${at.toEpochMilli()}}""")
         }
 
         fun updateMissing(id: String) {
