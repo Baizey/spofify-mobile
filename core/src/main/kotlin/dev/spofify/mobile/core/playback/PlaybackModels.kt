@@ -11,7 +11,6 @@ data class PlaybackContext(
     val id: String,
     val name: String,
     val revision: Long? = null,
-    val fence: String? = null,
 )
 
 /** Catalog row identity: entry/derived occurrence fields must be passed unchanged. */
@@ -21,7 +20,6 @@ data class PlaybackTrackReference(
     val entryId: String? = null,
     val targetId: String? = null,
     val occurrenceId: String? = null,
-    val selectionToken: String? = null,
 )
 
 @Serializable

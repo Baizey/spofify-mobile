@@ -757,8 +757,8 @@ class AccountChannel(
     fun renameDevice(name: String, deviceId: String) = online && send(fields("type" to "rename", "name" to name, "deviceId" to deviceId))
     private fun selection(track: PlaybackTrackReference?, ctx: PlaybackContext?) = buildJsonObject {
         put("kind", if (track == null) "collection" else "track")
-        track?.let { put("track", playbackJson.encodeToJsonElement(it.copy(selectionToken = null))) }
-        ctx?.let { put("context", playbackJson.encodeToJsonElement(it.copy(revision = null, fence = null))) }
+        track?.let { put("track", playbackJson.encodeToJsonElement(it)) }
+        ctx?.let { put("context", playbackJson.encodeToJsonElement(it.copy(revision = null))) }
     }
     fun playTrack(track: PlaybackTrackReference, context: PlaybackContext? = null) =
         issue(fields("type" to "play", "selection" to selection(track, context))) { engine.playTrack(track, context) }

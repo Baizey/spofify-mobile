@@ -14,7 +14,6 @@ internal class DeviceMusicLibrary(
         .groupBy({ it.first }, { it.second })
 
     override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?): LocalPlaybackRows? {
-        if (track?.selectionToken != null) return null
         val rows = when (context?.kind) {
             null -> listOfNotNull(tracks[track?.id]?.toPlayback())
             "album", "artist" -> (if (context.kind == "album") albums else artists)[context.id].orEmpty()
