@@ -64,7 +64,7 @@ class LocalMusicCatalog internal constructor(
     private val searches = linkedMapOf<String, RetainedSearch>()
 
     /** Batch ingestion for cache fills / completed downloads. Keep either or both real projections. */
-    suspend fun rememberTracks(observations: List<LocalTrackMetadata>) = local {
+    suspend fun rememberTracks(observations: List<LocalTrackMetadata>, commit: ((() -> Unit) -> Boolean)? = null) = local {
         require(observations.size <= MAX_TRACKS)
         if (observations.isEmpty()) return@local
         val current = tracks()
@@ -105,7 +105,7 @@ class LocalMusicCatalog internal constructor(
         if (updated != current.tracks) {
             val next = current.copy(tracks = updated)
             currentCoroutineContext().ensureActive()
-            storage.saveTracks(next)
+            storage.saveTracks(next, commit)
             tracks = next
             invalidateIndex()
         }
@@ -120,8 +120,9 @@ class LocalMusicCatalog internal constructor(
     suspend fun personalTrack(id: String): PersonalTrack? = withIndex { it.personal[validMusicEntityId(id)] }
 
     /** Pass null only for a confirmed online miss, not on failure or cancellation. */
-    suspend fun rememberArtwork(kind: MusicKind, id: String, bytes: ByteArray?) = local {
-        storage.saveArtwork(kind, validMusicEntityId(id), bytes)
+    suspend fun rememberArtwork(kind: MusicKind, id: String, bytes: ByteArray?, commit: ((() -> Unit) -> Boolean)? = null) = local {
+        currentCoroutineContext().ensureActive()
+        storage.saveArtwork(kind, validMusicEntityId(id), bytes, commit)
     }
 
     suspend fun artworkState(kind: MusicKind, id: String): LocalArtwork = local {

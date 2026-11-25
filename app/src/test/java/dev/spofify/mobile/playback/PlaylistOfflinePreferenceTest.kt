@@ -61,6 +61,30 @@ class PlaylistOfflinePreferenceTest {
         assertFalse(lines.any { "private" in it })
     }
 
+    @Test fun permanentFailureIsTerminalEvenIfNetworkPolicyRestartsAndTransientIoIsBounded() = runTest {
+        val disk = Disk().apply { wanted = setOf("gone", "io") }
+        val worker = disk.owner(backgroundScope)
+        val attempts = mutableMapOf<String, Int>()
+        fun startWorker() = backgroundScope.launch {
+            worker.download { id, _, _ ->
+                attempts[id] = attempts.getOrDefault(id, 0) + 1
+                if (id == "gone") throw OfflineException(OfflineFailure.NOT_FOUND, 404)
+                throw IOException("persistent disk error")
+            }
+        }
+        val first = startWorker()
+        runCurrent()
+        assertEquals(setOf("gone"), worker.failed.value)
+        advanceTimeBy(86_400_000); runCurrent()
+        assertEquals(mapOf("gone" to 1, "io" to 3), attempts)
+        assertEquals(setOf("gone", "io"), worker.failed.value)
+        first.cancel()
+        startWorker(); runCurrent()
+        advanceTimeBy(86_400_000); runCurrent()
+        assertEquals(mapOf("gone" to 1, "io" to 3), attempts)
+        assertEquals(PlaylistOfflineStatus.Failed, playlistOfflineStatuses(disk.wanted, emptySet(), emptyMap(), worker.failed.value)["gone"])
+    }
+
     @Test fun cancellingBackoffDoesNotRetryAndDiagnosticSinkCannotCancelWorker() = runTest {
         val disk = Disk()
         val lines = mutableListOf<String>()
@@ -183,8 +207,17 @@ class PlaylistOfflinePreferenceTest {
         assertEquals(listOf(derived), worker.complete())
     }
 
-    @Test fun legacySavedPlaylistsStartOnAndOffRemovesOnlyThatPlaylistEvenWithoutNetwork() = runTest {
+    @Test fun missingCurrentPreferenceDoesNotImportOrResaveManifests() = runTest {
         val disk = Disk().apply { save("one"); save("two") }
+        val worker = disk.owner(backgroundScope)
+        runCurrent()
+        assertEquals(emptySet<String>(), worker.wanted.value)
+        assertTrue(worker.complete().isEmpty())
+        assertEquals(2, disk.removals)
+    }
+
+    @Test fun persistedIntentPermitsLocalRemovalForOnlyThatPlaylistWithoutNetwork() = runTest {
+        val disk = Disk().apply { wanted = setOf("one", "two"); save("one"); save("two") }
         val worker = disk.owner(backgroundScope)
         runCurrent()
         assertEquals(setOf("one", "two"), worker.wanted.value)

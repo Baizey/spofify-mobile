@@ -191,18 +191,41 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     private fun offline(row: Row) = row.refs.isNotEmpty() || row.key in playlists.required
     fun hasOfflineReference(key: SongKey) = lock.withLock { entries[key]?.row?.let(::offline) == true }
     private fun meta(file: File) = File(dir, file.nameWithoutExtension + ".meta")
-    private fun save(entry: Entry, row: Row, commit: ((() -> Unit) -> Boolean)? = null, durable: () -> Unit = {}): Boolean {
+    private fun save(entry: Entry, row: Row, commit: ((() -> Unit) -> Boolean)? = null,
+        syncBeforePublish: Boolean = false, published: () -> Unit = {}): Boolean {
+        val tmp = stagedMetadata(row)
+        val target = meta(entry.file).toPath()
+        var previous: File? = null
+        try {
+            if (syncBeforePublish && entries[row.key] === entry) previous = stagedMetadata(entry.row)
+            val replace = {
+                Files.move(tmp.toPath(), target, ATOMIC_MOVE, REPLACE_EXISTING)
+                if (syncBeforePublish) try {
+                    playlists.syncDirectory()
+                } catch (failure: IOException) {
+                    // A failed promotion must not grant download-only pins through memory or on reopen.
+                    runCatching {
+                        if (previous == null) Files.deleteIfExists(target)
+                        else Files.move(previous.toPath(), target, ATOMIC_MOVE, REPLACE_EXISTING)
+                        playlists.markDirectoryDirty()
+                        playlists.beforeReclaim()
+                    }.exceptionOrNull()?.let(failure::addSuppressed)
+                    throw failure
+                }
+                entry.row = row
+                entry.downloaded = offline(row)
+                published()
+            }
+            return commit?.invoke(replace) ?: run { replace(); true }
+        } finally { tmp.delete(); previous?.delete() }
+    }
+
+    private fun stagedMetadata(row: Row): File {
         val tmp = File.createTempFile("ref", ".tmp", dir)
         try {
             tmp.outputStream().use { it.write(Json.encodeToString(row).toByteArray()); it.fd.sync() }
-            val replace = {
-                Files.move(tmp.toPath(), meta(entry.file).toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
-                entry.row = row
-                entry.downloaded = offline(row)
-                durable()
-            }
-            return commit?.invoke(replace) ?: run { replace(); true }
-        } finally { tmp.delete() }
+            return tmp
+        } catch (failure: Exception) { tmp.delete(); throw failure }
     }
     private fun unused(entry: Entry) = entry.readers == 0 && !entry.row.auto && !offline(entry.row) && entry.row.drafts.isEmpty()
     private fun releaseUnused(entry: Entry) {
@@ -349,30 +372,22 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     }
 
     internal fun complete(owner: MusicOwner) = lock.withLock {
-        recoverPendingPlaylist()
         playlists.complete(owner)
     }
     internal fun select(owner: MusicOwner, id: String) = lock.withLock {
-        recoverPendingPlaylist()
         playlists.select(owner, id)?.takeIf { entries.keys.containsAll(trackKeys(owner, it)) }
     }
 
-    private fun recoverPendingPlaylist() {
-        try { publishDurablePlaylist() } catch (_: IOException) { /* Serve the last durable view. */ }
-    }
-
-    private fun publishDurablePlaylist(cap: Int? = null, recovering: Boolean = true): Boolean? {
-        val change = playlists.publishDurable() ?: return null
-        // A failed sync allows arbitrary time before a retry. Recheck those bytes just as
-        // on reopen. Even a new commit needs to prove its verified bytes still open after sync.
+    private fun publishDurablePlaylist(cap: Int, commit: (() -> Unit) -> Boolean): Boolean {
+        val change = playlists.publishDurable(commit)
         for (key in change.required) {
             val entry = entries[key] ?: continue
-            if (!canOpen(entry, verifyDigest = recovering)) invalidate(entry, publish = false)
+            if (!canOpen(entry)) invalidate(entry, publish = false)
         }
         val playable = entries.keys.containsAll(change.required)
         refresh()
         reclaim(change.superseded)
-        if (cap != null) try { trim(change.owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
+        try { trim(change.owner, cap, emptyList()) } catch (_: IOException) { /* Next limit retries. */ }
         try { clearDraft(change.owner, change.id, emptySet(), {}) } catch (_: IOException) { /* Already durable. */ }
         refresh()
         return playable
@@ -391,7 +406,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         trace: OfflineAttemptTrace? = null, checkCurrent: () -> Unit): Set<SongKey> = lock.withLock {
         trace?.step(RESUME_SCAN)
         checkCurrent()
-        publishDurablePlaylist() // Do not remove drafts held by an unsynced manifest.
+        playlists.rollback() // Settle any aborted rename before dropping its draft holds.
         checkCurrent()
         clearDraft(owner, id, keys, checkCurrent)
         keys.filterTo(hashSetOf()) { key ->
@@ -424,23 +439,28 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
     internal fun commit(owner: MusicOwner, manifest: OfflineManifest, cap: Int,
         trace: OfflineAttemptTrace? = null, commit: (() -> Unit) -> Boolean) = lock.withLock {
         trace?.step(COMMIT_INDEX)
-        publishDurablePlaylist(cap)
+        playlists.rollback()
         val keys = trackKeys(owner, manifest)
         val id = manifest.collection.reference.id
         check(keys.all { key -> entries.getValue(key).let { e ->
             (id in e.row.drafts || playlists.contains(owner, id, key)) && canOpen(e)
         } })
         trace?.step(COMMIT_DISK_WAIT)
-        diskWrites.withLock {
-            trace?.step(COMMIT_WRITE)
-            playlists.rename(owner, manifest, keys, freeBytes() - RESERVE, commit)
+        try {
+            diskWrites.withLock {
+                trace?.step(COMMIT_WRITE)
+                playlists.rename(owner, manifest, keys, freeBytes() - RESERVE, commit)
+            }
+            trace?.step(COMMIT_CLEANUP)
+            if (!publishDurablePlaylist(cap, commit)) throw IOException("Playlist audio is unavailable")
+        } catch (failure: Exception) {
+            runCatching { playlists.rollback() }.exceptionOrNull()?.let(failure::addSuppressed)
+            throw failure
         }
-        trace?.step(COMMIT_CLEANUP)
-        if (publishDurablePlaylist(cap, recovering = false) != true) throw IOException("Playlist audio is unavailable")
     }
     internal fun remove(owner: MusicOwner, id: String, cap: Int, checkCurrent: () -> Unit) = lock.withLock {
         checkCurrent()
-        publishDurablePlaylist()
+        playlists.rollback()
         checkCurrent()
         val old = playlists.remove(owner, id)
         if (old != null) {
@@ -467,7 +487,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
         val entry = entries[key] ?: return@withLock false
         if (DIRECT_DOWNLOAD !in entry.row.refs) return@withLock false
         // Stage the rewrite before checking the exact incarnation. Only its final replace is fenced.
-        if (!save(entry, entry.row.copy(refs = entry.row.refs - DIRECT_DOWNLOAD), commit, playlists::markDirectoryDirty))
+        if (!save(entry, entry.row.copy(refs = entry.row.refs - DIRECT_DOWNLOAD), commit, published = playlists::markDirectoryDirty))
             return@withLock false
         try {
             // Never reclaim the blob while the durable metadata may still name its direct hold.
@@ -510,10 +530,8 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                         } else if (commitDownload != null) {
                             val previous = it.row
                             if (DIRECT_DOWNLOAD !in previous.refs) {
-                                save(it, previous.copy(refs = previous.refs + DIRECT_DOWNLOAD), commitDownload) {
-                                    playlists.syncDirectory()
-                                    refresh()
-                                }
+                                save(it, previous.copy(refs = previous.refs + DIRECT_DOWNLOAD), commitDownload,
+                                    syncBeforePublish = true, published = ::refresh)
                             }
                         } else if (!it.row.auto) retainAuto(it, cap, priority)
                         return
@@ -595,8 +613,7 @@ class MusicBlobStore internal constructor(private val dir: File, private val fre
                 try {
                     if (commitDownload != null) {
                         if (!canOpen(entry)) throw IOException("Verified audio cannot be opened")
-                        if (!save(entry, row, commitDownload) {
-                                playlists.syncDirectory()
+                        if (!save(entry, row, commitDownload, syncBeforePublish = true) {
                                 entries[key] = entry
                                 touch(entry)
                                 refresh()

@@ -32,7 +32,7 @@ internal class PlaylistFiles(private val dir: File, private val forceDirectory: 
         }
     }
     private data class Saved(val file: File, val tracks: Set<SongKey>)
-    private data class Pending(val key: Pair<MusicOwner, String>, val next: Saved, val previous: OfflineManifest?)
+    private data class Pending(val key: Pair<MusicOwner, String>, val next: Saved, val previous: ByteArray?)
     data class Publication(val owner: MusicOwner, val id: String, val superseded: Set<SongKey>, val required: Set<SongKey>)
     private var pending: Pending? = null
     private val saved = mutableMapOf<Pair<MusicOwner, String>, Saved>()
@@ -42,8 +42,7 @@ internal class PlaylistFiles(private val dir: File, private val forceDirectory: 
     fun readyIds(available: Set<SongKey>): Set<Pair<MusicOwner, String>> =
         saved.entries.mapNotNullTo(hashSetOf()) { (id, playlist) -> id.takeIf { available.containsAll(playlist.tracks) } }
 
-    // A rename/unlink linearizes the operation. Don't delete any superseded bytes before the
-    // directory entry is durable (including reopen after process death before this barrier).
+    // No superseded bytes can be removed until the manifest directory is durable.
     private var flushNeeded = true
     fun syncDirectory() = forceDirectory(dir)
     fun markDirectoryDirty() { flushNeeded = true }
@@ -68,7 +67,7 @@ internal class PlaylistFiles(private val dir: File, private val forceDirectory: 
     fun contains(owner: MusicOwner, id: String, key: SongKey) = saved[owner to id]?.tracks?.contains(key) == true
     fun select(owner: MusicOwner, id: String): OfflineManifest? {
         val key = owner to id
-        pending?.takeIf { it.key == key }?.let { return it.previous }
+        pending?.takeIf { it.key == key }?.let { return it.previous?.let { bytes -> Json.decodeFromString<Document>(bytes.decodeToString()).manifest() } }
         return saved[key]?.let { read(it.file).manifest() }
     }
     fun complete(owner: MusicOwner): List<OfflineManifest> = saved.keys.asSequence()
@@ -96,7 +95,7 @@ internal class PlaylistFiles(private val dir: File, private val forceDirectory: 
             requireNotNull(c.description), requireNotNull(c.revision), manifest.fence,
             manifest.items.map { Item(it.occurrenceId, it.track) })
         val file = saved[key]?.file ?: File(dir, "${UUID.randomUUID()}.playlist")
-        val next = Pending(key, Saved(file, keys), select(owner, c.reference.id))
+        val next = Pending(key, Saved(file, keys), saved[key]?.file?.readBytes())
         val tmp = File.createTempFile("manifest", ".tmp", dir)
         try {
             val bytes = Json.encodeToString(doc).toByteArray()
@@ -111,14 +110,36 @@ internal class PlaylistFiles(private val dir: File, private val forceDirectory: 
         } finally { tmp.delete() }
     }
 
-    /** The rename was authorized; only the directory barrier may publish its membership.
-     * Until then [saved] retains the prior manifest and blob counts. The new bytes have draft holds. */
-    fun publishDurable(): Publication? {
-        val next = pending ?: return null
+    /** Both the rename and reader-visible membership require the original job's authorization.
+     * The directory barrier must run outside the authorization lock. */
+    fun publishDurable(commit: (() -> Unit) -> Boolean): Publication {
+        val next = checkNotNull(pending)
         beforeReclaim()
-        val superseded = replace(next.key, next.next)
+        var change: Publication? = null
+        if (!commit {
+                val superseded = replace(next.key, next.next)
+                pending = null
+                change = Publication(next.key.first, next.key.second, superseded, next.next.tracks)
+            }) throw CancellationException("Playlist publication retired")
+        return checkNotNull(change)
+    }
+
+    /** A failed or retired candidate can be rolled back, never promoted by a later reader. */
+    fun rollback() {
+        val candidate = pending ?: return
+        val target = candidate.next.file.toPath()
+        val previous = candidate.previous
+        if (previous == null) Files.deleteIfExists(target)
+        else {
+            val tmp = File.createTempFile("rollback", ".tmp", dir)
+            try {
+                tmp.outputStream().use { it.write(previous); it.fd.sync() }
+                Files.move(tmp.toPath(), target, ATOMIC_MOVE, REPLACE_EXISTING)
+            } finally { tmp.delete() }
+        }
+        markDirectoryDirty()
         pending = null
-        return Publication(next.key.first, next.key.second, superseded, next.next.tracks)
+        beforeReclaim()
     }
 
     fun remove(owner: MusicOwner, id: String): Set<SongKey>? {

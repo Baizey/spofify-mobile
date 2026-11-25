@@ -21,7 +21,8 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
     private val tracksFile = File(directory, "tracks.json")
 
     fun loadTracks(): CatalogTrackData = readJson(tracksFile, MAX_TRACK_BYTES) ?: CatalogTrackData()
-    fun saveTracks(data: CatalogTrackData) = writeJson(tracksFile, MAX_TRACK_BYTES, data)
+    fun saveTracks(data: CatalogTrackData, authorized: ((() -> Unit) -> Boolean)? = null) =
+        writeJson(tracksFile, MAX_TRACK_BYTES, data, authorized ?: commit)
 
     fun artwork(kind: MusicKind, id: String): LocalArtwork {
         val bytes = read(artworkFile(kind, id), MAX_ARTWORK_BYTES + 1) ?: return LocalArtwork.Unknown
@@ -32,10 +33,11 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
         }
     }
 
-    fun saveArtwork(kind: MusicKind, id: String, bytes: ByteArray?) {
+    fun saveArtwork(kind: MusicKind, id: String, bytes: ByteArray?, authorized: ((() -> Unit) -> Boolean)? = null) {
         require(bytes == null || bytes.size in 1..MAX_ARTWORK_BYTES)
         val target = artworkFile(kind, id)
-        atomicWrite(target, if (bytes == null) byteArrayOf(MISSING) else byteArrayOf(PRESENT) + bytes)
+        val gate = authorized ?: commit
+        atomicWrite(target, if (bytes == null) byteArrayOf(MISSING) else byteArrayOf(PRESENT) + bytes, gate)
         val entries = artwork.listFiles().orEmpty().filter { it.isFile && it.name.endsWith(".art") }
         var size = entries.sumOf(File::length)
         var count = entries.size
@@ -44,7 +46,7 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
             if (size <= MAX_ARTWORK_TOTAL_BYTES && count <= MAX_ARTWORK_ENTRIES) break
             val length = file.length()
             var deleted = false
-            if (!commit { deleted = Files.deleteIfExists(file.toPath()) }) break
+            if (!gate { deleted = Files.deleteIfExists(file.toPath()) }) break
             if (deleted) { size -= length; count-- }
         }
     }
@@ -60,10 +62,10 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
         null
     }
 
-    private inline fun <reified T> writeJson(file: File, max: Int, data: T) {
+    private inline fun <reified T> writeJson(file: File, max: Int, data: T, noinline gate: (() -> Unit) -> Boolean) {
         val bytes = Json.encodeToString(data).encodeToByteArray()
         require(bytes.size <= max) { "Local metadata limit exceeded" }
-        atomicWrite(file, bytes)
+        atomicWrite(file, bytes, gate)
     }
 
     private fun read(file: File, max: Int): ByteArray? = try {
@@ -83,7 +85,7 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
         null
     }
 
-    private fun atomicWrite(file: File, bytes: ByteArray) {
+    private fun atomicWrite(file: File, bytes: ByteArray, gate: (() -> Unit) -> Boolean) {
         val parent = requireNotNull(file.parentFile)
         Files.createDirectories(parent.toPath())
         val temporary = Files.createTempFile(parent.toPath(), ".catalog-", ".tmp")
@@ -92,7 +94,7 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
                 stream.write(bytes)
                 stream.fd.sync()
             }
-            if (!commit { Files.move(temporary, file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING) })
+            if (!gate { Files.move(temporary, file.toPath(), ATOMIC_MOVE, REPLACE_EXISTING) })
                 throw CancellationException("Catalog owner retired")
         } finally {
             Files.deleteIfExists(temporary)

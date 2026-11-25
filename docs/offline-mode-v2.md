@@ -41,6 +41,7 @@ When a watched playlist needs details, `syncPlaylist` fetches the current rows f
 ## 3. Downloads and playback
 
 - A track is **Downloaded** only once its audio has been fully written, verified against the download contract, and durably recorded as playable by the client. Publish completion only after the file can be opened for playback. Partial transfers and temporary streaming buffers do not count. Downloads survive normal restarts and ordinary metadata or streaming-cache eviction.
+- Android keeps the previous playlist download until the replacement's directory sync succeeds and the original job is still authorized. A failed or retired replacement does not become playable through a later read. Retry transient save failures at most twice; a permanent failure stops the worker and appears as failed instead of pending, without retrying on network policy changes.
 - Prefer a valid download whenever playback belongs to the local client, even online. If the file is missing or unreadable, correct the recorded availability. A saved index entry alone does not make a track playable.
 - When streaming stops because the service is lost or manual mode is enabled, continue at the current position from a valid local copy if possible. Otherwise, play the remaining buffer for the current track without fetching more audio. Pause with a brief reason if the track cannot continue.
 - When the user explicitly selects an unavailable track, show why it cannot play. Do not substitute a different track. During automatic queue advance, skip unavailable entries in queue order and stop if none can play. Repeat must not spin through an unavailable queue indefinitely.
@@ -54,6 +55,8 @@ When a watched playlist needs details, `syncPlaylist` fetches the current rows f
 ## 5. Acceptance tests
 
 Run on both clients. Use an injectable clock, controlled responses, and network request counts where applicable. Cover the relaunch path on a running client as well as in automated tests.
+
+On Android, `bash scripts/test-current-go-offline.sh /path/to/spofify-go` builds the pinned provider-free Go fixture in disposable storage. It verifies socket opening and explicit `sync`, manual and derived occurrence order, one direct track download, and reopening the saved details and playable audio from disk. It needs loopback TCP and cached Go/Gradle dependencies; it does not exercise Media3 or render Android UI.
 
 | Scenario | Expected result |
 | --- | --- |

@@ -48,7 +48,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         emitAll(repository.await()?.completeIds() ?: flowOf(emptySet()))
     }
     private val playlistProgress = MutableStateFlow<Map<String, OfflinePlaylistProgress>>(emptyMap())
-    val offlinePlaylistStatuses = combine(offlinePlaylists.wanted, committedPlaylistIds, playlistProgress, ::playlistOfflineStatuses)
+    val offlinePlaylistStatuses = combine(offlinePlaylists.wanted, committedPlaylistIds, playlistProgress, offlinePlaylists.failed, ::playlistOfflineStatuses)
         .stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
     // The KTX edit helper discards commit's result; don't publish an unpersisted choice.
@@ -83,7 +83,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
                 val store = storage.initialized.await() ?: error("Download storage unavailable")
                 sessions.withOnlineGrant(grant) {
                     personal.persistPlaylistForDownload(playlistId, occurrenceId, track.id, grant)
-                    catalog.rememberTracks(listOf(LocalTrackMetadata.Personal(track)))
+                    catalog.rememberTracks(listOf(LocalTrackMetadata.Personal(track)), sessions.catalogCommit(grant))
                     withContext(Dispatchers.IO) {
                         val job = coroutineContext.job
                         store.download(SongKey(owner, track.id), track.name, cache.options.value.cap,
@@ -142,10 +142,11 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         }
     }
 
-    private val queue = MutableStateFlow<List<PlaybackTrack>>(emptyList())
-    fun observePlayback(view: PlaybackView) {
-        queue.value = view.queue
-        onlinePlayback.value = PlayerPresentation(view).onlineReady
+    private val queue = MutableStateFlow<Pair<OnlineGrant?, List<PlaybackTrack>>>(null to emptyList())
+    fun observePlayback(view: PlaybackView, grant: OnlineGrant?) {
+        val online = PlayerPresentation(view).onlineReady
+        queue.value = grant to view.queue.takeIf { grant != null && online && !view.isolatedOutput }.orEmpty()
+        onlinePlayback.value = online
     }
 
     init {
@@ -162,16 +163,21 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         }
         scope.launch {
             val store = storage.initialized.await() ?: return@launch
-            combine(store.songs, queue) { songs, tracks ->
+            combine(store.songs, queue) { songs, (grant, tracks) ->
                 val byId = tracks.associateBy { it.id }
-                songs.filter { it.key.owner == owner && (it.auto || it.offline) }.map {
+                grant to songs.filter { it.key.owner == owner && (it.auto || it.offline) }.map {
                     val row = byId[it.key.id]
-                    LocalTrackMetadata.Cached(it.key.id, row?.name?.ifBlank { it.title } ?: it.title,
-                        row?.albumId.orEmpty(), row?.albumName.orEmpty(), row?.artists.orEmpty(), ((row?.duration ?: 0.0) * 1000).toLong())
+                    val local = LocalTrackMetadata.Cached(it.key.id, it.title, "", "", emptyList(), 0)
+                    local to row?.let { track -> local.copy(title = track.name.ifBlank { it.title }, albumId = track.albumId,
+                        album = track.albumName, artists = track.artists, durationMs = (track.duration * 1000).toLong()) }
                 }
-            }.distinctUntilChanged().collect { observations ->
-                for (batch in observations.chunked(500)) try { catalog.rememberTracks(batch) }
-                catch (e: CancellationException) { throw e } catch (_: Exception) { /* Unusable metadata is not playback authority. */ }
+            }.distinctUntilChanged().collect { (grant, observations) ->
+                for (batch in observations.chunked(500)) try {
+                    catalog.rememberTracks(batch.map { it.first })
+                    if (grant != null) catalog.rememberTracks(batch.mapNotNull { it.second }, sessions.catalogCommit(grant))
+                } catch (e: CancellationException) {
+                    currentCoroutineContext().ensureActive() // A rejected old grant does not retire this local observer.
+                } catch (_: Exception) { /* Unusable metadata is not playback authority. */ }
                 metadataVersion.value++
             }
         }
@@ -254,7 +260,10 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
                     ids.collect { available ->
                         val known = catalog.availableTracks().filter { it.albumId.isNotEmpty() && it.artists.isNotEmpty() }.mapTo(hashSetOf()) { it.id }
                         for (id in available - known) if (seen.add(id)) {
-                            try { catalog.rememberTracks(listOf(LocalTrackMetadata.Library(client.detail(MusicKind.TRACK, id)))) }
+                            try {
+                                catalog.rememberTracks(listOf(LocalTrackMetadata.Library(client.detail(MusicKind.TRACK, id))),
+                                    sessions.catalogCommit(grant))
+                            }
                             catch (e: CancellationException) { throw e } catch (_: Exception) { /* No guessed metadata. */ }
                         }
                     }
@@ -272,7 +281,7 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
             requireNotNull(collection.revision), "", "")
         personal.retainDownload(summary, manifest.items.map { PersonalManualEntry(it.occurrenceId, it.position, it.track) }, grant)
         manifest.items.distinctBy { it.track.id }.chunked(500).forEach { chunk ->
-            try { catalog.rememberTracks(chunk.map { LocalTrackMetadata.Personal(it.track) }) }
+            try { catalog.rememberTracks(chunk.map { LocalTrackMetadata.Personal(it.track) }, grant?.let(sessions::catalogCommit)) }
             catch (e: CancellationException) { throw e } catch (_: Exception) { /* Manifest retains its own verified metadata. */ }
         }
     }

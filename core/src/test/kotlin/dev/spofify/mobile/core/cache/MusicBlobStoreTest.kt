@@ -102,6 +102,29 @@ class MusicBlobStoreTest {
         assertNull(reopened.pin(key, downloadOnly = true) { true })
     }
 
+    @Test fun failedDirectorySyncDuringAutoPromotionPreservesAutoAndNeverGrantsDownloadOnlyPins() = runBlocking {
+        var fail = false
+        val store = MusicBlobStore(root.root, { Long.MAX_VALUE }, java.nio.file.Files::deleteIfExists) { path ->
+            if (fail) { fail = false; throw IOException("injected directory fsync failure") }
+            dev.spofify.mobile.core.offline.syncPlaylistDirectory(path)
+        }
+        store.put()
+        fail = true
+        val error = runCatching {
+            store.download(key, "Song", 3, { true }, { error("Must reuse AUTO") }, { publish -> publish(); true }) { _, _ ->
+                error("Must not transfer")
+            }
+        }.exceptionOrNull()
+        assertTrue(error is IOException)
+        for (candidate in listOf(store, MusicBlobStore(root.root))) {
+            assertTrue(candidate.songs.value.single().auto)
+            assertFalse(candidate.songs.value.single().offline)
+            assertFalse(candidate.hasOfflineReference(key))
+            assertNull(candidate.pin(key, downloadOnly = true) { true })
+            candidate.pin(key) { true }!!.use { pin -> pin.open(0).use { assertArrayEquals(bytes, it.input.readBytes()) } }
+        }
+    }
+
     @Test fun recoveryDiscardsOrphanStagingAndSameLengthCorruption() = runBlocking {
         MusicBlobStore(root.root).put()
         root.root.listFiles()!!.single { it.extension == "blob" }.writeBytes(bytes.reversedArray())

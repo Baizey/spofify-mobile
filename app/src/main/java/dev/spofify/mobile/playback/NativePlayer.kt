@@ -113,7 +113,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
             { sessions.renew(identity) }, { Log.w("SpofifyPlayer", "Session maintenance check failed") }).also { it.start() }
         scope.launch {
             controller.state.collect { state ->
-                music.observePlayback(state)
+                music.observePlayback(state, controller.socketGrant)
                 audio.recheckSourceMode(isolated = state.offline || state.isolatedOutput || sessions.manualOffline.value || sessions.onlineGrant.value == null)
                 reconcile()
             }

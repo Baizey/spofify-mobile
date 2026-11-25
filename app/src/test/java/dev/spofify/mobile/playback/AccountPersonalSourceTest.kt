@@ -232,6 +232,39 @@ class AccountPersonalSourceTest {
         } finally { releaseRename.countDown() }
     }
 
+    @Test fun lateOnlineCatalogWritesCannotPublishAfterManualModeEvenWithSameIdentity() = runTest {
+        val f = Fixture(this, temporary.root, stale = false)
+        val grant = requireNotNull(f.sessions.onlineGrant.value)
+        val identity = grant.identity
+        val catalog = LocalMusicCatalog(temporary.root, identity, commit = { f.sessions.commitLocalIfCurrent(identity, it) }) { setOf("track") }
+        fun metadata(name: String) = LocalTrackMetadata.Cached("track", name)
+        catalog.rememberTracks(listOf(metadata("Saved")))
+        catalog.rememberArtwork(dev.spofify.mobile.core.library.MusicKind.TRACK, "track", byteArrayOf(4))
+        val reachedCommit = CompletableDeferred<Unit>()
+        val releaseCommit = CountDownLatch(1)
+        val gated = f.sessions.catalogCommit(grant)
+        val work = backgroundScope.async(Dispatchers.IO) {
+            runCatching { catalog.rememberTracks(listOf(LocalTrackMetadata.Library(dev.spofify.mobile.core.library.MusicItem(
+                dev.spofify.mobile.core.library.MusicKind.TRACK, "track", "Late", emptyList(), "", "", "", 0, 0, true, 1, 1))), commit = { rename ->
+                reachedCommit.complete(Unit)
+                check(releaseCommit.await(10, TimeUnit.SECONDS))
+                gated(rename)
+            }) }.exceptionOrNull()
+        }
+        try {
+            withContext(Dispatchers.IO) { withTimeout(10_000) { reachedCommit.await() } }
+            f.sessions.setManualOffline(true)
+            assertTrue(f.sessions.isCurrent(identity))
+            assertNull(f.sessions.onlineGrant.value)
+        } finally { releaseCommit.countDown() }
+        assertTrue(work.await() is CancellationException)
+        val art = runCatching { catalog.rememberArtwork(dev.spofify.mobile.core.library.MusicKind.TRACK, "track", null, gated) }
+        assertTrue(art.exceptionOrNull() is CancellationException)
+        val reopened = LocalMusicCatalog(temporary.root, identity) { setOf("track") }
+        assertEquals("Saved", reopened.availableTracks().single().name)
+        assertArrayEquals(byteArrayOf(4), reopened.artwork(dev.spofify.mobile.core.library.MusicKind.TRACK, "track"))
+    }
+
     private inner class Fixture(private val test: TestScope, root: java.io.File, stale: Boolean,
         initial: PersonalCacheSnapshot? = null, beforePersist: suspend (PersonalCacheSnapshot) -> Unit = {}) {
         private val dispatcher = StandardTestDispatcher(test.testScheduler)
@@ -270,6 +303,8 @@ class AccountPersonalSourceTest {
             override fun facts() = AudioFacts()
             override fun pause() = Unit
             override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double) = AudioResult.OK
+            override suspend fun execute(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double,
+                desiredPlaying: Boolean, isAuthorized: () -> Boolean) = AudioResult.OK
         }, test.backgroundScope)
 
         fun open() {

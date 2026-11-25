@@ -23,6 +23,8 @@ class AccountChannel(
     private val view = MutableStateFlow(PlaybackView(localOutput = true, offline = true))
     val state = view.asStateFlow()
     private var socket: PlaybackConnection? = null
+    var socketGrant: OnlineGrant? = null
+        private set
     private var worker: Job? = null
     private var life = 0L
     private var connection = PlaybackConnectionState.DISCONNECTED
@@ -204,6 +206,7 @@ class AccountChannel(
                 conn = live
                 if (attempt != life || !current()) return@launch
                 socket = live
+                socketGrant = personalGrant
                 sampleClock.reset()
                 sequence = 0
                 commandCounter = 0
@@ -260,6 +263,7 @@ class AccountChannel(
     }
 
     private fun detach(replaced: Boolean) {
+        socketGrant = null
         val fallback = if (!replaced && !retainedLocal && online && !isOwner()) {
             // One queue per account: a controller keeps the latest confirmed shared
             // traversal, never its old isolated queue or an optimistic prediction.

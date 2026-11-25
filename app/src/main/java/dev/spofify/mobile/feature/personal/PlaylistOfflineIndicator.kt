@@ -31,6 +31,7 @@ internal fun PlaylistOfflineIndicator(status: PlaylistOfflineStatus?, modifier: 
             null -> Unit
             PlaylistOfflineStatus.Saved -> SpofifyIcon(SpofifyGlyph.Downloaded, "Saved for offline", Modifier.size(20.dp), colors.primary)
             PlaylistOfflineStatus.Pending -> SpofifyIcon(SpofifyGlyph.DownloadPending, "Offline download pending", Modifier.size(20.dp), colors.onSurfaceVariant)
+            PlaylistOfflineStatus.Failed -> SpofifyIcon(SpofifyGlyph.DownloadFailed, "Couldn’t save for offline", Modifier.size(20.dp), colors.error)
             is PlaylistOfflineStatus.Downloading -> {
                 val (verified, total) = status.progress
                 val label = if (tile) "${if (total == 0) 100 else verified * 100 / total}%" else "$verified/$total"

@@ -49,6 +49,7 @@ enum class SpofifyGlyph(
     Down("m6 9 6 6 6-6"),
     Downloaded("M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M12 7v9m-4-4 4 4 4-4"),
     DownloadPending("M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M12 7v5l3 2"),
+    DownloadFailed("M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M12 7v6m0 3h.01"),
     Up("m6 15 6-6 6 6"),
     Next("M17 5v14M5 5l10 7-10 7z", filled = true),
     Previous("M7 5v14m12-14L9 12l10 7z", filled = true),

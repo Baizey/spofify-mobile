@@ -13,17 +13,22 @@ import kotlinx.coroutines.flow.*
 internal class MusicSources(val library: LibraryApi, val search: SearchApi, val personal: LivePersonal,
     val content: TrackContentApi, val local: Boolean, val readOwner: LibraryReadOwner? = null)
 
+internal fun SessionRepository.catalogCommit(grant: OnlineGrant): (() -> Unit) -> Boolean = { publish ->
+    publishIfCurrent(grant, publish)
+}
+
 internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant, catalog: LocalMusicCatalog, account: LivePersonal): MusicSources {
     val id = grant.identity
     val library = LibraryClient(sessions, id)
     val search = SearchClient(sessions, id)
     val content = TrackContentClient(sessions, id)
+    val commit = sessions.catalogCommit(grant)
     suspend fun <T : Any> read(block: suspend () -> T) = sessions.withOnlineGrant(grant) { block() }
     suspend fun retain(block: suspend () -> Unit) {
         try { block() } catch (e: CancellationException) { throw e } catch (_: Exception) { /* A cache write cannot fail an online read. */ }
     }
     suspend fun remember(items: List<MusicItem>) = retain {
-        catalog.rememberTracks(items.filter { it.kind == MusicKind.TRACK }.map(LocalTrackMetadata::Library))
+        catalog.rememberTracks(items.filter { it.kind == MusicKind.TRACK }.map(LocalTrackMetadata::Library), commit)
     }
     val browse = object : LibraryApi {
         override suspend fun search(kind: MusicKind, query: String, offset: Int) = read { library.search(kind, query, offset).also { remember(it.items) } }
@@ -32,7 +37,7 @@ internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant,
         override suspend fun detail(kind: MusicKind, id: String) = read { library.detail(kind, id).also { remember(listOf(it)) } }
         override suspend fun artwork(kind: MusicKind, id: String): ByteArray? = read {
             // withOnlineGrant excludes null; wrap confirmed misses without turning failures into misses.
-            Result.success(library.artwork(kind, id).also { retain { catalog.rememberArtwork(kind, id, it) } })
+            Result.success(library.artwork(kind, id).also { retain { catalog.rememberArtwork(kind, id, it, commit) } })
         }.getOrThrow()
     }
     val ranked = object : SearchApi {
