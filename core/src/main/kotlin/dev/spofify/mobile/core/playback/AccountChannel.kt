@@ -18,6 +18,7 @@ class AccountChannel(
     private val clock: PlaybackClock = SystemPlaybackClock, private val current: () -> Boolean = { true },
     library: LocalPlaybackLibrary = EmptyPlaybackLibrary,
     recordPlay: (dev.spofify.mobile.core.personal.PersonalHistoryEntry) -> Unit = {},
+    private val confirmedPlaylist: (String) -> Boolean = { true },
 ) : AutoCloseable {
     private val view = MutableStateFlow(PlaybackView(localOutput = true, offline = true))
     val state = view.asStateFlow()
@@ -702,11 +703,12 @@ class AccountChannel(
 
     private fun newCommandId(): String? = if (commandCounter < MAX_SAFE_INTEGER) "$connectionId:${++commandCounter}" else null
 
-    private fun issue(action: JsonObject, offline: () -> Boolean = { false }): Boolean {
+    private fun issue(action: JsonObject, context: PlaybackContext? = null, offline: () -> Boolean = { false }): Boolean {
         if (!current() || superseded || connection == PlaybackConnectionState.CLOSED || !addressableAccountChoice(action)) return false
         if (!online || retainedLocal && action.kind !in setOf("play", "select")) {
             return offline()
         }
+        if (context != null && context.kind in setOf("playlist", "derived") && !confirmedPlaylist(context.id)) return false
         if (desynced || pending.size >= MAX_PENDING) return false
         val c = (nativeCursor.takeIf { isOwner() && nativeAhead() } ?: confirmed.cursor)
         val display = projection.project(displayBasis(), pending.values)
@@ -761,15 +763,15 @@ class AccountChannel(
         ctx?.let { put("context", playbackJson.encodeToJsonElement(it.copy(revision = null))) }
     }
     fun playTrack(track: PlaybackTrackReference, context: PlaybackContext? = null) =
-        issue(fields("type" to "play", "selection" to selection(track, context))) { engine.playTrack(track, context) }
+        issue(fields("type" to "play", "selection" to selection(track, context)), context) { engine.playTrack(track, context) }
     fun playCollection(context: PlaybackContext, shuffle: Boolean = false) = issue(buildJsonObject {
         put("type", "play"); put("selection", selection(null, context)); put("shuffle", shuffle)
         if (shuffle) put("seed", kotlin.random.Random.nextLong(1L shl 32))
-    }) { engine.playCollection(context, shuffle) }
+    }, context) { engine.playCollection(context, shuffle) }
     fun queueTrack(track: PlaybackTrackReference, context: PlaybackContext? = null, next: Boolean = false) =
-        issue(fields("type" to "add", "selection" to selection(track, context), "placement" to if (next) "next" else "low")) { engine.queueTrack(track, context, next) }
+        issue(fields("type" to "add", "selection" to selection(track, context), "placement" to if (next) "next" else "low"), context) { engine.queueTrack(track, context, next) }
     fun queueCollection(context: PlaybackContext, next: Boolean = false) =
-        issue(fields("type" to "add", "selection" to selection(null, context), "placement" to if (next) "next" else "low")) { engine.queueCollection(context, next) }
+        issue(fields("type" to "add", "selection" to selection(null, context), "placement" to if (next) "next" else "low"), context) { engine.queueCollection(context, next) }
 
     override fun close() {
         if (connection == PlaybackConnectionState.CLOSED) return

@@ -94,8 +94,8 @@ internal class AccountPersonalSource(
         connectionGrant = null
         connectionEpoch++
         waitingForAccount = false
-        // A scoped read error closes the Go socket rather than sending a response. In particular,
-        // don't continually reconnect and rerequest an omitted ID that might have been deleted.
+        // Unexpected scoped read failures may close the socket; bound repeat attempts.
+        // Exact missing responses are handled separately and keep the binding open.
         val until = monotonicMs() + READ_COOLDOWN_MS
         transfers.keys.forEach { failedUntil[it] = until }
         transfers.clear()
@@ -123,19 +123,25 @@ internal class AccountPersonalSource(
                         } catch (_: IllegalArgumentException) { requestAccount(repair = true) }
                     }
                     update.part?.let(::receivePart)
+                    update.missing?.let { reply ->
+                        takeCurrentTransfer(reply.playlistId)?.let { replica.receiveMissing(reply.playlistId, it.version) }
+                    }
                 }
             }
         }
     }
 
+    private fun takeCurrentTransfer(id: String): PlaylistTransfer? {
+        val transfer = transfers.remove(id) ?: return null
+        if (transfer.version == replica.version(id) && replica.confirmsPlaylist(id)) return transfer
+        // Consume the obsolete reply before starting again: the wire has no request ID.
+        requestDetail(id)
+        return null
+    }
+
     private fun receivePart(part: PlaylistPart) {
         val id = part.summary.id
-        val transfer = transfers.remove(id) ?: return
-        if (transfer.version != replica.version(id)) {
-            // Consume the obsolete reply before starting again: the wire has no request ID.
-            requestDetail(id)
-            return
-        }
+        val transfer = takeCurrentTransfer(id) ?: return
         val rows = try { transfer.accept(part) } catch (_: IllegalArgumentException) {
             failedUntil[id] = monotonicMs() + READ_COOLDOWN_MS
             return
@@ -148,7 +154,10 @@ internal class AccountPersonalSource(
         if (replica.view.value.ready) action() else beforeRestore.addLast(action)
     }
 
-    override fun command(intent: PersonalIntent): Boolean = send(intent)
+    override fun command(intent: PersonalIntent): Boolean {
+        if (intent.playlistId?.let { !replica.confirmsPlaylist(it) } == true) return false
+        return send(intent)
+    }
 
     private fun send(intent: PersonalIntent): Boolean {
         val owner = connectionGrant ?: return false
@@ -184,7 +193,7 @@ internal class AccountPersonalSource(
     }
 
     private fun requestDetail(id: String) {
-        if (waitingForAccount || id !in watching || id in transfers || !replica.knowsPlaylist(id) || !replica.detailStale(id)) return
+        if (waitingForAccount || id !in watching || id in transfers || !replica.confirmsPlaylist(id) || !replica.detailStale(id)) return
         if (failedUntil[id]?.let { monotonicMs() < it } == true) return
         if (connectionGrant != null) sendTransfer(PlaylistTransfer(id, replica.version(id)))
     }
@@ -196,6 +205,7 @@ internal class AccountPersonalSource(
     suspend fun persistPlaylistForDownload(id: String, occurrenceId: String, trackId: String, owner: OnlineGrant) {
         fun ReplicaPlaylist.containsOccurrence() = rows.any { it.id == occurrenceId && it.track.id == trackId }
         check(sessions.onlineGrant.value === owner)
+        check(replica.confirmsPlaylist(id))
         val current = replica.snapshots.value
         val selected = checkNotNull(current.details[id])
         check(selected.containsOccurrence())
@@ -205,7 +215,8 @@ internal class AccountPersonalSource(
                 snapshot.details[id]?.let { it.revision >= revision && it.containsOccurrence() } == true
             }
         } != null)
-        if (sessions.onlineGrant.value !== owner) throw CancellationException("Download grant retired")
+        if (sessions.onlineGrant.value !== owner || !replica.confirmsPlaylist(id))
+            throw CancellationException("Download authority retired")
     }
 
     fun retainDownload(summary: PersonalPlaylistSummary, rows: List<PersonalManualEntry>, owner: OnlineGrant?) = afterRestore {

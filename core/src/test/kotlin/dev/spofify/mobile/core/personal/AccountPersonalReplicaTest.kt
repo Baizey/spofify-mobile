@@ -22,17 +22,19 @@ class AccountPersonalReplicaTest {
         AccountPersonalReplica(Clock.fixed(at, ZoneOffset.UTC)).apply { restore(saved) }
     private val identity = AccountIdentity("https://example.invalid", "account", "fixture", 1)
 
-    @Test fun cappedPrefixDoesNotDeleteUnmentionedAcceptedDetailsButShortSnapshotDoes() {
+    @Test fun exactlyQuotaSnapshotIsCompleteAndDiskAloneNeverGrantsPlaylistAuthority() {
         val r = replica(PersonalCacheSnapshot(listOf(summary), details = mapOf("p" to ReplicaPlaylist(1, listOf(one, two)))))
-        val capped = List(100) { summary.copy(id = "new-$it") }
-        r.receiveSnapshot(PersonalSnapshot(capped, emptyList()))
-        assertFalse(r.view.value.listsComplete)
-        assertEquals(101, r.view.value.playlists.size)
-        assertEquals(listOf(one, two), r.snapshots.value.details.getValue("p").rows)
-        r.receiveSnapshot(PersonalSnapshot(capped.dropLast(1), emptyList()))
+        assertFalse(r.confirmsPlaylist("p"))
+        assertFalse(r.view.value.playlists.single().capabilities.editEntries)
+        assertEquals(listOf(one.id, two.id), r.view.value.details.getValue("p").rows.map { it.id })
+        val canonical = List(100) { summary.copy(id = "new-$it") }
+        r.receiveSnapshot(PersonalSnapshot(canonical, emptyList()))
         assertTrue(r.view.value.listsComplete)
-        assertFalse(r.knowsPlaylist("p"))
+        assertEquals(canonical, r.view.value.playlists)
+        assertFalse(r.confirmsPlaylist("p"))
         assertFalse("p" in r.snapshots.value.details)
+        assertTrue("p" in r.snapshots.value.deletedPlaylists)
+        assertTrue(r.confirmsPlaylist(canonical.first().id))
     }
 
     @Test fun confirmedDeleteFencesLateDetailAndManifestHydrationAfterReopenEvenWhenCapped() {
@@ -43,13 +45,13 @@ class AccountPersonalReplicaTest {
         r.receiveChange(PersonalChange(deleted = "p"))
         r.replaceDetail(beforeDelete, summary, listOf(one, two))
         r.retainDownload(summary, listOf(one, two))
-        assertFalse(r.knowsPlaylist("p"))
+        assertFalse(r.snapshots.value.playlists.any { it.id == "p" })
         val file = PersonalCacheFile(root.root, identity)
         file.write(r.snapshots.value)
         val reopened = replica(file.read())
         reopened.receiveSnapshot(PersonalSnapshot(List(100) { summary.copy(id = "list-$it") }, emptyList()))
         reopened.retainDownload(summary, listOf(one, two))
-        assertFalse(reopened.knowsPlaylist("p"))
+        assertFalse(reopened.snapshots.value.playlists.any { it.id == "p" })
         assertFalse("p" in reopened.snapshots.value.details)
     }
 
@@ -79,9 +81,13 @@ class AccountPersonalReplicaTest {
         r.receiveChange(PersonalChange(playlist = summary.copy(revision = 2), entries = EntryChange(moved = two.id)))
         r.replaceDetail(version, summary, listOf(one, two))
         assertEquals(listOf(two.copy(position = 4), one.copy(position = 8)), r.snapshots.value.details.getValue("p").rows)
-        r.receiveChange(PersonalChange(playlist = summary.copy(revision = 3, trackCount = 1, availableCount = 1),
-            entries = EntryChange(removed = two.id)))
-        assertEquals(listOf(one.copy(position = 7)), r.snapshots.value.details.getValue("p").rows)
+        val edited = summary.copy(revision = 3, trackCount = 1, availableCount = 1)
+        assertEquals("p", r.receiveChange(PersonalChange(playlist = edited, entries = EntryChange(removed = two.id))))
+        assertTrue(r.detailStale("p"))
+        assertEquals(listOf(two.copy(position = 4), one.copy(position = 8)), r.snapshots.value.details.getValue("p").rows)
+        r.replaceDetail(r.version("p"), edited, listOf(one.copy(position = 1)))
+        assertFalse(r.detailStale("p"))
+        assertEquals(listOf(one.copy(position = 1)), r.snapshots.value.details.getValue("p").rows)
     }
 
     @Test fun transferChecksContinuationAndAllowsGoTokenResetWithoutCollapsingTrackDuplicates() {

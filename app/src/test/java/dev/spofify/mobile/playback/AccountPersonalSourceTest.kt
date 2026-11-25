@@ -71,6 +71,75 @@ class AccountPersonalSourceTest {
         assertEquals(listOf(three), f.saved.read().localPlays)
     }
 
+    @Test fun exactlyQuotaSnapshotRemovesOmittedDiskPlaylistWithoutDispatchingReadOrEdit() = runTest {
+        val initial = PersonalCacheSnapshot(listOf(summary), details = mapOf(summary.id to ReplicaPlaylist(1, emptyList())))
+        val f = Fixture(this, temporary.root, stale = false, initial = initial)
+        runCurrent()
+        f.source.watch(summary.id).use {
+            assertEquals(summary.id, f.source.replica.view.value.playlists.single().id)
+            assertFalse(f.source.replica.view.value.playlists.single().capabilities.editMetadata)
+            assertFalse(f.source.command(PersonalIntent("deletePlaylist", playlistId = summary.id)))
+            f.open()
+            assertTrue(f.socket.commands().isEmpty())
+            val full = List(100) { summary.copy(id = "confirmed-$it") }
+            f.update(PersonalUpdate(snapshot = PersonalSnapshot(full, emptyList())))
+            assertTrue(f.socket.commands().isEmpty())
+            assertFalse(f.source.command(PersonalIntent("renamePlaylist", playlistId = summary.id, name = "Discard")))
+            assertEquals(full, f.saved.read().playlists)
+            assertTrue(f.saved.read().details.isEmpty())
+            assertTrue(summary.id in f.saved.read().deletedPlaylists)
+            assertTrue(f.source.command(PersonalIntent("renamePlaylist", playlistId = full.first().id, name = "Allowed")))
+        }
+    }
+
+    @Test fun scopedMissingIgnoresUnsolicitedIdsAndDeletesOnlyCurrentContinuationWithoutDisconnect() = runTest {
+        val list = summary.copy(trackCount = 2, availableCount = 2)
+        val other = summary.copy(id = "other")
+        val row = PersonalManualEntry("one", 0, PersonalTrack("track", "track", "Song", true, PersonalCoverage(1, 1, 1)))
+        val saved = listOf(row, row.copy(id = "two", position = 1))
+        val initial = PersonalCacheSnapshot(listOf(list, other), details = mapOf(list.id to ReplicaPlaylist(list.revision, saved)))
+        val f = Fixture(this, temporary.root, stale = false, initial = initial)
+        f.open()
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(list, other), emptyList())))
+        f.updateMissing(list.id) // No admitted scoped request yet.
+        assertTrue(f.source.replica.confirmsPlaylist(list.id))
+        f.source.watch(list.id).use {
+            f.update(PersonalUpdate(part = PlaylistPart(list, token = "a".repeat(64), offset = 0, rows = listOf(row), more = true)))
+            assertEquals(JsonPrimitive(1), f.socket.commands().last()["offset"])
+            assertEquals(saved, f.saved.read().details.getValue(list.id).rows)
+            f.updateMissing(other.id)
+            assertTrue(f.source.replica.confirmsPlaylist(other.id))
+            f.updateMissing(list.id)
+            f.source.retainDownload(list, saved, owner = null)
+            runCurrent()
+            assertFalse(f.source.replica.confirmsPlaylist(list.id))
+            assertTrue(list.id in f.saved.read().deletedPlaylists)
+            assertFalse(list.id in f.saved.read().details)
+            assertTrue(f.source.replica.view.value.connected)
+            assertTrue(f.socket.isOpen)
+            assertTrue(f.source.command(PersonalIntent("renamePlaylist", playlistId = other.id, name = "Still connected")))
+            f.update(PersonalUpdate(part = PlaylistPart(list, token = "a".repeat(64), offset = 1,
+                rows = listOf(row.copy(id = "two", position = 1)), more = false)))
+            assertFalse(list.id in f.saved.read().details)
+        }
+    }
+
+    @Test fun scopedMissingFromSupersededRequestCannotDeleteAcceptedNewerState() = runTest {
+        val f = Fixture(this, temporary.root, stale = false)
+        f.open()
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
+        f.source.watch(summary.id).use {
+            assertEquals(1, f.socket.commands().size)
+            val edited = summary.copy(revision = 2, name = "Confirmed newer")
+            f.update(PersonalUpdate(change = PersonalChange(playlist = edited)))
+            f.updateMissing(summary.id)
+            assertEquals(2, f.socket.commands().size)
+            assertEquals(edited, f.saved.read().playlists.single())
+            f.update(PersonalUpdate(part = PlaylistPart(edited, token = "a".repeat(64), offset = 0, rows = emptyList(), more = false)))
+            assertEquals(2L, f.saved.read().details.getValue(summary.id).revision)
+        }
+    }
+
     @Test fun watchedInvalidationConsumesObsoleteContinuationBeforeRepairingAndNeverPublishesPrefix() = runTest {
         val f = Fixture(this, temporary.root, stale = false)
         f.open()
@@ -330,6 +399,11 @@ class AccountPersonalSourceTest {
         fun open() {
             channel.connect("Phone", "phone", requireNotNull(sessions.onlineGrant.value))
             socket.offer("""{"type":"snapshot","sessionId":"room","connectionId":"conn","revision":0,"owner":{"generation":0},"devices":[{"deviceId":"phone","name":"Phone","canPlay":true}],"player":{"queue":[],"cursor":{"key":0,"positionMs":0,"desiredPlaying":false},"repeat":"off","shuffle":false},"serverTimeMs":${at.toEpochMilli()}}""")
+            test.runCurrent()
+        }
+
+        fun updateMissing(id: String) {
+            socket.offer("""{"type":"personal","update":{"missing":{"playlistId":"$id"}}}""")
             test.runCurrent()
         }
 

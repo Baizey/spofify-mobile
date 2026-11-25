@@ -23,8 +23,14 @@ data class PersonalIntent(
 @Serializable
 data class PersonalUpdate(
     val snapshot: PersonalSnapshot? = null, val change: PersonalChange? = null, val part: PlaylistPart? = null,
+    val missing: PlaylistMissing? = null,
 ) {
-    init { require(listOf(snapshot, change, part).count { it != null } == 1) }
+    init { require(listOf(snapshot, change, part, missing).count { it != null } == 1) }
+}
+
+@Serializable
+data class PlaylistMissing(val playlistId: String) {
+    init { require(playlistId.isNotBlank()) }
 }
 
 @Serializable
@@ -84,6 +90,7 @@ data class PersonalReplicaView(
     val listsKnown: Boolean = false,
     val listsComplete: Boolean = false,
     val deletedPlaylists: Set<String> = emptySet(),
+    val confirmedPlaylistIds: Set<String> = emptySet(),
 )
 
 /** Player-looper reducer. Only complete scoped reads replace accepted rows; versions fence
@@ -94,6 +101,7 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
     private val durable = MutableStateFlow(PersonalCacheSnapshot())
     val snapshots = durable.asStateFlow()
     private var connected = false
+    private var confirmed = emptySet<String>()
     private var online = false
     private var ready = false
     private var available = emptySet<String>()
@@ -111,15 +119,19 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
         publish(durable.value)
     }
 
-    fun disconnected() { connected = false; publish(durable.value) }
+    fun disconnected() {
+        connected = false
+        confirmed = emptySet()
+        publish(durable.value)
+    }
 
     private fun stale(at: Long?) = at == null || clock.millis() - at !in 0 until freshnessMs
     fun accountStale() = durable.value.let { stale(it.listsAt) || stale(it.recentAt) }
     fun detailStale(id: String) = stale(durable.value.details[id]?.refreshedAt)
-    fun knowsPlaylist(id: String) = durable.value.playlists.any { it.id == id }
+    fun confirmsPlaylist(id: String) = id in confirmed
 
     fun replaceDetail(version: Long, summary: PersonalPlaylistSummary, rows: List<PersonalManualEntry>) {
-        if (!connected || version != version(summary.id)) return
+        if (!confirmsPlaylist(summary.id) || version != version(summary.id)) return
         val data = durable.value
         val prior = data.playlists.firstOrNull { it.id == summary.id } ?: return
         if (summary.revision < prior.revision || summary.kind != prior.kind) return
@@ -146,26 +158,37 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
     fun receiveSnapshot(snap: PersonalSnapshot) {
         require(validRecent(snap.recent))
         val ids = snap.playlists.associateBy { it.id }
-        require(ids.size == snap.playlists.size && ids.size <= PLAYLIST_PREFIX && snap.playlists.all(::validPlaylistSummary))
+        require(ids.size == snap.playlists.size && ids.size <= PLAYLIST_QUOTA && snap.playlists.all(::validPlaylistSummary))
         val data = durable.value
-        // Exactly 100 is ambiguous: only a shorter snapshot proves absence.
-        val complete = ids.size < PLAYLIST_PREFIX
-        val omitted = data.playlists.filter { it.id !in ids }
-        val removed = if (complete) omitted.mapTo(hashSetOf()) { it.id } else emptySet()
+        // Go emits only a complete list, including at the account quota.
+        val removed = data.playlists.filterNot { it.id in ids }.mapTo(hashSetOf()) { it.id }
         val prior = data.playlists.associateBy { it.id }
         require(snap.playlists.none { it.revision < (prior[it.id]?.revision ?: 0) || it.id in data.deletedPlaylists })
         val invalidated = snap.playlists.filter { it != prior[it.id] }.mapTo(hashSetOf()) { it.id } + removed
         invalidated.forEach(::changed)
+        confirmed = ids.keys
         connected = true
         val now = clock.millis()
         publish(mergeServerHistory(data, snap.recent).copy(
-            playlists = if (complete) snap.playlists else snap.playlists + omitted,
-            listsAt = now, recentAt = now, listsComplete = complete,
+            playlists = snap.playlists,
+            listsAt = now, recentAt = now, listsComplete = true,
             deletedPlaylists = data.deletedPlaylists + removed,
             details = data.details.filterKeys { it !in removed }.mapValues { (id, detail) ->
                 if (id in invalidated) detail.copy(refreshedAt = null) else detail
             },
         ))
+    }
+
+    /** A binding-scoped missing response has the same membership effect as a confirmed delete. */
+    fun receiveMissing(id: String, version: Long) {
+        if (version == version(id) && confirmsPlaylist(id)) publish(delete(durable.value, id))
+    }
+
+    private fun delete(data: PersonalCacheSnapshot, id: String): PersonalCacheSnapshot {
+        confirmed -= id
+        changed(id)
+        return data.copy(playlists = data.playlists.filterNot { it.id == id }, details = data.details - id,
+            deletedPlaylists = data.deletedPlaylists + id)
     }
 
     /** Returns the playlist to repair when a confirmed edit cannot update its rows exactly. */
@@ -187,14 +210,11 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
             require(validRecent(items))
             next = mergeServerHistory(next, items)
         }
-        delta.deleted?.let { id ->
-            changed(id)
-            next = next.copy(playlists = next.playlists.filterNot { it.id == id }, details = next.details - id,
-                deletedPlaylists = next.deletedPlaylists + id)
-        }
+        delta.deleted?.let { next = delete(next, it) }
         delta.playlist?.let { summary ->
             val id = summary.id
             if (id in next.deletedPlaylists || next.playlists.any { it.id == id && it.revision > summary.revision }) return@let
+            confirmed += id
             changed(id)
             next = next.copy(playlists = replace(next.playlists, summary))
             val old = next.details[id]
@@ -215,16 +235,17 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
     private fun publish(data: PersonalCacheSnapshot) {
         durable.value = data
         val recent = (data.recent + data.localPlays).distinctBy(::key).sortedWith(historyOrder).take(RECENT_LIMIT)
-        fun PersonalTrack.visible() = copy(hasAudio = if (online) hasAudio || id in available else id in available)
-        val details = data.details.mapValues { (_, detail) ->
-            detail.copy(rows = detail.rows.map { it.copy(track = it.track.visible()) })
+        fun PersonalTrack.visible(remote: Boolean) = copy(hasAudio = remote && hasAudio || id in available)
+        val details = data.details.mapValues { (id, detail) ->
+            detail.copy(rows = detail.rows.map { it.copy(track = it.track.visible(online && confirmsPlaylist(id))) })
         }
-        val lists = if (connected) data.playlists else data.playlists.map {
-            it.copy(capabilities = PersonalPlaylistCapabilities(false, false, false, it.capabilities.play, false, false, false))
+        val lists = data.playlists.map { summary ->
+            if (confirmsPlaylist(summary.id)) summary else summary.copy(capabilities = PersonalPlaylistCapabilities(
+                false, false, false, !online && summary.capabilities.play, false, false, false))
         }
-        mutable.value = PersonalReplicaView(connected, lists, recent.map { it.copy(track = it.track.visible()) }, details,
+        mutable.value = PersonalReplicaView(connected, lists, recent.map { it.copy(track = it.track.visible(online)) }, details,
             ready, data.recentAt != null || data.localPlays.isNotEmpty(), data.listsAt != null || data.playlists.isNotEmpty(),
-            data.listsComplete, data.deletedPlaylists)
+            data.listsComplete, data.deletedPlaylists, confirmed)
     }
 
     private fun applyEntries(original: List<PersonalManualEntry>, edit: EntryChange?): List<PersonalManualEntry>? {
@@ -235,13 +256,9 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
             if (!validPlaylistTrack(row.track) || rows.any { it.id == row.id } || row.position <= (rows.lastOrNull()?.position ?: -1)) return null
             rows.add(row)
         }
-        edit.removed?.let { id ->
-            val index = rows.indexOfFirst { it.id == id }
-            if (index < 0) return null
-            rows.removeAt(index)
-            // Go compacts persisted slots on removal; hidden occurrences still occupy slots.
-            for (i in index until rows.size) rows[i] = rows[i].copy(position = rows[i].position - 1)
-        }
+        // Go compacts all persisted slots on removal, including occurrences not projected to
+        // listeners. An ID alone is not an exact position patch; retain and repair the detail.
+        if (edit.removed != null) return null
         edit.moved?.let { id ->
             val from = rows.indexOfFirst { it.id == id }
             if (from < 0) return null
@@ -267,7 +284,7 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
     }
 
     companion object {
-        const val PLAYLIST_PREFIX = 100
+        const val PLAYLIST_QUOTA = 100
         const val RECENT_LIMIT = 40
         private const val LOCAL_HISTORY_LIMIT = 10_000
     }

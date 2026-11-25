@@ -61,7 +61,7 @@ class AccountChannelTest {
         }
     }
 
-    private class Fixture(val test: TestScope) {
+    private class Fixture(val test: TestScope, confirmedPlaylist: (String) -> Boolean = { true }) {
         val audio = Audio()
         var socket = Socket()
         var opens = 0
@@ -78,7 +78,7 @@ class AccountChannelTest {
         }, audio, test.backgroundScope, clock, library = object : LocalPlaybackLibrary {
             override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
             override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = LocalPlaybackRows(rows)
-        })
+        }, confirmedPlaylist = confirmedPlaylist)
         val view get() = channel.state.value
         fun connect() { channel.connect("Phone", "self"); test.runCurrent() }
         fun snapshot(owner: String? = "self", generation: Long = 1, revision: Long = 1,
@@ -469,6 +469,25 @@ class AccountChannelTest {
         assertTrue(f.channel.sendPersonal(fields("type" to "renamePlaylist", "playlistId" to "p", "name" to "Updated")))
         assertTrue(f.socket.sent.any { it.kind == "personal" })
         assertTrue(f.socket.commands().isEmpty())
+    }
+
+    @Test fun onlinePlaylistSelectionRequiresCurrentMembershipButLocalSelectionDoesNot() = runTest {
+        var confirmed = false
+        val f = Fixture(this) { it == "p" && confirmed }
+        val context = PlaybackContext("playlist", "p", "Cached")
+        val track = PlaybackTrackReference(rows.first().id)
+        f.connect(); f.snapshot()
+        assertFalse(f.channel.playTrack(track, context))
+        assertFalse(f.channel.queueCollection(context))
+        assertTrue(f.socket.commands().isEmpty())
+        confirmed = true
+        assertTrue(f.channel.queueCollection(context))
+        assertEquals(1, f.socket.commands().size)
+        confirmed = false
+        f.disconnect()
+        assertTrue(f.channel.playCollection(context))
+        runCurrent()
+        assertTrue(f.view.offline)
     }
 
     @Test fun accountSyncEchoDoesNotUndoAnUnconfirmedNativeAdvance() = runTest {

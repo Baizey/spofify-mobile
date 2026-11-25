@@ -14,6 +14,7 @@ internal data class PlaylistDetailState(
     val rows: List<PlaylistSong> = emptyList(),
     val context: PlaybackContext? = null,
     val loaded: Boolean = false,
+    val confirmed: Boolean = false,
     val filter: String = "",
     val message: String? = null,
     val deleted: Boolean = false,
@@ -48,6 +49,7 @@ internal class PlaylistDetailViewModel(private val source: LivePersonal, private
                         occurrenceId = row.id.takeIf { derived })
                 }
                 mutable.value = mutable.value.copy(summary = summary, rows = rows, loaded = detail != null, deleted = false,
+                    confirmed = id in snapshot.confirmedPlaylistIds,
                     message = if (snapshot.ready && detail == null) "Not saved on this device." else null,
                     context = detail?.let { playlistContext(summary) })
             }

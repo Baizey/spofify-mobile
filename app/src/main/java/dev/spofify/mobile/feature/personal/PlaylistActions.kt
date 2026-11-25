@@ -54,9 +54,9 @@ internal fun PlaylistCollectionSheet(
             if (summary != null) {
                 item("library") { SheetGroup("Library") }
                 if (offline != null) item("save-offline") {
-                    val enabled = wanted != null && summary.id !in pending && (checked || connected)
+                    val enabled = wanted != null && summary.id !in pending && (checked || connected && state.confirmed)
                     Row(Modifier.fillMaxWidth().heightIn(min = 54.dp)
-                        .toggleable(checked, enabled = enabled, role = Role.Switch) { offline.set(summary.id, it) }
+                        .toggleable(checked, enabled = enabled, role = Role.Switch) { music.setPlaylistOffline(summary.id, it) }
                         .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                         SpofifyIcon(SpofifyGlyph.Down, null, Modifier.size(22.dp))
