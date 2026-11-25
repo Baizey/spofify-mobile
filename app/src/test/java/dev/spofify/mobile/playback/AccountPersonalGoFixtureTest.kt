@@ -47,7 +47,7 @@ class AccountPersonalGoFixtureTest {
                 }).jsonObject
                 fun JsonObject.string(key: String) = getValue(key).jsonPrimitive.content
                 assertEquals("ready", ready.string("event"))
-                assertEquals("3ee2d80b1664f566dbd1eae3a8b1b3e19c526556", ready.string("sourceRevision"))
+                assertEquals("d17804f0d5c033cb6737e3fdbbc5cada5dd06dad", ready.string("sourceRevision"))
                 val origin = ready.string("origin").also { require(it.startsWith("http://127.0.0.1:")) }
                 val targets = ready.getValue("targets").jsonArray.map { it.jsonObject }
                 val manual = targets.single { it["playlistKind"]?.jsonPrimitive?.content == "manual" }.string("id")
@@ -129,8 +129,41 @@ class AccountPersonalGoFixtureTest {
                         }
                     }
                     assertTrue(store.songs.value.single().direct)
+
+                    // Exercise the production remove delta and scoped repair, not just startup order.
+                    val manualBefore = detail.getValue(manual)
+                    val removed = manualBefore.rows.first()
+                    val survivors = manualBefore.rows.drop(1)
+                    withContext(looper) {
+                        watches[1].close() // Keep the last accepted derived rows; do not fetch a new materialization here.
+                        assertTrue(source.command(PersonalIntent("removeEntry", playlistId = manual, entryId = removed.id)))
+                    }
+                    val repaired = source.replica.snapshots.first { snapshot ->
+                        snapshot.details[manual]?.let { it.revision > manualBefore.revision && it.refreshedAt != null } == true
+                    }.details.getValue(manual)
+                    assertEquals(survivors.map { it.id }, repaired.rows.map { it.id })
+                    assertEquals(survivors.indices.map(Int::toLong), repaired.rows.map { it.position })
+                    assertEquals(1L, repaired.rows[1].position) // Former slot 2 is now the second visible duplicate.
+                    withContext(looper) { source.persistPlaylistForDownload(manual, row.id, row.track.id, grant) }
+
+                    // A raw non-owned probe is admitted only by this test transport, not Android UI.
+                    // Verify Go returns the exact scoped missing envelope and still handles sync.
+                    val foreign = ready.string("otherPlaylistId")
+                    val missing = CompletableDeferred<JsonObject>()
+                    val listener = withContext(looper) {
+                        channel.onPersonal { update, _ -> if (update?.containsKey("missing") == true) missing.complete(update) }
+                            .also {
+                                assertTrue(channel.sendPersonal(buildJsonObject { put("type", "syncPlaylist"); put("playlistId", foreign) }))
+                            }
+                    }
+                    try {
+                        assertEquals(buildJsonObject { putJsonObject("missing") { put("playlistId", foreign) } }, missing.await())
+                        stamp.addAndGet(300_001)
+                        withContext(looper) { source.refreshAccount() }
+                        source.replica.snapshots.first { snapshot -> snapshot.listsAt == stamp.get() }
+                    } finally { withContext(looper) { listener.close() } }
                     sessions.setManualOffline(true)
-                    withContext(looper) { watches.forEach(AutoCloseable::close); source.attach(null); channel.close() }
+                    withContext(looper) { watches[0].close(); source.attach(null); channel.close() }
                     val reopenedStore = MusicBlobStore(blobDir)
                     reopenedStore.pin(key, downloadOnly = true) { true }!!.use { pin ->
                         pin.open(0).use { assertTrue(it.input.readBytes().isNotEmpty()) }
@@ -143,9 +176,10 @@ class AccountPersonalGoFixtureTest {
                     assertFalse(reopened.connected)
                     for (id in listOf(manual, derived)) {
                         val rows = reopened.details.getValue(id).rows
-                        assertEquals(expected, rows.map { it.track.id })
-                        assertEquals(detail.getValue(id).rows.map { it.id }, rows.map { it.id })
-                        assertEquals(3, rows.count { it.track.hasAudio })
+                        val accepted = if (id == manual) repaired else detail.getValue(derived)
+                        assertEquals(accepted.rows.map { it.track.id }, rows.map { it.track.id })
+                        assertEquals(accepted.rows.map { it.id to it.position }, rows.map { it.id to it.position })
+                        assertEquals(if (id == manual) 2 else 3, rows.count { it.track.hasAudio })
                     }
                 }
             } finally {
