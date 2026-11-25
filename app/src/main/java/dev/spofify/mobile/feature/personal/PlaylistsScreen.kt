@@ -24,21 +24,17 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
-import dev.spofify.mobile.core.personal.PersonalLibraryApi
-import dev.spofify.mobile.playback.DevicePersonalLibrary
+import dev.spofify.mobile.playback.LivePersonal
 import dev.spofify.mobile.core.personal.PersonalPlaylistSummary
 import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.playback.PlaylistOfflineStatus
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicRowGeometry
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun PlaylistsScreen(
-    api: PersonalLibraryApi,
+    api: LivePersonal,
     loader: ImageLoader,
     playback: AppPlayback?,
     music: dev.spofify.mobile.playback.AccountMusic?,
@@ -53,50 +49,24 @@ internal fun PlaylistsScreen(
     val offlineStatuses = music?.offlinePlaylistStatuses?.collectAsStateWithLifecycle()?.value.orEmpty()
     val player = playback?.observe()
     val ready = player?.canLoadTrack == true
-    val scope = rememberCoroutineScope()
-    var queueJob by remember { mutableStateOf<Job?>(null) }
-    var queueError by remember { mutableStateOf<String?>(null) }
     var creating by remember { mutableStateOf(false) }
     var more by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
     val queue: (PersonalPlaylistSummary) -> Unit = { summary ->
-        if (queueJob?.isActive != true) {
-            queueError = null
-            val captured = personalGestureBinding(summary, null, playback?.presentation?.view)
-            queueJob = scope.launch {
-                try {
-                    val context = if (api is dev.spofify.mobile.playback.LivePersonal) playlistContext(summary)
-                        else freshPlaylistContext(api, summary.id)
-                    val current = playback?.presentation
-                    if (current?.canLoadTrack == true && captured == personalGestureBinding(summary, null, current.view) &&
-                        model.state.value.items.any { it.id == summary.id }) playback.queueCollection(context)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (failure: Exception) { queueError = personalError(failure) }
-            }
+        if (playback?.presentation?.canLoadTrack == true && model.state.value.items.any { it.id == summary.id }) {
+            playback.queueCollection(playlistContext(summary))
         }
     }
-    LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
-    LaunchedEffect(state.created) {
-        model.refresh()
-        state.created?.let {
-            model.consumeCreated()
-            onOpenPlaylist(it.id)
-        }
-    }
+    LaunchedEffect(model) { model.refresh() }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically) {
             Text("Playlists", Modifier.weight(1f).semantics { heading() }, style = MaterialTheme.typography.headlineMedium)
-            IconButton({ creating = true }, enabled = state.canCreate && !state.writing && !state.needsReview, modifier = Modifier.size(48.dp)) {
+            IconButton({ creating = true }, enabled = state.canCreate, modifier = Modifier.size(48.dp)) {
                 SpofifyIcon(SpofifyGlyph.Plus, "Create playlist", Modifier.size(24.dp))
             }
         }
         TextButton(onDownloads, Modifier.padding(start = 12.dp)) { Text("Downloads") }
-        if (state.writing) LinearProgressIndicator(Modifier.fillMaxWidth().height(3.dp))
-        val failure = state.error ?: state.message ?: queueError
-        if (failure != null) Box(Modifier.padding(horizontal = 20.dp)) {
-            PersonalStatus(false, failure)
-        }
+        state.message?.let { message -> Box(Modifier.padding(horizontal = 20.dp)) { PersonalStatus(false, message) } }
         Box(Modifier.weight(1f).fillMaxWidth()) {
             if (state.loaded && state.items.isEmpty() && state.message == null) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -120,7 +90,7 @@ internal fun PlaylistsScreen(
     }
     more?.let { selection ->
         state.items.firstOrNull { it.id == selection.id }?.let { summary ->
-            PlaylistSummaryActions(api, summary, playback, music, onMutationAcknowledged = model::refresh, onDismiss = { more = null })
+            PlaylistSummaryActions(api, summary, playback, music, onDismiss = { more = null })
         }
     }
 }
@@ -163,11 +133,10 @@ internal fun PlaylistSummaryRow(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddTrackToPlaylistSheet(
-    api: PersonalLibraryApi,
+internal fun AddTrackToPlaylistSheet(
+    api: LivePersonal,
     track: MusicItem,
     onDismiss: () -> Unit,
-    onAdded: (PersonalPlaylistSummary) -> Unit = {},
 ) {
     val owner = requireNotNull(LocalViewModelStoreOwner.current)
     val model: PlaylistsViewModel = viewModel(owner, key = "playlist-picker-${System.identityHashCode(api)}-${track.id}",
@@ -175,20 +144,9 @@ fun AddTrackToPlaylistSheet(
     val state by model.state.collectAsStateWithLifecycle()
     val scroll = rememberLazyListState()
     var creating by remember { mutableStateOf(false) }
-    val priorAddition = remember(model) { model.state.value.added }
     val priorSent = remember(model) { model.state.value.addSent }
     LaunchedEffect(state.addSent) { if (state.addSent != priorSent) onDismiss() }
-    LaunchedEffect(model) { if (model.state.value.loaded) model.refresh() }
-    LaunchedEffect(state.created) { if (state.created != null) model.consumeCreated() }
-    LaunchedEffect(state.added) {
-        state.added?.let {
-            model.consumeAdded()
-            if (it !== priorAddition) {
-                onAdded(it)
-                onDismiss()
-            }
-        }
-    }
+    LaunchedEffect(model) { model.refresh() }
     if (creating) PlaylistNameSheet("New playlist", onDismiss = { creating = false }) { name, description ->
         creating = false
         model.create(name, description)
@@ -199,17 +157,17 @@ fun AddTrackToPlaylistSheet(
                 item("heading") {
                     Column(Modifier.padding(horizontal = 20.dp)) {
                         SheetHeading("Add to playlist")
-                        PersonalStatus(state.writing, state.error ?: state.message)
+                        PersonalStatus(false, state.message)
                     }
-                    SheetListAction("New playlist", SpofifyGlyph.Plus, !state.writing && !state.needsReview) { creating = true }
+                    SheetListAction("New playlist", SpofifyGlyph.Plus, state.canCreate) { creating = true }
                 }
                 items(state.items.filter { it.capabilities.addTracks }, key = { it.id }) { summary ->
                     SheetListAction(summary.name, SpofifyGlyph.Playlists,
-                        !state.writing && !state.loading && !state.needsReview && track.kind == MusicKind.TRACK && track.hasAudio) {
+                        state.canCreate && track.kind == MusicKind.TRACK && track.hasAudio) {
                         model.add(track.id, summary)
                     }
                 }
-                if (state.loaded && state.items.none { it.capabilities.addTracks }) item("empty") {
+                if (state.loaded && state.message == null && state.items.none { it.capabilities.addTracks }) item("empty") {
                     Text("No playlists", Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }

@@ -19,12 +19,9 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
     private val directory = File(root, "catalog-v1-${key(identity.origin, identity.accountId)}")
     private val artwork = File(directory, "artwork")
     private val tracksFile = File(directory, "tracks.json")
-    private val historyFile = File(directory, "history.json")
 
     fun loadTracks(): CatalogTrackData = readJson(tracksFile, MAX_TRACK_BYTES) ?: CatalogTrackData()
-    fun loadHistory(): CatalogHistory = readJson(historyFile, MAX_HISTORY_BYTES) ?: CatalogHistory()
     fun saveTracks(data: CatalogTrackData) = writeJson(tracksFile, MAX_TRACK_BYTES, data)
-    fun saveHistory(data: CatalogHistory) = writeJson(historyFile, MAX_HISTORY_BYTES, data)
 
     fun artwork(kind: MusicKind, id: String): LocalArtwork {
         val bytes = read(artworkFile(kind, id), MAX_ARTWORK_BYTES + 1) ?: return LocalArtwork.Unknown
@@ -104,7 +101,6 @@ internal class LocalCatalogStorage(root: File, identity: AccountIdentity, privat
 
     companion object {
         private const val MAX_TRACK_BYTES = 8 * 1024 * 1024
-        private const val MAX_HISTORY_BYTES = 4 * 1024 * 1024
         private const val MAX_ARTWORK_BYTES = 1024 * 1024
         private const val MAX_ARTWORK_TOTAL_BYTES = 32 * 1024 * 1024L
         private const val MAX_ARTWORK_ENTRIES = 512

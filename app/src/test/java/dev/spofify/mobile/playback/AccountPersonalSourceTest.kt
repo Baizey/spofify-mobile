@@ -9,7 +9,11 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import dev.spofify.mobile.core.origin.ServerOrigin
 import dev.spofify.mobile.core.personal.*
-import dev.spofify.mobile.core.personal.AccountPersonalReplica.Resource
+import dev.spofify.mobile.core.playback.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.serialization.json.*
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
@@ -27,70 +31,56 @@ class AccountPersonalSourceTest {
     private val summary = PersonalPlaylistSummary("p", "Saved name", "", PersonalPlaylistKind.MANUAL,
         PersonalCountState.EXACT, 0, 0, PersonalPlaylistCapabilities(true, true, false, true, false, true, true), 1, "", "")
 
-    @Test fun staleViewsRenderFromDiskShareOneFetchAndKeepSnapshotOnPartialResponse() = runTest {
-        val fixture = Fixture(this, temporary.root, stale = true)
+    @Test fun diskFirstAndAccountSyncCoalescesWithoutAcceptingRetiredGrant() = runTest {
+        val f = Fixture(this, temporary.root, stale = true)
         runCurrent()
-        val view = fixture.source.replica.view.value
-        assertEquals("Saved name", view.playlists.single().name)
-        assertTrue(view.historyKnown)
-        repeat(6) { fixture.source.checkFreshness() }
-        runCurrent()
-        assertEquals(1, fixture.listCalls)
-        assertEquals(1, fixture.historyCalls)
-        fixture.list.complete(PersonalPage(listOf(summary.copy(name = "Partial response")), 2, 100, 0))
-        runCurrent()
-        assertEquals("Saved name", fixture.source.replica.view.value.playlists.single().name)
-        assertEquals(at.toEpochMilli() - 300_000, fixture.source.replica.snapshots.value.listsAt)
-        assertFalse(fixture.source.replica.stale(Resource.History))
-        assertTrue(fixture.source.replica.stale(Resource.Lists))
-        assertEquals(1, fixture.listCalls)
+        assertEquals("Saved name", f.source.replica.view.value.playlists.single().name)
+        assertTrue(f.source.replica.view.value.historyKnown)
+        f.source.checkFreshness()
+        assertTrue(f.socket.sent.isEmpty())
+        f.open()
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
+        repeat(6) { f.source.checkFreshness() }
+        assertEquals(0, f.socket.sent.count { it["type"] == JsonPrimitive("sync") })
+        f.clock = Clock.offset(f.clock, java.time.Duration.ofMinutes(5))
+        repeat(6) { f.source.checkFreshness() }
+        assertEquals(1, f.socket.sent.count { it["type"] == JsonPrimitive("sync") })
+        f.sessions.setManualOffline(true)
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary.copy(name = "Late response")), emptyList())))
+        assertEquals("Saved name", f.source.replica.view.value.playlists.single().name)
+        assertEquals(at.toEpochMilli(), f.saved.read().listsAt)
     }
 
-    @Test fun freshListIsNotFetchedAndRetiredResponseCannotOverwriteDisk() = runTest {
-        val fixture = Fixture(this, temporary.root, stale = false)
-        runCurrent()
-        repeat(6) { fixture.source.checkFreshness() }
-        runCurrent()
-        assertEquals(0, fixture.listCalls)
-        fixture.clock = Clock.offset(fixture.clock, java.time.Duration.ofMinutes(5))
-        fixture.source.refresh(Resource.Lists)
-        runCurrent()
-        assertEquals(1, fixture.listCalls)
-        fixture.sessions.signOut()
-        fixture.list.complete(PersonalPage(listOf(summary.copy(name = "Late response")), 1, 100, 0))
-        runCurrent()
-        assertEquals("Saved name", fixture.source.replica.view.value.playlists.single().name)
-        assertEquals("Saved name", fixture.saved.read().playlists.single().name)
-    }
-
-    @Test fun watchedInvalidationRepairsAfterOlderRequestFailsWithoutAnotherScreenEntry() = runTest {
-        val fixture = Fixture(this, temporary.root, stale = false)
-        runCurrent()
-        val owner = requireNotNull(fixture.sessions.onlineGrant.value)
-        fixture.source.applyConfirmed(owner, PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
-        val watch = fixture.source.watch(summary.id)
-        try {
-            runCurrent()
-            assertEquals(1, fixture.detailCalls)
-            val changed = summary.copy(name = "Confirmed", revision = 2, trackCount = 1, availableCount = 1)
-            fixture.liveSummary = changed
-            fixture.source.applyConfirmed(owner, PersonalUpdate(change = PersonalChange(playlist = changed, rowsInvalid = true)))
-            assertEquals("Confirmed", fixture.source.replica.view.value.playlists.single().name)
-            fixture.oldDetail.completeExceptionally(PersonalLibraryException(503, PersonalLibraryErrorCode.HTTP_ERROR))
-            runCurrent()
-            assertEquals(1, fixture.detailCalls)
-            advanceTimeBy(500)
-            runCurrent()
-            assertEquals(3, fixture.detailCalls)
-            val repaired = fixture.source.replica.snapshots.value.details.getValue(summary.id)
-            assertEquals(listOf("new-occurrence"), repaired.rows.map { it.id })
-            assertEquals(2L, repaired.revision)
-            assertFalse(fixture.source.replica.stale(Resource.Detail(summary.id)))
-        } finally { watch.close() }
+    @Test fun watchedInvalidationConsumesObsoleteContinuationBeforeRepairingAndNeverPublishesPrefix() = runTest {
+        val f = Fixture(this, temporary.root, stale = false)
+        f.open()
+        val initial = summary.copy(trackCount = 2, availableCount = 2)
+        val row = PersonalManualEntry("one", 3, PersonalTrack("track", "track", "Song", true, PersonalCoverage(1, 1, 1)))
+        val token = "a".repeat(64)
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(initial), emptyList())))
+        val one = f.source.watch(summary.id)
+        val two = f.source.watch(summary.id)
+        assertEquals(1, f.socket.commands().size)
+        f.update(PersonalUpdate(part = PlaylistPart(initial, token = token, offset = 0, rows = listOf(row), more = true)))
+        assertTrue(f.source.replica.snapshots.value.details.isEmpty())
+        assertEquals(JsonPrimitive(1), f.socket.commands().last()["offset"])
+        assertEquals(JsonPrimitive(token), f.socket.commands().last()["known"])
+        val changed = initial.copy(name = "Confirmed", revision = 2)
+        f.update(PersonalUpdate(change = PersonalChange(playlist = changed, rowsInvalid = true)))
+        assertEquals(2, f.socket.commands().size)
+        f.update(PersonalUpdate(part = PlaylistPart(initial, token = token, offset = 1, rows = listOf(row.copy(id = "two", position = 7)), more = false)))
+        assertEquals(3, f.socket.commands().size)
+        assertNull(f.socket.commands().last()["known"])
+        assertTrue(f.source.replica.snapshots.value.details.isEmpty())
+        f.update(PersonalUpdate(part = PlaylistPart(changed, token = "b".repeat(64), offset = 0,
+            rows = listOf(row, row.copy(id = "two", position = 7)), more = false)))
+        assertEquals(listOf("one", "two"), f.saved.read().details.getValue(summary.id).rows.map { it.id })
+        assertEquals(2L, f.source.replica.snapshots.value.details.getValue(summary.id).revision)
+        one.close(); two.close()
     }
 
     @Test fun selectedTrackIsNotDownloadedUntilTheDetailContainingItsOccurrenceIsDurable() = runTest {
-        val initial = PersonalCacheSnapshot(listOf(summary), details = mapOf(summary.id to ReplicaPlaylist(1, emptyList())),
+        val initial = PersonalCacheSnapshot(listOf(summary), details = mapOf(summary.id to ReplicaPlaylist(1, emptyList(), at.toEpochMilli())),
             listsAt = at.toEpochMilli(), recentAt = at.toEpochMilli())
         val held = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
@@ -100,8 +90,9 @@ class AccountPersonalSourceTest {
         runCurrent()
         val grant = requireNotNull(fixture.sessions.onlineGrant.value)
         val row = PersonalManualEntry("added", 0, PersonalTrack("track", "track", "Song", true, PersonalCoverage(1, 1, 1)))
-        fixture.source.applyConfirmed(grant, PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
-        fixture.source.applyConfirmed(grant, PersonalUpdate(change = PersonalChange(
+        fixture.open()
+        fixture.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
+        fixture.update(PersonalUpdate(change = PersonalChange(
             playlist = summary.copy(revision = 2, trackCount = 1, availableCount = 1), entries = EntryChange(added = row))))
         runCurrent()
         assertTrue(held.isCompleted)
@@ -241,7 +232,7 @@ class AccountPersonalSourceTest {
         } finally { releaseRename.countDown() }
     }
 
-    private inner class Fixture(test: TestScope, root: java.io.File, stale: Boolean,
+    private inner class Fixture(private val test: TestScope, root: java.io.File, stale: Boolean,
         initial: PersonalCacheSnapshot? = null, beforePersist: suspend (PersonalCacheSnapshot) -> Unit = {}) {
         private val dispatcher = StandardTestDispatcher(test.testScheduler)
         var clock = Clock.fixed(at, ZoneOffset.UTC)
@@ -273,26 +264,26 @@ class AccountPersonalSourceTest {
             override fun write(enabled: Boolean) = Unit
         })
         val saved = PersonalCacheFile(root, identity)
-        val list = CompletableDeferred<PersonalPage<PersonalPlaylistSummary>>()
-        var listCalls = 0
-        var historyCalls = 0
-        var detailCalls = 0
-        var liveSummary = summary
-        val oldDetail = CompletableDeferred<PersonalPlaylistSummary>()
-        private val client = object : PersonalLibraryApi by PersonalLibraryClient(sessions, identity) {
-            override suspend fun playlists(limit: Int, offset: Int, kind: PersonalPlaylistKind?): PersonalPage<PersonalPlaylistSummary> {
-                listCalls++
-                return withContext(NonCancellable) { list.await() }
-            }
-            override suspend fun playlist(id: String): PersonalPlaylistSummary =
-                if (++detailCalls == 1) oldDetail.await() else liveSummary
-            override suspend fun manualEntries(id: String, limit: Int, offset: Int): PersonalPage<PersonalManualEntry> =
-                PersonalPage(listOf(PersonalManualEntry("new-occurrence", 0,
-                    PersonalTrack("track", "new-track", "New track", true, PersonalCoverage(1, 1, 1)))), 1, limit, offset)
-            override suspend fun history(limit: Int, offset: Int): PersonalPage<PersonalHistoryEntry> {
-                historyCalls++
-                return PersonalPage(emptyList(), 0, limit, offset)
-            }
+        val socket = TestSocket()
+        private val channel = AccountChannel(PlaybackTransport { _, _, _, _ -> socket }, object : AudioExecutor {
+            override val observations = emptyFlow<AudioObservation>()
+            override fun facts() = AudioFacts()
+            override fun pause() = Unit
+            override suspend fun prepare(binding: AudioBinding, track: PlaybackTrack?, elapsed: Double) = AudioResult.OK
+        }, test.backgroundScope)
+
+        fun open() {
+            channel.connect("Phone", "phone", requireNotNull(sessions.onlineGrant.value))
+            socket.offer("""{"type":"snapshot","sessionId":"room","connectionId":"conn","revision":0,"owner":{"generation":0},"devices":[{"deviceId":"phone","name":"Phone","canPlay":true}],"player":{"queue":[],"cursor":{"key":0,"positionMs":0,"desiredPlaying":false},"repeat":"off","shuffle":false},"serverTimeMs":${at.toEpochMilli()}}""")
+            test.runCurrent()
+        }
+
+        fun update(update: PersonalUpdate) {
+            socket.offer(buildJsonObject {
+                put("type", "personal")
+                put("update", Json { explicitNulls = false }.encodeToJsonElement(update))
+            }.toString())
+            test.runCurrent()
         }
         val source: AccountPersonalSource
         init {
@@ -301,9 +292,22 @@ class AccountPersonalSourceTest {
             sessions.start()
             test.runCurrent()
             assertEquals(identity, sessions.onlineGrant.value?.identity)
-            source = AccountPersonalSource(root, identity, sessions, test.backgroundScope, client,
-                AccountPersonalReplica(clockProxy), dispatcher,
+            source = AccountPersonalSource(root, identity, sessions, test.backgroundScope,
+                replica = AccountPersonalReplica(clockProxy), io = dispatcher,
                 monotonicMs = { test.testScheduler.currentTime }, beforePersist = beforePersist)
+            source.attach(channel)
         }
+    }
+
+    private class TestSocket : PlaybackConnection {
+        private val inbox = Channel<String>(Channel.UNLIMITED)
+        override val messages = inbox.receiveAsFlow()
+        override val isOpen get() = open
+        private var open = true
+        val sent = mutableListOf<JsonObject>()
+        fun offer(frame: String) { check(inbox.trySend(frame).isSuccess) }
+        fun commands() = sent.mapNotNull { it["command"]?.jsonObject }
+        override fun close() { open = false; inbox.close() }
+        override fun send(text: String): Boolean = open.also { if (it) sent += Json.parseToJsonElement(text).jsonObject }
     }
 }

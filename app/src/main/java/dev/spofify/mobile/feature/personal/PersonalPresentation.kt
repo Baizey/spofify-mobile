@@ -37,16 +37,12 @@ internal data class PlaylistSong(
     val track: PersonalTrack,
     val entryId: String? = null,
     val occurrenceId: String? = null,
-    val selectionToken: String? = null,
-    val liveOccurrence: Boolean = false,
 ) {
-    fun reference(context: PlaybackContext?, savedLocally: Boolean = false): PlaybackTrackReference? {
+    fun reference(context: PlaybackContext?): PlaybackTrackReference? {
         if (context == null || !track.hasAudio) return null
         return when (context.kind) {
             "playlist" -> entryId?.let { PlaybackTrackReference(track.id, entryId = it) }
-            "derived" -> if (occurrenceId == null || !savedLocally && !liveOccurrence && selectionToken == null) null else PlaybackTrackReference(
-                track.id, targetId = context.id, occurrenceId = occurrenceId, selectionToken = selectionToken,
-            )
+            "derived" -> occurrenceId?.let { PlaybackTrackReference(track.id, targetId = context.id, occurrenceId = it) }
             else -> null
         }
     }
@@ -88,34 +84,9 @@ internal fun naturalPlaylistOrder(items: List<PersonalPlaylistSummary>): List<Pe
 internal fun playlistContext(summary: PersonalPlaylistSummary): PlaybackContext =
     PlaybackContext(if (summary.kind == PersonalPlaylistKind.DERIVED) "derived" else "playlist", summary.id, summary.name)
 
-/** Local saved manifests retain their original materialized collection context. */
-internal suspend fun freshPlaylistContext(api: PersonalLibraryApi, id: String): PlaybackContext {
-    val summary = api.playlist(id)
-    if (summary.kind == PersonalPlaylistKind.MANUAL) return PlaybackContext("playlist", summary.id, summary.name)
-    val page = api.derivedEntries(id, limit = 1)
-    if (!page.complete || page.revision == null || page.fence.isBlank()) {
-        throw PersonalLibraryException(409, PersonalLibraryErrorCode.STALE_EVALUATION)
-    }
-    return PlaybackContext("derived", summary.id, summary.name, page.revision, page.fence)
-}
-
 internal fun playlistCount(summary: PersonalPlaylistSummary): String = when {
     summary.trackCount == null -> "Count pending"
     summary.countState == PersonalCountState.STALE -> "${summary.trackCount} songs · stored result"
     summary.trackCount == 1L -> "1 song"
     else -> "${summary.trackCount} songs"
-}
-
-internal fun personalError(failure: Exception, mutation: Boolean = false): String {
-    val error = failure as? PersonalLibraryException
-    return when {
-        error?.code == PersonalLibraryErrorCode.STALE_EVALUATION -> "Refresh the rules playlist before listening."
-        error?.status == 409 -> "This playlist changed elsewhere. Refresh and review before trying again."
-        error?.status == 401 -> "Sign in again to use your library."
-        error?.status == 404 -> "This playlist or song is no longer available."
-        mutation && (error == null || error.status == 0 || error.status == 408 || error.status >= 500) ->
-            "The change couldn't be confirmed. Refresh to check before trying again; it wasn't resubmitted."
-        mutation -> "The change wasn't saved. Refresh and review before trying again."
-        else -> "Can't load music."
-    }
 }

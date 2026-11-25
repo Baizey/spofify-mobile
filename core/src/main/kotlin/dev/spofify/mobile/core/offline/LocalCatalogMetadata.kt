@@ -11,7 +11,6 @@ import dev.spofify.mobile.core.library.MusicItemWire
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.library.projectMusicItem
 import dev.spofify.mobile.core.library.validMusicEntityId
-import dev.spofify.mobile.core.personal.PersonalHistoryEntry
 import dev.spofify.mobile.core.personal.PersonalTrack
 import kotlinx.serialization.Serializable
 
@@ -80,8 +79,7 @@ internal data class CatalogLyricMiss(
     fun lyrics(id: String) = TrackLyrics(id, LyricsState.NOT_FOUND, recordingVersion, sourceGeneration, reason = reason)
 }
 
-@Serializable
-internal data class CatalogHistory(val entries: List<PersonalHistoryEntry> = emptyList())
+
 
 internal fun MusicItem.catalogWire(): MusicItemWire {
     require(kind == MusicKind.TRACK)

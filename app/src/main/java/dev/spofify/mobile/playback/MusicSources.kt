@@ -4,17 +4,16 @@ import dev.spofify.mobile.core.auth.*
 import dev.spofify.mobile.core.content.*
 import dev.spofify.mobile.core.library.*
 import dev.spofify.mobile.core.offline.*
-import dev.spofify.mobile.core.personal.*
 import dev.spofify.mobile.core.search.*
 import dev.spofify.mobile.feature.library.LibraryReadOwner
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
 
 /** One logical data generation, independent of navigation destinations and playback ticks. */
-internal class MusicSources(val library: LibraryApi, val search: SearchApi, val personal: PersonalLibraryApi,
+internal class MusicSources(val library: LibraryApi, val search: SearchApi, val personal: LivePersonal,
     val content: TrackContentApi, val local: Boolean, val readOwner: LibraryReadOwner? = null)
 
-internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant, catalog: LocalMusicCatalog, account: PersonalLibraryApi): MusicSources {
+internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant, catalog: LocalMusicCatalog, account: LivePersonal): MusicSources {
     val id = grant.identity
     val library = LibraryClient(sessions, id)
     val search = SearchClient(sessions, id)
@@ -47,48 +46,4 @@ internal fun onlineMusicSources(sessions: SessionRepository, grant: OnlineGrant,
         override suspend fun lyrics(trackId: String) = read { content.lyrics(trackId) } // Display rights only, never persist text.
     }
     return MusicSources(browse, ranked, account, track, false, LibraryReadOwner(sessions, grant))
-}
-
-/** Read-only projection of complete saved memberships, not server mutation or derived-selection authority. */
-internal class DevicePersonalLibrary(private val catalog: LocalMusicCatalog,
-    private val complete: suspend () -> List<OfflineManifest>) : PersonalLibraryApi {
-    private fun OfflineManifest.summary(): PersonalPlaylistSummary {
-        val kind = if (collection.playlistKind == OfflinePlaylistKind.MANUAL) PersonalPlaylistKind.MANUAL else PersonalPlaylistKind.DERIVED
-        return PersonalPlaylistSummary(collection.reference.id, collection.name, collection.description.orEmpty(), kind,
-            PersonalCountState.EXACT, total, recordedAudioTotal, PersonalPlaylistCapabilities(false, false, false,
-                items.isNotEmpty(), false, false, false), requireNotNull(collection.revision), "", "")
-    }
-    suspend fun manifest(id: String) = complete().firstOrNull { it.collection.reference.id == id }
-    private suspend fun requireSaved(id: String) = manifest(id) ?: throw PersonalLibraryException(404, PersonalLibraryErrorCode.PLAYLIST_NOT_FOUND)
-    override suspend fun playlists(limit: Int, offset: Int, kind: PersonalPlaylistKind?): PersonalPage<PersonalPlaylistSummary> {
-        val all = complete().map { it.summary() }.filter { kind == null || it.kind == kind }
-        return PersonalPage(all.drop(offset).take(limit), all.size.toLong(), limit, offset)
-    }
-    override suspend fun playlist(id: String) = requireSaved(id).summary()
-    override suspend fun manualEntries(id: String, limit: Int, offset: Int): PersonalPage<PersonalManualEntry> {
-        val saved = requireSaved(id)
-        require(saved.collection.playlistKind == OfflinePlaylistKind.MANUAL)
-        return PersonalPage(saved.items.drop(offset).take(limit).map { PersonalManualEntry(it.occurrenceId, it.position, it.track) }, saved.total, limit, offset)
-    }
-    override suspend fun derivedEntries(id: String, limit: Int, cursor: String?): PersonalDerivedPage {
-        val saved = requireSaved(id)
-        require(saved.collection.playlistKind == OfflinePlaylistKind.DERIVED)
-        val offset = cursor?.toInt() ?: 0
-        val rows = saved.items.drop(offset).take(limit).map { PersonalDerivedEntry(it.occurrenceId, null, it.position, it.track) }
-        return PersonalDerivedPage(rows, saved.total, saved.recordedAudioTotal, limit,
-            (offset + rows.size).takeIf { it < saved.total }?.toString(), saved.collection.revision, saved.fence, true)
-    }
-    override suspend fun history(limit: Int, offset: Int) = catalog.history(limit, offset)
-    private fun onlineOnly(): Nothing = throw UnsupportedOperationException("Not available from device storage")
-    override suspend fun recent(limit: Int) = onlineOnly()
-    override suspend fun likes(limit: Int, offset: Int) = onlineOnly()
-    override suspend fun likeStatus(trackIds: List<String>) = onlineOnly()
-    override suspend fun setLike(trackId: String, liked: Boolean) = onlineOnly()
-    override suspend fun toggleLike(trackId: String, currentlyLiked: Boolean) = onlineOnly()
-    override suspend fun createManualPlaylist(name: String, description: String) = onlineOnly()
-    override suspend fun renamePlaylist(id: String, name: String, description: String, expectedRevision: Long) = onlineOnly()
-    override suspend fun deletePlaylist(id: String, expectedRevision: Long) = onlineOnly()
-    override suspend fun addTrack(id: String, trackId: String, expectedRevision: Long) = onlineOnly()
-    override suspend fun removeEntry(id: String, entryId: String, expectedRevision: Long) = onlineOnly()
-    override suspend fun reorderEntries(id: String, entryIds: List<String>, expectedRevision: Long) = onlineOnly()
 }

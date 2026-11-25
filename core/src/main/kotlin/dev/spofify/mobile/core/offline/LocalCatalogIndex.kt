@@ -12,7 +12,6 @@ internal class LocalCatalogIndex(
     val revision: Long,
     available: Set<String>,
     metadata: CatalogTrackData,
-    history: CatalogHistory,
 ) {
     val tracks: Map<String, MusicItem>
     val personal: Map<String, PersonalTrack>
@@ -24,13 +23,7 @@ internal class LocalCatalogIndex(
     private val postings: Map<Char, List<Document>>
 
     init {
-        val records = metadata.tracks.filterKeys(available::contains).toMutableMap()
-        for (entry in history.entries) {
-            val id = entry.track.id
-            if (id !in available || entry.metadataMissing) continue
-            val observed = records[id] ?: CatalogTrackRecord()
-            if (observed.personal == null) records[id] = observed.copy(personal = entry.track)
-        }
+        val records = metadata.tracks.filterKeys(available::contains)
         personal = records.mapNotNull { (id, record) -> record.personal?.let { id to it } }.toMap()
         tracks = records.toSortedMap().mapValues { (_, record) -> record.project().copy(
             hasAudio = true, availableTracks = 1, totalTracks = 1,

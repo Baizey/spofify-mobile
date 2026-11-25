@@ -15,7 +15,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.PersonalHistoryEntry
-import dev.spofify.mobile.core.personal.PersonalLibraryApi
+import dev.spofify.mobile.playback.LivePersonal
 import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.core.playback.PlaybackTrackReference
 import dev.spofify.mobile.feature.library.MusicRowGeometry
@@ -26,7 +26,7 @@ import dev.spofify.mobile.feature.library.activateTrackRow
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun RecentScreen(
-    api: PersonalLibraryApi,
+    api: LivePersonal,
     loader: ImageLoader,
     playback: AppPlayback?,
     onNavigate: (MusicKind, String) -> Unit,
@@ -47,7 +47,7 @@ internal fun RecentScreen(
         }
         activateTrackRow(entry.track.id, entry.track.hasAudio && playback?.presentation?.canLoadTrack == true,
             play = { playback?.playTrack(it) },
-            openDetails = if (entry.metadataMissing || api is dev.spofify.mobile.playback.DevicePersonalLibrary && !entry.track.hasAudio) null else ({ onNavigate(MusicKind.TRACK, entry.track.id) }),
+            openDetails = if (entry.metadataMissing) null else ({ onNavigate(MusicKind.TRACK, entry.track.id) }),
             notice = { actionError = it })
     }
     val queue: (PersonalHistoryEntry) -> Unit = { entry ->
@@ -62,7 +62,7 @@ internal fun RecentScreen(
             if (error != null) PersonalStatus(false, error)
         }
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            if (state.items?.isEmpty() == true && !state.loading && state.error == null) {
+            if (state.items?.isEmpty() == true && state.error == null) {
                 Text("Nothing played yet", Modifier.padding(horizontal = MusicRowGeometry.EDGE_GUTTER.dp, vertical = 16.dp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }

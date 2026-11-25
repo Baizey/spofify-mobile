@@ -3,7 +3,6 @@ package dev.spofify.mobile.playback
 import android.util.Log
 import dev.spofify.mobile.core.auth.*
 import dev.spofify.mobile.core.personal.*
-import dev.spofify.mobile.core.personal.AccountPersonalReplica.Resource
 import dev.spofify.mobile.core.playback.AccountChannel
 import java.io.File
 import kotlinx.coroutines.*
@@ -13,17 +12,14 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.encodeToJsonElement
 
-internal fun PersonalLibraryApi.personalEditsAvailable(): Boolean =
-    (this as? LivePersonal)?.replica?.view?.value?.connected ?: (this !is DevicePersonalLibrary)
-
-internal interface LivePersonal {
+internal interface LivePersonal : PersonalLibraryApi {
     val replica: AccountPersonalReplica
     fun command(intent: PersonalIntent): Boolean
     fun watch(id: String): AutoCloseable
-    fun refresh(resource: Resource) {}
+    fun refreshAccount()
 }
 
-/** The account scope serializes view changes on Main; disk and HTTP run off the player looper. */
+/** The account scope serializes socket results and view changes on the player looper. */
 internal class AccountPersonalSource(
     root: File, private val identity: AccountIdentity, private val sessions: SessionRepository,
     private val scope: CoroutineScope, private val client: PersonalLibraryApi = PersonalLibraryClient(sessions, identity),
@@ -31,17 +27,15 @@ internal class AccountPersonalSource(
     private val io: CoroutineDispatcher = Dispatchers.IO,
     private val monotonicMs: () -> Long = android.os.SystemClock::elapsedRealtime,
     private val beforePersist: suspend (PersonalCacheSnapshot) -> Unit = {},
-) : LivePersonal, PersonalLibraryApi by client {
+) : LivePersonal {
     private val codec = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val file = PersonalCacheFile(root, identity)
-    private val reads = PersonalCacheReads(client)
     private val persisted = MutableStateFlow(PersonalCacheSnapshot())
     private val watching = mutableMapOf<String, Int>()
-    private val requests = mutableMapOf<Resource, Job>()
-    private val missed = mutableSetOf<Resource>()
-    private val pendingRepair = mutableSetOf<Resource.Detail>()
-    private val failed = mutableMapOf<Resource, Long>()
-    private var grant: OnlineGrant? = null
+    private val transfers = mutableMapOf<String, PlaylistTransfer>()
+    private val failedUntil = mutableMapOf<String, Long>()
+    private var waitingForAccount = false
+    private var nextAccountRepairAt = 0L
     private var connectionGrant: OnlineGrant? = null
     private var channel: AccountChannel? = null
     private var subscription: AutoCloseable? = null
@@ -55,7 +49,6 @@ internal class AccountPersonalSource(
             persisted.value = saved
             replica.restore(saved)
             while (beforeRestore.isNotEmpty()) beforeRestore.removeFirst().invoke()
-            checkFreshness()
             var last = saved
             replica.snapshots.collect { snapshot ->
                 if (snapshot == last) return@collect
@@ -71,67 +64,90 @@ internal class AccountPersonalSource(
             }
         }
         scope.launch {
-            sessions.onlineGrant.collect { next ->
-                val owner = next?.takeIf { it.identity == identity }
-                if (owner === grant) return@collect
-                requests.values.forEach { it.cancel() }
-                requests.clear(); missed.clear(); pendingRepair.clear(); failed.clear()
-                grant = owner
-                if (connectionGrant !== owner) replica.disconnected()
-                checkFreshness()
+            sessions.onlineGrant.collect { owner ->
+                if (connectionGrant != null && connectionGrant !== owner) disconnect()
             }
         }
     }
 
-    fun availability(online: Boolean, ids: Set<String>) {
-        replica.availability(online, ids)
-    }
+    fun availability(online: Boolean, ids: Set<String>) = replica.availability(online, ids)
 
     fun attach(next: AccountChannel?) {
         if (next === channel) return
         subscription?.close()
-        connectionEpoch++
-        replica.disconnected()
-        connectionGrant = null
+        disconnect()
         channel = next
-        subscription = next?.onPersonal { wire ->
+        subscription = next?.onPersonal { wire, owner ->
             if (channel !== next || !sessions.isCurrent(identity)) return@onPersonal
-            if (wire == null) {
-                connectionGrant = null
-                connectionEpoch++
-                replica.disconnected()
-            } else {
-                val owner = sessions.onlineGrant.value?.takeIf { it.identity == identity } ?: return@onPersonal
-                val update = runCatching { codec.decodeFromJsonElement(PersonalUpdate.serializer(), wire) }
-                    .getOrNull() ?: return@onPersonal
-                applyConfirmed(owner, update)
+            if (wire == null) disconnect()
+            else if (owner?.identity == identity) {
+                val update = runCatching { codec.decodeFromJsonElement(PersonalUpdate.serializer(), wire) }.getOrNull()
+                if (update != null) receive(owner, update)
             }
         }
     }
 
-    internal fun applyConfirmed(owner: OnlineGrant, update: PersonalUpdate) {
+    private fun disconnect() {
+        connectionGrant = null
+        connectionEpoch++
+        waitingForAccount = false
+        // A scoped read error closes the Go socket rather than sending a response. In particular,
+        // don't continually reconnect and rerequest an omitted ID that might have been deleted.
+        val until = monotonicMs() + READ_COOLDOWN_MS
+        transfers.keys.forEach { failedUntil[it] = until }
+        transfers.clear()
+        replica.disconnected()
+    }
+
+    private fun receive(owner: OnlineGrant, update: PersonalUpdate) {
         val epoch = connectionEpoch
         afterRestore {
             if (epoch != connectionEpoch) return@afterRestore
-            var repair: Resource.Detail? = null
-            val applied = try {
-                sessions.publishIfCurrent(owner) {
-                    repair = replica.receive(update)
+            sessions.publishIfCurrent(owner) {
+                val snapshot = update.snapshot
+                if (snapshot != null) {
+                    waitingForAccount = false
+                    try { replica.receiveSnapshot(snapshot) } catch (_: IllegalArgumentException) { return@publishIfCurrent }
                     connectionGrant = owner
+                    watching.keys.toList().forEach(::requestDetail)
+                } else if (connectionGrant === owner) {
+                    update.change?.let { change ->
+                        try {
+                            replica.receiveChange(change)?.let { id ->
+                                failedUntil.remove(id)
+                                requestDetail(id)
+                            }
+                        } catch (_: IllegalArgumentException) { requestAccount(repair = true) }
+                    }
+                    update.part?.let(::receivePart)
                 }
-            } catch (_: IllegalArgumentException) { false }
-            if (!applied) return@afterRestore
-            repair?.takeIf { it.id in watching }?.let { request(it, confirmedRepair = true) }
-            if (update.change?.playlist != null || update.change?.deleted != null) refresh(Resource.Lists)
-            if (update.snapshot != null) checkFreshness()
+            }
         }
+    }
+
+    private fun receivePart(part: PlaylistPart) {
+        val id = part.summary.id
+        val transfer = transfers.remove(id) ?: return
+        if (transfer.version != replica.version(id)) {
+            // Consume the obsolete reply before starting again: the wire has no request ID.
+            requestDetail(id)
+            return
+        }
+        val rows = try { transfer.accept(part) } catch (_: IllegalArgumentException) {
+            failedUntil[id] = monotonicMs() + READ_COOLDOWN_MS
+            return
+        }
+        if (rows != null) replica.replaceDetail(transfer.version, part.summary, rows)
+        else if (id in watching) sendTransfer(transfer)
     }
 
     private fun afterRestore(action: () -> Unit) {
         if (replica.view.value.ready) action() else beforeRestore.addLast(action)
     }
 
-    override fun command(intent: PersonalIntent): Boolean {
+    override fun command(intent: PersonalIntent): Boolean = send(intent)
+
+    private fun send(intent: PersonalIntent): Boolean {
         val owner = connectionGrant ?: return false
         var sent = false
         sessions.publishIfCurrent(owner) { sent = channel?.sendPersonal(codec.encodeToJsonElement(intent) as JsonObject) == true }
@@ -139,72 +155,39 @@ internal class AccountPersonalSource(
     }
 
     fun checkFreshness() {
-        refresh(Resource.Lists)
-        refresh(Resource.History)
-        watching.keys.toList().forEach { refresh(Resource.Detail(it)) }
+        refreshAccount()
+        watching.keys.toList().forEach(::requestDetail)
+    }
+
+    override fun refreshAccount() = requestAccount(repair = false)
+
+    private fun requestAccount(repair: Boolean) {
+        val owner = connectionGrant ?: return // Opening the account socket already sends a snapshot.
+        if (waitingForAccount || if (repair) monotonicMs() < nextAccountRepairAt else !replica.accountStale()) return
+        sessions.publishIfCurrent(owner) {
+            waitingForAccount = channel?.syncPersonal() == true
+            if (waitingForAccount) nextAccountRepairAt = monotonicMs() + READ_COOLDOWN_MS
+        }
     }
 
     override fun watch(id: String): AutoCloseable {
         watching[id] = (watching[id] ?: 0) + 1
-        refresh(Resource.Detail(id))
+        refreshAccount()
+        requestDetail(id)
         return AutoCloseable {
             val count = watching[id] ?: return@AutoCloseable
             if (count == 1) watching.remove(id) else watching[id] = count - 1
         }
     }
 
-    override fun refresh(resource: Resource) = request(resource, confirmedRepair = false)
+    private fun requestDetail(id: String) {
+        if (id !in watching || id in transfers || !replica.knowsPlaylist(id) || !replica.detailStale(id)) return
+        if (failedUntil[id]?.let { monotonicMs() < it } == true) return
+        if (connectionGrant != null) sendTransfer(PlaylistTransfer(id, replica.version(id)))
+    }
 
-    private fun request(resource: Resource, confirmedRepair: Boolean) {
-        val owner = grant ?: return
-        if (!replica.view.value.ready || sessions.onlineGrant.value !== owner || !replica.stale(resource)) return
-        val version = replica.version(resource)
-        if (requests[resource]?.isActive == true) {
-            if (confirmedRepair && resource is Resource.Detail) pendingRepair.add(resource) else missed.add(resource)
-            return
-        }
-        if (!confirmedRepair && failed[resource]?.let { monotonicMs() < it } == true) return
-        val task = scope.launch(start = CoroutineStart.LAZY) {
-            try {
-                sessions.withOnlineGrant(owner) {
-                    if (confirmedRepair) delay(500)
-                    for (attempt in 0..2) {
-                        if (replica.version(resource) != version) break
-                        try {
-                            val publish: () -> Unit = when (resource) {
-                                Resource.Lists -> reads.lists().let { { replica.replaceLists(version, it) } }
-                                Resource.History -> reads.history().let { { replica.replaceHistory(version, it) } }
-                                is Resource.Detail -> reads.detail(resource.id).let { (summary, rows) ->
-                                    { replica.replaceDetail(version, summary, rows) }
-                                }
-                            }
-                            ensureActive()
-                            sessions.publishIfCurrent(owner, publish)
-                            break
-                        } catch (failure: PersonalLibraryException) {
-                            if (replica.version(resource) != version) break
-                            if (attempt == 2 || failure.code != PersonalLibraryErrorCode.CONNECTION_FAILED &&
-                                failure.status !in setOf(408, 429, 502, 503, 504)) throw failure
-                            delay(500L shl attempt)
-                        }
-                    }
-                }
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) {
-                if (replica.version(resource) == version) failed[resource] = monotonicMs() + 30_000
-            }
-            finally {
-                if (requests[resource] === coroutineContext.job) {
-                    requests.remove(resource)
-                    val repair = resource is Resource.Detail && pendingRepair.remove(resource)
-                    val repeat = missed.remove(resource)
-                    if (repair) request(resource, confirmedRepair = true)
-                    else if (repeat && replica.version(resource) != version) refresh(resource)
-                }
-            }
-        }
-        requests[resource] = task
-        task.start()
+    private fun sendTransfer(transfer: PlaylistTransfer) {
+        if (send(transfer.command())) transfers[transfer.id] = transfer
     }
 
     suspend fun persistPlaylistForDownload(id: String, occurrenceId: String, trackId: String, owner: OnlineGrant) {
@@ -237,5 +220,6 @@ internal class AccountPersonalSource(
     override suspend fun likes(limit: Int, offset: Int) = online { client.likes(limit, offset) }
     override suspend fun likeStatus(trackIds: List<String>) = online { client.likeStatus(trackIds) }
     override suspend fun setLike(trackId: String, liked: Boolean) = online { client.setLike(trackId, liked) }
-    override suspend fun toggleLike(trackId: String, currentlyLiked: Boolean) = online { client.toggleLike(trackId, currentlyLiked) }
 }
+
+private const val READ_COOLDOWN_MS = 30_000L

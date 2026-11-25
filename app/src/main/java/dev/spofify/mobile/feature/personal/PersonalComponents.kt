@@ -29,8 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicKind
-import dev.spofify.mobile.core.personal.PersonalLibraryApi
-import dev.spofify.mobile.playback.personalEditsAvailable
+import dev.spofify.mobile.playback.LivePersonal
 import dev.spofify.mobile.core.personal.PersonalTrack
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.feature.library.MusicArtwork
@@ -149,7 +148,7 @@ internal fun PlaylistNameSheet(
 
 @Composable
 internal fun PersonalSongActions(
-    api: PersonalLibraryApi,
+    api: LivePersonal,
     track: PersonalTrack,
     loader: ImageLoader,
     playable: Boolean,
@@ -163,11 +162,10 @@ internal fun PersonalSongActions(
     downloading: Boolean = false,
 ) {
     var adding by remember(track.id) { mutableStateOf(false) }
+    val personal by api.replica.view.collectAsState()
+    val connected = personal.connected
     if (adding) {
-        AddTrackToPlaylistSheet(api, track.musicItem(), onDismiss = { adding = false }, onAdded = {
-            adding = false
-            onDismiss()
-        })
+        AddTrackToPlaylistSheet(api, track.musicItem(), onDismiss = { adding = false })
     } else SpofifySheet(onDismiss) {
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") {
@@ -197,7 +195,7 @@ internal fun PersonalSongActions(
             downloadAction?.let { (label, action) -> item("download") {
                 SheetAction(label, SpofifyGlyph.Down, !downloading) { action() }
             } }
-            item("add") { SheetAction("Add to playlist", SpofifyGlyph.Plus, api.personalEditsAvailable() && track.hasAudio) { adding = true } }
+            item("add") { SheetAction("Add to playlist", SpofifyGlyph.Plus, connected && track.hasAudio) { adding = true } }
             onRemove?.let { remove -> item("remove") { SheetAction("Remove this entry", SpofifyGlyph.Trash) {
                 onDismiss()
                 remove()

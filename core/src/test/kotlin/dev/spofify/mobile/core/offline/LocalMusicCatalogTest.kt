@@ -13,7 +13,6 @@ import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
 import dev.spofify.mobile.core.personal.PersonalArtist
 import dev.spofify.mobile.core.personal.PersonalCoverage
-import dev.spofify.mobile.core.personal.PersonalHistoryEntry
 import dev.spofify.mobile.core.personal.PersonalTrack
 import dev.spofify.mobile.core.search.SearchErrorCode
 import dev.spofify.mobile.core.search.SearchException
@@ -155,28 +154,6 @@ class LocalMusicCatalogTest {
         assertEquals(SearchErrorCode.INVALID_SEARCH_REQUEST, failure<SearchException> { catalog.search("x", limit = 51) }.code)
     }
 
-    @Test fun historyRoundTripsAcrossLoginButNotAccountOrOriginAndSurvivesAudioEviction() = runBlocking {
-        val rows = listOf(history("ev-2", track("a", "Music")), history("ev-1", track("a", "Music")),
-            history("ev-1", track("gone", "Unknown")).copy(origin = "offline", metadataMissing = true))
-        available = setOf("a", "gone")
-        open().rememberHistory(rows)
-        val reopened = open(identity.copy(username = "renamed", incarnation = 2))
-        assertEquals(rows[0], reopened.history(limit = 1).items.first())
-        assertEquals(rows[0].track, reopened.personalTrack("a"))
-        assertNull(reopened.personalTrack("gone"))
-        assertEquals(listOf("a"), reopened.search("Music", MusicKind.TRACK, 10).items.map { it.id })
-        available = emptySet()
-        val snapshot = reopened.history()
-        assertEquals(3L, snapshot.total)
-        assertEquals(rows.map { it.copy(track = it.track.copy(hasAudio = false)) }, snapshot.items)
-        assertTrue(reopened.search("Music").items.isEmpty())
-        assertTrue(open(identity.copy(accountId = "other")).history().items.isEmpty())
-        assertTrue(open(identity.copy(origin = "https://two.example")).history().items.isEmpty())
-        // Only an explicit successful online snapshot (including a successful empty result) replaces it.
-        reopened.rememberHistory(emptyList())
-        assertTrue(open().history().items.isEmpty())
-    }
-
     @Test fun artworkAndLyricsMissesRoundTripButDisplayLyricsAreNeverPersisted() = runBlocking {
         val catalog = open()
         available = setOf("a", "b")
@@ -267,8 +244,6 @@ class LocalMusicCatalogTest {
     private fun libraryTrack(id: String, name: String) = MusicItem(MusicKind.TRACK, id, name,
         listOf(Artist("artist-1", "Beyoncé"), Artist("", "Guest Ágata")), "album-1", "Nuit d'été", "2025", 120000,
         1, true, 8, 10)
-
-    private fun history(id: String, track: PersonalTrack) = PersonalHistoryEntry(id, "2025-02-28T00:00:00Z", track)
 
     private suspend inline fun <reified T : Throwable> failure(block: () -> Unit): T {
         val error = runCatching { block() }.exceptionOrNull()

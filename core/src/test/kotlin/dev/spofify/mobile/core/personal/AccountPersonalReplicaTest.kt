@@ -1,83 +1,102 @@
 package dev.spofify.mobile.core.personal
 
-import java.nio.file.Files
+import dev.spofify.mobile.core.auth.AccountIdentity
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
-import dev.spofify.mobile.core.auth.AccountIdentity
+import kotlinx.serialization.json.JsonObject
 import org.junit.Assert.*
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class AccountPersonalReplicaTest {
-    private val now = Instant.parse("2026-01-01T00:00:00Z")
-    private val clock = Clock.fixed(now, ZoneOffset.UTC)
-    private val summary = PersonalPlaylistSummary("p", "Duplicates", "", PersonalPlaylistKind.MANUAL,
+    @get:Rule val root = TemporaryFolder()
+    private val at = Instant.parse("2026-01-01T00:00:00Z")
+    private val track = PersonalTrack("track", "t", "Song", true, PersonalCoverage(1, 1, 1))
+    private val summary = PersonalPlaylistSummary("p", "Saved", "", PersonalPlaylistKind.MANUAL,
         PersonalCountState.EXACT, 2, 2, PersonalPlaylistCapabilities(true, true, false, true, false, true, true), 1, "", "")
-    private val track = PersonalTrack("track", "song", "Song", true, PersonalCoverage(1, 1, 1))
-    private val one = PersonalManualEntry("e1", 0, track)
-    private val two = PersonalManualEntry("e2", 1, track)
-    private val detail = AccountPersonalReplica.Resource.Detail(summary.id)
-    private val lists = AccountPersonalReplica.Resource.Lists
-    private val history = AccountPersonalReplica.Resource.History
+    private val one = PersonalManualEntry("one", 4, track)
+    private val two = PersonalManualEntry("two", 8, track)
+    private fun replica(saved: PersonalCacheSnapshot = PersonalCacheSnapshot()) =
+        AccountPersonalReplica(Clock.fixed(at, ZoneOffset.UTC)).apply { restore(saved) }
+    private val identity = AccountIdentity("https://example.invalid", "account", "fixture", 1)
 
-    @Test fun relaunchKeepsDuplicateOccurrencesAndDistinctLocalPlaysScopedToAccount() {
-        val temp = Files.createTempDirectory("personal-cache-test").toFile()
-        try {
-            val identity = AccountIdentity("https://example.test", "a", "A", 1)
-            val file = PersonalCacheFile(temp, identity)
-            val replica = AccountPersonalReplica(clock)
-            replica.restore(file.read())
-            replica.replaceLists(0, listOf(summary, summary.copy(id = "summary-only")))
-            replica.replaceDetail(0, summary, listOf(one, two))
-            val local = PersonalHistoryEntry("local", now.toString(), track, origin = "offline")
-            replica.recordLocal(local)
-            replica.recordLocal(local.copy(id = "second"))
-            file.write(replica.snapshots.value)
-            val relaunched = AccountPersonalReplica(clock)
-            relaunched.restore(PersonalCacheFile(temp, identity.copy(incarnation = 2)).read())
-            assertFalse(relaunched.stale(detail))
-            assertFalse(relaunched.stale(lists))
-            assertTrue(AccountPersonalReplica(Clock.offset(clock, java.time.Duration.ofMinutes(5))).apply {
-                restore(file.read())
-            }.stale(detail))
-            assertNull(relaunched.view.value.details["summary-only"])
-            assertEquals(listOf("e1", "e2"), relaunched.view.value.details.getValue(summary.id).rows.map { it.id })
-            assertFalse(relaunched.view.value.details.getValue(summary.id).rows.first().track.hasAudio)
-            relaunched.availability(false, setOf(track.id))
-            relaunched.replaceHistory(0, listOf(local, local.copy(id = "server", origin = null)))
-            assertEquals(setOf("local", "second", "server"), relaunched.view.value.recent.map { it.id }.toSet())
-            assertTrue(relaunched.view.value.recent.all { it.track.hasAudio })
-            assertEquals(PersonalCacheSnapshot(), PersonalCacheFile(temp, identity.copy(accountId = "b")).read())
-            assertEquals(PersonalCacheSnapshot(), PersonalCacheFile(temp, identity.copy(origin = "https://other.test")).read())
-        } finally { temp.deleteRecursively() }
+    @Test fun cappedPrefixDoesNotDeleteUnmentionedAcceptedDetailsButShortSnapshotDoes() {
+        val r = replica(PersonalCacheSnapshot(listOf(summary), details = mapOf("p" to ReplicaPlaylist(1, listOf(one, two)))))
+        val capped = List(100) { summary.copy(id = "new-$it") }
+        r.receiveSnapshot(PersonalSnapshot(capped, emptyList()))
+        assertFalse(r.view.value.listsComplete)
+        assertEquals(101, r.view.value.playlists.size)
+        assertEquals(listOf(one, two), r.snapshots.value.details.getValue("p").rows)
+        r.receiveSnapshot(PersonalSnapshot(capped.dropLast(1), emptyList()))
+        assertTrue(r.view.value.listsComplete)
+        assertFalse(r.knowsPlaylist("p"))
+        assertFalse("p" in r.snapshots.value.details)
     }
 
-    @Test fun confirmedChangeFencesOlderRefreshAndTargetsOccurrence() {
-        val replica = AccountPersonalReplica(clock)
-        replica.restore(PersonalCacheSnapshot())
-        replica.replaceLists(0, listOf(summary))
-        replica.replaceDetail(0, summary, listOf(one, two))
-        replica.receive(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), emptyList())))
-        val listVersion = replica.version(lists)
-        val detailVersion = replica.version(detail)
-        val edit = summary.copy(name = "edited", trackCount = 1, availableCount = 1, revision = 2)
-        replica.receive(PersonalUpdate(change = PersonalChange(playlist = edit, entries = EntryChange(removed = one.id))))
-        replica.replaceLists(listVersion, emptyList())
-        replica.replaceDetail(detailVersion, summary, listOf(one, two))
-        assertEquals(edit, replica.view.value.playlists.single())
-        assertEquals(listOf(two.id), replica.view.value.details.getValue(summary.id).rows.map { it.id })
+    @Test fun confirmedDeleteFencesLateDetailAndManifestHydrationAfterReopenEvenWhenCapped() {
+        val r = replica()
+        r.receiveSnapshot(PersonalSnapshot(listOf(summary), emptyList()))
+        val beforeDelete = r.version("p")
+        r.replaceDetail(beforeDelete, summary, listOf(one, two))
+        r.receiveChange(PersonalChange(deleted = "p"))
+        r.replaceDetail(beforeDelete, summary, listOf(one, two))
+        r.retainDownload(summary, listOf(one, two))
+        assertFalse(r.knowsPlaylist("p"))
+        val file = PersonalCacheFile(root.root, identity)
+        file.write(r.snapshots.value)
+        val reopened = replica(file.read())
+        reopened.receiveSnapshot(PersonalSnapshot(List(100) { summary.copy(id = "list-$it") }, emptyList()))
+        reopened.retainDownload(summary, listOf(one, two))
+        assertFalse(reopened.knowsPlaylist("p"))
+        assertFalse("p" in reopened.snapshots.value.details)
     }
 
-    @Test fun olderHistoryRefreshCannotUndoSocketDeltaOrLocalPlay() {
-        val replica = AccountPersonalReplica(clock)
-        replica.restore(PersonalCacheSnapshot())
-        val online = PersonalHistoryEntry("event", now.toString(), track)
-        val offline = online.copy(origin = "offline")
-        replica.receive(PersonalUpdate(snapshot = PersonalSnapshot(emptyList(), listOf(online))))
-        val old = replica.version(history)
-        replica.recordLocal(offline)
-        replica.receive(PersonalUpdate(change = PersonalChange(recent = RecentChange(removed = listOf(RecentKey(online.id))))))
-        replica.replaceHistory(old, listOf(online))
-        assertEquals(listOf("offline"), replica.view.value.recent.map { it.origin })
+    @Test fun reconnectAndDiskReopenPreserveDistinctRepeatedTrackEventsAndOrigins() {
+        val r = replica()
+        val online = PersonalHistoryEntry("same-event", at.toString(), track)
+        val fromOtherDevice = online.copy(origin = "offline")
+        val local = online.copy(id = "local", origin = "offline")
+        r.receiveSnapshot(PersonalSnapshot(emptyList(), listOf(online)))
+        r.recordLocal(local)
+        r.disconnected()
+        val file = PersonalCacheFile(root.root, identity)
+        file.write(r.snapshots.value)
+        val reopened = replica(file.read())
+        reopened.receiveSnapshot(PersonalSnapshot(emptyList(), listOf(online, fromOtherDevice)))
+        assertEquals(3, reopened.view.value.recent.size)
+        reopened.receiveChange(PersonalChange(recent = RecentChange(removed = listOf(RecentKey(online.id)))))
+        assertEquals(setOf("local" to "offline", "same-event" to "offline"), reopened.view.value.recent.map { it.id to it.origin }.toSet())
+        assertTrue(PersonalCacheFile(root.root, identity.copy(accountId = "different")).read().recent.isEmpty())
+    }
+
+    @Test fun manualMoveKeepsOccurrenceOrderAndStoredSlotsAndFencesOlderReads() {
+        val r = replica()
+        r.receiveSnapshot(PersonalSnapshot(listOf(summary), emptyList()))
+        val version = r.version("p")
+        r.replaceDetail(version, summary, listOf(one, two))
+        r.receiveChange(PersonalChange(playlist = summary.copy(revision = 2), entries = EntryChange(moved = two.id)))
+        r.replaceDetail(version, summary, listOf(one, two))
+        assertEquals(listOf(two.copy(position = 4), one.copy(position = 8)), r.snapshots.value.details.getValue("p").rows)
+    }
+
+    @Test fun transferChecksContinuationAndAllowsGoTokenResetWithoutCollapsingTrackDuplicates() {
+        val derived = summary.copy(kind = PersonalPlaylistKind.DERIVED, evaluationState = PersonalEvaluationState.READY)
+        val definition = JsonObject(emptyMap())
+        val token = "a".repeat(64)
+        val initial = PlaylistPart(derived, definition, token, 0, listOf(one), true)
+        val bad = PlaylistTransfer("p", 1)
+        assertNull(bad.accept(initial))
+        assertThrows(IllegalArgumentException::class.java) { bad.accept(initial.copy(offset = 1, rows = listOf(one), more = false)) }
+        val short = PlaylistTransfer("p", 1)
+        assertThrows(IllegalArgumentException::class.java) { short.accept(initial.copy(more = false)) }
+        val good = PlaylistTransfer("p", 1)
+        assertNull(good.accept(initial))
+        assertEquals(1, good.command().offset)
+        assertEquals(token, good.command().known)
+        val replacement = initial.copy(token = "b".repeat(64), rows = listOf(two.copy(position = 3)))
+        assertNull(good.accept(replacement))
+        assertEquals(listOf(two.copy(position = 3), one), good.accept(replacement.copy(offset = 1, rows = listOf(one), more = false)))
     }
 }

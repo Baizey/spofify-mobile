@@ -30,7 +30,7 @@ import dev.spofify.mobile.designsystem.SpofifyIcon
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun PlaylistDetailScreen(
-    api: PersonalLibraryApi,
+    api: dev.spofify.mobile.playback.LivePersonal,
     id: String,
     loader: ImageLoader,
     playback: AppPlayback?,
@@ -46,7 +46,7 @@ internal fun PlaylistDetailScreen(
     val ready = player?.canLoadTrack == true
     val context = state.context
     val summary = state.summary
-    val playable = ready && context != null && !state.loading && !state.writing && !state.needsRefresh &&
+    val playable = ready && context != null &&
         summary?.capabilities?.play == true && state.rows.any { it.track.hasAudio }
     val offlineStatus = music?.offlinePlaylistStatuses?.collectAsStateWithLifecycle()?.value?.get(id)
     val downloaded = music?.downloadedIds?.collectAsStateWithLifecycle()?.value.orEmpty()
@@ -57,21 +57,21 @@ internal fun PlaylistDetailScreen(
     var songMenu by remember(model) { mutableStateOf<PlaylistSong?>(null) }
     var renaming by remember(model) { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var deleting by remember(model) { mutableStateOf<PersonalPlaylistSummary?>(null) }
-    var removing by remember(model) { mutableStateOf<Pair<PlaylistSong, Long>?>(null) }
+    var removing by remember(model) { mutableStateOf<PlaylistSong?>(null) }
     var actionError by remember(model) { mutableStateOf<String?>(null) }
     val send: (() -> Boolean?) -> Unit = { action -> action(); actionError = null }
     val playRow: (PlaylistSong) -> Unit = { row ->
-        val reference = row.takeIf { it in state.rows }?.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)
+        val reference = row.takeIf { it in state.rows }?.reference(context)
         if (playable && reference != null) send { playback?.playTrack(reference, context) }
         else if (row.track.hasAudio && !ready && row in state.rows) onNavigate(MusicKind.TRACK, row.track.id)
         else actionError = if (player?.view?.offline == true) "This song isn’t downloaded." else "Audio unavailable"
     }
     val queueRow: (PlaylistSong) -> Unit = { row ->
-        if (playable && row in state.rows) row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary)?.let { reference -> send { playback?.queueTrack(reference, context) } }
+        if (playable && row in state.rows) row.reference(context)?.let { reference -> send { playback?.queueTrack(reference, context) } }
     }
     DisposableEffect(model) {
         val watch = model.watch()
-        onDispose { watch?.close() }
+        onDispose { watch.close() }
     }
     LaunchedEffect(state.context, state.rows) { songMenu = null }
     LaunchedEffect(state.deleted) { if (state.deleted) onBack() }
@@ -93,18 +93,13 @@ internal fun PlaylistDetailScreen(
                 SpofifyIcon(SpofifyGlyph.More, "More actions for ${summary?.name ?: "playlist"}", Modifier.size(24.dp))
             }
         }
-        val failure = state.error ?: state.message ?: actionError ?: player?.error ?:
-            if (state.loaded && !state.completeCollection) "Rules result unavailable." else null
-        if (failure != null || state.writing) {
-            Box(Modifier.padding(horizontal = 20.dp)) {
-                PersonalStatus(state.writing, failure)
-            }
-        }
+        val failure = state.message ?: actionError ?: player?.error
+        if (failure != null) Box(Modifier.padding(horizontal = 20.dp)) { PersonalStatus(false, failure) }
         if (state.rows.isNotEmpty() || state.filter.isNotBlank()) PersonalSongFilter(state.filter, model::filter)
         Box(Modifier.weight(1f).fillMaxWidth()) {
             val emptyMessage = when {
                 state.noMatches -> "No matches"
-                state.loaded && state.completeCollection && state.rows.isEmpty() -> "No songs yet"
+                state.loaded && state.rows.isEmpty() -> "No songs yet"
                 else -> null
             }
             if (emptyMessage != null) Text(emptyMessage, Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
@@ -113,7 +108,7 @@ internal fun PlaylistDetailScreen(
             LazyColumn(Modifier.fillMaxSize(), reverseLayout = true, contentPadding = PaddingValues(bottom = 8.dp)) {
                 items(visibleRows.asReversed(), key = { it.identity }) { row ->
                     PersonalSongRow(row.track, loader, onPlay = { playRow(row) }, onMore = { songMenu = row },
-                        onQueue = if (playable && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null) ({ queueRow(row) }) else null,
+                        onQueue = if (playable && row.reference(context) != null) ({ queueRow(row) }) else null,
                         gestureBinding = playback to personalGestureBinding(row, context, player?.view),
                         downloaded = row.track.id in downloaded, downloading = row.track.id in downloading)
                 }
@@ -138,8 +133,7 @@ internal fun PlaylistDetailScreen(
             menu = false
             deleting = summary
         },
-        onDismiss = { menu = false },
-        onOfflineRemoved = if (api is dev.spofify.mobile.playback.DevicePersonalLibrary) ({ menu = false; onBack() }) else null)
+        onDismiss = { menu = false })
     songMenu?.let { row ->
         val downloadAction: Pair<String, () -> Unit>? = when {
             music == null -> null
@@ -147,28 +141,28 @@ internal fun PlaylistDetailScreen(
             canDownload && row.track.hasAudio && row.track.id !in downloaded -> "Download" to { music.download(row.track, id, row.identity) { actionError = "Couldn’t download this song." } }
             else -> null
         }
-        PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context, api is dev.spofify.mobile.playback.DevicePersonalLibrary) != null,
+        PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context) != null,
             onPlay = { playRow(row) }, onQueue = { queueRow(row) }, onNavigate = onNavigate,
             onRemove = if (state.canEdit && summary?.capabilities?.editEntries == true && row.entryId != null) ({
-                removing = row to requireNotNull(summary).revision
+                removing = row
             }) else null, onDismiss = { songMenu = null }, downloadAction = downloadAction, downloading = row.track.id in downloading)
     }
     renaming?.let { original ->
         PlaylistNameSheet("Edit details", original.name, original.description, onDismiss = { renaming = null }) { name, description ->
             renaming = null
-            model.rename(name, description, original.revision)
+            model.rename(name, description)
         }
     }
-    deleting?.let { original ->
+    if (deleting != null) {
         PersonalConfirmSheet("Delete playlist?", "This removes the playlist, not the songs.", "Delete", onDismiss = { deleting = null }) {
             deleting = null
-            model.delete(original.revision)
+            model.delete()
         }
     }
-    removing?.let { (row, revision) ->
+    removing?.let { row ->
         PersonalConfirmSheet("Remove this entry?", "Other occurrences and music files are unchanged.", "Remove", onDismiss = { removing = null }) {
             removing = null
-            model.remove(row, revision)
+            model.remove(row)
         }
     }
 }

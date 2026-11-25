@@ -14,8 +14,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.ImageLoader
 import dev.spofify.mobile.core.library.MusicItem
 import dev.spofify.mobile.core.library.MusicKind
-import dev.spofify.mobile.core.personal.PersonalLibraryApi
-import dev.spofify.mobile.playback.personalEditsAvailable
+import dev.spofify.mobile.playback.LivePersonal
 import dev.spofify.mobile.core.playback.*
 import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.designsystem.*
@@ -28,7 +27,7 @@ internal data class MusicActionSelection(val item: MusicItem, val context: Playb
 internal fun MusicActionsSheet(
     selection: MusicActionSelection,
     controller: AppPlayback?,
-    personal: PersonalLibraryApi,
+    personal: LivePersonal,
     loader: ImageLoader,
     onNavigate: (MusicKind, String) -> Unit,
     onDismiss: () -> Unit,
@@ -71,7 +70,7 @@ internal fun MusicActionsSheet(
             }
             if (item.kind == MusicKind.TRACK) {
                 SheetGroup("Library")
-                SheetAction("Add to playlist", SpofifyGlyph.Plus, personal.personalEditsAvailable() && item.hasAudio) { adding = true }
+                SheetAction("Add to playlist", SpofifyGlyph.Plus, personal.replica.view.value.connected && item.hasAudio) { adding = true }
                 val navigableArtists = item.artists.filter { it.id.isNotBlank() }
                 if (navigableArtists.isNotEmpty() || item.albumId.isNotBlank()) SheetGroup("Go to")
                 navigableArtists.forEach { artist ->

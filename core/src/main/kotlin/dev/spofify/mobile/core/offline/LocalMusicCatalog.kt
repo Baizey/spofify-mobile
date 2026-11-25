@@ -16,8 +16,6 @@ import dev.spofify.mobile.core.library.MusicPage
 import dev.spofify.mobile.core.library.projectMusicItem
 import dev.spofify.mobile.core.library.validMusicEntityId
 import dev.spofify.mobile.core.library.validSearchQuery
-import dev.spofify.mobile.core.personal.PersonalHistoryEntry
-import dev.spofify.mobile.core.personal.PersonalPage
 import dev.spofify.mobile.core.personal.PersonalTrack
 import dev.spofify.mobile.core.search.MAX_RETAINED_SEARCH_RESULTS
 import dev.spofify.mobile.core.search.SearchApi
@@ -60,7 +58,6 @@ class LocalMusicCatalog internal constructor(
     private val storage = LocalCatalogStorage(root, identity, commit)
     private val mutex = Mutex()
     private var tracks: CatalogTrackData? = null
-    private var retainedHistory: CatalogHistory? = null
     private var indexedAvailable: Set<String> = emptySet()
     private var index: LocalCatalogIndex? = null
     private var revision = 0L
@@ -151,37 +148,6 @@ class LocalMusicCatalog internal constructor(
         val next = current.copy(lyricMisses = updated)
         storage.saveTracks(next)
         tracks = next
-    }
-
-    /** Replace with a successful, newest-first online prefix beginning at offset zero. No append API. */
-    suspend fun rememberHistory(entries: List<PersonalHistoryEntry>) = local {
-        val retained = entries.take(MAX_HISTORY).map { entry ->
-            validMusicEntityId(entry.id)
-            Instant.parse(entry.playedAt)
-            entry.receivedAt?.let(Instant::parse)
-            require(entry.origin.isNullOrEmpty() || entry.origin == "offline")
-            entry.copy(track = entry.track.catalogCopy())
-        }
-        require(retained.distinctBy { it.origin.orEmpty() to it.id }.size == retained.size)
-        val next = CatalogHistory(retained)
-        if (next != retainedHistory()) {
-            currentCoroutineContext().ensureActive()
-            storage.saveHistory(next)
-            retainedHistory = next
-            invalidateIndex()
-        }
-    }
-
-    /** History count is the retained prefix, never the remote total. Recompute playability, not membership. */
-    suspend fun history(limit: Int = PAGE_SIZE, offset: Int = 0): PersonalPage<PersonalHistoryEntry> = local {
-        require(limit in 1..100)
-        validOffset(offset)
-        val rows = retainedHistory().entries
-        val available = availableTrackIds()
-        val page = rows.drop(offset).take(limit).map { entry ->
-            entry.copy(track = entry.track.copy(hasAudio = entry.track.id in available && !entry.metadataMissing))
-        }
-        PersonalPage(page, rows.size.toLong(), limit, offset)
     }
 
     /** Use the authenticated-owner lifetime, not the offline-mode toggle, for [active]. */
@@ -279,11 +245,9 @@ class LocalMusicCatalog internal constructor(
     private suspend fun <T> withIndex(read: (LocalCatalogIndex) -> T): T = local {
         val available = availableTrackIds()
         val data = tracks()
-        val history = retainedHistory()
         val relevant = data.tracks.keys.filterTo(hashSetOf(), available::contains)
-        history.entries.filter { !it.metadataMissing && it.track.id in available }.forEach { relevant.add(it.track.id) }
         if (index == null || relevant != indexedAvailable) {
-            index = LocalCatalogIndex(++revision, relevant, data, history)
+            index = LocalCatalogIndex(++revision, relevant, data)
             indexedAvailable = relevant
             searches.clear()
         }
@@ -296,7 +260,6 @@ class LocalMusicCatalog internal constructor(
     }
 
     private fun tracks() = tracks ?: storage.loadTracks().also { tracks = it }
-    private fun retainedHistory() = retainedHistory ?: storage.loadHistory().also { retainedHistory = it }
 
     private suspend fun <T> local(block: suspend () -> T): T = withContext(Dispatchers.IO) {
         mutex.withLock { block() }
@@ -304,7 +267,6 @@ class LocalMusicCatalog internal constructor(
 
     private companion object {
         const val MAX_TRACKS = 10_000
-        const val MAX_HISTORY = 500
         const val MAX_LYRIC_MISSES = 2_000
         const val MAX_SEARCHES = 16
         const val SEARCH_LIFETIME_SECONDS = 300L

@@ -16,13 +16,12 @@ import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
-import dev.spofify.mobile.core.personal.PersonalLibraryApi
+import dev.spofify.mobile.playback.LivePersonal
 import dev.spofify.mobile.core.personal.PersonalPlaylistKind
 import dev.spofify.mobile.core.personal.PersonalPlaylistSummary
 import dev.spofify.mobile.playback.AppPlayback
 import dev.spofify.mobile.designsystem.*
 import dev.spofify.mobile.playback.AccountMusic
-import dev.spofify.mobile.playback.DevicePersonalLibrary
 
 /** Shared playlist menu for the list and detail screens. */
 @Composable
@@ -35,7 +34,6 @@ internal fun PlaylistCollectionSheet(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
-    onOfflineRemoved: (() -> Unit)? = null,
 ) {
     val summary = state.summary
     val offline = music?.offlinePlaylists
@@ -43,16 +41,11 @@ internal fun PlaylistCollectionSheet(
     val pending = offline?.pending?.collectAsStateWithLifecycle()?.value.orEmpty()
     val checked = summary?.id in wanted.orEmpty()
     val connected = music?.canManageDownloads?.collectAsStateWithLifecycle()?.value == true
-    val removed by rememberUpdatedState(onOfflineRemoved)
-    LaunchedEffect(summary?.id, checked) {
-        // Offline screens show complete downloads only; after removing one, leave/refresh it.
-        if (wanted != null && !checked) removed?.invoke()
-    }
     SpofifySheet(onDismiss) {
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 22.dp)) {
             item("heading") {
                 SheetHeading(summary?.name ?: "Playlist")
-                PersonalStatus(state.loading || state.writing, state.error ?: state.message)
+                PersonalStatus(false, state.message)
             }
             if (state.rows.isNotEmpty() || summary?.trackCount?.let { it > 0 } == true) {
                 item("play") { SheetAction("Play now", SpofifyGlyph.Play, playable, onPlay) }
@@ -86,27 +79,26 @@ internal fun PlaylistCollectionSheet(
 /** A summary's More sheet resolves fresh action authority before enabling musical actions. */
 @Composable
 internal fun PlaylistSummaryActions(
-    api: PersonalLibraryApi,
+    api: LivePersonal,
     summary: PersonalPlaylistSummary,
     playback: AppPlayback?,
     music: AccountMusic?,
-    onMutationAcknowledged: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val id = summary.id
     val owner = requireNotNull(LocalViewModelStoreOwner.current)
     val model: PlaylistDetailViewModel = viewModel(owner, key = "playlist-menu-${System.identityHashCode(api)}-$id",
-        factory = viewModelFactory { initializer { PlaylistDetailViewModel(api, id, onMutationAcknowledged) } })
+        factory = viewModelFactory { initializer { PlaylistDetailViewModel(api, id) } })
     val state by model.state.collectAsStateWithLifecycle()
     val player = playback?.observe()
     val context = state.context
     val playable = player?.canLoadTrack == true && context != null &&
-        !state.loading && !state.writing && !state.needsRefresh && state.rows.isNotEmpty() && state.summary?.capabilities?.play == true
+        state.rows.isNotEmpty() && state.summary?.capabilities?.play == true
     var editing by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
     var deleting by remember { mutableStateOf<PersonalPlaylistSummary?>(null) }
     DisposableEffect(model) {
         val watch = model.watch()
-        onDispose { watch?.close() }
+        onDispose { watch.close() }
     }
     LaunchedEffect(state.deleted) { if (state.deleted) onDismiss() }
     when {
@@ -114,15 +106,14 @@ internal fun PlaylistSummaryActions(
             val original = requireNotNull(editing)
             PlaylistNameSheet("Edit details", original.name, original.description, onDismiss = { editing = null }) { name, description ->
                 editing = null
-                model.rename(name, description, original.revision)
+                model.rename(name, description)
             }
         }
         deleting != null -> {
-            val original = requireNotNull(deleting)
             PersonalConfirmSheet("Delete playlist?", "This removes the playlist, not the songs.", "Delete",
                 onDismiss = { deleting = null }) {
                 deleting = null
-                model.delete(original.revision)
+                model.delete()
             }
         }
         else -> PlaylistCollectionSheet(if (state.summary == null) state.copy(summary = summary) else state, playable, music,
@@ -133,7 +124,6 @@ internal fun PlaylistSummaryActions(
                 if (context != null && playback?.queueCollection(context) == true) onDismiss()
             },
             onEdit = { editing = state.summary }, onDelete = { deleting = state.summary },
-            onDismiss = onDismiss,
-            onOfflineRemoved = if (api is DevicePersonalLibrary) ({ onDismiss(); onMutationAcknowledged() }) else null)
+            onDismiss = onDismiss)
     }
 }

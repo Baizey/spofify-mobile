@@ -1,5 +1,6 @@
 package dev.spofify.mobile.core.playback
 
+import dev.spofify.mobile.core.auth.OnlineGrant
 import java.util.UUID
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -74,7 +75,7 @@ class AccountChannel(
             occurrence?.let { put("occurrence", it) }
         }
     }
-    private val listeners = mutableSetOf<(JsonObject?) -> Unit>()
+    private val listeners = mutableSetOf<(JsonObject?, OnlineGrant?) -> Unit>()
     private val history = PlaybackHistory(clock, recordPlay)
     private fun sampleHistory(facts: AudioFacts) {
         val q = engine.state.value
@@ -113,11 +114,12 @@ class AccountChannel(
         }
     }
 
-    fun onPersonal(fn: (JsonObject?) -> Unit): AutoCloseable {
+    fun onPersonal(fn: (JsonObject?, OnlineGrant?) -> Unit): AutoCloseable {
         listeners += fn
         return AutoCloseable { listeners -= fn }
     }
     fun sendPersonal(command: JsonObject) = online && send(fields("type" to "personal", "command" to command))
+    fun syncPersonal() = online && send(fields("type" to "sync"))
     fun matchesLocalAudio(binding: AudioBinding): Boolean = localAuthority && engine.operationIsCurrent(binding)
     private fun isOwner() = online && !retainedLocal && owner.deviceId == deviceId
     private fun localQueue(): AccountState = AccountState.from(engine.state.value)
@@ -178,7 +180,7 @@ class AccountChannel(
         detach(false)
     }
 
-    fun connect(name: String, deviceId: String): Job {
+    fun connect(name: String, deviceId: String, personalGrant: OnlineGrant? = null): Job {
         if (!current() || manual || superseded || connection == PlaybackConnectionState.CLOSED) return scope.launch { }
         val attempt = ++life
         worker?.cancel()
@@ -235,7 +237,7 @@ class AccountChannel(
                         "offer" -> if (frame.long("generation") == owner.generation && online && !desynced)
                             send(fields("type" to "accept", "id" to frame.string("id"), "generation" to owner.generation))
                         "pong" -> { sampleClock.accept(frame.long("clientTimeMs"), frame.long("serverTimeMs")); publish() }
-                        "personal" -> listeners.toList().forEach { it(frame.getValue("update").jsonObject) }
+                        "personal" -> listeners.toList().forEach { it(frame.getValue("update").jsonObject, personalGrant) }
                         else -> error("Unknown account frame")
                     }
                 }
@@ -286,7 +288,7 @@ class AccountChannel(
         connection = PlaybackConnectionState.DISCONNECTED
         fallback?.let { engine.adopt(it, execute = false) }
         publish()
-        listeners.toList().forEach { it(null) }
+        listeners.toList().forEach { it(null, null) }
     }
 
     private fun snapshot(m: JsonObject, localAtHello: HelloLocal?, initial: Boolean) {
@@ -846,7 +848,7 @@ class AccountChannel(
         engine.retire()
         nativeView.cancel()
         ticker.cancel()
-        listeners.toList().forEach { it(null) }
+        listeners.toList().forEach { it(null, null) }
         listeners.clear()
         clearPending()
         publish()

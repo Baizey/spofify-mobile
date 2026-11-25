@@ -133,7 +133,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         reconnect = exact?.let { owner ->
             PlaybackReconnect(scope, controller.state,
                 { !retired && sessions.isCurrent(identity) && !sessions.manualOffline.value && sessions.onlineGrant.value === owner },
-                { reconnectDiagnostic = ReconnectDiagnostic(); controller.connect("Phone", deviceId) }, { stillCurrent ->
+                { reconnectDiagnostic = ReconnectDiagnostic(); controller.connect("Phone", deviceId, owner) }, { stillCurrent ->
                     if (stillCurrent()) {
                         val diagnostic = reconnectDiagnostic
                         Log.w("SpofifyPlayer", "Playback connection attempts exhausted: phase=${diagnostic.phase.name} " +

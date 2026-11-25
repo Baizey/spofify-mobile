@@ -23,15 +23,10 @@ class DeviceMusicLibraryTest {
     @Test fun savedDerivedDetailNeedsNoServerTokenAndSelectsTheExactDuplicate() = runTest {
         val saved = manifest(OfflinePlaylistKind.DERIVED)
         val available = mutableSetOf("song", "other")
-        val catalog = LocalMusicCatalog(folder.root, AccountIdentity("https://one.example", "a", "u", 1)) { available }
-        val personal = DevicePersonalLibrary(catalog) { listOf(saved) }
-        assertFalse(personal.playlist("list").capabilities.editEntries)
-        val entry = personal.derivedEntries("list", 1, "1").items.single()
-        assertNull(entry.selectionToken)
+        val entry = saved.items[1]
         val row = PlaylistSong(entry.occurrenceId, entry.position, entry.track, occurrenceId = entry.occurrenceId)
         val ctx = PlaybackContext("derived", "list", "List", 4, "fence")
-        assertNull(row.reference(ctx)) // never submit a device-only occurrence online
-        val ref = requireNotNull(row.reference(ctx, savedLocally = true))
+        val ref = requireNotNull(row.reference(ctx))
         val resolver = DeviceMusicLibrary(emptyList(), listOf(saved), available::contains)
         val rows = requireNotNull(resolver.resolve(ref, ctx))
         assertEquals(1, rows.selectedIndex)
@@ -53,6 +48,5 @@ class DeviceMusicLibraryTest {
             assertEquals(listOf("song"), resolver.resolve(null, ctx)?.tracks?.map { it.id })
             assertNull(resolver.resolve(PlaybackTrackReference("other"), ctx))
         }
-        assertTrue(catalog.history().items.isEmpty())
     }
 }
