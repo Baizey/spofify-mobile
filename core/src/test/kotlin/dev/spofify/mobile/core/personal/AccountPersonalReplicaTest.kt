@@ -79,6 +79,9 @@ class AccountPersonalReplicaTest {
         r.receiveChange(PersonalChange(playlist = summary.copy(revision = 2), entries = EntryChange(moved = two.id)))
         r.replaceDetail(version, summary, listOf(one, two))
         assertEquals(listOf(two.copy(position = 4), one.copy(position = 8)), r.snapshots.value.details.getValue("p").rows)
+        r.receiveChange(PersonalChange(playlist = summary.copy(revision = 3, trackCount = 1, availableCount = 1),
+            entries = EntryChange(removed = two.id)))
+        assertEquals(listOf(one.copy(position = 7)), r.snapshots.value.details.getValue("p").rows)
     }
 
     @Test fun transferChecksContinuationAndAllowsGoTokenResetWithoutCollapsingTrackDuplicates() {

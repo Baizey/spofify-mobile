@@ -69,11 +69,11 @@ class SessionSocketTest {
         } finally { socket.close() }
     }
 
-    @Test fun helloUsesExactlyOneSnapshotBudgetMeasuredInUtf8Bytes() {
+    @Test fun helloIsSentOnceAndBothOutboundFramesAreBoundedInUtf8Bytes() {
         val transport = FakeSocket()
         val socket = opened(transport)
         try {
-            val hello = "😀".repeat(5 * 1024 * 1024 / 4)
+            val hello = "😀".repeat(16_384)
             assertFalse(socket.send("before hello"))
             assertFalse(socket.sendHello(hello + "x"))
             assertTrue(socket.sendHello(hello))

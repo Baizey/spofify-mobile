@@ -35,7 +35,7 @@ internal class AccountPersonalSource(
     private val transfers = mutableMapOf<String, PlaylistTransfer>()
     private val failedUntil = mutableMapOf<String, Long>()
     private var waitingForAccount = false
-    private var nextAccountRepairAt = 0L
+    private var nextAccountReadAt = 0L
     private var connectionGrant: OnlineGrant? = null
     private var channel: AccountChannel? = null
     private var subscription: AutoCloseable? = null
@@ -83,6 +83,9 @@ internal class AccountPersonalSource(
             else if (owner?.identity == identity) {
                 val update = runCatching { codec.decodeFromJsonElement(PersonalUpdate.serializer(), wire) }.getOrNull()
                 if (update != null) receive(owner, update)
+                else if ("snapshot" in wire && connectionGrant === owner) {
+                    sessions.publishIfCurrent(owner) { waitingForAccount = false }
+                }
             }
         }
     }
@@ -163,10 +166,10 @@ internal class AccountPersonalSource(
 
     private fun requestAccount(repair: Boolean) {
         val owner = connectionGrant ?: return // Opening the account socket already sends a snapshot.
-        if (waitingForAccount || if (repair) monotonicMs() < nextAccountRepairAt else !replica.accountStale()) return
+        if (waitingForAccount || monotonicMs() < nextAccountReadAt || !repair && !replica.accountStale()) return
         sessions.publishIfCurrent(owner) {
             waitingForAccount = channel?.syncPersonal() == true
-            if (waitingForAccount) nextAccountRepairAt = monotonicMs() + READ_COOLDOWN_MS
+            if (waitingForAccount) nextAccountReadAt = monotonicMs() + READ_COOLDOWN_MS
         }
     }
 
@@ -181,7 +184,7 @@ internal class AccountPersonalSource(
     }
 
     private fun requestDetail(id: String) {
-        if (id !in watching || id in transfers || !replica.knowsPlaylist(id) || !replica.detailStale(id)) return
+        if (waitingForAccount || id !in watching || id in transfers || !replica.knowsPlaylist(id) || !replica.detailStale(id)) return
         if (failedUntil[id]?.let { monotonicMs() < it } == true) return
         if (connectionGrant != null) sendTransfer(PlaylistTransfer(id, replica.version(id)))
     }

@@ -190,14 +190,12 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
         }
         scope.launch {
             // Keep this ready before an online owner detaches; a mode change needn't await reindexing.
-            combine(ids, offlinePlaylists.wanted, metadataVersion) { _, _, version -> version }
-                .collectLatest {
-                    val complete = offlinePlaylists.complete()
-                    deviceIndex = withContext(Dispatchers.Default) {
-                        DeviceMusicLibrary(catalog.availableTracks(), complete) { it in ids.value }
-                    }
-                    mutableIndexReady.value = true
+            combine(ids, metadataVersion) { _, _ -> Unit }.collectLatest {
+                deviceIndex = withContext(Dispatchers.Default) {
+                    DeviceMusicLibrary(catalog.availableTracks()) { it in ids.value }
                 }
+                mutableIndexReady.value = true
+            }
         }
         scope.launch {
             val diagnostics = playlistDownloadDiagnostics

@@ -380,7 +380,7 @@ class PlaybackLifetimeTest {
 
     private class FakeTransport : PlaybackTransport {
         val sockets = mutableListOf<FakeSocket>()
-        override suspend fun connect(name: String, deviceId: String, local: JsonObject?, reattachBasis: JsonObject?): PlaybackConnection =
+        override suspend fun connect(name: String, deviceId: String): PlaybackConnection =
             FakeSocket().also { sockets += it }
     }
 

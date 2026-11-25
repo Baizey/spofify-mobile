@@ -227,7 +227,7 @@ class RoutingPlayerTest {
             override fun monotonicMs() = scope.testScheduler.currentTime
             override fun wallTimeMs() = 1_700_000_000_000L + monotonicMs()
         }
-        val controller = AccountChannel(PlaybackTransport { _, _, _, _ -> connection }, audio, scope.backgroundScope, clock, library = library)
+        val controller = AccountChannel(PlaybackTransport { _, _ -> connection }, audio, scope.backgroundScope, clock, library = library)
         val native = Proxy.newProxyInstance(Player::class.java.classLoader, arrayOf(Player::class.java)) { _, method, _ ->
             nativeCalls.add(method.name)
             when (method.returnType) {

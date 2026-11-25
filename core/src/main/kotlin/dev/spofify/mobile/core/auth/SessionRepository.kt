@@ -10,8 +10,6 @@ import dev.spofify.mobile.core.playback.isValidDeviceName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -94,14 +92,11 @@ class SessionRepository(
     @Serializable private class Admission(val ticket: String)
     @Serializable private class Hello(
         val type: String, val ticket: String, val name: String, val deviceId: String, val canPlay: Boolean,
-        val local: JsonObject? = null,
-        val reattachBasis: JsonObject? = null,
     )
 
-    fun playbackTransport(expected: AccountIdentity): PlaybackTransport = PlaybackTransport { name, deviceId, local, reattachBasis ->
+    fun playbackTransport(expected: AccountIdentity): PlaybackTransport = PlaybackTransport { name, deviceId ->
         require(isValidDeviceName(name))
         require(deviceId.isNotBlank() && deviceId.toByteArray().size <= 128 && deviceId.none(Char::isISOControl))
-        val claim = local?.takeIf { requireNotNull(it["queue"] as? JsonArray) { "Local player has no queue" }.isNotEmpty() }
         featureExchange(expected) { client, record, headers, authority ->
             val transport = featureTransport(client)
             val response = transport.post(listOf("api", "me", "player", "connect"), "{}",
@@ -115,7 +110,7 @@ class SessionRepository(
                 if (!authority.isCurrent || !sameCredential(saved, record))
                     throw CancellationException("Session retired")
             }
-            val hello = featureJson.encodeToString(Hello("hello", admission.ticket, name, deviceId, true, claim, reattachBasis))
+            val hello = featureJson.encodeToString(Hello("hello", admission.ticket, name, deviceId, true))
             transport.socket(record.cookie, hello, authority, headers)
         }
     }

@@ -18,7 +18,6 @@ class AccountChannel(
     private val clock: PlaybackClock = SystemPlaybackClock, private val current: () -> Boolean = { true },
     library: LocalPlaybackLibrary = EmptyPlaybackLibrary,
     recordPlay: (dev.spofify.mobile.core.personal.PersonalHistoryEntry) -> Unit = {},
-    private val shareDetachedPlayback: Boolean = false,
 ) : AutoCloseable {
     private val view = MutableStateFlow(PlaybackView(localOutput = true, offline = true))
     val state = view.asStateFlow()
@@ -52,13 +51,9 @@ class AccountChannel(
     private val advancing get() = advances.firstOrNull()?.advance
     private data class ConditionalExecution(val id: String, val cursor: AccountCursor)
     private var transportCommit: ConditionalExecution? = null
-    private data class ClaimReconciliation(val id: String, val cursor: AccountCursor, val sentAt: Long)
-    private var claimReconciliation: ClaimReconciliation? = null
-    private var claimRepairFollowsCommit = false
-    private var localAction = 0L
     private val handledExecutions = linkedSetOf<String>()
-    private fun nativeAhead() = advancing != null || transportCommit != null || claimReconciliation != null
-    private var detached: Detached? = null
+    private fun nativeAhead() = advancing != null || transportCommit != null
+    private var personalSync = false
     private var sequence = 0L
     private var commandCounter = 0L
     private var established = 0L
@@ -70,13 +65,6 @@ class AccountChannel(
     private var executing: String? = null
     private val settlements = ArrayList<AccountSettlement>()
     private var error: String? = null
-    private data class HelloLocal(val state: AccountState, val binding: AudioBinding?, val action: Long)
-    private data class Detached(val session: String, val generation: Long, val revision: Long, val occurrence: String?) {
-        fun json() = buildJsonObject {
-            put("sessionId", session); put("generation", generation); put("revision", revision)
-            occurrence?.let { put("occurrence", it) }
-        }
-    }
     private val listeners = mutableSetOf<(JsonObject?, OnlineGrant?) -> Unit>()
     private val history = PlaybackHistory(clock, recordPlay)
     private fun sampleHistory(facts: AudioFacts) {
@@ -109,8 +97,7 @@ class AccountChannel(
                     pending.remove(id); timeouts.remove(id)
                     error = "unavailable"
                 }
-                if (advances.firstOrNull()?.sentAt?.let { now - it >= ADVANCE_CONFIRM_MS } == true ||
-                    claimReconciliation?.sentAt?.let { now - it >= SETTLEMENT_MS } == true) socket?.close()
+                if (advances.firstOrNull()?.sentAt?.let { now - it >= ADVANCE_CONFIRM_MS } == true) socket?.close()
                 publish()
             }
         }
@@ -121,7 +108,12 @@ class AccountChannel(
         return AutoCloseable { listeners -= fn }
     }
     fun sendPersonal(command: JsonObject) = online && send(fields("type" to "personal", "command" to command))
-    fun syncPersonal() = online && send(fields("type" to "sync"))
+    fun syncPersonal(): Boolean {
+        if (!online) return false
+        if (desynced || personalSync) return true // Playback repair also sends a personal snapshot.
+        personalSync = send(fields("type" to "sync"))
+        return personalSync
+    }
     fun matchesLocalAudio(binding: AudioBinding): Boolean = localAuthority && engine.operationIsCurrent(binding)
     private fun isOwner() = online && !retainedLocal && owner.deviceId == deviceId
     private fun localQueue(): AccountState = AccountState.from(engine.state.value)
@@ -200,9 +192,7 @@ class AccountChannel(
             var handshake: Job? = null
             try {
                 val started = clock.monotonicMs()
-                val localAtHello = localQueue().takeIf { shareDetachedPlayback && it.queue.isNotEmpty() }?.let { HelloLocal(it, engine.operationBinding(), localAction) }
-                val claim = localAtHello?.let { playbackJson.encodeToJsonElement(it.state).jsonObject }
-                val live = withTimeout(ATTEMPT_MS) { transport.connect(name, deviceId, claim, detached?.json().takeIf { shareDetachedPlayback }) }
+                val live = withTimeout(ATTEMPT_MS) { transport.connect(name, deviceId) }
                 conn = live
                 if (attempt != life || !current()) return@launch
                 socket = live
@@ -219,7 +209,7 @@ class AccountChannel(
                     require(!initial || frame.kind == "snapshot")
                     when (frame.kind) {
                         "snapshot" -> {
-                            snapshot(frame, localAtHello.takeIf { initial }, initial)
+                            snapshot(frame, initial)
                             if (initial) {
                                 initial = false
                                 handshake.cancel()
@@ -264,6 +254,7 @@ class AccountChannel(
 
     private fun detach(replaced: Boolean) {
         socketGrant = null
+        personalSync = false
         val fallback = if (!replaced && !retainedLocal && online && !isOwner()) {
             // One queue per account: a controller keeps the latest confirmed shared
             // traversal, never its old isolated queue or an optimistic prediction.
@@ -271,9 +262,6 @@ class AccountChannel(
             confirmed.presentation(elapsedMs = measured?.positionMs ?: confirmed.cursor.positionMs)
                 .copy(desiredPlaying = false)
         } else null
-        if (isOwner() && !replaced && !nativeAhead()) detached = Detached(sessionId, owner.generation, revision, confirmed.cursor.occurrence)
-        // Do not smuggle an unconfirmed/rejected online transition back as detached progress.
-        if (replaced || nativeAhead()) detached = null
         if (replaced || !retainedLocal && online && !isOwner()) {
             localAuthority = false
             engine.resetOutput()
@@ -295,7 +283,7 @@ class AccountChannel(
         listeners.toList().forEach { it(null, null) }
     }
 
-    private fun snapshot(m: JsonObject, localAtHello: HelloLocal?, initial: Boolean) {
+    private fun snapshot(m: JsonObject, initial: Boolean) {
         // No part of a failed handshake can reset the reconnect budget or authorize audio.
         val nextSession = m.string("sessionId").also { require(it.isNotEmpty()) }
         val nextRevision = m.long("revision").also { require(it in 0..MAX_SAFE_INTEGER) }
@@ -311,33 +299,25 @@ class AccountChannel(
         val previouslyOnline = online
         val previouslyOwner = isOwner()
         val old = confirmed
-        val awaitingClaim = claimReconciliation
-        val reconciledClaim = awaitingClaim?.cursor == next.cursor
         val generationChanged = nextSession != sessionId || nextOwner.generation != owner.generation
-        // Go orders this repair after the conditional echo, before any held commands.
-        // It reaffirms the just-committed visit, not a rejection of the successor EOF
-        // that this client could only report after receiving that echo.
-        val reaffirmedCommit = claimRepairFollowsCommit && transportCommit == null && !generationChanged &&
-            nextRevision == revision && next.cursor == old.cursor
-        claimRepairFollowsCommit = false
+        val routineSync = personalSync && !desynced && previouslyOnline && !generationChanged &&
+            nextRevision == revision && next == old && nextOwner == owner && bindingId == connectionId
+        personalSync = false
+        if (routineSync) {
+            // A personal freshness check also echoes the canonical player. The unchanged echo
+            // does not reject a local EOF or conditional action still waiting to be reflected.
+            devices = roster
+            actual = sample
+            sampleClock.seed(serverTime)
+            publish()
+            return
+        }
         val local = localQueue()
-        if (!previouslyOnline && !shareDetachedPlayback && localAuthority &&
+        if (!previouslyOnline && localAuthority &&
             (local.cursor.desiredPlaying || engine.state.value.error == "connection")) retainedLocal = true
-        // The matching snapshot, not the hello alone, proves what was accepted. An operation
-        // started after hello (e.g. an isolated seek) isn't covered by that acknowledgement.
-        val acceptedClaim = nextOwner.deviceId == deviceId && !previouslyOnline && localAtHello?.state?.cursor == next.cursor
         val localFailure = engine.state.value.error
-        val pausedAfterLoss = !shareDetachedPlayback && !previouslyOnline && nextOwner.deviceId == deviceId &&
+        val pausedAfterLoss = !previouslyOnline && nextOwner.deviceId == deviceId &&
             local.cursor.occurrence != null && local.cursor.occurrence == next.cursor.occurrence && !local.cursor.desiredPlaying
-        val retainedFailure = acceptedClaim && localFailure.isNotEmpty() && local.cursor.sameVisit(next.cursor) &&
-            localAction == localAtHello.action
-        val retained = retainedFailure || acceptedClaim && local.cursor.key != 0L && local.cursor.sameVisit(next.cursor) &&
-            local.cursor.desiredPlaying == next.cursor.desiredPlaying &&
-            (local.cursor == next.cursor || localAtHello.binding == engine.operationBinding() && localAction == localAtHello.action)
-        // Intentionally compare row identity and order, not server-rebuilt display metadata.
-        val reconciliation = local.cursor.takeIf { cursor -> initial && acceptedClaim &&
-            localAction != localAtHello.action && cursor != next.cursor && cursor.key != 0L &&
-            local.queue.map { it.key } == next.queue.map { it.key } && next.queue.any { it.key == cursor.key } }
         if (generationChanged) {
             if (!previouslyOnline || nextSession != sessionId) clearPending()
             else {
@@ -363,17 +343,13 @@ class AccountChannel(
         actual = sample
         sampleClock.seed(serverTime)
         desynced = false
-        detached = null
         projection.rememberCollection(confirmed.queue, confirmed.collectionFirst)
         retireSettled()
         val existingVisit = nativeCursor
         val awaitingTransport = transportCommit
         val committedTransport = awaitingTransport?.cursor == next.cursor
-        val buffered = if (reconciledClaim || reaffirmedCommit) advances.toList() else emptyList()
         advances.clear()
-        advances.addAll(buffered)
         transportCommit = null
-        claimReconciliation = null
         if (retainedLocal) {
             // The socket is recovered (including personal updates) but this local visit
             // remains private. Do not replace its queue or report progress to the room.
@@ -389,33 +365,15 @@ class AccountChannel(
             nativeCursor = AccountCursor.Empty
         } else {
             localAuthority = true
-            val keep = retained || previouslyOwner && !generationChanged &&
-                (when { awaitingClaim != null -> reconciledClaim; awaitingTransport != null -> committedTransport; else -> old.cursor == next.cursor }) &&
-                (buffered.isNotEmpty() || existingVisit.sameVisit(next.cursor) && existingVisit.desiredPlaying == next.cursor.desiredPlaying)
+            val keep = previouslyOwner && !generationChanged &&
+                (if (awaitingTransport != null) committedTransport else old.cursor == next.cursor) &&
+                existingVisit.sameVisit(next.cursor) && existingVisit.desiredPlaying == next.cursor.desiredPlaying
             if (!keep) { nativeFact = null; clearExecution() }
             nativeRevision = revision
-            if (reconciliation != null) {
-                val id = newCommandId() ?: return
-                claimReconciliation = ClaimReconciliation(id, reconciliation, clock.monotonicMs())
-                nativeCursor = reconciliation
-                // Send before publishing READY so a reentrant command cannot overtake reconciliation.
-                val basis = Detached(sessionId, owner.generation, revision, next.cursor.occurrence).json()
-                send(fields("type" to "reconcileClaim", "id" to id, "basis" to basis,
-                    "cursor" to playbackJson.encodeToJsonElement(reconciliation)))
-                // Local queue/settings edits don't import. From this point use shared
-                // traversal even while we retain the already applied local transport.
-                val p = next.copy(cursor = reconciliation).presentation()
-                engine.adopt(p.copy(elapsed = local.cursor.positionMs.seconds(), isPlaying = engine.state.value.isPlaying,
-                    error = engine.state.value.error), execute = false)
-                syncLocalMeasurements()
-                publish()
-                return
-            }
-            nativeCursor = if (buffered.isEmpty()) next.cursor else existingVisit
+            nativeCursor = next.cursor
             val operation = ++execution
             publish() // FGS admission must see this device as current before the native start.
             if (execution != operation || !isOwner()) return
-            if (buffered.isNotEmpty()) { sendAdvance(); return }
             engine.adopt(next.presentation().let { if (pausedAfterLoss) it.copy(desiredPlaying = false,
                 elapsed = local.cursor.positionMs.seconds(), error = localFailure) else if (keep) it.copy(elapsed = local.cursor.positionMs.seconds(),
                 isPlaying = engine.state.value.isPlaying, error = localFailure,
@@ -467,46 +425,31 @@ class AccountChannel(
         if (action !in CONDITIONAL_ACTIONS || c.id in handledExecutions) return
         handledExecutions += c.id
         if (handledExecutions.size > MAX_PENDING) handledExecutions.remove(handledExecutions.first())
-        // Go's in-flight execute wins this conflict and its claim repair is held until
-        // execution settles. Do not report or use the provisional claim's measurements.
-        val outgoingClaim = claimReconciliation
-        val displacedClaim = outgoingClaim != null
-        if (displacedClaim) {
-            claimReconciliation = null
-            advances.clear()
-            nativeFact = null
-        } else {
-            // Native facts can indicate EOF before the observation collector has resumed.
-            engine.consumeNativeEnd()
-            if (!isOwner() || desynced) return
-        }
+        // Native facts can indicate EOF before the observation collector has resumed.
+        engine.consumeNativeEnd()
+        if (!isOwner() || desynced) return
         val old = nativeCursor
-        val q = if (displacedClaim) confirmed.presentation() else engine.state.value
+        val q = engine.state.value
         val row = if (action == "next") LocalPlaybackQueue.successor(q, naturalEnd = false)?.let(q.queue::get) else null
         if (old.key == 0L || c.basis.occurrence != old.occurrence || c.basis.key?.let { it != old.key } == true || nativeAhead() ||
-            displacedClaim && !old.sameVisit(confirmed.cursor) ||
             exhaustedVisit?.let { (visit, at) -> visit == old.occurrence && orderedAt < at } == true ||
             action == "next" && c.basis.successorKey != (row?.key ?: 0L)) {
             queueSettlement(c.id, "stale")
-            if (displacedClaim) claimReconciliation = outgoingClaim
-            val reportedCursor = if (displacedClaim) confirmed.cursor else old
-            report(nativeFact ?: newObservation(reportedCursor, AudioFacts(elapsed = q.elapsed, isLoading = reportedCursor.desiredPlaying)),
+            report(nativeFact ?: newObservation(old, AudioFacts(elapsed = q.elapsed, isLoading = old.desiredPlaying)),
                 reflectedRevision = revision, settlementOnly = true)
             return
         }
-        val elapsed = if (displacedClaim) q.elapsed else engine.sampleCurrent()?.elapsed ?: q.elapsed
-        val sourceCursor = if (displacedClaim) confirmed.cursor else old
+        val elapsed = engine.sampleCurrent()?.elapsed ?: q.elapsed
         val to = when {
             action == "seek" -> {
                 val duration = q.current?.duration?.takeIf { it > 0 }?.let(::secondsMs)
                 val requested = c.action.long("positionMs")
-                sourceCursor.copy(positionMs = duration?.let { minOf(requested, it) } ?: requested)
+                old.copy(positionMs = duration?.let { minOf(requested, it) } ?: requested)
             }
-            row == null -> sourceCursor.copy(positionMs = secondsMs(elapsed), desiredPlaying = false)
+            row == null -> old.copy(positionMs = secondsMs(elapsed), desiredPlaying = false)
             else -> AccountCursor(row.key, UUID.randomUUID().toString(), 0, true)
         }
         transportCommit = ConditionalExecution(c.id, to)
-        claimRepairFollowsCommit = displacedClaim
         nativeCursor = to
         nativeRevision = revision
         nativeFact = null
@@ -583,7 +526,6 @@ class AccountChannel(
         executing = command?.id
         advances.clear()
         transportCommit = null
-        claimReconciliation = null
         nativeFact = null
         nativeRevision = revision
         nativeCursor = next
@@ -614,11 +556,6 @@ class AccountChannel(
     private fun result(m: JsonObject) {
         val id = m.string("id")
         val status = m.string("status")
-        // The server sends the definitive canonical snapshot before the terminal result.
-        if (claimReconciliation?.id == id) {
-            if (status != "accepted") socket?.close() // a peer that violates that fence cannot keep provisional authority
-            return
-        }
         val p = pending[id] ?: return
         if (status == "accepted") { p.accepted = true; return }
         if (status !in setOf("applied", "satisfied", "stale", "failed", "unavailable")) return
@@ -636,8 +573,6 @@ class AccountChannel(
     private fun clearExecution() {
         executing = null
         transportCommit = null
-        claimReconciliation = null
-        claimRepairFollowsCommit = false
         settlements.clear()
         ++execution
     }
@@ -690,7 +625,6 @@ class AccountChannel(
         if (!localAuthority) return
         sampleHistory(f)
         if (!online || retainedLocal) {
-            ++localAction
             engine.advanceAvailable(q)
             publish()
             return
@@ -725,7 +659,7 @@ class AccountChannel(
             advance.observation = nativeFact ?: AccountObservation(next.key, next.occurrence, 0,
                 clock.wallTimeMs().coerceAtLeast(0), if (row == null) "stopped" else "loading")
             nativeFact = advance.observation
-            if (advances.firstOrNull() === advance && transportCommit == null && claimReconciliation == null) sendAdvance()
+            if (advances.firstOrNull() === advance && transportCommit == null) sendAdvance()
         }
         publish()
     }
@@ -771,10 +705,7 @@ class AccountChannel(
     private fun issue(action: JsonObject, offline: () -> Boolean = { false }): Boolean {
         if (!current() || superseded || connection == PlaybackConnectionState.CLOSED || !addressableAccountChoice(action)) return false
         if (!online || retainedLocal && action.kind !in setOf("play", "select")) {
-            val before = localQueue().cursor
-            val applied = offline()
-            if (applied && localQueue().cursor != before) ++localAction
-            return applied
+            return offline()
         }
         if (desynced || pending.size >= MAX_PENDING) return false
         val c = (nativeCursor.takeIf { isOwner() && nativeAhead() } ?: confirmed.cursor)

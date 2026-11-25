@@ -56,7 +56,7 @@ internal class SessionSocket(
         }
     }
 
-    /** Only admission gets the snapshot-size budget, and only as the first frame. */
+    /** Only the admission path can send the first frame. Android never uploads an isolated queue. */
     fun sendHello(text: String): Boolean {
         if (text.utf8Size() > MAX_HELLO_BYTES) return false
         return authority.runIfCurrent {
@@ -103,8 +103,8 @@ internal class SessionSocket(
     companion object {
         private const val SUPERSEDED_CODE = 4001
         private const val SUPERSEDED_REASON = "superseded"
-        const val MAX_HELLO_BYTES = 5 * 1024 * 1024
         private const val MAX_COMMAND_BYTES = 64 * 1024
+        const val MAX_HELLO_BYTES = MAX_COMMAND_BYTES
         private const val MAX_INCOMING_FRAMES = 256
         private const val MAX_INCOMING_BYTES = 5L * 1024 * 1024
     }

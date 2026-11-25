@@ -235,7 +235,13 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
             if (!validPlaylistTrack(row.track) || rows.any { it.id == row.id } || row.position <= (rows.lastOrNull()?.position ?: -1)) return null
             rows.add(row)
         }
-        edit.removed?.let { id -> if (!rows.removeAll { it.id == id }) return null }
+        edit.removed?.let { id ->
+            val index = rows.indexOfFirst { it.id == id }
+            if (index < 0) return null
+            rows.removeAt(index)
+            // Go compacts persisted slots on removal; hidden occurrences still occupy slots.
+            for (i in index until rows.size) rows[i] = rows[i].copy(position = rows[i].position - 1)
+        }
         edit.moved?.let { id ->
             val from = rows.indexOfFirst { it.id == id }
             if (from < 0) return null

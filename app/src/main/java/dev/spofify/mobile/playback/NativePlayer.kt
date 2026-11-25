@@ -73,11 +73,11 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
         val current = { !retired && scope.isActive && sessions.isCurrent(identity) }
         val port = audio.port({ sessions.manualOffline.value || view?.let { it.offline || it.isolatedOutput } != false }, current)
         val transport = sessions.playbackTransport(identity)
-        val boundTransport = PlaybackTransport { name, device, local, reattachBasis ->
+        val boundTransport = PlaybackTransport { name, device ->
             val grant = reconnectGrant ?: throw CancellationException("No playback admission grant")
             val diagnostic = reconnectDiagnostic
             try {
-                sessions.withOnlineGrant(grant) { transport.connect(name, device, local, reattachBasis) }
+                sessions.withOnlineGrant(grant) { transport.connect(name, device) }
                     .also { diagnostic.phase = ReconnectPhase.FIRST_SNAPSHOT }
             } catch (failure: AuthFailure) {
                 diagnostic.failure = failure.kind

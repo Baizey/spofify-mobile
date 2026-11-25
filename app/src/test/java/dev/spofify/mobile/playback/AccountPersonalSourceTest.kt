@@ -51,6 +51,26 @@ class AccountPersonalSourceTest {
         assertEquals(at.toEpochMilli(), f.saved.read().listsAt)
     }
 
+    @Test fun socketReconnectKeepsDistinctRecentRowsAndLocalUnmatchedOccurrence() = runTest {
+        val f = Fixture(this, temporary.root, stale = false)
+        val track = PersonalTrack("track", "same-track", "Song", true, PersonalCoverage(1, 1, 1))
+        val one = PersonalHistoryEntry("same-event", at.toString(), track)
+        val two = one.copy(origin = "offline")
+        val three = two.copy(id = "offline-device-only")
+        f.open()
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), listOf(one, two))))
+        f.source.recordLocal(three)
+        f.socket.close()
+        runCurrent()
+        assertFalse(f.source.replica.view.value.connected)
+        f.socket = TestSocket()
+        f.open()
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(summary), listOf(one, two))))
+        assertEquals(3, f.source.replica.view.value.recent.size)
+        assertEquals(listOf(one, two), f.saved.read().recent)
+        assertEquals(listOf(three), f.saved.read().localPlays)
+    }
+
     @Test fun watchedInvalidationConsumesObsoleteContinuationBeforeRepairingAndNeverPublishesPrefix() = runTest {
         val f = Fixture(this, temporary.root, stale = false)
         f.open()
@@ -297,8 +317,8 @@ class AccountPersonalSourceTest {
             override fun write(enabled: Boolean) = Unit
         })
         val saved = PersonalCacheFile(root, identity)
-        val socket = TestSocket()
-        private val channel = AccountChannel(PlaybackTransport { _, _, _, _ -> socket }, object : AudioExecutor {
+        var socket = TestSocket()
+        private val channel = AccountChannel(PlaybackTransport { _, _ -> socket }, object : AudioExecutor {
             override val observations = emptyFlow<AudioObservation>()
             override fun facts() = AudioFacts()
             override fun pause() = Unit

@@ -2,12 +2,10 @@ package dev.spofify.mobile.core.playback
 
 import java.io.Closeable
 import kotlinx.coroutines.flow.Flow
-import kotlinx.serialization.json.JsonObject
 
 /** Admission (including the credential-private hello) belongs to the transport. */
 fun interface PlaybackTransport {
-    suspend fun connect(name: String, deviceId: String, local: JsonObject?, reattachBasis: JsonObject?): PlaybackConnection
-    suspend fun connect(name: String, deviceId: String) = connect(name, deviceId, null, null)
+    suspend fun connect(name: String, deviceId: String): PlaybackConnection
 }
 
 /** messages completes or fails immediately on socket/auth loss. Never replay frames. */
