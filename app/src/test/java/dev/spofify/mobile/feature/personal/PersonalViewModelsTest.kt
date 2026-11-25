@@ -85,6 +85,12 @@ class PersonalViewModelsTest {
         runCurrent()
         assertTrue(model.state.value.showEmpty)
         assertTrue(model.state.value.canSaveOnline)
+        val acceptedAt = source.replica.snapshots.value.details.getValue(summary.id).refreshedAt
+        source.replica.receiveSnapshot(PersonalSnapshot(listOf(pending), emptyList()))
+        runCurrent()
+        assertFalse(model.state.value.showEmpty)
+        assertFalse(model.state.value.canSaveOnline)
+        assertEquals(acceptedAt, source.replica.snapshots.value.details.getValue(summary.id).refreshedAt)
     }
 
     @Test fun recentUsesOccurrencesAndDistinguishesUnknownFromEmpty() = runTest(dispatcher) {

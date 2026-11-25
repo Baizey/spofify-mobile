@@ -51,7 +51,7 @@ internal class PlaylistDetailViewModel(private val source: LivePersonal, private
                 }
                 mutable.value = mutable.value.copy(summary = summary, rows = rows, loaded = detail != null, deleted = false,
                     canSaveOnline = id in snapshot.sharedPlayablePlaylistIds,
-                    showEmpty = detail?.rows?.isEmpty() == true && (!derived || detail.refreshedAt != null),
+                    showEmpty = detail?.rows?.isEmpty() == true && (!derived || detail.hasContinuity),
                     message = if (snapshot.ready && detail == null) "Not saved on this device." else null,
                     context = detail?.let { playlistContext(summary) })
             }

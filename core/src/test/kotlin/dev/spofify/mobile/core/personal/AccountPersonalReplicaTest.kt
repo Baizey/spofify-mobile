@@ -18,8 +18,8 @@ class AccountPersonalReplicaTest {
         PersonalCountState.EXACT, 2, 2, PersonalPlaylistCapabilities(true, true, false, true, false, true, true), 1, "", "")
     private val one = PersonalManualEntry("one", 4, track)
     private val two = PersonalManualEntry("two", 8, track)
-    private fun replica(saved: PersonalCacheSnapshot = PersonalCacheSnapshot()) =
-        AccountPersonalReplica(Clock.fixed(at, ZoneOffset.UTC)).apply { restore(saved) }
+    private fun replica(saved: PersonalCacheSnapshot = PersonalCacheSnapshot(), now: Instant = at) =
+        AccountPersonalReplica(Clock.fixed(now, ZoneOffset.UTC)).apply { restore(saved) }
     private val identity = AccountIdentity("https://example.invalid", "account", "fixture", 1)
 
     @Test fun exactlyQuotaSnapshotIsCompleteAndDiskAloneNeverGrantsPlaylistAuthority() {
@@ -84,7 +84,10 @@ class AccountPersonalReplicaTest {
         val edited = summary.copy(revision = 3, trackCount = 1, availableCount = 1)
         assertEquals("p", r.receiveChange(PersonalChange(playlist = edited, entries = EntryChange(removed = two.id))))
         assertTrue(r.detailStale("p"))
-        assertEquals(listOf(two.copy(position = 4), one.copy(position = 8)), r.snapshots.value.details.getValue("p").rows)
+        val retained = r.snapshots.value.details.getValue("p")
+        assertEquals(at.toEpochMilli(), retained.refreshedAt)
+        assertFalse(retained.hasContinuity)
+        assertEquals(listOf(two.copy(position = 4), one.copy(position = 8)), retained.rows)
         r.replaceDetail(r.version("p"), edited, listOf(one.copy(position = 1)))
         assertFalse(r.detailStale("p"))
         assertEquals(listOf(one.copy(position = 1)), r.snapshots.value.details.getValue("p").rows)
@@ -107,22 +110,28 @@ class AccountPersonalReplicaTest {
             // A scoped reply may reveal materialization status before another account list arrives.
             r.replaceDetail(r.version("p"), nonReady, wireRows)
             assertEquals(nonReady, r.snapshots.value.playlists.single())
-            assertEquals(ReplicaPlaylist(ready.revision, listOf(one, two)), r.snapshots.value.details.getValue("p"))
+            val lastGood = ReplicaPlaylist(ready.revision, listOf(one, two), at.toEpochMilli(), invalidated = true)
+            assertEquals(lastGood, r.snapshots.value.details.getValue("p"))
             assertTrue(r.detailStale("p"))
             assertFalse(r.canPlaySharedPlaylist("p"))
             val file = PersonalCacheFile(root.root, identity)
             file.write(r.snapshots.value)
-            val reopened = replica(file.read())
+            val recoveryTime = at.plusSeconds(1) // The old timestamp is still within the freshness window.
+            val reopened = replica(file.read(), now = recoveryTime)
             reopened.availability(false, setOf(track.id))
-            assertEquals(listOf(one, two), reopened.view.value.details.getValue("p").rows)
+            assertEquals(lastGood, reopened.view.value.details.getValue("p"))
+            assertTrue(reopened.detailStale("p"))
             assertFalse(reopened.canPlaySharedPlaylist("p"))
             val recovered = ready.copy(revision = 3, trackCount = 1, availableCount = 1)
             reopened.availability(true, emptySet())
             reopened.receiveSnapshot(PersonalSnapshot(listOf(recovered), emptyList()))
             assertFalse(reopened.canPlaySharedPlaylist("p")) // A ready list summary cannot authorize old rows.
+            assertEquals(lastGood, reopened.snapshots.value.details.getValue("p"))
             reopened.replaceDetail(reopened.version("p"), recovered, listOf(two))
-            assertEquals(listOf(two), reopened.snapshots.value.details.getValue("p").rows)
-            assertEquals(at.toEpochMilli(), reopened.snapshots.value.details.getValue("p").refreshedAt)
+            val replacement = reopened.snapshots.value.details.getValue("p")
+            assertEquals(listOf(two), replacement.rows)
+            assertEquals(recoveryTime.toEpochMilli(), replacement.refreshedAt)
+            assertTrue(replacement.hasContinuity)
             assertTrue(reopened.canPlaySharedPlaylist("p"))
         }
     }

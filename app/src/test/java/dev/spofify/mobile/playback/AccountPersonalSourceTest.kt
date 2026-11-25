@@ -168,8 +168,10 @@ class AccountPersonalSourceTest {
                 val requestCount = f.socket.commands().size
                 val wireRows = if (pending) emptyList() else listOf(row.copy(id = "stale-only"))
                 f.update(PersonalUpdate(part = PlaylistPart(updated, definition, token, 0, wireRows, false)))
-                assertEquals(listOf(row), f.saved.read().details.getValue(list.id).rows)
-                assertNull(f.saved.read().details.getValue(list.id).refreshedAt)
+                val retained = f.saved.read().details.getValue(list.id)
+                assertEquals(listOf(row), retained.rows)
+                assertEquals(at.toEpochMilli(), retained.refreshedAt)
+                assertFalse(retained.hasContinuity)
                 assertFalse(f.source.replica.canPlaySharedPlaylist(list.id))
                 assertFalse(f.source.command(PersonalIntent("copyPlaylist", playlistId = list.id, name = "Copy")))
                 f.source.watch(list.id).close()
@@ -181,10 +183,13 @@ class AccountPersonalSourceTest {
             assertEquals(before + 1, f.socket.commands().size)
             assertFalse(f.source.replica.canPlaySharedPlaylist(list.id))
             val replacement = row.copy(id = "recovered")
+            f.clock = Clock.offset(f.clock, java.time.Duration.ofSeconds(1))
             f.update(PersonalUpdate(part = PlaylistPart(ready, definition, token, 0, listOf(replacement), false)))
             assertTrue(f.source.replica.canPlaySharedPlaylist(list.id))
-            assertEquals(listOf(replacement), f.saved.read().details.getValue(list.id).rows)
-            assertNotNull(f.saved.read().details.getValue(list.id).refreshedAt)
+            val accepted = f.saved.read().details.getValue(list.id)
+            assertEquals(listOf(replacement), accepted.rows)
+            assertEquals(at.plusSeconds(1).toEpochMilli(), accepted.refreshedAt)
+            assertTrue(accepted.hasContinuity)
         }
     }
 

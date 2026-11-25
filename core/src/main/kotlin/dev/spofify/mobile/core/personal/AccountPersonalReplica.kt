@@ -66,7 +66,15 @@ data class RecentKey(val id: String, val origin: String = "")
 data class RecentInsertion(val index: Int, val item: PersonalHistoryEntry)
 
 @Serializable
-data class ReplicaPlaylist(val revision: Long, val rows: List<PersonalManualEntry>, val refreshedAt: Long? = null)
+data class ReplicaPlaylist(
+    val revision: Long,
+    val rows: List<PersonalManualEntry>,
+    val refreshedAt: Long? = null,
+    val invalidated: Boolean = false,
+) {
+    /** A saved projection remains readable after invalidation but no longer conveys continuity. */
+    val hasContinuity get() = refreshedAt != null && !invalidated
+}
 
 @Serializable
 data class PersonalCacheSnapshot(
@@ -127,7 +135,7 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
 
     private fun stale(at: Long?) = at == null || clock.millis() - at !in 0 until freshnessMs
     fun accountStale() = durable.value.let { stale(it.listsAt) || stale(it.recentAt) }
-    fun detailStale(id: String) = stale(durable.value.details[id]?.refreshedAt)
+    fun detailStale(id: String) = stale(durable.value.details[id]?.takeIf { it.hasContinuity }?.refreshedAt)
     fun confirmsPlaylist(id: String) = id in confirmed
 
     fun canPlaySharedPlaylist(id: String): Boolean {
@@ -138,7 +146,7 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
 
     private fun sharedPlayable(summary: PersonalPlaylistSummary, detail: ReplicaPlaylist?): Boolean =
         confirmsPlaylist(summary.id) && summary.capabilities.play && (summary.kind == PersonalPlaylistKind.MANUAL ||
-            summary.projection() == PlaylistProjection.CURRENT && detail?.revision == summary.revision && detail.refreshedAt != null)
+            summary.projection() == PlaylistProjection.CURRENT && detail?.revision == summary.revision && detail.hasContinuity)
 
     /** Accept the summary independently of the rows. A non-ready evaluation invalidates
      * freshness but never evicts last-good rows, including a previously accepted empty result. */
@@ -153,8 +161,8 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
         val old = data.details[id]
         val detail = when (projection) {
             PlaylistProjection.CURRENT -> ReplicaPlaylist(summary.revision, rows, clock.millis())
-            PlaylistProjection.STORED -> old?.copy(refreshedAt = null) ?: ReplicaPlaylist(summary.revision, rows)
-            PlaylistProjection.UNMATERIALIZED -> old?.copy(refreshedAt = null)
+            PlaylistProjection.STORED -> old?.copy(invalidated = true) ?: ReplicaPlaylist(summary.revision, rows)
+            PlaylistProjection.UNMATERIALIZED -> old?.copy(invalidated = true)
         }
         publish(data.copy(playlists = replace(data.playlists, summary), details =
             if (detail != null) data.details + (id to detail) else data.details))
@@ -195,7 +203,7 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
             listsAt = now, recentAt = now, listsComplete = true,
             deletedPlaylists = data.deletedPlaylists + removed,
             details = data.details.filterKeys { it !in removed }.mapValues { (id, detail) ->
-                if (id in invalidated) detail.copy(refreshedAt = null) else detail
+                if (id in invalidated) detail.copy(invalidated = true) else detail
             },
         ))
     }
@@ -240,13 +248,13 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
             next = next.copy(playlists = replace(next.playlists, summary))
             val old = next.details[id]
             val rows = old?.takeIf { !delta.rowsInvalid && summary.projection() == PlaylistProjection.CURRENT &&
-                it.refreshedAt != null && it.revision == summary.revision - 1 }
+                it.hasContinuity && it.revision == summary.revision - 1 }
                 ?.let { applyEntries(it.rows, delta.entries) }
                 ?.takeIf { it.size.toLong() == summary.trackCount }
             if (rows != null) {
                 next = next.copy(details = next.details + (id to old.copy(revision = summary.revision, rows = rows)))
             } else {
-                if (old != null) next = next.copy(details = next.details + (id to old.copy(refreshedAt = null)))
+                if (old != null) next = next.copy(details = next.details + (id to old.copy(invalidated = true)))
                 repair = id
             }
         }
