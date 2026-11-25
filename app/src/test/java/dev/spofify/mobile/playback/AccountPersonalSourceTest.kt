@@ -146,6 +146,48 @@ class AccountPersonalSourceTest {
         }
     }
 
+    @Test fun nonReadyWirePartsKeepLastGoodAndReadyChangeRepairsWithoutWaitingForCooldown() = runTest {
+        val f = Fixture(this, temporary.root, stale = false)
+        val list = summary.copy(kind = PersonalPlaylistKind.DERIVED, evaluationState = PersonalEvaluationState.READY,
+            trackCount = 1, availableCount = 1)
+        val definition = JsonObject(emptyMap())
+        val token = "a".repeat(64)
+        val row = PersonalManualEntry("accepted", 0, PersonalTrack("track", "track", "Song", true, PersonalCoverage(1, 1, 1)))
+        f.open()
+        f.update(PersonalUpdate(snapshot = PersonalSnapshot(listOf(list), emptyList())))
+        f.source.watch(list.id).use {
+            f.update(PersonalUpdate(part = PlaylistPart(list, definition, token, 0, listOf(row), false)))
+            assertTrue(f.source.replica.canPlaySharedPlaylist(list.id))
+            var updated = list
+            for (evaluation in listOf(PersonalEvaluationState.STALE, PersonalEvaluationState.ERROR, PersonalEvaluationState.PENDING)) {
+                val pending = evaluation == PersonalEvaluationState.PENDING
+                updated = updated.copy(revision = updated.revision + 1, evaluationState = evaluation,
+                    countState = if (pending) PersonalCountState.PENDING else PersonalCountState.STALE,
+                    trackCount = if (pending) null else 1, availableCount = if (pending) null else 1)
+                f.update(PersonalUpdate(change = PersonalChange(playlist = updated, rowsInvalid = true)))
+                val requestCount = f.socket.commands().size
+                val wireRows = if (pending) emptyList() else listOf(row.copy(id = "stale-only"))
+                f.update(PersonalUpdate(part = PlaylistPart(updated, definition, token, 0, wireRows, false)))
+                assertEquals(listOf(row), f.saved.read().details.getValue(list.id).rows)
+                assertNull(f.saved.read().details.getValue(list.id).refreshedAt)
+                assertFalse(f.source.replica.canPlaySharedPlaylist(list.id))
+                assertFalse(f.source.command(PersonalIntent("copyPlaylist", playlistId = list.id, name = "Copy")))
+                f.source.watch(list.id).close()
+                assertEquals(requestCount, f.socket.commands().size)
+            }
+            val ready = list.copy(revision = updated.revision + 1)
+            val before = f.socket.commands().size
+            f.update(PersonalUpdate(change = PersonalChange(playlist = ready, rowsInvalid = true)))
+            assertEquals(before + 1, f.socket.commands().size)
+            assertFalse(f.source.replica.canPlaySharedPlaylist(list.id))
+            val replacement = row.copy(id = "recovered")
+            f.update(PersonalUpdate(part = PlaylistPart(ready, definition, token, 0, listOf(replacement), false)))
+            assertTrue(f.source.replica.canPlaySharedPlaylist(list.id))
+            assertEquals(listOf(replacement), f.saved.read().details.getValue(list.id).rows)
+            assertNotNull(f.saved.read().details.getValue(list.id).refreshedAt)
+        }
+    }
+
     @Test fun watchedInvalidationConsumesObsoleteContinuationBeforeRepairingAndNeverPublishesPrefix() = runTest {
         val f = Fixture(this, temporary.root, stale = false)
         f.open()

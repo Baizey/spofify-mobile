@@ -59,6 +59,34 @@ class PersonalViewModelsTest {
         assertNull(source.watched)
     }
 
+    @Test fun pendingRulesAreNotPresentedAsAnEmptyPlaylistAndStoredRowsAreNotOnlineActions() = runTest(dispatcher) {
+        val source = Source()
+        source.replica.availability(true, emptySet())
+        val model = keep(PlaylistDetailViewModel(source, summary.id))
+        val pending = summary.copy(kind = PersonalPlaylistKind.DERIVED, countState = PersonalCountState.PENDING,
+            evaluationState = PersonalEvaluationState.PENDING, trackCount = null, availableCount = null)
+        source.replica.receiveSnapshot(PersonalSnapshot(listOf(pending), emptyList()))
+        source.replica.replaceDetail(source.replica.version(summary.id), pending, emptyList())
+        runCurrent()
+        assertFalse(model.state.value.loaded)
+        assertFalse(model.state.value.showEmpty)
+        assertNull(model.state.value.context)
+        val stale = pending.copy(countState = PersonalCountState.STALE, evaluationState = PersonalEvaluationState.ERROR,
+            trackCount = 1, availableCount = 1)
+        source.replica.replaceDetail(source.replica.version(summary.id), stale, listOf(PersonalManualEntry("stored", 0, track)))
+        runCurrent()
+        assertEquals(listOf("stored"), model.state.value.rows.map { it.identity })
+        assertFalse(model.state.value.showEmpty)
+        assertFalse(model.state.value.canSaveOnline)
+        assertEquals(false, model.state.value.summary?.capabilities?.play)
+        val ready = stale.copy(countState = PersonalCountState.EXACT, evaluationState = PersonalEvaluationState.READY,
+            trackCount = 0, availableCount = 0)
+        source.replica.replaceDetail(source.replica.version(summary.id), ready, emptyList())
+        runCurrent()
+        assertTrue(model.state.value.showEmpty)
+        assertTrue(model.state.value.canSaveOnline)
+    }
+
     @Test fun recentUsesOccurrencesAndDistinguishesUnknownFromEmpty() = runTest(dispatcher) {
         val source = Source()
         val model = keep(RecentViewModel(source))

@@ -110,10 +110,14 @@ internal class AccountPersonalSource(
                 val snapshot = update.snapshot
                 if (snapshot != null) {
                     waitingForAccount = false
+                    val watchedVersions = watching.keys.associateWith(replica::version)
                     try { replica.receiveSnapshot(snapshot) } catch (_: IllegalArgumentException) { return@publishIfCurrent }
                     nextAccountReadAt = 0L
                     connectionGrant = owner
-                    watching.keys.toList().forEach(::requestDetail)
+                    for ((id, version) in watchedVersions) {
+                        if (replica.version(id) != version) failedUntil.remove(id)
+                        requestDetail(id)
+                    }
                 } else if (connectionGrant === owner) {
                     update.change?.let { change ->
                         try {
@@ -147,8 +151,11 @@ internal class AccountPersonalSource(
             failedUntil[id] = monotonicMs() + READ_COOLDOWN_MS
             return
         }
-        if (rows != null) replica.replaceDetail(transfer.version, part.summary, rows)
-        else if (id in watching) sendTransfer(transfer)
+        if (rows != null) {
+            replica.replaceDetail(transfer.version, part.summary, rows)
+            // An unchanged non-ready result is not permission to loop on screen re-entry.
+            if (replica.detailStale(id)) failedUntil[id] = monotonicMs() + READ_COOLDOWN_MS
+        } else if (id in watching) sendTransfer(transfer)
     }
 
     private fun afterRestore(action: () -> Unit) {
@@ -156,7 +163,9 @@ internal class AccountPersonalSource(
     }
 
     override fun command(intent: PersonalIntent): Boolean {
-        if (intent.playlistId?.let { !replica.confirmsPlaylist(it) } == true) return false
+        intent.playlistId?.let { id ->
+            if (!replica.confirmsPlaylist(id) || intent.type == "copyPlaylist" && !replica.canPlaySharedPlaylist(id)) return false
+        }
         return send(intent)
     }
 
@@ -206,7 +215,7 @@ internal class AccountPersonalSource(
     suspend fun persistPlaylistForDownload(id: String, occurrenceId: String, trackId: String, owner: OnlineGrant) {
         fun ReplicaPlaylist.containsOccurrence() = rows.any { it.id == occurrenceId && it.track.id == trackId }
         check(sessions.onlineGrant.value === owner)
-        check(replica.confirmsPlaylist(id))
+        check(replica.canPlaySharedPlaylist(id))
         val current = replica.snapshots.value
         val selected = checkNotNull(current.details[id])
         check(selected.containsOccurrence())
@@ -216,7 +225,7 @@ internal class AccountPersonalSource(
                 snapshot.details[id]?.let { it.revision >= revision && it.containsOccurrence() } == true
             }
         } != null)
-        if (sessions.onlineGrant.value !== owner || !replica.confirmsPlaylist(id))
+        if (sessions.onlineGrant.value !== owner || !replica.canPlaySharedPlaylist(id))
             throw CancellationException("Download authority retired")
     }
 

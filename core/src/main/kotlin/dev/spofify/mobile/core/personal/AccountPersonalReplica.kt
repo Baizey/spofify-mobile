@@ -90,7 +90,7 @@ data class PersonalReplicaView(
     val listsKnown: Boolean = false,
     val listsComplete: Boolean = false,
     val deletedPlaylists: Set<String> = emptySet(),
-    val confirmedPlaylistIds: Set<String> = emptySet(),
+    val sharedPlayablePlaylistIds: Set<String> = emptySet(),
 )
 
 /** Player-looper reducer. Only complete scoped reads replace accepted rows; versions fence
@@ -130,13 +130,34 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
     fun detailStale(id: String) = stale(durable.value.details[id]?.refreshedAt)
     fun confirmsPlaylist(id: String) = id in confirmed
 
-    fun replaceDetail(version: Long, summary: PersonalPlaylistSummary, rows: List<PersonalManualEntry>) {
-        if (!confirmsPlaylist(summary.id) || version != version(summary.id)) return
+    fun canPlaySharedPlaylist(id: String): Boolean {
         val data = durable.value
-        val prior = data.playlists.firstOrNull { it.id == summary.id } ?: return
+        val summary = data.playlists.firstOrNull { it.id == id } ?: return false
+        return sharedPlayable(summary, data.details[id])
+    }
+
+    private fun sharedPlayable(summary: PersonalPlaylistSummary, detail: ReplicaPlaylist?): Boolean =
+        confirmsPlaylist(summary.id) && summary.capabilities.play && (summary.kind == PersonalPlaylistKind.MANUAL ||
+            summary.projection() == PlaylistProjection.CURRENT && detail?.revision == summary.revision && detail.refreshedAt != null)
+
+    /** Accept the summary independently of the rows. A non-ready evaluation invalidates
+     * freshness but never evicts last-good rows, including a previously accepted empty result. */
+    fun replaceDetail(version: Long, summary: PersonalPlaylistSummary, rows: List<PersonalManualEntry>) {
+        val id = summary.id
+        if (!confirmsPlaylist(id) || version != version(id)) return
+        val data = durable.value
+        val prior = data.playlists.firstOrNull { it.id == id } ?: return
         if (summary.revision < prior.revision || summary.kind != prior.kind) return
-        val detail = ReplicaPlaylist(summary.revision, rows, clock.millis())
-        publish(data.copy(playlists = replace(data.playlists, summary), details = data.details + (summary.id to detail)))
+        val projection = summary.projection() ?: return
+        if (rows.size.toLong() != (summary.trackCount ?: 0L)) return
+        val old = data.details[id]
+        val detail = when (projection) {
+            PlaylistProjection.CURRENT -> ReplicaPlaylist(summary.revision, rows, clock.millis())
+            PlaylistProjection.STORED -> old?.copy(refreshedAt = null) ?: ReplicaPlaylist(summary.revision, rows)
+            PlaylistProjection.UNMATERIALIZED -> old?.copy(refreshedAt = null)
+        }
+        publish(data.copy(playlists = replace(data.playlists, summary), details =
+            if (detail != null) data.details + (id to detail) else data.details))
     }
 
     /** A manifest supplies offline rows, never overrides authoritative membership or accepted rows. */
@@ -218,7 +239,8 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
             changed(id)
             next = next.copy(playlists = replace(next.playlists, summary))
             val old = next.details[id]
-            val rows = old?.takeIf { !delta.rowsInvalid && it.refreshedAt != null && it.revision == summary.revision - 1 }
+            val rows = old?.takeIf { !delta.rowsInvalid && summary.projection() == PlaylistProjection.CURRENT &&
+                it.refreshedAt != null && it.revision == summary.revision - 1 }
                 ?.let { applyEntries(it.rows, delta.entries) }
                 ?.takeIf { it.size.toLong() == summary.trackCount }
             if (rows != null) {
@@ -236,16 +258,20 @@ class AccountPersonalReplica(private val clock: Clock = Clock.systemUTC(), priva
         durable.value = data
         val recent = (data.recent + data.localPlays).distinctBy(::key).sortedWith(historyOrder).take(RECENT_LIMIT)
         fun PersonalTrack.visible(remote: Boolean) = copy(hasAudio = remote && hasAudio || id in available)
+        val shared = data.playlists.filter { sharedPlayable(it, data.details[it.id]) }.mapTo(hashSetOf()) { it.id }
         val details = data.details.mapValues { (id, detail) ->
-            detail.copy(rows = detail.rows.map { it.copy(track = it.track.visible(online && confirmsPlaylist(id))) })
+            detail.copy(rows = detail.rows.map { it.copy(track = it.track.visible(online && id in shared)) })
         }
         val lists = data.playlists.map { summary ->
-            if (confirmsPlaylist(summary.id)) summary else summary.copy(capabilities = PersonalPlaylistCapabilities(
-                false, false, false, !online && summary.capabilities.play, false, false, false))
+            val play = if (online) summary.id in shared else summary.capabilities.play
+            val capabilities = if (confirmsPlaylist(summary.id)) summary.capabilities.copy(
+                play = play, copyToManual = summary.capabilities.copyToManual && summary.id in shared)
+            else PersonalPlaylistCapabilities(false, false, false, play, false, false, false)
+            summary.copy(capabilities = capabilities)
         }
         mutable.value = PersonalReplicaView(connected, lists, recent.map { it.copy(track = it.track.visible(online)) }, details,
             ready, data.recentAt != null || data.localPlays.isNotEmpty(), data.listsAt != null || data.playlists.isNotEmpty(),
-            data.listsComplete, data.deletedPlaylists, confirmed)
+            data.listsComplete, data.deletedPlaylists, shared)
     }
 
     private fun applyEntries(original: List<PersonalManualEntry>, edit: EntryChange?): List<PersonalManualEntry>? {

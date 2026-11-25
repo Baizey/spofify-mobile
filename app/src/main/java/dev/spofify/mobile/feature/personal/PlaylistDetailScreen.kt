@@ -99,7 +99,7 @@ internal fun PlaylistDetailScreen(
         Box(Modifier.weight(1f).fillMaxWidth()) {
             val emptyMessage = when {
                 state.noMatches -> "No matches"
-                state.loaded && state.rows.isEmpty() -> "No songs yet"
+                state.showEmpty -> "No songs yet"
                 else -> null
             }
             if (emptyMessage != null) Text(emptyMessage, Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
@@ -138,7 +138,7 @@ internal fun PlaylistDetailScreen(
         val downloadAction: Pair<String, () -> Unit>? = when {
             music == null -> null
             row.track.id in direct -> "Remove download" to { music.removeDownload(row.track.id) { actionError = "Couldn’t remove download." } }
-            canDownload && state.confirmed && row.track.hasAudio && row.track.id !in downloaded -> "Download" to { music.download(row.track, id, row.identity) { actionError = "Couldn’t download this song." } }
+            canDownload && state.canSaveOnline && row.track.hasAudio && row.track.id !in downloaded -> "Download" to { music.download(row.track, id, row.identity) { actionError = "Couldn’t download this song." } }
             else -> null
         }
         PersonalSongActions(api, row.track, loader, playable && row in state.rows && row.reference(context) != null,

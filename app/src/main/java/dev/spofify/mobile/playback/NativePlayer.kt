@@ -88,7 +88,7 @@ internal class NativePlayer(private val app: Application, val identity: AccountI
             override fun monotonicMs() = SystemClock.elapsedRealtime()
             override fun wallTimeMs() = System.currentTimeMillis()
         }, current, library = music.library, recordPlay = music.personal::recordLocal,
-            confirmedPlaylist = music.personal.replica::confirmsPlaylist)
+            canPlaySharedPlaylist = music.personal.replica::canPlaySharedPlaylist)
         val selected = AppPlayback(controller, music.indexReady) { current() && mutable.value?.controller === controller }
         controller.setOffline(manual)
         music.personal.attach(controller)

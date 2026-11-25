@@ -1,8 +1,8 @@
 # Offline Mode v2
 
-**Applies to:** Spofify Desktop and Mobile. This is the target client behavior, not a description of what has shipped. It does not change the server's offline v1 API or require both clients to use the same storage or networking implementation.
+**Applies to:** Spofify Desktop and Mobile. Desktop, Mobile and Go upgrade in lockstep and use only the current protocols. The Go download routes are versioned `/api/me/offline/v1`; this label specifies the current download API, not a legacy client mode.
 
-Offline Mode v2 replaces the previous client offline mode. Backward compatibility with its behavior or stored state is not required.
+Offline Mode v2 replaces the previous client offline mode. Clients do not import v1 offline state or fall back to its behavior. The clients may use different storage and networking implementations.
 
 ## 1. Connectivity and mode
 
@@ -23,7 +23,7 @@ Offline Mode v2 replaces the previous client offline mode. Backward compatibilit
 
 ### Stored data
 
-- **Playlists:** Persist the playlist list and successfully fetched playlist details, including track order, duplicate occurrences, and metadata needed to render rows. Persist enough metadata for any playlist with downloaded tracks to open offline, even when only some tracks are downloaded. This does not require prefetching the track list of every playlist.
+- **Playlists:** Persist the playlist list and successfully fetched playlist details, including track order, duplicate occurrences, and metadata needed to render rows. A successful account playlist snapshot is complete, including at the 100-playlist account quota. Remove omitted playlists and their saved browse details; cached data alone never authorizes edits. Persist enough metadata for any playlist with downloaded tracks to open offline, even when only some tracks are downloaded. This does not require prefetching the track list of every playlist.
 - **Recently Played:** Persist the last known history. Record qualifying local plays using the same eligibility rule used online. Offline plays appear immediately and survive restart. Merge subsequent server history without erasing unmatched local plays within the normal history retention window. Do not deduplicate distinct plays merely because they use the same track ID. Uploading offline play history is not required by this spec.
 - Store caches durably and scope them to the active account. Missing artwork must not block a view. Cached metadata is not evidence that audio is available offline. A cached playlist name without saved details is **not saved on this device**, not an empty playlist.
 
@@ -34,16 +34,11 @@ Offline Mode v2 replaces the previous client offline mode. Backward compatibilit
 - Apply confirmed online changes to the corresponding cache immediately. A complete successful refresh may replace its snapshot. A failed, cancelled, incomplete, or superseded refresh must not erase a valid snapshot or roll back a newer confirmed edit. Do not advance the freshness timestamp on failure.
 - Retain stale snapshots for offline use. Disable server-only edits offline; do not claim success or silently queue mutations. Local download removal and local playback remain available.
 
-**Android account wire:** Connection admission and a top-level `sync` both produce the account snapshot. It supplies the newest 40 server play occurrences; identity is `(event ID, origin)`, not track ID. Unmatched local plays remain separately durable and are merged into the presentation. There is no REST refresh path. The account quota is 100 playlists. A successful snapshot contains the complete list, including at exactly 100; it replaces membership and invalidates saved details for omitted playlists. Saved playlists are visible before refresh but cannot authorize online playlist operations.
-
-When a watched playlist needs details, `syncPlaylist` fetches the current rows for that ID in scoped parts. A continuation uses the last token and the number of rows received; the server can restart at offset zero with a new token. The client validates the binding, offset, summary, count, and occurrence identities before replacing accepted rows. A scoped `missing` reply for the current transfer has the same local effect as a confirmed deletion and does not disconnect the socket. A partial, invalid, disconnected, or superseded transfer does not advance freshness. Keep previously accepted rows while repairing a removal or if the server sends an incomplete stale rules result.
-
 ## 3. Downloads and playback
 
 - A track is **Downloaded** only once its audio has been fully written, verified against the download contract, and durably recorded as playable by the client. Publish completion only after the file can be opened for playback. Partial transfers and temporary streaming buffers do not count. Downloads survive normal restarts and ordinary metadata or streaming-cache eviction.
-- Android keeps the previous playlist download until the replacement's directory sync succeeds and the original job is still authorized. A failed or retired replacement does not become playable through a later read. Retry transient save failures at most twice; a permanent failure stops the worker and appears as failed instead of pending, without retrying on network policy changes.
 - Prefer a valid download whenever playback belongs to the local client, even online. If the file is missing or unreadable, correct the recorded availability. A saved index entry alone does not make a track playable.
-- When streaming stops because the service is lost or manual mode is enabled, continue at the current position from a valid local copy if possible. Otherwise, play the remaining buffer for the current track without fetching more audio. Pause with a brief reason if the track cannot continue.
+- When streaming stops because the service is lost or manual mode is enabled, continue at the current position from a valid local copy if possible. Otherwise, drain the existing buffer of that occurrence without fetching more audio. Readmit the source for each new occurrence, including Repeat One. Pause with a brief reason if the track cannot continue.
 - When the user explicitly selects an unavailable track, show why it cannot play. Do not substitute a different track. During automatic queue advance, skip unavailable entries in queue order and stop if none can play. Repeat must not spin through an unavailable queue indefinitely.
 - Keep Downloads easy to reach. Indicate unavailable tracks in saved views without obscuring their metadata.
 
@@ -55,8 +50,6 @@ When a watched playlist needs details, `syncPlaylist` fetches the current rows f
 ## 5. Acceptance tests
 
 Run on both clients. Use an injectable clock, controlled responses, and network request counts where applicable. Cover the relaunch path on a running client as well as in automated tests.
-
-On Android, `bash scripts/test-current-go-offline.sh /path/to/spofify-go` builds the pinned provider-free Go fixture in disposable storage. It verifies socket opening and explicit `sync`, manual and derived occurrence order, one direct track download, and reopening the saved details and playable audio from disk. It needs loopback TCP and cached Go/Gradle dependencies; set `SPOFIFY_GO_FIXTURE_PORT` to an available port if the harness requires a fixed loopback grant. It does not exercise Media3 or render Android UI.
 
 | Scenario | Expected result |
 | --- | --- |

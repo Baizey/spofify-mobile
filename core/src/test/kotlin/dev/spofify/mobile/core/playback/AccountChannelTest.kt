@@ -78,7 +78,7 @@ class AccountChannelTest {
         }, audio, test.backgroundScope, clock, library = object : LocalPlaybackLibrary {
             override suspend fun hasAudio(track: PlaybackTrack, isAuthorized: () -> Boolean) = isAuthorized()
             override fun resolve(track: PlaybackTrackReference?, context: PlaybackContext?) = LocalPlaybackRows(rows)
-        }, confirmedPlaylist = confirmedPlaylist)
+        }, canPlaySharedPlaylist = confirmedPlaylist)
         val view get() = channel.state.value
         fun connect() { channel.connect("Phone", "self"); test.runCurrent() }
         fun snapshot(owner: String? = "self", generation: Long = 1, revision: Long = 1,

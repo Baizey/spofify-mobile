@@ -75,11 +75,11 @@ internal class AccountMusic(app: Application, private val identity: AccountIdent
     val trackDownloads = MutableStateFlow<Set<String>>(emptySet())
 
     fun setPlaylistOffline(id: String, save: Boolean) {
-        if (!save || onlinePlayback.value && personal.replica.confirmsPlaylist(id)) offlinePlaylists.set(id, save)
+        if (!save || onlinePlayback.value && personal.replica.canPlaySharedPlaylist(id)) offlinePlaylists.set(id, save)
     }
 
     fun download(track: PersonalTrack, playlistId: String, occurrenceId: String, failure: () -> Unit) {
-        if (!personal.replica.confirmsPlaylist(playlistId)) return
+        if (!personal.replica.canPlaySharedPlaylist(playlistId)) return
         val grant = sessions.onlineGrant.value?.takeIf { it.identity == identity && onlinePlayback.value } ?: return
         if (track.id in trackDownloads.value) return
         trackDownloads.update { it + track.id }

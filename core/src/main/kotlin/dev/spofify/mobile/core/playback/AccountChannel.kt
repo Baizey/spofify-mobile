@@ -18,7 +18,7 @@ class AccountChannel(
     private val clock: PlaybackClock = SystemPlaybackClock, private val current: () -> Boolean = { true },
     library: LocalPlaybackLibrary = EmptyPlaybackLibrary,
     recordPlay: (dev.spofify.mobile.core.personal.PersonalHistoryEntry) -> Unit = {},
-    private val confirmedPlaylist: (String) -> Boolean = { true },
+    private val canPlaySharedPlaylist: (String) -> Boolean = { true },
 ) : AutoCloseable {
     private val view = MutableStateFlow(PlaybackView(localOutput = true, offline = true))
     val state = view.asStateFlow()
@@ -708,7 +708,7 @@ class AccountChannel(
         if (!online || retainedLocal && action.kind !in setOf("play", "select")) {
             return offline()
         }
-        if (context != null && context.kind in setOf("playlist", "derived") && !confirmedPlaylist(context.id)) return false
+        if (context != null && context.kind in setOf("playlist", "derived") && !canPlaySharedPlaylist(context.id)) return false
         if (desynced || pending.size >= MAX_PENDING) return false
         val c = (nativeCursor.takeIf { isOwner() && nativeAhead() } ?: confirmed.cursor)
         val display = projection.project(displayBasis(), pending.values)
