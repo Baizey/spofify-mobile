@@ -83,6 +83,8 @@ dependencies {
 tasks.withType<Test>().configureEach {
     maxHeapSize = "256m"
     maxParallelForks = 1
+    inputs.property("goOfflineFixture", providers.environmentVariable("SPOFIFY_GO_FIXTURE_BIN").orElse(""))
+    inputs.property("goOfflineFixturePort", providers.environmentVariable("SPOFIFY_GO_FIXTURE_PORT").orElse("0"))
     System.getenv("TMPDIR")?.let { systemProperty("java.io.tmpdir", it) }
     System.getenv("HOME")?.let { systemProperty("user.home", it) }
 }

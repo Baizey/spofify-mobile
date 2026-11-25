@@ -56,7 +56,7 @@ When a watched playlist needs details, `syncPlaylist` fetches the current rows f
 
 Run on both clients. Use an injectable clock, controlled responses, and network request counts where applicable. Cover the relaunch path on a running client as well as in automated tests.
 
-On Android, `bash scripts/test-current-go-offline.sh /path/to/spofify-go` builds the pinned provider-free Go fixture in disposable storage. It verifies socket opening and explicit `sync`, manual and derived occurrence order, one direct track download, and reopening the saved details and playable audio from disk. It needs loopback TCP and cached Go/Gradle dependencies; it does not exercise Media3 or render Android UI.
+On Android, `bash scripts/test-current-go-offline.sh /path/to/spofify-go` builds the pinned provider-free Go fixture in disposable storage. It verifies socket opening and explicit `sync`, manual and derived occurrence order, one direct track download, and reopening the saved details and playable audio from disk. It needs loopback TCP and cached Go/Gradle dependencies; set `SPOFIFY_GO_FIXTURE_PORT` to an available port if the harness requires a fixed loopback grant. It does not exercise Media3 or render Android UI.
 
 | Scenario | Expected result |
 | --- | --- |
