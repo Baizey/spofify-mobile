@@ -41,6 +41,7 @@ class AccountPersonalGoFixtureTest {
         // The real controller/source each use one looper. An executor models that here without Android APIs.
         java.util.concurrent.Executors.newSingleThreadExecutor().asCoroutineDispatcher().use { looper ->
             val scope = CoroutineScope(SupervisorJob() + looper)
+            var verified = false
             try {
                 val ready = Json.parseToJsonElement(checkNotNull(process.inputStream.bufferedReader().readLine()) {
                     "Pinned Go fixture exited before its ready descriptor"
@@ -182,15 +183,18 @@ class AccountPersonalGoFixtureTest {
                         assertEquals(if (id == manual) 2 else 3, rows.count { it.track.hasAudio })
                     }
                 }
+                verified = true
             } finally {
                 scope.coroutineContext.job.cancelAndJoin()
                 process.outputStream.close()
-                if (!process.waitFor(10, TimeUnit.SECONDS)) {
+                // Go grants its own socket/HTTP shutdown up to 15 seconds; allow for its
+                // shutdown budget rather than killing a still-cleaning process first.
+                if (!process.waitFor(20, TimeUnit.SECONDS)) {
                     process.destroyForcibly()
                     process.waitFor(5, TimeUnit.SECONDS)
-                    fail("Go fixture did not stop after closing its owned stdin")
-                }
-                if (process.exitValue() == 0) {
+                    if (verified) fail("Go fixture did not stop after closing its owned stdin")
+                } else if (verified) {
+                    assertEquals("Go fixture must exit cleanly", 0, process.exitValue())
                     val stopped = Json.parseToJsonElement(errors.readLines().last()).jsonObject
                     assertEquals(JsonPrimitive("stopped"), stopped["event"])
                     assertEquals(JsonPrimitive(true), stopped["clean"])
